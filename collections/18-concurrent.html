@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Конкурентные коллекции изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ИТЕРАЦИЯ И СТРИМЫ</div>
+  <h1>Конкурентные коллекции изнутри</h1>
+  <p class="lead">Обычные коллекции в многопоточном коде ломаются тихо: теряются записи, портятся структуры, итераторы видят полуизменённое состояние. Синхронизированные обёртки спасают отдельные операции, но не составные «проверить-и-сделать». Разбираем, как устроен <code>ConcurrentHashMap</code> (CAS на пустую корзину, блокировка головы корзины, распределённый счётчик, совместный resize), <code>CopyOnWriteArrayList</code>, списки с пропусками и блокирующие очереди — и какую коллекцию брать для какой задачи.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">synchronizedMap</span><span class="tag">check-then-act</span><span class="tag">ConcurrentHashMap</span><span class="tag">CopyOnWrite</span><span class="tag">SkipList</span><span class="tag">BlockingQueue</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="race"><span class="h-num">18.1</span>Синхронизация отдельных методов не спасает составные операции</h2>
+<div class="widget stepper" id="raceSim">
+  <div class="widget-title">Два потока регистрируют один и тот же логин в Collections.synchronizedMap</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Поток 1</h5><div class="items"><span class="chip" id="r1a">containsKey("anna")</span><span class="chip off" id="r1b">put("anna", user1)</span></div></div>
+    <div class="lane"><h5>Карта</h5><div class="items"><span class="chip" id="rm">{}</span></div></div>
+    <div class="lane"><h5>Поток 2</h5><div class="items"><span class="chip" id="r2a">containsKey("anna")</span><span class="chip off" id="r2b">put("anna", user2)</span></div></div>
+  </div>
+  <section class="st-step" data-t="Код" data-hl="r1a r2a" data-log="if (!map.containsKey(login)) map.put(login, user);   // каждый метод synchronized"><p>Каждый метод обёртки берёт монитор, поэтому сами вызовы атомарны. Но между <code>containsKey</code> и <code>put</code> монитор отпускается.</p></section>
+  <section class="st-step" data-t="Обе проверки" data-hl="r1a r2a rm" data-log="T1: containsKey → false; T2: containsKey → false (карта всё ещё пуста)"><p>Оба потока проверили — логина нет.</p></section>
+  <section class="st-step" data-t="Обе вставки" data-hl="r1b r2b rm" data-log="T1: put(anna, user1); T2: put(anna, user2) → user1 тихо затёрт"><p>Оба вставили; второй затёр первого. Два пользователя думают, что зарегистрированы.</p></section>
+  <section class="st-step" data-t="Решение" data-hl="rm" data-log="ConcurrentHashMap: map.putIfAbsent(login, user) == null  — атомарно; или computeIfAbsent"><p>Атомарная составная операция внутри коллекции: <code>putIfAbsent</code>, <code>computeIfAbsent</code>, <code>merge</code>, <code>replace(k, old, new)</code>, <code>remove(k, v)</code> у <code>ConcurrentMap</code>. С synchronizedMap — внешний <code>synchronized (map) { … }</code> вокруг обеих операций. И итерацию синхронизированной обёртки тоже нужно вручную обернуть в <code>synchronized (map)</code>.</p></section>
+</div>
+
+<h2 id="chm"><span class="h-num">18.2</span>ConcurrentHashMap (Java 8+)</h2>
+<div class="widget" id="chW">
+  <div class="widget-title">Что делает put в зависимости от состояния корзины</div>
+  <div class="controls"><label>ситуация<select id="chS" class="wide">
+    <option value="empty">корзина пуста</option>
+    <option value="chain">в корзине есть узлы, конкуренции нет</option>
+    <option value="contend">два потока пишут в одну корзину</option>
+    <option value="other">два потока пишут в разные корзины</option>
+    <option value="resize">идёт resize (ForwardingNode в корзине)</option>
+    <option value="get">get во время всего этого</option>
+    <option value="size">size() под нагрузкой</option>
+  </select></label></div>
+  <div class="out" id="chOut"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    empty: "tabAt(i) == null → casTabAt(i, null, new Node(...))\nБлокировок нет: одна атомарная CAS. При неудаче (кто-то успел) — повтор цикла.",
+    chain: "f = tabAt(i) — голова корзины\nsynchronized (f) {               // блокировка ТОЛЬКО этой корзины\n    проверить, что голова не сменилась\n    пройти цепочку / дерево: заменить значение или добавить узел в хвост\n}\nесли цепочка ≥ 8 — treeifyBin (TreeBin с собственной лёгкой блокировкой чтение/запись)",
+    contend: "оба потока: synchronized на одном объекте-голове → второй ждёт\nКонкуренция только на «горячей» корзине. Горячий ключ (одна запись, которую все обновляют) — узкое место; для счётчиков используйте LongAdder как значение: map.computeIfAbsent(k, x -> new LongAdder()).increment()",
+    other: "разные корзины → разные мониторы или CAS → полностью параллельно\nВ Java 7 карта делилась на 16 сегментов-блокировок; в Java 8 гранулярность — каждая корзина",
+    resize: "поток видит в корзине ForwardingNode (hash = MOVED)\n→ helpTransfer: вместо ожидания ПОМОГАЕТ переносить корзины в новую таблицу (диапазоны раздаются через transferIndex)\nКогда все корзины перенесены, table заменяется новой; get через ForwardingNode читает из новой таблицы",
+    get: "get не блокирует никогда: volatile-чтение таблицы и полей узла (val и next — volatile)\nВидит последнее завершённое изменение по ключу (happens-before от put к get этого ключа)",
+    size: "size() = baseCount + Σ CounterCell[i]   (как LongAdder)\nпри конкуренции за baseCount потоки увеличивают разные ячейки — нет общей точки конкуренции\nрезультат — моментальная оценка, может быть устаревшим; для больших карт — mappingCount() (long)"
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { $("chOut").textContent = D[$("chS").value]; }
+  $("chS").addEventListener("change", run); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Отличие от HashMap</th><th>Причина</th></tr>
+<tr><td>null-ключи и null-значения запрещены</td><td>в конкурентной среде <code>get(k) == null</code> должно однозначно значить «нет ключа»: между <code>containsKey</code> и <code>get</code> состояние может измениться</td></tr>
+<tr><td>Итераторы слабо согласованные</td><td>никогда не бросают CME; отражают состояние на какой-то момент обхода; могут увидеть (или нет) изменения после своего создания</td></tr>
+<tr><td><code>computeIfAbsent</code> атомарна</td><td>функция выполняется под блокировкой корзины не более одного раза на ключ — нельзя делать в ней долгую работу и изменять эту же карту</td></tr>
+<tr><td>Массовые параллельные операции</td><td><code>forEach(parallelismThreshold, …)</code>, <code>reduce</code>, <code>search</code></td></tr>
+</table></div>
+
+<h2 id="cow"><span class="h-num">18.3</span>CopyOnWriteArrayList и снимки</h2>
+<pre data-title="устройство"><code class="java">public class CopyOnWriteArrayList&lt;E&gt; {
+    private transient volatile Object[] array;
+    public boolean add(E e) {
+        synchronized (lock) {
+            Object[] es = getArray();
+            es = Arrays.copyOf(es, es.length + 1);   // КОПИЯ всего массива на каждую запись: O(n)
+            es[es.length - 1] = e;
+            setArray(es);                            // volatile-публикация
+            return true;
+        }
+    }
+    public E get(int i) { return elementAt(getArray(), i); }   // без блокировок
+    public Iterator&lt;E&gt; iterator() { return new COWIterator&lt;&gt;(getArray(), 0); }   // снимок: remove() не поддерживается
+}</code></pre>
+<p>Идеален для «читают постоянно, пишут редко»: списки слушателей и обработчиков событий, конфигурация, маршруты. Ужасен для частых записей: 10 000 add = 50 млн копирований ссылок.</p>
+
+<h2 id="others"><span class="h-num">18.4</span>Списки с пропусками и очереди</h2>
+<ul>
+  <li><b>ConcurrentSkipListMap/Set</b> — упорядоченная конкурентная карта (аналог TreeMap): список с пропусками на CAS, без блокировок, O(log n) в среднем; навигационные методы, диапазоны.</li>
+  <li><b>ConcurrentLinkedQueue/Deque</b> — неблокирующие очереди Майкла–Скотта на CAS: максимальная пропускная способность, но без ожидания при пустоте.</li>
+</ul>
+<div class="widget" id="qW">
+  <div class="widget-title">Какую очередь выбрать</div>
+  <div class="controls">
+    <label>ограничение размера<select id="qB"><option value="1">нужно (backpressure)</option><option value="0">не нужно</option></select></label>
+    <label>ждать при пустоте/переполнении<select id="qW2"><option value="1">да (производитель–потребитель)</option><option value="0">нет</option></select></label>
+    <label>порядок<select id="qO"><option value="fifo">FIFO</option><option value="prio">по приоритету</option><option value="delay">по времени готовности</option><option value="hand">передача из рук в руки</option></select></label>
+  </div>
+  <div class="verdict" id="qV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var b = $("qB").value === "1", w = $("qW2").value === "1", o = $("qO").value, r, why;
+    if (o === "prio") { r = "PriorityBlockingQueue"; why = "неограниченная куча с блокирующим take(); для ограничения — внешний Semaphore"; }
+    else if (o === "delay") { r = "DelayQueue"; why = "элементы реализуют Delayed; take() отдаёт элемент, когда истекла задержка — основа планировщиков"; }
+    else if (o === "hand") { r = "SynchronousQueue / LinkedTransferQueue"; why = "ёмкость 0: put ждёт, пока кто-то сделает take (используется в Executors.newCachedThreadPool); TransferQueue умеет и буферизовать, и передавать напрямую"; }
+    else if (!w) { r = "ConcurrentLinkedQueue"; why = "неблокирующая, неограниченная, самая быстрая при конкуренции; poll возвращает null при пустоте"; }
+    else if (b) { r = "ArrayBlockingQueue (или LinkedBlockingQueue(capacity))"; why = "ограниченная: put блокируется при заполнении — естественное противодавление; ArrayBlockingQueue — один lock и массив, LinkedBlockingQueue — две блокировки (голова/хвост), выше пропускная способность"; }
+    else { r = "LinkedBlockingQueue()"; why = "без ограничения (Integer.MAX_VALUE) — осторожно: при медленном потребителе очередь растёт до OutOfMemoryError (так устроены Executors.newFixedThreadPool)"; }
+    $("qV").className = "verdict ok"; $("qV").innerHTML = "<b>" + r + "</b><br>" + why;
+  }
+  ["qB", "qW2", "qO"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">18.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему ConcurrentHashMap запрещает null-значения?</p><ul><li>Для экономии памяти</li><li>Чтобы get(k) == null однозначно означало отсутствие ключа: проверить containsKey и затем get атомарно нельзя</li><li>Из-за ограничений CAS</li><li>Это ошибка дизайна</li></ul><div class="why">Даг Ли: неоднозначность null недопустима в конкурентных картах.</div></div>
+<div class="mcq" data-ok="3"><p>Как атомарно увеличить счётчик слова в ConcurrentHashMap&lt;String, Long&gt;?</p><ul><li>map.put(w, map.get(w) + 1)</li><li>synchronized (w) { … }</li><li>map.get(w).increment()</li><li>map.merge(w, 1L, Long::sum)</li></ul><div class="why">Или LongAdder в качестве значения для горячих ключей.</div></div>
+<div class="mcq" data-ok="0"><p>Что видит итератор CopyOnWriteArrayList, если во время обхода добавить элемент?</p><ul><li>Снимок на момент создания итератора — нового элемента нет, исключения нет</li><li>CME</li><li>Новый элемент</li><li>Итератор блокируется</li></ul><div class="why">Запись создала новый массив; итератор держит старый.</div></div>
+<div class="mcq" data-ok="2"><p>Чем опасна неограниченная LinkedBlockingQueue в пуле потоков?</p><ul><li>Она медленная</li><li>Она не потокобезопасна</li><li>Если задачи поступают быстрее, чем обрабатываются, очередь растёт без предела — OutOfMemoryError вместо отказа</li><li>Она теряет задачи</li></ul><div class="why">Ограничивайте очередь и задайте политику отказа.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните, как ConcurrentHashMap в Java 8 обеспечивает потокобезопасность без глобальной блокировки.</summary><div class="a"><p>Таблица корзин с volatile-доступом (Unsafe/VarHandle). Вставка в пустую корзину — CAS. В непустую — synchronized на узле-голове этой корзины (блокируется только она). Чтение — без блокировок, через volatile-поля узлов. Размер — распределённый счётчик (baseCount + CounterCells). Расширение — совместное: потоки, встретившие ForwardingNode, помогают переносить диапазоны корзин. Длинные цепочки — TreeBin. Итераторы — слабо согласованные.</p></div></details>
+<details class="q"><summary>synchronizedList против CopyOnWriteArrayList против ConcurrentLinkedQueue — когда что?</summary><div class="a"><p>synchronizedList — простая защита при умеренной конкуренции и смешанной нагрузке; итерацию надо синхронизировать вручную. CopyOnWriteArrayList — много чтений и итераций, редкие записи (слушатели). ConcurrentLinkedQueue — очередь с частыми добавлениями и извлечениями без индексного доступа. Для производитель–потребитель — BlockingQueue.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

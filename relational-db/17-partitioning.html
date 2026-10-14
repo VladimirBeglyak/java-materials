@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Партиционирование и большие таблицы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.pt-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; margin: 12px 0; }
+.pt-cell { font: 12px var(--font-mono); text-align: center; padding: 8px 4px; border: 1.5px solid var(--line); border-radius: 6px; background: var(--bg-sunk); opacity: .45; transition: all .2s; }
+.pt-cell.on { opacity: 1; border-color: var(--accent); background: var(--accent-soft); }
+.pt-cell.gone { text-decoration: line-through; opacity: .25; }
+</style>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ЭКСПЛУАТАЦИЯ И МАСШТАБ</div>
+  <h1>Партиционирование и большие таблицы</h1>
+  <p class="lead">Таблица на миллиарды строк и терабайты: VACUUM идёт сутки, индексы не помещаются в память, удаление старых данных — многочасовой DELETE. Партиционирование делит таблицу на части по ключу. Когда оно действительно помогает, как выбрать ключ, что такое отсечение партиций, какие ограничения появляются и чем партиционирование отличается от шардинга.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">RANGE/LIST/HASH</span><span class="tag">partition pruning</span><span class="tag">pg_partman</span><span class="tag">ретенция</span><span class="tag">шардинг</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">17.1</span>Зачем — и когда не нужно</h2>
+<div class="grid-2">
+  <div class="card"><h4>Реальные выгоды</h4><ul><li><b>Удаление старых данных</b> — <code>DROP</code>/<code>DETACH</code> партиции мгновенно вместо DELETE миллионов строк с раздуванием.</li><li><b>Отсечение партиций</b>: запросы за последний месяц читают одну партицию и её маленькие индексы.</li><li><b>Обслуживание по частям</b>: VACUUM, REINDEX, pg_repack — по партиции; старые партиции заморожены и не трогаются.</li><li>Разные хранилища (табличные пространства) для горячих и архивных данных.</li></ul></div>
+  <div class="card"><h4>Когда вредно</h4><ul><li>Запросы <b>не</b> содержат ключ партиционирования — читаются все партиции, планирование дороже.</li><li>Таблица меньше ~50–100 ГБ без требований ретенции — обычный индекс быстрее и проще.</li><li>Тысячи мелких партиций — планирование и блокировки на каждую.</li><li>Нужна глобальная уникальность по столбцу вне ключа — PostgreSQL её не поддерживает.</li></ul></div>
+</div>
+
+<h2 id="kinds"><span class="h-num">17.2</span>Три вида</h2>
+<pre data-title="декларативное партиционирование"><code class="sql">-- RANGE: по времени — самый частый случай
+CREATE TABLE events (
+  id         bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id  bigint NOT NULL,
+  created_at timestamptz NOT NULL,
+  payload    jsonb,
+  PRIMARY KEY (id, created_at)          -- ключ партиционирования обязан входить в PK и UNIQUE
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2026_10 PARTITION OF events
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE events_default PARTITION OF events DEFAULT;   -- страховка для «неожиданных» дат
+CREATE INDEX ON events (tenant_id, created_at);            -- создаётся в каждой партиции
+
+-- LIST: по набору значений
+CREATE TABLE orders_by_region (...) PARTITION BY LIST (region);
+CREATE TABLE orders_eu PARTITION OF orders_by_region FOR VALUES IN ('DE', 'FR', 'PL');
+
+-- HASH: равномерно по ключу, когда нет естественного диапазона
+CREATE TABLE sessions (...) PARTITION BY HASH (user_id);
+CREATE TABLE sessions_p0 PARTITION OF sessions FOR VALUES WITH (MODULUS 8, REMAINDER 0);</code></pre>
+
+<h2 id="pruning"><span class="h-num">17.3</span>Отсечение партиций</h2>
+<div class="widget" id="ptW">
+  <div class="widget-title">Какие партиции прочитает запрос</div>
+  <div class="controls">
+    <label>запрос<select id="ptQ" class="wide">
+      <option value="month">WHERE created_at &gt;= '2026-10-01' AND created_at &lt; '2026-11-01'</option>
+      <option value="quarter">WHERE created_at BETWEEN '2026-07-01' AND '2026-09-30'</option>
+      <option value="now">WHERE created_at &gt; now() - interval '7 days' (отсечение при выполнении)</option>
+      <option value="func">WHERE date_trunc('month', created_at) = '2026-10-01'</option>
+      <option value="tenant">WHERE tenant_id = 42 (без ключа партиционирования)</option>
+      <option value="id">WHERE id = 123456 (по первичному ключу без даты)</option>
+    </select></label>
+    <button class="btn" type="button" id="ptDrop">Ретенция: удалить партиции старше 6 мес.</button>
+  </div>
+  <div class="pt-grid" id="ptGrid"></div>
+  <div class="verdict" id="ptV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var names = ["2025-11", "2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"], dropped = 0;
+  var Q = {
+    month: [[11], "ok", "Планировщик отсёк все партиции, кроме одной: читаются только данные и индексы октября."],
+    quarter: [[8, 9, 10], "ok", "Три партиции квартала. Остальные даже не открываются."],
+    now: [[11], "ok", "now() неизвестна при планировании, но отсечение выполняется при запуске (initial pruning): в EXPLAIN видно «Subplans Removed: 10»."],
+    func: [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "bad", "Функция над ключом партиционирования мешает отсечению — как и с индексами. Пишите условие диапазоном по самому столбцу."],
+    tenant: [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "bad", "Ключ партиционирования не указан — запрос идёт во все партиции (в каждой — по своему индексу tenant_id). Если такие запросы основные, ключ выбран неверно или в запрос надо добавить диапазон дат."],
+    id: [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], "warn", "Поиск по id без даты — 12 поисков по индексам. Передавайте дату вместе с id (в URL, в событии), если поиск по ключу частый."]
+  };
+  function run() {
+    var q = Q[$("ptQ").value], on = q[0].filter(function (i) { return i >= dropped; });
+    $("ptGrid").innerHTML = names.map(function (n, i) { return '<div class="pt-cell' + (i < dropped ? " gone" : on.indexOf(i) >= 0 ? " on" : "") + '">events_<br>' + n.replace("-", "_") + "</div>"; }).join("");
+    $("ptV").className = "verdict " + q[1];
+    $("ptV").textContent = "Читается партиций: " + on.length + " из " + (names.length - dropped) + ". " + q[2] + (dropped ? " Старые партиции удалены командой DROP TABLE — мгновенно, без VACUUM и раздувания." : "");
+  }
+  $("ptQ").addEventListener("change", run);
+  $("ptDrop").addEventListener("click", function () { dropped = dropped ? 0 : 6; $("ptDrop").textContent = dropped ? "Вернуть все партиции" : "Ретенция: удалить партиции старше 6 мес."; run(); });
+  run();
+})();
+</script>
+
+<h2 id="ops"><span class="h-num">17.4</span>Эксплуатация</h2>
+<ul>
+  <li><b>Создавать партиции заранее</b>: если партиции на следующий месяц нет, вставки упадут (или уйдут в DEFAULT, из которой потом сложно вынести). Автоматизация: расширение <code>pg_partman</code> + <code>pg_cron</code> или задача в приложении.</li>
+  <li><b>Удаление</b>: <code>ALTER TABLE events DETACH PARTITION events_2025_10 CONCURRENTLY;</code> затем выгрузить в архив (S3, Parquet) и <code>DROP</code>.</li>
+  <li><b>Индексы</b>: <code>CREATE INDEX</code> на родителе создаёт индекс во всех партициях и блокирует запись; для живой системы — <code>CREATE INDEX CONCURRENTLY</code> на каждой партиции, затем <code>CREATE INDEX ON ONLY</code> родителя и <code>ATTACH PARTITION</code> индексов.</li>
+  <li><b>Число партиций</b>: десятки–сотни — нормально, тысячи — проблемы планирования. Месячные партиции для данных за несколько лет; дневные — для огромных потоков с короткой ретенцией.</li>
+  <li><b>Перевод существующей таблицы</b>: создать партиционированную, старую подключить как одну большую партицию (с CHECK-ограничением, чтобы ATTACH не сканировал), новые данные — в новые партиции.</li>
+</ul>
+
+<h2 id="sharding"><span class="h-num">17.5</span>Партиционирование ≠ шардинг</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Партиционирование</th><th>Шардинг</th></tr>
+<tr><td>Где части</td><td>на одном сервере</td><td>на разных серверах</td></tr>
+<tr><td>Что масштабирует</td><td>управляемость, ретенция, скорость запросов с ключом</td><td>запись, объём, память — сверх одного сервера</td></tr>
+<tr><td>Транзакции и JOIN</td><td>как обычно</td><td>между шардами — дорого или невозможно</td></tr>
+<tr><td>Инструменты</td><td>встроенное в PostgreSQL</td><td>Citus, шардинг в приложении (по tenant_id), Vitess (MySQL), распределённые SQL-базы (YugabyteDB, CockroachDB)</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Порядок масштабирования</span>
+Оптимизация запросов и индексов → больше железа (вертикально — современные серверы держат десятки ТБ и сотни ядер) → реплики для чтения → партиционирование больших таблиц → вынос частей системы в отдельные базы (по сервисам) → и только потом шардинг. Шардинг — необратимое усложнение каждой фичи.
+</div>
+
+<h2 id="quiz"><span class="h-num">17.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Главная практическая выгода партиционирования таблицы событий по месяцам?</p><ul><li>Ускорение любых запросов</li><li>Мгновенное удаление старых данных (DROP партиции) и чтение только нужных месяцев</li><li>Возможность хранить больше столбцов</li><li>Автоматический шардинг</li></ul><div class="why">Ретенция и отсечение партиций — основные причины.</div></div>
+<div class="mcq" data-ok="3"><p>Почему в партиционированной таблице первичный ключ должен включать ключ партиционирования?</p><ul><li>Так требует стандарт SQL</li><li>Для ускорения вставки</li><li>Чтобы работал VACUUM</li><li>Уникальность проверяется индексом внутри каждой партиции; глобальных индексов нет</li></ul><div class="why">Уникальность (id, created_at) гарантируется, уникальность одного id — нет.</div></div>
+<div class="mcq" data-ok="0"><p>Запросы в основном ищут по <code>tenant_id</code>, а таблица партиционирована по дате. Что происходит?</p><ul><li>Каждый запрос проходит по всем партициям</li><li>PostgreSQL автоматически перестроит партиции</li><li>Запросы станут быстрее</li><li>Запросы вернут ошибку</li></ul><div class="why">Ключ партиционирования выбирают по основным запросам и по ретенции.</div></div>
+<div class="mcq" data-ok="2"><p>Что случится при вставке строки с датой, для которой нет партиции и нет DEFAULT?</p><ul><li>Создастся новая партиция</li><li>Строка попадёт в последнюю партицию</li><li>Ошибка: no partition of relation found for row</li><li>Строка будет проигнорирована</li></ul><div class="why">Поэтому партиции создают заранее и мониторят.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Таблица событий 4 ТБ, хранить нужно 13 месяцев. Как организовать?</summary><div class="a"><p>RANGE по <code>created_at</code> помесячно (или понедельно при очень большом потоке), pg_partman создаёт партиции на несколько периодов вперёд, ежемесячная задача отключает (DETACH CONCURRENTLY) партицию старше 13 месяцев, выгружает её в объектное хранилище и удаляет. Все запросы приложения содержат диапазон дат. Первичный ключ (id, created_at). BRIN или B-tree по created_at внутри партиций, индексы под основные запросы.</p></div></details>
+<details class="q"><summary>Когда переходить к шардингу?</summary><div class="a"><p>Когда исчерпаны вертикальное масштабирование, реплики, оптимизация и разделение по сервисам, а запись или рабочий набор данных не помещаются в один сервер. Предпосылка — естественный ключ шардирования (tenant, пользователь), по которому почти все запросы и транзакции локальны. Варианты: Citus для PostgreSQL, шардинг в приложении, распределённая SQL-база.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

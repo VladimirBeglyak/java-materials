@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · GIN, GiST, BRIN и другие индексы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ВНУТРЕННЕЕ УСТРОЙСТВО</div>
+  <h1>GIN, GiST, BRIN и другие индексы</h1>
+  <p class="lead">B-tree умеет порядок и равенство. Но «найти документы, где jsonb содержит ключ», «строки, где в названии есть подстрока», «бронирования, пересекающиеся по времени», «точки в радиусе 5 км» и «события за час в таблице на 5 млрд строк» требуют других структур. Обзор индексов PostgreSQL с тем, когда какой брать.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">GIN</span><span class="tag">GiST</span><span class="tag">BRIN</span><span class="tag">Hash</span><span class="tag">pg_trgm</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="overview"><span class="h-num">7.1</span>Обзор</h2>
+<div class="table-wrap"><table>
+<tr><th>Тип</th><th>Структура</th><th>Для чего</th><th>Операторы</th></tr>
+<tr><td><b>B-tree</b></td><td>сбалансированное дерево по порядку</td><td>равенство, диапазоны, сортировка, уникальность</td><td><code>= &lt; &gt; BETWEEN IN, LIKE 'a%'</code></td></tr>
+<tr><td><b>Hash</b></td><td>хэш-таблица</td><td>только равенство; меньше B-tree на длинных ключах</td><td><code>=</code></td></tr>
+<tr><td><b>GIN</b></td><td>инвертированный индекс: элемент → список строк</td><td>«содержит»: jsonb, массивы, полнотекстовый поиск, триграммы</td><td><code>@&gt; ? ?| &amp;&amp; @@ LIKE '%x%'</code></td></tr>
+<tr><td><b>GiST</b></td><td>дерево ограничивающих «областей»</td><td>геометрия, диапазоны, пересечения, ближайшие соседи</td><td><code>&amp;&amp; @&gt; &lt;-&gt;</code></td></tr>
+<tr><td><b>SP-GiST</b></td><td>несбалансированные разбиения (quad-tree, префиксное дерево)</td><td>точки, IP-адреса, префиксы строк</td><td><code>&lt;&lt; &gt;&gt; ^@</code></td></tr>
+<tr><td><b>BRIN</b></td><td>min/max на блок страниц</td><td>огромные таблицы, где порядок значений совпадает с физическим (время вставки)</td><td><code>&lt; &gt; =</code></td></tr>
+<tr><td><b>HNSW / IVFFlat</b> (pgvector)</td><td>граф или кластеры векторов</td><td>приближённый поиск ближайших векторов (эмбеддинги)</td><td><code>&lt;-&gt; &lt;=&gt;</code></td></tr>
+</table></div>
+
+<h2 id="gin"><span class="h-num">7.2</span>GIN: «что содержит»</h2>
+<p>Инвертированный индекс, как алфавитный указатель в конце книги: для каждого <b>элемента</b> (ключа jsonb, элемента массива, слова, триграммы) — отсортированный список строк, где он встречается. Запрос «содержит A и B» пересекает списки.</p>
+<pre data-title="jsonb, массивы, полнотекстовый и подстрочный поиск"><code class="sql">-- jsonb: поиск по содержимому документа
+CREATE INDEX products_attrs ON products USING gin (attrs jsonb_path_ops);
+SELECT * FROM products WHERE attrs @&gt; '{"color": "red", "size": "M"}';
+
+-- массивы тегов
+CREATE INDEX posts_tags ON posts USING gin (tags);
+SELECT * FROM posts WHERE tags @&gt; ARRAY['postgres', 'index'];
+
+-- полнотекстовый поиск
+ALTER TABLE articles ADD COLUMN tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('russian', title || ' ' || body)) STORED;
+CREATE INDEX articles_tsv ON articles USING gin (tsv);
+SELECT id, ts_rank(tsv, q) FROM articles, websearch_to_tsquery('russian', 'индексы postgres') q
+WHERE tsv @@ q ORDER BY 2 DESC LIMIT 10;
+
+-- подстрока и опечатки: триграммы
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX users_name_trgm ON users USING gin (name gin_trgm_ops);
+SELECT * FROM users WHERE name ILIKE '%петров%';
+SELECT name, similarity(name, 'Пятров') FROM users WHERE name % 'Пятров';</code></pre>
+<div class="callout warn"><span class="c-title">Цена GIN — запись</span>
+Одна строка с 50 словами — 50 обновлений списков. Чтобы вставки не тормозили, GIN копит изменения в «pending list» (<code>fastupdate</code>) и вливает их позже — поиск при этом просматривает и этот список. Для таблиц с интенсивной записью следите за <code>gin_pending_list_limit</code> и autovacuum.
+</div>
+
+<h2 id="trgm"><span class="h-num">7.3</span>Как работают триграммы</h2>
+<div class="widget" id="tgW">
+  <div class="widget-title">Разбор строки на триграммы</div>
+  <div class="controls"><label>строка<input type="text" id="tgA" value="петров"></label><label>поиск<input type="text" id="tgB" value="пятров"></label></div>
+  <div class="out" id="tgOut"></div>
+  <div class="verdict" id="tgV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function tri(s) {
+    var set = {};
+    s.toLowerCase().split(/[^0-9a-zа-яё]+/i).filter(Boolean).forEach(function (w) { w = "  " + w + " "; for (var i = 0; i + 3 <= w.length; i++) set[w.substr(i, 3)] = 1; });
+    return Object.keys(set).sort();
+  }
+  function run() {
+    var a = tri($("tgA").value), b = tri($("tgB").value), common = a.filter(function (x) { return b.indexOf(x) >= 0; });
+    var uni = a.length + b.length - common.length, sim = uni ? common.length / uni : 0;
+    function show(l) { return l.map(function (x) { return "«" + x + "»"; }).join(" "); }
+    $("tgOut").textContent = "строка: " + show(a) + "\nпоиск:  " + show(b) + "\nобщие:  " + show(common);
+    $("tgV").className = "verdict " + (sim >= 0.3 ? "ok" : "warn");
+    $("tgV").textContent = "similarity = " + common.length + " / " + uni + " = " + sim.toFixed(2) + (sim >= 0.3 ? " ≥ 0.3 (порог pg_trgm.similarity_threshold) — строка найдётся оператором %" : " < 0.3 — оператор % строку не вернёт") + ". Для ILIKE '%…%' индекс выбирает строки, содержащие все триграммы образца, затем проверяет точное совпадение.";
+  }
+  ["tgA", "tgB"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+
+<h2 id="gist"><span class="h-num">7.4</span>GiST: пересечения, расстояния, исключения</h2>
+<p>GiST хранит в узлах «ограничивающие области» (прямоугольник, диапазон), покрывающие всё под ними. Поиск спускается во все поддеревья, чья область пересекается с запросом. Это даёт поиск по пересечению, вхождению и ближайших соседей (<code>ORDER BY geom &lt;-&gt; точка LIMIT 10</code>).</p>
+<pre data-title="бронирования без пересечений — гарантия на уровне базы"><code class="sql">CREATE EXTENSION IF NOT EXISTS btree_gist;   -- чтобы в GiST можно было использовать = для room_id
+CREATE TABLE bookings (
+  id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  room_id bigint NOT NULL,
+  during  tstzrange NOT NULL,
+  EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;)   -- нет двух броней одной комнаты с пересечением
+);
+INSERT INTO bookings (room_id, during) VALUES (1, '[2026-05-01 10:00, 2026-05-01 12:00)');
+INSERT INTO bookings (room_id, during) VALUES (1, '[2026-05-01 11:00, 2026-05-01 13:00)');
+-- ERROR: conflicting key value violates exclusion constraint
+
+-- геоданные (PostGIS): кафе в радиусе 1 км, ближайшие первыми
+SELECT name FROM places
+WHERE ST_DWithin(geog, ST_MakePoint(27.56, 53.90)::geography, 1000)
+ORDER BY geog &lt;-&gt; ST_MakePoint(27.56, 53.90)::geography LIMIT 10;</code></pre>
+<div class="callout ok"><span class="c-title">Exclusion constraint — недооценённый инструмент</span>
+Проверка «нет пересечений» в коде приложения подвержена гонкам (две транзакции одновременно проверили и обе вставили — тема 12). Ограничение исключения в базе решает это без блокировок вручную.
+</div>
+
+<h2 id="brin"><span class="h-num">7.5</span>BRIN: индекс на килобайты для таблицы на терабайт</h2>
+<p>BRIN хранит для каждого блока из 128 страниц только минимум и максимум столбца. Если данные добавляются по времени, блоки «сами отсортированы»: для запроса за последний час подходят единицы блоков. Индекс в тысячи раз меньше B-tree и почти не замедляет вставку.</p>
+<div class="widget" id="brW">
+  <div class="widget-title">BRIN: когда работает, а когда нет</div>
+  <div class="controls">
+    <label>корреляция порядка значений с физическим<select id="brCor"><option value="1">идеальная (время вставки)</option><option value="0.9">высокая (небольшие опоздания)</option><option value="0.5">средняя</option><option value="0">нет (случайные значения)</option></select></label>
+  </div>
+  <div class="out" id="brOut"></div>
+  <div class="verdict" id="brV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var c = +$("brCor").value, blocks = 24, rows = [], hits = 0, q0 = 40, q1 = 45;
+    for (var b = 0; b < blocks; b++) {
+      var center = b * 100 / blocks, spread = (1 - c) * 50 + 2;
+      var mn = Math.max(0, Math.round(center - spread * Math.random() - (1 - c) * 30 * Math.random())), mx = Math.min(100, Math.round(center + 100 / blocks + spread * Math.random() + (1 - c) * 30 * Math.random()));
+      if (c === 0) { mn = Math.round(Math.random() * 5); mx = 95 + Math.round(Math.random() * 5); }
+      var h = !(mx < q0 || mn > q1); if (h) hits++;
+      rows.push((h ? "▶ " : "  ") + "блок " + String(b + 1).padStart(2) + ": min " + String(mn).padStart(3) + "  max " + String(mx).padStart(3));
+    }
+    $("brOut").textContent = "запрос: WHERE ts BETWEEN 40 AND 45\n" + rows.join("\n");
+    $("brV").className = "verdict " + (hits <= 6 ? "ok" : "bad");
+    $("brV").textContent = "Нужно прочитать блоков: " + hits + " из " + blocks + ". " + (hits <= 6 ? "BRIN отсекает почти всё — отличный выбор." : "Диапазоны блоков перекрываются, BRIN не помогает: нужен B-tree или переупорядочивание данных (CLUSTER).");
+  }
+  $("brCor").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="BRIN для журнала событий"><code class="sql">CREATE INDEX events_ts_brin ON events USING brin (created_at) WITH (pages_per_range = 64);
+-- проверка корреляции: близко к 1 — BRIN подходит
+SELECT correlation FROM pg_stats WHERE tablename = 'events' AND attname = 'created_at';</code></pre>
+
+<h2 id="hash"><span class="h-num">7.6</span>Hash и прочее</h2>
+<ul>
+  <li><b>Hash</b> — с PostgreSQL 10 журналируется и безопасен. Только равенство, без уникальности и сортировки. Выигрыш — на длинных ключах (URL, токены), где B-tree большой. В большинстве случаев B-tree достаточно.</li>
+  <li><b>SP-GiST</b> — для данных, которые естественно делятся на непересекающиеся части: точки (quad-tree), IP-сети (<code>inet</code>), префиксный поиск строк.</li>
+  <li><b>bloom</b> (расширение) — один индекс на много столбцов для произвольных сочетаний равенств; вероятностный, с перепроверкой.</li>
+  <li><b>pgvector HNSW</b> — приближённый поиск ближайших векторов для семантического поиска и RAG; подробно — в пособии по выбору хранилищ.</li>
+</ul>
+
+<h2 id="choose"><span class="h-num">7.7</span>Что выбрать: подбор по запросу</h2>
+<div class="widget" id="ixW">
+  <div class="widget-title">Подбор индекса</div>
+  <div class="controls"><label>какой запрос ускоряем<select id="ixQ" class="wide">
+    <option value="eq">WHERE email = ? (точное совпадение)</option>
+    <option value="range">WHERE created_at BETWEEN ? AND ? ORDER BY created_at</option>
+    <option value="prefix">WHERE name LIKE 'Петр%'</option>
+    <option value="substr">WHERE name ILIKE '%петр%'</option>
+    <option value="json">WHERE attrs @&gt; '{"color":"red"}'</option>
+    <option value="fts">полнотекстовый поиск по статьям</option>
+    <option value="overlap">пересекающиеся интервалы времени</option>
+    <option value="geo">точки в радиусе / ближайшие</option>
+    <option value="log">последний час в таблице событий на 5 млрд строк</option>
+    <option value="lowsel">WHERE status = 'new' (1% строк), остальное 'done'</option>
+    <option value="vector">похожие по эмбеддингу документы</option>
+  </select></label></div>
+  <pre><code class="sql" id="ixOut"></code></pre>
+  <div class="verdict" id="ixV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    eq: ["CREATE UNIQUE INDEX users_email ON users (lower(email));", "B-tree (часто уникальный, по нормализованному выражению). Hash — только если ключ очень длинный и уникальность не нужна."],
+    range: ["CREATE INDEX events_created ON events (created_at);", "B-tree: даёт и диапазон, и порядок без сортировки."],
+    prefix: ["CREATE INDEX users_name_pat ON users (name text_pattern_ops);", "B-tree с text_pattern_ops (или collation \"C\"): префиксный LIKE превращается в диапазон."],
+    substr: ["CREATE EXTENSION pg_trgm;\nCREATE INDEX users_name_trgm ON users USING gin (name gin_trgm_ops);", "GIN по триграммам: подстрока, ILIKE, похожие строки (оператор %). Образец короче 3 символов индекс почти не сужает."],
+    json: ["CREATE INDEX products_attrs ON products USING gin (attrs jsonb_path_ops);", "GIN с jsonb_path_ops — компактнее, поддерживает @>. Если часто ищут по одному ключу — B-tree по выражению (attrs->>'color')."],
+    fts: ["CREATE INDEX articles_tsv ON articles USING gin (tsv);", "GIN по tsvector (сгенерированный столбец). Для сложной релевантности, опечаток, фасетов на больших объёмах — отдельный поисковый движок (OpenSearch)."],
+    overlap: ["CREATE INDEX bookings_during ON bookings USING gist (during);\n-- или EXCLUDE USING gist (room_id WITH =, during WITH &&)", "GiST по диапазонному типу; ограничение исключения запрещает пересечения на уровне базы."],
+    geo: ["CREATE INDEX places_geog ON places USING gist (geog);", "GiST (PostGIS): ST_DWithin и сортировка по расстоянию <->."],
+    log: ["CREATE INDEX events_ts_brin ON events USING brin (created_at);", "BRIN: килобайты вместо десятков гигабайт, если данные пишутся по времени. Плюс партиционирование по времени (тема 17)."],
+    lowsel: ["CREATE INDEX orders_new ON orders (created_at) WHERE status = 'new';", "Частичный B-tree: индексирует только 1% строк. Индекс по status целиком бесполезен для 'done' и раздут."],
+    vector: ["CREATE EXTENSION vector;\nCREATE INDEX docs_emb ON docs USING hnsw (embedding vector_cosine_ops);", "HNSW (pgvector): приближённый поиск ближайших соседей. Результат может пропускать часть точных соседей — настраивается ef_search."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("ixQ").value]; $("ixOut").textContent = d[0]; $("ixV").textContent = d[1]; }
+  $("ixQ").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">7.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой индекс ускорит <code>WHERE description ILIKE '%кофе%'</code>?</p><ul><li>B-tree по description</li><li>Hash</li><li>GIN с gin_trgm_ops</li><li>BRIN</li></ul><div class="why">Подстрока с начальным % — задача для триграмм.</div></div>
+<div class="mcq" data-ok="0"><p>Когда BRIN бесполезен?</p><ul><li>Когда значения столбца разбросаны по таблице случайно (низкая корреляция с физическим порядком)</li><li>Когда таблица очень большая</li><li>Когда данные пишутся по времени</li><li>Когда запросы — диапазоны</li></ul><div class="why">BRIN хранит min/max блока; при случайном порядке у каждого блока диапазон почти весь.</div></div>
+<div class="mcq" data-ok="3"><p>Как гарантировать отсутствие пересекающихся бронирований одной комнаты при конкурентных вставках?</p><ul><li>Проверить SELECT-ом в приложении перед INSERT</li><li>UNIQUE (room_id, start_time)</li><li>Триггер с SELECT</li><li>EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;)</li></ul><div class="why">Ограничение исключения проверяется базой атомарно; проверки в приложении и триггере без блокировок подвержены гонкам.</div></div>
+<div class="mcq" data-ok="1"><p>Почему GIN-индекс может замедлять вставки сильнее, чем B-tree?</p><ul><li>Он не журналируется</li><li>Одна строка содержит много элементов (слов, ключей), каждый — обновление своего списка строк</li><li>Он блокирует таблицу</li><li>Он хранит строки целиком</li></ul><div class="why">Поэтому есть fastupdate и pending list.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда полнотекстового поиска PostgreSQL достаточно, а когда нужен отдельный поисковый движок?</summary><div class="a"><p>Достаточно для поиска по тысячам–миллионам документов с простой релевантностью, стеммингом, фразами, когда важна транзакционная согласованность с данными. Отдельный движок (OpenSearch/Elasticsearch) — при сложной релевантности (BM25 с бустами, синонимы, исправление опечаток, фасеты и агрегации), больших объёмах и нагрузке на поиск, которую не хочется класть на основную базу.</p></div></details>
+<details class="q"><summary>Индекс по jsonb: GIN или B-tree по выражению?</summary><div class="a"><p>GIN — когда запросы ищут по разным ключам документа (@>, ?). B-tree по выражению <code>((attrs->>'sku'))</code> — когда ищут по одному известному ключу на равенство или диапазон; он меньше и поддерживает сортировку. Если ключ используется постоянно, возможно, его стоит вынести в обычный столбец.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

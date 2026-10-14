@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Deadlock, диагностика, тестирование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ИНЖЕНЕРИЯ</div>
+  <h1>Deadlock, диагностика, тестирование</h1>
+  <p class="lead">Многопоточные баги не воспроизводятся по запросу: они проявляются под нагрузкой, на другом железе, раз в неделю. Здесь — как их предотвращать на этапе проектирования, находить в продакшене по thread dump и ловить тестами.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">jstack / jcmd</span><span class="tag">JFR</span><span class="tag">jcstress</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="deadlock"><span class="h-num">11.1</span>Deadlock</h2>
+<p>Взаимная блокировка возникает, только когда одновременно выполнены <b>все четыре условия Коффмана</b>: (1) взаимное исключение, (2) удержание и ожидание (держу A, жду B), (3) нет принудительного отбора ресурса, (4) циклическое ожидание. Достаточно сломать любое — на практике ломают (4) или (2).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 210" role="img" aria-label="Циклическое ожидание">
+  <defs><marker id="k1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
+  <marker id="k2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <circle cx="180" cy="60" r="34" class="box-info"/><text x="180" y="66" text-anchor="middle" font-weight="700">T1</text>
+  <circle cx="180" cy="160" r="34" class="box-info"/><text x="180" y="166" text-anchor="middle" font-weight="700">T2</text>
+  <rect x="380" y="36" width="130" height="48" rx="8" class="box-warn"/><text x="445" y="65" text-anchor="middle" class="mono">lock(acc 1)</text>
+  <rect x="380" y="136" width="130" height="48" rx="8" class="box-warn"/><text x="445" y="165" text-anchor="middle" class="mono">lock(acc 2)</text>
+  <path d="M376 60 H218" class="ln" marker-end="url(#k1)"/><text x="296" y="52" text-anchor="middle" font-size="12">держит</text>
+  <path d="M376 160 H218" class="ln" marker-end="url(#k1)"/><text x="296" y="152" text-anchor="middle" font-size="12">держит</text>
+  <path d="M210 80 L382 142" class="ln-acc" marker-end="url(#k2)"/><text x="330" y="102" font-size="12" fill="var(--accent)">ждёт</text>
+  <path d="M210 140 L382 78" class="ln-acc" marker-end="url(#k2)"/>
+  <text x="560" y="60" font-size="13">T1: transfer(acc1 → acc2)</text>
+  <text x="560" y="84" font-size="13">T2: transfer(acc2 → acc1)</text>
+  <text x="560" y="120" font-size="13" class="muted">Каждый взял «свой» первый лок</text>
+  <text x="560" y="140" font-size="13" class="muted">и ждёт лок другого — навсегда.</text>
+</svg>
+</figure>
+
+<pre data-title="Динамический deadlock: порядок зависит от аргументов" class="bad-code"><code class="java">public void transfer(Account from, Account to, BigDecimal amount) {
+    synchronized (from) {
+        synchronized (to) {               // transfer(a,b) || transfer(b,a) → deadlock
+            from.debit(amount);
+            to.credit(amount);
+        }
+    }
+}</code></pre>
+<pre data-title="Исправление: глобальный порядок захвата" class="good-code"><code class="java">public void transfer(Account from, Account to, BigDecimal amount) {
+    if (from.id() == to.id()) throw new IllegalArgumentException("same account");
+    Account first  = from.id() &lt; to.id() ? from : to;   // всегда сначала меньший id
+    Account second = first == from ? to : from;
+    synchronized (first) {
+        synchronized (second) {
+            from.debit(amount);
+            to.credit(amount);
+        }
+    }
+}
+// Нет уникального ключа? System.identityHashCode + отдельный «tie-breaker» лок при равенстве (JCiP 10.1.2).</code></pre>
+
+<h3>Способы предотвращения</h3>
+<div class="table-wrap"><table>
+<tr><th>Приём</th><th>Ломает условие</th><th>Комментарий</th></tr>
+<tr><td>Глобальный порядок захвата локов</td><td>циклическое ожидание</td><td>основной способ; документируйте порядок</td></tr>
+<tr><td><code>tryLock(timeout)</code> с откатом</td><td>удержание и ожидание</td><td>тема 04; не забудьте случайную паузу против livelock</td></tr>
+<tr><td>Один лок вместо нескольких / неизменяемые снимки</td><td>все</td><td>часто самое простое решение</td></tr>
+<tr><td><b>Open calls</b>: не вызывать чужой код под локом</td><td>удержание и ожидание</td><td>колбэки, слушатели, вызовы других сервисов — после выхода из synchronized</td></tr>
+<tr><td>В БД — одинаковый порядок UPDATE строк, <code>SELECT ... FOR UPDATE</code> отсортированно</td><td>циклическое ожидание</td><td>те же принципы; MySQL/PostgreSQL обнаружат deadlock и откатят одну транзакцию</td></tr>
+</table></div>
+
+<pre data-title="Скрытый deadlock: вызов чужого кода под локом" class="bad-code"><code class="java">class Taxi {
+    private Point location;
+    private final Dispatcher dispatcher;
+    public synchronized void setLocation(Point p) {   // держим лок Taxi
+        location = p;
+        if (p.equals(destination)) dispatcher.notifyAvailable(this);  // берём лок Dispatcher
+    }
+}
+class Dispatcher {
+    public synchronized Image getImage() {           // держим лок Dispatcher
+        for (Taxi t : taxis) image.draw(t.getLocation());  // берём лок Taxi → цикл
+    }
+}
+// Исправление: сузить synchronized до обновления location, вызов dispatcher — вне лока (open call).</code></pre>
+
+<h2 id="others"><span class="h-num">11.2</span>Livelock, starvation и голодание пула</h2>
+<div class="grid-3">
+  <div class="card"><h4>Livelock</h4><p>Потоки не заблокированы, но бесконечно уступают друг другу: оба сделали tryLock, оба откатились, оба повторили одновременно. Лечится случайной задержкой (jitter) перед повтором.</p></div>
+  <div class="card"><h4>Starvation</h4><p>Поток постоянно проигрывает конкуренцию: несправедливый лок, писатель в RW-локе при потоке читателей, низкий приоритет. Лечится fair-режимом или перепроектированием.</p></div>
+  <div class="card"><h4>Thread starvation deadlock</h4><p>Задачи пула ждут результатов других задач того же пула, а свободных потоков нет. Локов нет, а система стоит. Классика с <code>future.get()</code>/<code>join()</code> внутри задачи.</p></div>
+</div>
+
+<h2 id="dump"><span class="h-num">11.3</span>Thread dump: читать и находить</h2>
+<pre data-title="Как снять"><code class="plain">jcmd &lt;pid&gt; Thread.print -l           # с информацией о java.util.concurrent локах
+jstack -l &lt;pid&gt;                       # то же, классический инструмент
+kill -3 &lt;pid&gt;                         # в stdout процесса
+jcmd &lt;pid&gt; Thread.dump_to_file -format=json dump.json   # включая виртуальные потоки</code></pre>
+<pre data-title="Фрагмент дампа при deadlock"><code class="plain">Found one Java-level deadlock:
+=============================
+"transfer-1":
+  waiting to lock monitor 0x00007f3a2c004e00 (object 0x000000071ab2c3d8, a com.bank.Account),
+  which is held by "transfer-2"
+"transfer-2":
+  waiting to lock monitor 0x00007f3a2c007f20 (object 0x000000071ab2c3c0, a com.bank.Account),
+  which is held by "transfer-1"
+
+"transfer-1" #31 prio=5 os_prio=0 tid=0x... nid=0x5c1f waiting for monitor entry
+   java.lang.Thread.State: BLOCKED (on object monitor)
+        at com.bank.TransferService.transfer(TransferService.java:42)
+        - waiting to lock &lt;0x000000071ab2c3d8&gt; (a com.bank.Account)
+        - locked &lt;0x000000071ab2c3c0&gt; (a com.bank.Account)</code></pre>
+<p>Дамп ловит deadlock и на <code>synchronized</code>, и на <code>ReentrantLock</code> (с флагом <code>-l</code> видно «Locked ownable synchronizers»). Программно: <code>ManagementFactory.getThreadMXBean().findDeadlockedThreads()</code> — можно вывести в health-check.</p>
+<div class="callout info"><span class="c-title">Методика анализа «всё тормозит»</span>
+Снимите 3–5 дампов с интервалом 5–10 секунд. Потоки, стоящие в одном и том же месте во всех дампах, — подозреваемые. Сгруппируйте по стеку (fastthread.io, IntelliJ «Analyze Stack Trace»): 150 потоков в <code>HikariPool.getConnection</code> — исчерпан пул соединений; 200 потоков <code>BLOCKED</code> на одном мониторе — узкое место на локе; все потоки пула в <code>FutureTask.get</code> — голодание пула.
+</div>
+
+<h2 id="jfr"><span class="h-num">11.4</span>JFR и профилирование конкуренции</h2>
+<div class="table-wrap"><table>
+<tr><th>Инструмент</th><th>Что показывает</th></tr>
+<tr><td><code>jcmd &lt;pid&gt; JFR.start duration=60s filename=rec.jfr</code></td><td>запись с низкими накладными расходами, можно в продакшене</td></tr>
+<tr><td>JFR <code>jdk.JavaMonitorEnter</code></td><td>долгие ожидания входа в synchronized: какой монитор, кто держал</td></tr>
+<tr><td>JFR <code>jdk.ThreadPark</code></td><td>долгие park (ReentrantLock, очереди, Condition)</td></tr>
+<tr><td>JFR <code>jdk.VirtualThreadPinned</code></td><td>pinning виртуальных потоков</td></tr>
+<tr><td>async-profiler <code>-e lock</code></td><td>flame graph времени ожидания на локах</td></tr>
+<tr><td>JDK Mission Control</td><td>визуальный анализ записи JFR</td></tr>
+</table></div>
+
+<h2 id="testing"><span class="h-num">11.5</span>Тестирование конкурентного кода</h2>
+<p>Обычный юнит-тест запускает код один раз на одном расписании потоков — он почти никогда не ловит гонку. Нужны: множество повторений с максимальной конкуренцией, проверки инвариантов, специальные инструменты.</p>
+
+<h3>Стресс-тест со «стартовым пистолетом»</h3>
+<pre data-title="JUnit 5"><code class="java">@RepeatedTest(50)
+void concurrentIncrementsAreNotLost() throws Exception {
+    Counter counter = new Counter();
+    int threads = 16, perThread = 10_000;
+    CountDownLatch start = new CountDownLatch(1);
+    try (ExecutorService pool = Executors.newFixedThreadPool(threads)) {
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; threads; t++) {
+            fs.add(pool.submit(() -&gt; {
+                start.await();                              // все стартуют одновременно
+                for (int i = 0; i &lt; perThread; i++) counter.increment();
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future&lt;?&gt; f : fs) f.get(10, TimeUnit.SECONDS); // пробрасывает исключения потоков в тест
+    }
+    assertEquals((long) threads * perThread, counter.get());
+}</code></pre>
+<ul>
+  <li>Потоков больше, чем ядер — больше переключений и чередований.</li>
+  <li>Всегда <code>future.get()</code> — иначе <code>AssertionError</code> в потоке пула не провалит тест.</li>
+  <li>Асинхронные ожидания — через <b>Awaitility</b> (<code>await().atMost(2, SECONDS).until(...)</code>), а не <code>Thread.sleep</code>.</li>
+  <li>Время — через инжектируемый <code>Clock</code>, как в вашем RateLimiter: тест управляет временем детерминированно.</li>
+</ul>
+
+<h3>jcstress: проверка на уровне модели памяти</h3>
+<p>OpenJDK-инструмент, который запускает крошечные «акторы» миллионы раз в разных потоках и собирает все наблюдённые результаты. Только так можно увидеть переупорядочивания, которые разрешает JMM.</p>
+<pre data-title="Store-load reordering: результат 0,0 реально наблюдается на x86"><code class="java">@JCStressTest
+@Outcome(id = {"0, 1", "1, 0", "1, 1"}, expect = Expect.ACCEPTABLE, desc = "Ожидаемые чередования")
+@Outcome(id = "0, 0", expect = Expect.ACCEPTABLE_INTERESTING, desc = "Обе записи застряли в store buffer")
+@State
+public class DekkerTest {
+    int x, y;                                  // сделайте volatile — "0, 0" исчезнет
+
+    @Actor public void actor1(II_Result r) { x = 1; r.r1 = y; }
+    @Actor public void actor2(II_Result r) { y = 1; r.r2 = x; }
+}</code></pre>
+
+<h3>JMH: производительность</h3>
+<p>Сравнение <code>synchronized</code> / <code>ReentrantLock</code> / <code>AtomicLong</code> / <code>LongAdder</code> делайте только в JMH с <code>@Threads(N)</code> и <code>@State(Scope.Benchmark)</code>: прогрев JIT, защита от dead-code elimination, форки JVM. Самописный цикл с <code>System.nanoTime</code> измеряет что угодно, кроме того, что вы хотите.</p>
+
+<h2 id="checklist"><span class="h-num">11.6</span>Чек-лист code review</h2>
+<ol class="steps">
+  <li>Для каждого общего изменяемого поля понятно, каким механизмом обеспечен HB (аннотируйте: <code>@GuardedBy("lock")</code>).</li>
+  <li>Нет check-then-act и read-modify-write вне лока/атомарной операции.</li>
+  <li>Несколько локов — задокументирован порядок захвата; под локом не вызывается чужой код.</li>
+  <li><code>unlock()</code>, <code>release()</code>, <code>countDown()</code>, <code>ThreadLocal.remove()</code> — в <code>finally</code>.</li>
+  <li><code>InterruptedException</code> не проглатывается.</li>
+  <li>Все пулы: ограниченная очередь, именованные потоки, политика отказа, graceful shutdown.</li>
+  <li>Нет блокирующих вызовов в commonPool, event loop и под локом бакета CHM.</li>
+  <li>У каждого ожидания есть таймаут.</li>
+  <li>Исключения из асинхронных задач кто-то логирует или обрабатывает.</li>
+</ol>
+
+<h2 id="sim"><span class="h-num">11.7</span>Интерактив: deadlock и способы его избежать</h2>
+<pre><code class="java">void transfer(Account from, Account to, long amount) {
+    synchronized (from) {
+        synchronized (to) { from.debit(amount); to.credit(amount); }
+    }
+}
+// Поток T1: transfer(A, B, 100)        Поток T2: transfer(B, A, 50)</code></pre>
+<div class="widget" id="dlW">
+  <div class="widget-title">Симулятор: два перевода навстречу друг другу</div>
+  <div class="controls"><label>вариант кода<select id="dlMode" style="max-width:100%">
+    <option value="naive">как написано: порядок блокировок = порядок аргументов</option>
+    <option value="lucky">как написано, но T1 успел взять оба лока до старта T2</option>
+    <option value="order">блокировки всегда в порядке возрастания id счёта</option>
+    <option value="trylock">ReentrantLock.tryLock(50 мс) с откатом и повтором</option>
+    <option value="global">один общий лок на все переводы</option>
+    <option value="open">вызов чужого метода (listener.onTransfer) под блокировкой</option>
+  </select></label></div>
+  <div class="lanes">
+    <div class="lane"><h5>Монитор A</h5><div class="items" id="dlA"></div></div>
+    <div class="lane"><h5>Монитор B</h5><div class="items" id="dlB"></div></div>
+  </div>
+  <div class="log" id="dlLog" style="max-height:280px"></div>
+  <div class="verdict" id="dlOut"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    naive: ["T1", "T2", ["T1: synchronized(A) ✓", "T2: synchronized(B) ✓", "T1: synchronized(B) … BLOCKED — B у T2", "T2: synchronized(A) … BLOCKED — A у T1", "", "jstack:", "Found one Java-level deadlock:", "\"T1\": waiting to lock monitor 0x…b (a Account), which is held by \"T2\"", "\"T2\": waiting to lock monitor 0x…a (a Account), which is held by \"T1\""], "bad", "Циклическое ожидание: каждый держит то, что нужно другому. Проявляется только при неудачном чередовании — в тестах может не случиться ни разу, а под нагрузкой проявится. Потоки висят вечно, CPU при этом 0%."],
+    lucky: ["свободен", "свободен", ["T1: synchronized(A) ✓", "T1: synchronized(B) ✓", "T1: перевод выполнен, выход из обоих", "T2: synchronized(B) ✓", "T2: synchronized(A) ✓", "T2: перевод выполнен"], "warn", "Ошибка в коде та же, просто чередование оказалось удачным. Именно поэтому deadlock нельзя «проверить тестом»: нужна гарантия по построению."],
+    order: ["свободен", "свободен", ["порядок: сначала счёт с меньшим id", "T1 (A→B): synchronized(A) ✓", "T2 (B→A): сортирует → synchronized(A) … BLOCKED", "T1: synchronized(B) ✓ → перевод → выход", "T2: synchronized(A) ✓, synchronized(B) ✓ → перевод"], "ok", "Глобальный порядок захвата разрывает цикл: поток, ждущий A, ещё не держит B. Самое надёжное средство. При равных ключах — третий «tie-breaker» лок."],
+    trylock: ["свободен", "свободен", ["T1: lockA.tryLock() ✓", "T2: lockB.tryLock() ✓", "T1: lockB.tryLock(50 мс) → false → unlock(A), пауза случайной длины", "T2: lockA.tryLock(50 мс) → true → перевод → unlock обоих", "T1: повтор: A ✓, B ✓ → перевод"], "ok", "Deadlock невозможен: никто не ждёт бесконечно. Нужна случайная пауза перед повтором, иначе потоки будут синхронно отступать и сталкиваться снова — livelock."],
+    global: ["свободен", "свободен", ["T1: synchronized(Bank.class) ✓ → перевод", "T2: synchronized(Bank.class) … ждёт", "T1: выход", "T2: ✓ → перевод"], "warn", "Один лок — цикла быть не может. Цена — все переводы выполняются последовательно: масштабируемости нет. Для редких операций годится."],
+    open: ["T1", "T2", ["T1: synchronized(A) ✓ → listener.onTransfer(...)", "   listener внутри вызывает audit.record() → synchronized(auditLog)", "T2: synchronized(auditLog) ✓ → читает счёт → synchronized(A) … BLOCKED", "T1: synchronized(auditLog) … BLOCKED", "", "deadlock через код, которого не видно в методе transfer"], "bad", "Вызов «чужого» метода (слушателя, колбэка, переопределяемого метода) под блокировкой: вы не знаете, какие локи он возьмёт. Правило open call: под локом — только свои поля; чужие методы вызывать после выхода из synchronized, передав им копию данных."]
+  };
+  var s = document.getElementById("dlMode"), $ = function (id) { return document.getElementById(id); };
+  function chip(o) { return '<span class="chip ' + (o === "свободен" ? "ok" : "bad") + '">' + (o === "свободен" ? o : "удерживает " + o) + "</span>"; }
+  function run() { var d = D[s.value]; $("dlA").innerHTML = chip(d[0]); $("dlB").innerHTML = chip(d[1]); $("dlLog").textContent = d[2].join("\n"); $("dlOut").className = "verdict " + d[3]; $("dlOut").textContent = d[4]; }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">11.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какие условия нужны для deadlock (условия Коффмана)?</p><ul><li>Достаточно двух потоков</li><li>Взаимное исключение, удержание и ожидание, отсутствие вытеснения, циклическое ожидание — все четыре сразу</li><li>Только циклическое ожидание</li><li>Нехватка памяти</li></ul><div class="why">Сломайте любое: порядок блокировок (нет цикла), tryLock с таймаутом (есть «вытеснение»), один лок (нет удержания и ожидания).</div></div>
+<div class="mcq" data-ok="2"><p>Приложение не отвечает, CPU 0%. Что сделать первым?</p><ul><li>Перезапустить</li><li>Увеличить heap</li><li>Снять thread dump (jstack / jcmd Thread.print) — он покажет, чего ждут потоки, и сам найдёт deadlock мониторов</li><li>Включить GC-логи</li></ul><div class="why">Сначала сохранить диагностику, потом перезапуск. Лучше два-три дампа с интервалом.</div></div>
+<div class="mcq" data-ok="0"><p>Чем livelock отличается от deadlock?</p><ul><li>Потоки не заблокированы и активно работают, но бесконечно уступают друг другу и не продвигаются</li><li>Это одно и то же</li><li>Livelock бывает только с одним потоком</li><li>При livelock CPU 0%</li></ul><div class="why">В дампе потоки RUNNABLE, CPU загружен. Лечится случайной задержкой (jitter) перед повтором.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Назовите четыре условия deadlock и способ сломать каждое.</summary><div class="a"><p>Взаимное исключение — неизменяемые/lock-free структуры. Удержание и ожидание — захватывать всё сразу или <code>tryLock</code> с откатом. Отсутствие отбора — таймауты и отмена (в БД — жертва deadlock откатывается). Циклическое ожидание — глобальный порядок захвата.</p></div></details>
+<details class="q"><summary>Сервис «завис», CPU 0%. Ваши действия?</summary><div class="a"><p>Несколько thread dump'ов с интервалом; поиск «Found one Java-level deadlock»; группировка потоков по стекам: где все ждут — пул соединений, внешний HTTP без таймаута, монитор, <code>Future.get</code> в задачах пула (голодание). Параллельно метрики пулов (active/queue), соединений БД, downstream-латентность. Затем исправление и тест, воспроизводящий сценарий.</p></div></details>
+<details class="q"><summary>Почему тест «запустить 2 потока и проверить результат» почти всегда проходит даже на неправильном коде?</summary><div class="a"><p>Потоки стартуют с задержкой, первый успевает закончить до старта второго — пересечения нет. Окно гонки — наносекунды. Нужно много итераций, синхронный старт (latch), больше потоков, чем ядер; для эффектов модели памяти — jcstress.</p></div></details>
+<details class="q"><summary>Что такое open call и почему это важно?</summary><div class="a"><p>Вызов внешнего (чужого, переопределяемого, удалённого) метода без удержания локов. Если вызывать чужой код под своим локом, неизвестно, какие локи он возьмёт — легко получить цикл и deadlock, плюс лок удерживается неопределённо долго. Порядок: под локом скопировать нужное состояние, выйти, вызвать внешний код.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

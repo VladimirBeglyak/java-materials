@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · LongAdder, LongAccumulator и Striped64</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.cells { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0; align-items: stretch; }
+.cells div { min-width: 64px; text-align: center; font: 12px var(--font-mono); border: 1.5px solid var(--line); border-radius: 6px; padding: 6px 4px; background: var(--bg-sunk); }
+.cells div b { display: block; font-size: 18px; }
+.cells div.base { border-color: var(--accent); background: var(--accent-soft); }
+.cells div.hit { border-color: var(--ok); background: var(--ok-soft); } .cells div.coll { border-color: var(--bad); background: var(--bad-soft); }
+</style>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ATOMIC</div>
+  <h1>LongAdder, LongAccumulator и Striped64</h1>
+  <p class="lead">Когда счётчик увеличивают десятки потоков, один <code>AtomicLong</code> становится узким местом (тема 02). <code>LongAdder</code> (Java 8) распределяет запись по массиву ячеек: без конкуренции — одно поле, при конкуренции — у каждого потока своя ячейка на своей кэш-линии. Симулятор покажет, как растёт массив ячеек и как потоки перехешируются при столкновениях.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Striped64</span><span class="tag">base и cells</span><span class="tag">probe</span><span class="tag">@Contended</span><span class="tag">sum()</span><span class="tag">LongAccumulator</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="design"><span class="h-num">6.1</span>Устройство</h2>
+<pre data-title="Striped64 / LongAdder (упрощённо)"><code class="java">abstract class Striped64 extends Number {
+    @jdk.internal.vm.annotation.Contended static final class Cell { volatile long value; }  // каждая ячейка — на своей кэш-линии
+    transient volatile Cell[] cells;      // null, пока нет конкуренции; размер — степень двойки, не больше ≈ NCPU
+    transient volatile long base;         // быстрый путь без конкуренции
+    transient volatile int cellsBusy;     // спин-блокировка на создание/расширение cells
+}
+public void increment() {               // LongAdder.add(1)
+    Cell[] cs; long b, v; int m; Cell c;
+    if ((cs = cells) != null || !casBase(b = base, b + 1)) {          // нет конкуренции → CAS base и всё
+        int probe = getProbe();                                       // «хэш» потока (поле Thread, как в ThreadLocalRandom)
+        if (cs == null || (m = cs.length - 1) &lt; 0 || (c = cs[probe &amp; m]) == null
+            || !c.cas(v = c.value, v + 1))
+            longAccumulate(1, null, uncontended);                     // медленный путь: создать/расширить cells, перехешировать probe
+    }
+}
+public long sum() { long s = base; for (Cell c : cells) if (c != null) s += c.value; return s; }   // НЕ атомарный снимок</code></pre>
+
+<h2 id="sim"><span class="h-num">6.2</span>Симулятор</h2>
+<div class="widget" id="adW">
+  <div class="widget-title">Потоки одновременно вызывают increment()</div>
+  <div class="controls">
+    <label>потоков<select id="adT"><option>1</option><option>2</option><option selected>6</option><option>12</option></select></label>
+    <label>NCPU<select id="adC"><option>4</option><option selected>8</option><option>16</option></select></label>
+    <button class="btn primary" type="button" id="adGo">Раунд: все потоки по increment()</button>
+    <button class="btn" type="button" id="adX10">×10 раундов</button>
+    <button class="btn" type="button" id="adR">↺</button>
+  </div>
+  <div class="cells" id="adCells"></div>
+  <div class="out" id="adOut"></div>
+  <div class="log" id="adLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, base, cells, probes, log, total, casFail, rounds, mark;
+  function reset() { base = 0; cells = null; probes = []; for (var i = 0; i < +$("adT").value; i++) probes.push(Math.floor(Math.random() * 1e6) + 1); log = ["new LongAdder(): base = 0, cells = null"]; total = 0; casFail = 0; rounds = 0; mark = {}; draw(); }
+  function round() {
+    var n = probes.length, ncpu = +$("adC").value, order = probes.map(function (p, i) { return i; }).sort(function () { return Math.random() - 0.5; }), touched = {}, baseTouched = false, msgs = [];
+    mark = {}; rounds++;
+    order.forEach(function (t) {
+      total++;
+      if (!cells) {
+        if (!baseTouched) { base++; baseTouched = true; mark.base = "hit"; return; }
+        casFail++; mark.base = "coll"; cells = [0, 0]; msgs.push("T" + t + ": CAS(base) провален (конкуренция) → создан cells[2]");
+      }
+      var idx = probes[t] & (cells.length - 1);
+      if (!touched[idx]) { touched[idx] = 1; cells[idx]++; mark[idx] = mark[idx] === "coll" ? "coll" : "hit"; return; }
+      casFail++; mark[idx] = "coll";
+      if (cells.length < ncpu) { var old = cells.length; cells = cells.concat(new Array(old).fill(0)); msgs.push("T" + t + ": столкновение в ячейке " + idx + " → расширение cells " + old + " → " + cells.length); }
+      else msgs.push("T" + t + ": столкновение в ячейке " + idx + ", cells уже ≈ NCPU → перехешировать probe");
+      probes[t] = (probes[t] * 1103515245 + 12345) & 0x7fffffff;
+      var j = probes[t] & (cells.length - 1); cells[j]++; touched[j] = 1; mark[j] = mark[j] || "hit";
+    });
+    log.push("раунд " + rounds + ": " + (msgs.length ? msgs.join("; ") : "все обновления без конфликтов")); draw();
+  }
+  function draw() {
+    var sum = base + (cells ? cells.reduce(function (a, b) { return a + b; }, 0) : 0);
+    $("adCells").innerHTML = '<div class="base ' + (mark.base || "") + '">base<b>' + base + "</b></div>" + (cells ? cells.map(function (c, i) { return '<div class="' + (mark[i] || "") + '">cell[' + i + "]<b>" + c + "</b></div>"; }).join("") : '<div style="opacity:.5">cells = null</div>');
+    $("adOut").textContent = "sum() = base + Σ cells = " + sum + " (вызовов increment: " + total + ")\nпроваленных CAS: " + casFail + " из " + total + " (" + (total ? Math.round(casFail / total * 100) : 0) + "%) — у AtomicLong при той же конкуренции провалы шли бы каждый раунд" + "\nпотоки: " + probes.map(function (p, i) { return "T" + i + "→" + (cells ? p & (cells.length - 1) : "base"); }).join(", ");
+    $("adLog").textContent = log.slice(-6).join("\n"); $("adLog").scrollTop = 1e6;
+  }
+  $("adGo").addEventListener("click", round); $("adX10").addEventListener("click", function () { for (var i = 0; i < 10; i++) round(); });
+  $("adR").addEventListener("click", reset); ["adT", "adC"].forEach(function (i) { $(i).addEventListener("change", reset); });
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Что видно</span>
+С одним потоком всё идёт в <code>base</code> — LongAdder не дороже AtomicLong. При конкуренции массив ячеек растёт до ≈ NCPU, после чего потоки распределяются по ячейкам перехешированием — провалы CAS почти исчезают. Ячейки никогда не уменьшаются: адрес памяти — плата за масштабируемость.
+</div>
+
+<h2 id="semantics"><span class="h-num">6.3</span>Семантика и аккумуляторы</h2>
+<div class="table-wrap"><table>
+<tr><th>Свойство</th><th>AtomicLong</th><th>LongAdder</th></tr>
+<tr><td>Запись при высокой конкуренции</td><td>деградирует</td><td>масштабируется</td></tr>
+<tr><td>Чтение</td><td>одно volatile-чтение, точное</td><td><code>sum()</code> обходит ячейки; во время записи — не атомарный снимок</td></tr>
+<tr><td>Операции</td><td>CAS, getAndSet, updateAndGet</td><td>только add/increment/decrement, sum, reset, sumThenReset (без CAS!)</td></tr>
+<tr><td>Память</td><td>16 Б</td><td>до NCPU × 128 Б</td></tr>
+<tr><td>Когда</td><td>последовательные id, CAS-логика, частые чтения</td><td>метрики, статистика, счётчики запросов</td></tr>
+</table></div>
+<pre data-title="LongAccumulator и метрики"><code class="java">LongAccumulator maxLatency = new LongAccumulator(Long::max, Long.MIN_VALUE);   // функция ассоциативна и коммутативна!
+maxLatency.accumulate(ns);
+DoubleAdder bytes = new DoubleAdder();
+
+ConcurrentHashMap&lt;String, LongAdder&gt; hits = new ConcurrentHashMap&lt;&gt;();
+hits.computeIfAbsent(endpoint, k -&gt; new LongAdder()).increment();          // горячие ключи без конкуренции на значении
+// Micrometer Counter, Dropwizard Meter и многие метрики построены именно так</code></pre>
+<div class="callout warn"><span class="c-title">Функция аккумулятора</span>
+Порядок применения обновлений к ячейкам и их объединения в <code>get()</code> не определён, а функция может вызываться повторно при неудачном CAS. Поэтому она обязана быть ассоциативной, коммутативной и без побочных эффектов: max, min, сумма, побитовое ИЛИ — да; «последнее значение» или среднее — нет.
+</div>
+
+<h2 id="quiz"><span class="h-num">6.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему LongAdder масштабируется лучше AtomicLong под конкурентной записью?</p><ul><li>Он использует блокировку</li><li>Потоки пишут в разные ячейки на разных кэш-линиях — нет общей точки конкуренции</li><li>Он не использует CAS</li><li>Он буферизует записи в ThreadLocal</li></ul><div class="why">Ячейки помечены @Contended.</div></div>
+<div class="mcq" data-ok="3"><p>Можно ли использовать LongAdder для генерации уникальных последовательных id?</p><ul><li>Да, он быстрее</li><li>Да, через sum()</li><li>Да, через incrementAndGet</li><li>Нет: нет атомарной операции «увеличить и вернуть новое значение», sum() не атомарен</li></ul><div class="why">Для id — AtomicLong.getAndIncrement.</div></div>
+<div class="mcq" data-ok="0"><p>Какая функция допустима для LongAccumulator?</p><ul><li>Long::max</li><li>(a, x) -&gt; x  (последнее значение)</li><li>(a, x) -&gt; (a + x) / 2</li><li>(a, x) -&gt; a - x</li></ul><div class="why">Ассоциативна и коммутативна только первая.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как Striped64 выбирает ячейку для потока и что делает при столкновениях?</summary><div class="a"><p>Каждый поток имеет «зонд» (probe) — псевдослучайное число в поле Thread (общее с ThreadLocalRandom). Индекс ячейки = probe &amp; (n − 1). Если CAS в ячейку провалился — сначала перехешировать probe (xorshift) и попробовать другую ячейку; если провалы продолжаются и размер меньше числа процессоров — удвоить массив под спин-блокировкой cellsBusy. Создание отсутствующей ячейки — тоже под cellsBusy.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

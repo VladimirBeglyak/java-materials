@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Путь запроса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ИНЖЕНЕРИЯ · ИТОГ</div>
+  <h1>Путь запроса и собеседование</h1>
+  <p class="lead">Классический вопрос «что происходит, когда вы вводите URL и нажимаете Enter» — идеальный экзамен: ответ проходит через все 14 тем. Здесь — полный разбор, калькулятор бюджета задержки и вопросы уровня Senior.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">калькулятор задержки</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="journey"><span class="h-num">15.1</span>https://app.bank.by/accounts — по шагам</h2>
+<ol class="steps">
+  <li><b>Браузер разбирает URL</b>: схема, хост, путь. Проверяет список HSTS — если домен там, <code>http://</code> заменяется на <code>https://</code> без запроса. Проверяет HTTP-кэш и Service Worker (тема 10).</li>
+  <li><b>DNS</b> (тема 08): кэш браузера → ОС → рекурсивный резолвер провайдера или DoH → (корень → .by → авторитативный). Параллельно A, AAAA и HTTPS-записи; последняя может сразу сообщить о поддержке HTTP/3.</li>
+  <li><b>Выбор адреса</b>: Happy Eyeballs — IPv6 и IPv4 почти одновременно (тема 03).</li>
+  <li><b>Локальная доставка</b>: адрес вне подсети → пакет на шлюз; ARP узнаёт MAC роутера; кадр по Wi-Fi уходит на роутер (тема 02, 03).</li>
+  <li><b>NAT</b> на роутере меняет адрес и порт источника; возможно, второй раз — на CGNAT провайдера (тема 04).</li>
+  <li><b>Интернет</b>: сеть провайдера → IXP или транзит → по BGP к ближайшему anycast-узлу CDN (тема 05).</li>
+  <li><b>TCP-рукопожатие</b> с edge-узлом CDN — 1 RTT, медленный старт (темы 06, 07). Или QUIC, если доступен (тема 11).</li>
+  <li><b>TLS 1.3</b>: ClientHello с SNI и ALPN, сертификат, проверка цепочки до корня, CertificateVerify — 1 RTT (тема 09).</li>
+  <li><b>HTTP/2-запрос</b>: HEADERS с сжатыми HPACK заголовками и cookie сессии (темы 10, 11).</li>
+  <li><b>CDN</b>: страница персональная (<code>Cache-Control: private</code>) — miss; запрос по прогретому соединению к origin.</li>
+  <li><b>Инфраструктура банка</b>: облачный L4/L7-балансировщик → WAF → ingress-контроллер (терминирует или перешифровывает TLS) → Service → kube-proxy DNAT → под (тема 13). Возможно, sidecar с mTLS.</li>
+  <li><b>Приложение</b>: поток Tomcat (или виртуальный поток) принимает запрос; аутентификация; вызовы сервиса счетов по gRPC через пул HTTP/2-соединений, запрос в MySQL через HikariCP, все с таймаутами и дедлайнами (тема 12).</li>
+  <li><b>Ответ</b>: JSON или HTML, сжатие Brotli, заголовки кэширования, <code>Set-Cookie</code> с Secure/HttpOnly/SameSite. Обратный путь через все прокси.</li>
+  <li><b>Браузер</b> разбирает HTML, находит CSS/JS/шрифты и запрашивает их по <b>тому же</b> HTTP/2-соединению; статику с хэшем в имени отдаёт кэш CDN с <code>immutable</code>.</li>
+  <li><b>Соединение</b> остаётся открытым (keep-alive) для следующих запросов; закрывается по idle timeout той стороны, у которой он короче.</li>
+</ol>
+
+<h2 id="calc"><span class="h-num">15.2</span>Калькулятор бюджета задержки</h2>
+<div class="widget" id="lat">
+  <div class="widget-title">Сколько стоит первый запрос</div>
+  <div class="controls">
+    <label>RTT до сервера, мс <input type="number" id="lRtt" value="80" min="1"></label>
+    <label>RTT до DNS-резолвера, мс <input type="number" id="lDns" value="20" min="0"></label>
+    <label>DNS <select id="lDnsC" style="width:auto"><option value="miss">не в кэше</option><option value="hit">в кэше</option></select></label>
+  </div>
+  <div class="controls">
+    <label>соединение <select id="lConn" style="width:auto">
+      <option value="tls12">новое: TCP + TLS 1.2</option><option value="tls13" selected>новое: TCP + TLS 1.3</option><option value="quic">новое: QUIC (HTTP/3)</option><option value="q0">QUIC 0-RTT (повторное)</option><option value="reuse">уже открыто (keep-alive)</option></select></label>
+    <label>сервер, мс <input type="number" id="lSrv" value="40" min="0"></label>
+    <label>ответ, КБ <input type="number" id="lSize" value="120" min="1"></label>
+  </div>
+  <svg id="lSvg" viewBox="0 0 760 120" style="width:100%;height:auto"></svg>
+  <div class="log" id="lOut"></div>
+</div>
+<script>
+(function(){
+  function $(i){return document.getElementById(i);}
+  function run(){
+    var rtt=+$("lRtt").value||0, dr=+$("lDns").value||0, conn=$("lConn").value, srv=+$("lSrv").value||0, kb=+$("lSize").value||1;
+    var parts=[];
+    if($("lDnsC").value==="miss"&&conn!=="reuse") parts.push(["DNS",dr,"info"]);
+    if(conn==="tls12"){parts.push(["TCP",rtt,"warn"]);parts.push(["TLS 1.2 (2 RTT)",2*rtt,"bad"]);}
+    if(conn==="tls13"){parts.push(["TCP",rtt,"warn"]);parts.push(["TLS 1.3",rtt,"bad"]);}
+    if(conn==="quic"){parts.push(["QUIC+TLS",rtt,"warn"]);}
+    var reqRtt=conn==="q0"?rtt:rtt;
+    parts.push(["запрос→ответ",reqRtt,"acc"]);
+    parts.push(["сервер",srv,"ok"]);
+    var seg=Math.ceil(kb*1024/1460), cw=10, sent=0, r=0;
+    if(conn==="reuse"){r=1;} else {while(sent<seg){sent+=cw;cw*=2;r++;}}
+    if(r>1) parts.push(["доп. раунды slow start ×"+(r-1),(r-1)*rtt,"warn"]);
+    var total=parts.reduce(function(a,p){return a+p[1];},0), x=0, g="";
+    parts.forEach(function(p){var w=total?p[1]/total*740:0; if(w>0){g+='<rect x="'+(10+x)+'" y="10" width="'+Math.max(w-2,1)+'" height="44" rx="4" fill="var(--'+(p[2]==="acc"?"accent":p[2])+'-soft)" stroke="var(--'+(p[2]==="acc"?"accent":p[2])+')"/>';
+      if(w>60) g+='<text x="'+(10+x+w/2)+'" y="30" text-anchor="middle" font-size="11">'+p[0]+'</text><text x="'+(10+x+w/2)+'" y="46" text-anchor="middle" font-size="11" class="mono">'+Math.round(p[1])+' мс</text>'; x+=w;}});
+    g+='<text x="10" y="80" font-size="13" font-weight="700">Итого ≈ '+Math.round(total)+' мс</text><text x="10" y="102" font-size="12" fill="var(--fg-muted)">'+seg+' сегментов ответа · сеть: '+Math.round(total-srv)+' мс ('+Math.round((total-srv)/Math.max(total,1)*100)+'%), сервер: '+srv+' мс</text>';
+    $("lSvg").innerHTML=g;
+    $("lOut").textContent=parts.map(function(p){return (p[0]+"                              ").slice(0,30)+Math.round(p[1])+" мс";}).join("\n")+
+      "\n\nПопробуйте: RTT 150 (Европа→Азия) и сравните TLS 1.2 и QUIC; поставьте «уже открыто» — так выглядит вызов из пула соединений.";
+  }
+  document.addEventListener("DOMContentLoaded",function(){["lRtt","lDns","lDnsC","lConn","lSrv","lSize"].forEach(function(i){$(i).addEventListener("input",run);$(i).addEventListener("change",run);});run();});
+})();
+</script>
+<p>Главный вывод, который стоит произнести на собеседовании: <b>на далёких маршрутах время ответа определяется числом RTT, а не скоростью канала</b>. Отсюда все оптимизации: CDN (уменьшить RTT), TLS 1.3 и QUIC (меньше рукопожатий), keep-alive и пулы (без рукопожатий и медленного старта), HTTP/2 (меньше соединений), кэширование (ноль RTT), батчинг и меньше последовательных вызовов между сервисами.</p>
+
+<h2 id="sd"><span class="h-num">15.3</span>Вопросы System Design с сетевой частью</h2>
+<div class="quiz">
+<details class="q"><summary>Платёжный API для клиентов в Европе и Азии. Как уложиться в 300 мс p99?</summary><div class="a"><p>Разложить бюджет: RTT Европа–Азия ~150–200 мс, новое соединение с TLS 1.3 — 2 RTT плюс запрос — уже больше 300 мс. Значит: edge/CDN или региональные точки входа рядом с клиентом (TCP/TLS за 10–20 мс), прогретые соединения edge→origin, обработка в ближайшем регионе, где возможно (авторизация, валидация), а запись в «домашний» регион по постоянным соединениям. Синхронные межрегиональные цепочки — исключить. Повтор на клиенте — с ключом идемпотентности.</p></div></details>
+<details class="q"><summary>Как спроектировать уведомления в реальном времени для 1 млн онлайн-пользователей?</summary><div class="a"><p>SSE или WebSocket через L7-балансировщик с поддержкой долгих соединений; шлюзы соединений (stateless, по 50–100 тыс. соединений на инстанс на event loop или виртуальных потоках), распределение событий по шлюзам через шину (Kafka → Redis Pub/Sub или маршрутизация по userId). Heartbeat чаще idle timeout NAT/LB, переподключение с jitter и Last-Event-ID, лимиты дескрипторов и эфемерных портов на прокси, graceful drain при деплое.</p></div></details>
+<details class="q"><summary>Межсервисные вызовы внутри кластера дают редкие 502 и Connection reset. План расследования?</summary><div class="a"><p>Корреляция с деплоями (гонка завершения пода → preStop) и с периодами простоя (idle timeout клиента больше серверного/sidecar → reset на переиспользованном соединении). Найти, какой прокси генерирует 502 (ingress, sidecar, клиентская библиотека), сравнить таймауты всех слоёв, tcpdump на поде с фильтром RST. Исправления: idle timeout клиента меньше серверного, ретраи идемпотентных запросов на одном уровне, graceful shutdown.</p></div></details>
+<details class="q"><summary>Почему после перехода на gRPC нагрузка между подами распределилась неравномерно?</summary><div class="a"><p>HTTP/2 мультиплексирует всё в одно долгое соединение, а Service Kubernetes балансирует на L4 — соединения, а не запросы. Решение: L7-прокси (Envoy, mesh), клиентская балансировка через headless Service, <code>max_connection_age</code> на сервере.</p></div></details>
+<details class="q"><summary>Нужно защитить публичный API от всплесков и ботов. Что и на каком уровне?</summary><div class="a"><p>L3/L4 — провайдер/CDN с anycast-скраббингом, SYN cookies. L7 на edge — WAF, rate limiting по ключу API/пользователю (а не только IP из-за CGNAT), бот-защита. В приложении — bulkhead и лимиты конкурентности, backpressure (ограниченные очереди, 429 с Retry-After), кэширование. Таймауты чтения заголовков против Slowloris.</p></div></details>
+</div>
+
+<h2 id="sim"><span class="h-num">15.4</span>Экспресс-тест по всему курсу</h2>
+<p>Десять симптомов из практики. По каждому — на каком уровне искать причину.</p>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p><code>curl</code> к сервису возвращает «Connection refused» мгновенно.</p><ul><li>Файрвол отбрасывает пакеты</li><li>Хост доступен, но на этом порту никто не слушает</li><li>DNS не разрешает имя</li><li>Истёк сертификат</li></ul><div class="why">Тема 14: RST в ответ на SYN. Файрвол дал бы таймаут, DNS — ошибку разрешения имени.</div></div>
+<div class="mcq" data-ok="2"><p>Первый запрос к сервису после простоя занимает 15 секунд, следующие — 20 мс.</p><ul><li>Медленный диск</li><li>Сборка мусора</li><li>NAT или файрвол удалил запись о простаивавшем соединении из пула; TCP ретранслирует в «чёрную дыру» до таймаута</li><li>Малый MTU</li></ul><div class="why">Темы 04, 12: keepalive и ограничение времени жизни соединений в пуле.</div></div>
+<div class="mcq" data-ok="0"><p>Файлы до 1 КБ скачиваются, большие — зависают; через другой канал всё работает.</p><ul><li>Проблема MTU: большие пакеты не проходят, ICMP «нужна фрагментация» фильтруется</li><li>Ошибка DNS</li><li>Перегрузка CPU</li><li>Неверный Content-Type</li></ul><div class="why">Тема 02: чёрная дыра Path MTU Discovery, типична для VPN и туннелей.</div></div>
+<div class="mcq" data-ok="3"><p>После смены IP сервиса часть клиентов ещё сутки ходит на старый адрес.</p><ul><li>BGP не сошёлся</li><li>Проблема ARP</li><li>Потеряны пакеты</li><li>Кэши DNS: TTL у резолверов, кэш в JVM, долгоживущие соединения</li></ul><div class="why">Тема 08: TTL снижают заранее, а клиенты должны переразрешать имя.</div></div>
+<div class="mcq" data-ok="1"><p>Сервис на HTTP/2 в сети с 2% потерь работает медленнее, чем на HTTP/1.1.</p><ul><li>HTTP/2 не сжимает заголовки</li><li>Блокировка начала очереди TCP: одна потеря тормозит все потоки единственного соединения</li><li>HTTP/2 не поддерживает keep-alive</li><li>Больше рукопожатий TLS</li></ul><div class="why">Тема 11: это и есть причина появления QUIC.</div></div>
+<div class="mcq" data-ok="2"><p>Запросы маленькие, RTT 1 мс, но каждый ответ приходит через ~40 мс.</p><ul><li>Медленный DNS</li><li>Slow start</li><li>Алгоритм Нейгла + отложенные ACK</li><li>Потери пакетов</li></ul><div class="why">Тема 07: TCP_NODELAY.</div></div>
+<div class="mcq" data-ok="0"><p>Браузер пишет «blocked by CORS policy», а тот же запрос из curl проходит.</p><ul><li>Сервер не вернул заголовки Access-Control-Allow-*; проверку выполняет браузер, curl её не делает</li><li>Проблема сертификата</li><li>Сервер недоступен из браузера</li><li>Неверный DNS в браузере</li></ul><div class="why">Тема 10: CORS — политика браузера, настраивается на сервере.</div></div>
+<div class="mcq" data-ok="3"><p>gRPC-сервис за L4-балансировщиком: из трёх подов нагружен один.</p><ul><li>Ошибка health check</li><li>Неверный алгоритм хэширования</li><li>Протечка памяти</li><li>Одно долгое HTTP/2-соединение закреплено за одним подом; нужна балансировка запросов на L7 или на клиенте</li></ul><div class="why">Темы 11, 13.</div></div>
+<div class="mcq" data-ok="1"><p>В облаке сервис перестал открывать новые исходящие соединения к одному внешнему API, к остальным — открывает.</p><ul><li>Закончилась память</li><li>Исчерпаны порты NAT-шлюза для пары «адрес источника — адрес:порт назначения»</li><li>Истёк TTL</li><li>Сломался BGP</li></ul><div class="why">Тема 04: нужен пул соединений с переиспользованием или больше адресов на NAT.</div></div>
+<div class="mcq" data-ok="2"><p>Java-клиент: «PKIX path building failed» при обращении к внутреннему сервису.</p><ul><li>Неверный пароль</li><li>Сервер перегружен</li><li>Клиент не доверяет издателю сертификата или сервер не прислал промежуточный сертификат</li><li>Не совпали версии HTTP</li></ul><div class="why">Тема 09: truststore и полная цепочка.</div></div>
+
+<h2 id="blitz"><span class="h-num">15.5</span>Блиц</h2>
+<div class="quiz">
+<details class="q"><summary>TCP vs UDP в трёх предложениях.</summary><div class="a"><p>TCP — соединение, надёжный упорядоченный поток байтов, управление потоком и перегрузкой, цена — рукопожатие и HOL-блокировка. UDP — независимые датаграммы без гарантий и без соединения, минимальные накладные расходы. Поверх UDP строят свои протоколы с другими компромиссами (QUIC).</p></div></details>
+<details class="q"><summary>Что такое RTT, bandwidth и BDP?</summary><div class="a"><p>RTT — время туда и обратно. Bandwidth — ёмкость канала в бит/с. BDP = bandwidth × RTT — сколько данных должно быть «в полёте», чтобы канал был загружен; ограничивает скорость, если окно TCP или буферы меньше.</p></div></details>
+<details class="q"><summary>Зачем TIME_WAIT и у кого он появляется?</summary><div class="a"><p>У стороны, закрывшей соединение первой, на 2×MSL (60 с в Linux): чтобы повторить последний ACK при потере и не принять опоздавшие пакеты старого соединения в новое с той же пятёркой.</p></div></details>
+<details class="q"><summary>Как работает NAT и что он ломает?</summary><div class="a"><p>Подменяет адрес (и порт) источника, храня таблицу трансляций. Ломает входящие соединения, рвёт простаивающие соединения по таймауту, прячет реальные IP клиентов, объединяет многих пользователей за одним IP.</p></div></details>
+<details class="q"><summary>Как сертификат защищает от MITM?</summary><div class="a"><p>Сертификат, подписанный доверенным CA, связывает имя хоста с публичным ключом; CertificateVerify доказывает владение приватным ключом. Посредник не может предъявить валидный сертификат на чужое имя без компрометации CA или ключа.</p></div></details>
+<details class="q"><summary>Чем 502 отличается от 504 и кто их генерирует?</summary><div class="a"><p>Оба — прокси. 502: бэкенд недоступен или ответил некорректно (reset, refused). 504: бэкенд не ответил в пределах таймаута прокси.</p></div></details>
+<details class="q"><summary>Почему DNS-изменения применяются не сразу?</summary><div class="a"><p>Кэширование на каждом уровне по TTL (и сверх него — в JVM и библиотеках), отрицательное кэширование, плюс открытые соединения в пулах продолжают ходить на старые адреса.</p></div></details>
+<details class="q"><summary>L4 vs L7 балансировщик?</summary><div class="a"><p>L4 распределяет соединения по IP/портам, быстрый и универсальный. L7 разбирает HTTP, распределяет запросы, маршрутизирует по пути/заголовкам, терминирует TLS, умеет ретраи и лимиты.</p></div></details>
+</div>
+
+<h2 id="practicum"><span class="h-num">15.6</span>Итоговый практикум</h2>
+<ol class="steps">
+  <li><b>Запишите</b> в Wireshark открытие любого HTTPS-сайта и найдите: DNS-запрос и ответ, SYN/SYN-ACK/ACK, ClientHello (SNI, ALPN), закрытие или переиспользование соединения. Посчитайте RTT по меткам времени.</li>
+  <li><b>Напишите</b> на Java клиент с явными connect/read/общим таймаутами и ретраями с jitter для идемпотентного GET; проверьте поведение против <code>nc -l</code>, который не отвечает, и против закрытого порта.</li>
+  <li><b>Нарисуйте</b> по памяти путь запроса в вашем рабочем сервисе: все прокси, балансировщики, пулы, их таймауты. Найдите хотя бы одно место, где нарушено правило «клиентский idle timeout меньше серверного» или «верхний таймаут больше нижнего».</li>
+  <li><b>Проверьте</b> дома, за CGNAT ли вы (тема 04), и получите отчёт <code>mtr</code> до двух сервисов — в соседней стране и на другом континенте.</li>
+  <li><b>Объясните вслух</b> раздел 15.1 за 5 минут без подсказок — это и есть готовый ответ на собеседовании.</li>
+</ol>
+<div class="callout interview"><span class="c-title">Дальше</span>
+Отмечайте темы в роадмапе (j1–s7) по мере прохождения — таблица соответствия на главной. Когда пройдёте пособие, можно провести mock-собеседование по сетям в формате симуляции, как в этом проекте, — от «что происходит при вводе URL» до разбора инцидента.
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

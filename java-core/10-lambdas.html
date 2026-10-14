@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Лямбды, функциональные интерфейсы, Optional</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ФУНКЦИОНАЛЬНЫЙ СТИЛЬ</div>
+  <h1>Лямбды, функциональные интерфейсы, Optional</h1>
+  <p class="lead">С Java 8 поведение можно передавать как значение: функцию — в метод, условие — в фильтр, действие — в обработчик. Глава объясняет, что такое лямбда с точки зрения языка и JVM, почему захваченная переменная должна быть «фактически финальной» и как пользоваться <code>Optional</code>, не делая код хуже.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">invokedynamic</span><span class="tag">method reference</span><span class="tag">Optional</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="syntax"><span class="h-num">10.1</span>От анонимного класса к лямбде</h2>
+<pre><code class="java">// Java 7: анонимный класс — пять строк ради одного выражения
+users.sort(new Comparator&lt;User&gt;() {
+    @Override public int compare(User a, User b) {
+        return a.name().compareTo(b.name());
+    }
+});
+
+users.sort((a, b) -&gt; a.name().compareTo(b.name()));     // лямбда
+users.sort(Comparator.comparing(User::name));           // ссылка на метод + фабрика компараторов</code></pre>
+<pre data-title="формы записи"><code class="java">x -&gt; x * 2                              // один параметр — скобки не нужны
+(x, y) -&gt; x + y                         // типы параметров выводятся
+(String s, int n) -&gt; s.repeat(n)        // типы указаны явно
+() -&gt; 42                                // без параметров
+x -&gt; { log(x); return x * 2; }          // блок: нужен явный return</code></pre>
+<p>Лямбда — не самостоятельный тип. Она всегда является реализацией какого-то <b>функционального интерфейса</b>, и компилятор определяет, какого именно, по контексту: типу переменной или параметра метода.</p>
+
+<h2 id="functional"><span class="h-num">10.2</span>Функциональные интерфейсы</h2>
+<p>Функциональный интерфейс — интерфейс с ровно одним абстрактным методом (default- и static-методов может быть сколько угодно). Аннотация <code>@FunctionalInterface</code> необязательна, но заставляет компилятор проверить это условие.</p>
+<div class="table-wrap"><table>
+<tr><th>Интерфейс</th><th>Метод</th><th>Смысл</th><th>Пример</th></tr>
+<tr><td><code>Function&lt;T, R&gt;</code></td><td><code>R apply(T)</code></td><td>Преобразование</td><td><code>User::name</code></td></tr>
+<tr><td><code>BiFunction&lt;T, U, R&gt;</code></td><td><code>R apply(T, U)</code></td><td>Преобразование двух аргументов</td><td><code>(a, b) -&gt; a + b</code></td></tr>
+<tr><td><code>UnaryOperator&lt;T&gt;</code></td><td><code>T apply(T)</code></td><td>Тип не меняется</td><td><code>String::trim</code></td></tr>
+<tr><td><code>BinaryOperator&lt;T&gt;</code></td><td><code>T apply(T, T)</code></td><td>Свёртка двух значений в одно</td><td><code>Integer::sum</code></td></tr>
+<tr><td><code>Predicate&lt;T&gt;</code></td><td><code>boolean test(T)</code></td><td>Условие</td><td><code>String::isBlank</code></td></tr>
+<tr><td><code>Supplier&lt;T&gt;</code></td><td><code>T get()</code></td><td>Поставщик, отложенное вычисление</td><td><code>ArrayList::new</code></td></tr>
+<tr><td><code>Consumer&lt;T&gt;</code></td><td><code>void accept(T)</code></td><td>Действие с побочным эффектом</td><td><code>System.out::println</code></td></tr>
+<tr><td><code>Runnable</code> / <code>Callable&lt;V&gt;</code></td><td><code>void run()</code> / <code>V call()</code></td><td>Задача без аргументов</td><td><code>() -&gt; sync()</code></td></tr>
+</table></div>
+<pre data-title="композиция"><code class="java">Predicate&lt;User&gt; adult = u -&gt; u.age() &gt;= 18;
+Predicate&lt;User&gt; active = User::isActive;
+Predicate&lt;User&gt; target = adult.and(active).and(Predicate.not(User::isBlocked));
+
+Function&lt;String, String&gt; normalize = String::strip;
+Function&lt;String, Integer&gt; parse = normalize.andThen(Integer::parseInt);   // сначала strip, затем parseInt</code></pre>
+<ul>
+  <li><b>Примитивные специализации</b> — <code>IntPredicate</code>, <code>IntFunction&lt;R&gt;</code>, <code>ToIntFunction&lt;T&gt;</code>, <code>IntUnaryOperator</code>, <code>LongSupplier</code> и другие — существуют, чтобы избежать упаковки: <code>Function&lt;Integer, Integer&gt;</code> на каждый вызов создаёт объекты, <code>IntUnaryOperator</code> — нет.</li>
+  <li><b>Свои интерфейсы</b> оправданы, когда стандартные не передают смысл (<code>PriceRule</code> понятнее, чем <code>BiFunction&lt;Order, Customer, BigDecimal&gt;</code>) или нужны три и более аргументов.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Проверяемые исключения и лямбды</span>
+Методы стандартных функциональных интерфейсов не объявляют проверяемых исключений, поэтому <code>list.forEach(f -&gt; Files.delete(f))</code> не компилируется. Варианты: обернуть исключение внутри лямбды в непроверяемое (<code>UncheckedIOException</code>); вынести тело в метод, который делает это сам; объявить собственный интерфейс с <code>throws</code>. Приём «sneaky throw», обманывающий компилятор, лучше не использовать: вызывающий код перестаёт знать, чего ждать.
+</div>
+
+<h2 id="method-refs"><span class="h-num">10.3</span>Ссылки на методы</h2>
+<div class="table-wrap"><table>
+<tr><th>Вид</th><th>Запись</th><th>Эквивалентная лямбда</th></tr>
+<tr><td>Статический метод</td><td><code>Integer::parseInt</code></td><td><code>s -&gt; Integer.parseInt(s)</code></td></tr>
+<tr><td>Метод конкретного объекта</td><td><code>System.out::println</code></td><td><code>x -&gt; System.out.println(x)</code></td></tr>
+<tr><td>Метод объекта, который придёт первым аргументом</td><td><code>String::toUpperCase</code></td><td><code>s -&gt; s.toUpperCase()</code></td></tr>
+<tr><td>Конструктор</td><td><code>ArrayList::new</code>, <code>String[]::new</code></td><td><code>() -&gt; new ArrayList&lt;&gt;()</code>, <code>n -&gt; new String[n]</code></td></tr>
+</table></div>
+<p>Третий вид путают чаще всего: <code>String::compareTo</code> как <code>Comparator&lt;String&gt;</code> означает <code>(a, b) -&gt; a.compareTo(b)</code> — первый параметр становится объектом вызова. Тонкость второго вида: в <code>obj::method</code> выражение <code>obj</code> вычисляется один раз, в момент создания ссылки; если <code>obj</code> равен <code>null</code>, исключение возникнет сразу, а не при вызове.</p>
+
+<h2 id="how"><span class="h-num">10.4</span>Как лямбда устроена внутри</h2>
+<p>Лямбда — <b>не</b> синтаксический сахар над анонимным классом. Для анонимного класса компилятор создаёт отдельный файл <code>Outer$1.class</code>. Для лямбды:</p>
+<ol class="steps">
+  <li>Тело лямбды компилируется в приватный метод того же класса: <code>lambda$main$0</code>.</li>
+  <li>На месте лямбды остаётся команда <code>invokedynamic</code> (<a href="01-platform.html#bytecode">тема 01</a>).</li>
+  <li>При первом выполнении JVM вызывает <code>LambdaMetafactory</code>, которая создаёт класс, реализующий нужный интерфейс и вызывающий этот метод.</li>
+  <li>Результат кэшируется: повторные проходы через то же место не создают ничего заново.</li>
+</ol>
+<div class="table-wrap"><table>
+<tr><th></th><th>Анонимный класс</th><th>Лямбда</th></tr>
+<tr><td><code>this</code> внутри</td><td>Сам анонимный объект</td><td>Объект окружающего класса</td></tr>
+<tr><td>Собственная область видимости</td><td>Да: может объявить поле и перекрыть имя</td><td>Нет: нельзя объявить переменную с именем существующей локальной</td></tr>
+<tr><td>Ссылка на внешний объект</td><td>Всегда</td><td>Только если тело использует <code>this</code> или поля</td></tr>
+<tr><td>Создание объектов</td><td>Новый при каждом выполнении</td><td>Незахватывающая — один экземпляр на всё время; захватывающая — новый при каждом выполнении</td></tr>
+<tr><td>Может реализовать</td><td>Любой интерфейс или класс</td><td>Только функциональный интерфейс</td></tr>
+</table></div>
+<pre data-title="разный смысл this"><code class="java">class Screen {
+    String name = "screen";
+    Runnable anon = new Runnable() {
+        String name = "anon";
+        public void run() { System.out.println(this.name); }   // anon
+    };
+    Runnable lambda = () -&gt; System.out.println(this.name);     // screen
+}</code></pre>
+<p>Практические следствия: лямбда, не использующая состояние объекта, не удерживает его в памяти (в отличие от анонимного класса — <a href="04-oop.html#nested">тема 04</a>); в стектрейсе лямбда выглядит как <code>lambda$process$3</code> — номер ничего не говорит, поэтому длинные лямбды лучше выносить в именованные методы.</p>
+
+<h2 id="capture"><span class="h-num">10.5</span>Захват переменных</h2>
+<p>Лямбда может использовать локальные переменные окружающего метода, но только <b>effectively final</b> — те, которым значение присвоено один раз. Слово <code>final</code> писать необязательно.</p>
+<pre class="bad-code"><code class="java">int count = 0;
+list.forEach(x -&gt; count++);                 // ошибка компиляции: count изменяется
+
+for (int i = 0; i &lt; 3; i++) {
+    tasks.add(() -&gt; System.out.println(i)); // ошибка: i изменяется циклом
+}</code></pre>
+<pre class="good-code"><code class="java">long count = list.stream().filter(this::matches).count();   // вычислять результат, а не менять переменную
+
+for (int i = 0; i &lt; 3; i++) {
+    int n = i;                                 // новая переменная на каждой итерации
+    tasks.add(() -&gt; System.out.println(n));
+}
+for (String s : names) tasks.add(() -&gt; System.out.println(s));   // переменная for-each — новая на каждом шаге</code></pre>
+<div class="callout info"><span class="c-title">Почему такое ограничение</span>
+Локальная переменная живёт в стеке и исчезает, когда метод завершается, а лямбда может быть выполнена позже и в другом потоке. Поэтому лямбда получает <b>копию значения</b>. Если бы переменную разрешалось менять, копия и оригинал разошлись бы, и код вёл бы себя не так, как читается. Запрет на изменение делает копирование незаметным.
+</div>
+<p>Ограничение касается самой переменной, а не объекта: в захваченный список можно добавлять элементы, поля <code>this</code> можно менять. Отсюда «обходы» через массив из одного элемента или <code>AtomicInteger</code> — они компилируются, но возвращают ту самую проблему, от которой защищал компилятор: общее изменяемое состояние, особенно опасное в параллельных стримах и других потоках.</p>
+
+<h2 id="optional"><span class="h-num">10.6</span>Optional</h2>
+<p><code>Optional&lt;T&gt;</code> — контейнер, который либо содержит значение, либо пуст. Он создан для одной цели: быть <b>возвращаемым типом</b> метода, у которого результата может не оказаться. Сигнатура <code>Optional&lt;User&gt; findByEmail(String)</code> сообщает то, что <code>User findByEmail(String)</code> скрывает.</p>
+<pre><code class="java">Optional&lt;User&gt; found = repository.findByEmail(email);
+
+String city = found.map(User::address)              // Optional&lt;Address&gt;
+                   .map(Address::city)              // Optional&lt;String&gt;; пусто, если адреса нет
+                   .filter(c -&gt; !c.isBlank())
+                   .orElse("не указан");
+
+User user = found.orElseThrow(() -&gt; new UserNotFoundException(email));
+found.ifPresent(mailer::sendWelcome);
+found.ifPresentOrElse(mailer::sendWelcome, () -&gt; log.warn("нет пользователя {}", email));   // Java 9
+
+Optional&lt;User&gt; any = primary.find(id).or(() -&gt; backup.find(id));   // Java 9: запасной источник
+// flatMap — когда функция сама возвращает Optional:  found.flatMap(User::manager)</code></pre>
+<div class="callout bad"><span class="c-title">Антипаттерны</span>
+<pre><code class="java">if (opt.isPresent()) { use(opt.get()); }             // тот же if (x != null), только длиннее
+opt.get();                                           // NoSuchElementException вместо NPE — не лучше
+
+User u = cache.find(id).orElse(loadFromDb(id));      // loadFromDb выполнится ВСЕГДА — аргумент вычисляется до вызова
+User u = cache.find(id).orElseGet(() -&gt; loadFromDb(id));   // выполнится только при пустом Optional
+
+Optional.of(maybeNull);                              // NPE; для возможного null — Optional.ofNullable
+Optional&lt;List&lt;Order&gt;&gt; findOrders(long userId);       // «нет заказов» — это пустой список, а не Optional
+Optional&lt;User&gt; find(long id) { return null; }        // обесценивает саму идею</code></pre>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Где</th><th>Использовать Optional?</th><th>Почему</th></tr>
+<tr><td>Возвращаемое значение</td><td><b>Да</b></td><td>Для этого он и создан</td></tr>
+<tr><td>Поле класса</td><td>Нет</td><td>Лишний объект на каждый экземпляр; <code>Optional</code> не сериализуем; допускающее <code>null</code> поле с геттером, возвращающим <code>Optional</code>, решает задачу</td></tr>
+<tr><td>Параметр метода</td><td>Нет</td><td>Вызывающий вынужден оборачивать; сам параметр всё равно может быть <code>null</code>. Лучше перегрузка</td></tr>
+<tr><td>Элемент коллекции, ключ карты</td><td>Нет</td><td>Отсутствующий элемент просто не кладут</td></tr>
+<tr><td>Примитивы в горячем коде</td><td><code>OptionalInt</code>, <code>OptionalLong</code></td><td>Без упаковки</td></tr>
+</table></div>
+
+<h2 id="lab"><span class="h-num">10.7</span>Интерактив: какой интерфейс и когда вычисляется</h2>
+<div class="widget" id="fiW">
+  <div class="widget-title">Подбор функционального интерфейса по форме лямбды</div>
+  <div class="controls"><label>форма<select id="fiShape">
+    <option value="sup">() → T</option><option value="con">T → ничего</option><option value="fun">T → R</option><option value="pred">T → boolean</option>
+    <option value="un">T → T</option><option value="bi">(T, U) → R</option><option value="bin">(T, T) → T</option><option value="bic">(T, U) → ничего</option>
+    <option value="run">() → ничего</option><option value="call">() → T, может бросить checked-исключение</option><option value="toint">T → int</option><option value="cmp">(T, T) → int</option></select></label></div>
+  <div class="out" id="fiOut"></div>
+</div>
+<div class="widget" id="opW">
+  <div class="widget-title">Симулятор: Optional и момент вычисления</div>
+  <p class="hint"><code>Optional&lt;User&gt; user = repo.findById(id);</code> и дорогой метод <code>loadDefault()</code> (запрос в БД, 200 мс).</p>
+  <div class="controls">
+    <label>в Optional<select id="opVal"><option value="present">пользователь найден</option><option value="empty">пусто</option></select></label>
+    <label>выражение<select id="opExpr"><option value="orElse">user.orElse(loadDefault())</option><option value="orElseGet">user.orElseGet(() -&gt; loadDefault())</option><option value="orElseThrow">user.orElseThrow(() -&gt; new NotFound(id))</option><option value="get">user.get()</option><option value="map">user.map(User::email).orElse("нет почты")</option><option value="isPresent">if (user.isPresent()) send(user.get());</option><option value="ofNull">Optional.of(null)</option></select></label>
+  </div>
+  <div class="verdict" id="opOut"></div>
+</div>
+<script>
+(function () {
+  var F = {
+    sup: ["Supplier<T>", "T get()", "Отложенное создание: orElseGet(supplier), Stream.generate, ленивые логи log.debug(() -> …)"],
+    con: ["Consumer<T>", "void accept(T t)", "forEach(consumer), ifPresent(consumer)"],
+    fun: ["Function<T, R>", "R apply(T t)", "map(function), Comparator.comparing(keyExtractor), computeIfAbsent"],
+    pred: ["Predicate<T>", "boolean test(T t)", "filter(predicate), removeIf, anyMatch. Комбинируется: and, or, negate, Predicate.not"],
+    un: ["UnaryOperator<T> (extends Function<T, T>)", "T apply(T t)", "List.replaceAll(operator), Stream.iterate(seed, operator)"],
+    bi: ["BiFunction<T, U, R>", "R apply(T t, U u)", "Map.compute(key, biFunction), Map.merge"],
+    bin: ["BinaryOperator<T> (extends BiFunction<T, T, T>)", "T apply(T a, T b)", "reduce(identity, operator), Collectors.toMap(…, mergeFunction)"],
+    bic: ["BiConsumer<T, U>", "void accept(T t, U u)", "Map.forEach((k, v) -> …)"],
+    run: ["Runnable", "void run()", "new Thread(runnable), executor.execute, CompletableFuture.runAsync"],
+    call: ["Callable<V>", "V call() throws Exception", "executor.submit(callable). Стандартные Supplier/Function checked-исключения бросать не могут — частая боль в стримах"],
+    toint: ["ToIntFunction<T>", "int applyAsInt(T t)", "mapToInt(String::length), Comparator.comparingInt — примитивные специализации избавляют от boxing"],
+    cmp: ["Comparator<T>", "int compare(T a, T b)", "sort, sorted, TreeMap. Строится из Function: Comparator.comparing(User::name)"]
+  };
+  var s = document.getElementById("fiShape"), o = document.getElementById("fiOut");
+  function run() { var f = F[s.value]; o.textContent = "Интерфейс:  " + f[0] + "\nМетод:      " + f[1] + "\nГде встречается: " + f[2]; }
+  s.addEventListener("change", run); run();
+
+  var v = document.getElementById("opVal"), e = document.getElementById("opExpr"), out = document.getElementById("opOut");
+  function run2() {
+    var p = v.value === "present", x = e.value, cls = "ok", t;
+    if (x === "orElse") { cls = p ? "bad" : "ok"; t = "loadDefault() вызван — аргумент метода вычисляется ДО вызова orElse, всегда. " + (p ? "Пользователь найден, а 200 мс и запрос в БД потрачены впустую. Если у loadDefault есть побочные эффекты (создание записи), они тоже произойдут." : "Здесь результат пригодился."); }
+    else if (x === "orElseGet") t = p ? "loadDefault() НЕ вызван: лямбда — это объект Supplier, его get() вызывается только для пустого Optional." : "Optional пуст → supplier.get() → loadDefault() вызван.";
+    else if (x === "orElseThrow") { t = p ? "Возвращён пользователь, исключение не создавалось." : "Брошено NotFound — объект исключения создан лениво через Supplier."; cls = p ? "ok" : "warn"; }
+    else if (x === "get") { cls = p ? "warn" : "bad"; t = p ? "Вернёт пользователя, но get() без проверки — тот же NPE, только под названием NoSuchElementException. С Java 10 предпочитайте orElseThrow()." : "NoSuchElementException: No value present."; }
+    else if (x === "map") t = p ? "map применил User::email; если email == null, map вернёт пустой Optional, и сработает orElse." : "map на пустом Optional не вызывает функцию → orElse возвращает строку.";
+    else if (x === "isPresent") { cls = "warn"; t = "Работает, но это if (user != null) в новой обёртке. Идиоматично: user.ifPresent(this::send) или ifPresentOrElse(…)."; }
+    else { cls = "bad"; t = "NullPointerException сразу: Optional.of требует не-null. Для значения, которое может быть null, — Optional.ofNullable(value)."; }
+    out.className = "verdict " + cls; out.textContent = t;
+  }
+  v.addEventListener("change", run2); e.addEventListener("change", run2); run2();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">10.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему лямбда может использовать локальную переменную, только если та effectively final?</p><ul><li>Так быстрее</li><li>Лямбда захватывает копию значения; изменяемая переменная рассинхронизировалась бы с копией, а лямбда может выполниться позже и в другом потоке</li><li>Это ограничение только для анонимных классов</li><li>Локальные переменные хранятся в куче</li></ul><div class="why">Локальная переменная живёт в кадре стека метода и исчезает при выходе из него. Поля объекта и элементы массива менять можно — они в куче.</div></div>
+<div class="mcq" data-ok="2"><p>Чем лямбда отличается от анонимного класса?</p><ul><li>Ничем, это синтаксический сахар</li><li>Лямбда медленнее</li><li>У лямбды нет своего this и отдельного class-файла: она компилируется в метод и создаётся через invokedynamic</li><li>Лямбда может иметь состояние</li></ul><div class="why"><code>this</code> в лямбде — внешний объект. Анонимный класс — настоящий класс со своим <code>this</code>, полями и файлом Outer$1.class.</div></div>
+<div class="mcq" data-ok="0"><p>Где Optional использовать НЕ стоит?</p><ul><li>В полях класса и параметрах методов</li><li>В возвращаемых значениях методов поиска</li><li>В цепочках map/filter</li><li>В результатах стримов: findFirst, max</li></ul><div class="why">Optional задуман как тип возвращаемого значения «результата может не быть». В полях он не сериализуем и добавляет объект, в параметрах заставляет вызывающего оборачивать значение.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое функциональный интерфейс и обязательна ли аннотация @FunctionalInterface?</summary><div class="a"><p>Интерфейс с единственным абстрактным методом; default- и static-методы не считаются. Аннотация необязательна — лямбду можно присвоить любому такому интерфейсу. Она нужна как защита: при добавлении второго абстрактного метода компилятор выдаст ошибку.</p></div></details>
+<details class="q"><summary>Чем лямбда отличается от анонимного класса?</summary><div class="a"><p>Реализацией: для лямбды не создаётся класс при компиляции — тело становится приватным методом, а объект формируется при выполнении через <code>invokedynamic</code>. Семантикой: <code>this</code> в лямбде — окружающий объект, у лямбды нет своей области видимости, она не удерживает внешний объект без необходимости, а незахватывающая лямбда существует в одном экземпляре.</p></div></details>
+<details class="q"><summary>Почему в лямбде можно использовать только effectively final локальные переменные?</summary><div class="a"><p>Лямбда копирует значения захваченных локальных переменных, потому что может выполняться после завершения метода и в другом потоке. Если бы переменную можно было менять, изменения не были бы видны копии, а код выглядел бы так, будто видны. Запрет устраняет эту неоднозначность и заодно защищает от гонок на локальных переменных.</p></div></details>
+<details class="q"><summary>Назовите четыре вида ссылок на методы.</summary><div class="a"><p>На статический метод (<code>Integer::parseInt</code>); на метод конкретного объекта (<code>System.out::println</code>); на метод экземпляра, где объектом вызова становится первый аргумент (<code>String::length</code>); на конструктор (<code>ArrayList::new</code>).</p></div></details>
+<details class="q"><summary>В чём разница между <code>orElse</code> и <code>orElseGet</code>?</summary><div class="a"><p><code>orElse(x)</code> принимает готовое значение — выражение вычисляется всегда, даже если <code>Optional</code> не пуст. <code>orElseGet(supplier)</code> вызывает поставщика только при пустом. Для константы подходит первый, для любого вычисления, запроса или создания объекта — второй.</p></div></details>
+<details class="q"><summary>Почему Optional не рекомендуют использовать в полях и параметрах?</summary><div class="a"><p>Он спроектирован как возвращаемый тип. В поле — лишняя аллокация и несериализуемость; в параметре — неудобство вызывающему и ложная гарантия (сам <code>Optional</code> может быть <code>null</code>). Для необязательного параметра лучше перегрузка метода или объект-параметры.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

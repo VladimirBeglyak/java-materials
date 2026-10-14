@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Reactive Streams и Reactor: сигналы и подписка</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · REACTOR</div>
+  <h1>Reactive Streams и Reactor: сигналы и подписка</h1>
+  <p class="lead">Вся реактивная экосистема JVM стоит на четырёх интерфейсах спецификации Reactive Streams (в JDK — <code>java.util.concurrent.Flow</code>). Поняв протокол «подписка → запрос n → не больше n элементов → завершение», вы поймёте, почему «ничего не происходит, пока не подпишешься», как работает противодавление и что на самом деле делает каждый оператор.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">Publisher</span><span class="tag">Subscriber</span><span class="tag">Subscription</span><span class="tag">request(n)</span><span class="tag">assembly vs subscription</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="spec"><span class="h-num">2.1</span>Четыре интерфейса</h2>
+<pre data-title="org.reactivestreams"><code class="java">public interface Publisher&lt;T&gt; {
+    void subscribe(Subscriber&lt;? super T&gt; s);
+}
+public interface Subscriber&lt;T&gt; {
+    void onSubscribe(Subscription s);   // ровно один раз, первым
+    void onNext(T t);                   // 0..N раз, не больше, чем запрошено
+    void onError(Throwable t);          // терминальный
+    void onComplete();                  // терминальный
+}
+public interface Subscription {
+    void request(long n);               // «готов принять ещё n»
+    void cancel();
+}
+public interface Processor&lt;T, R&gt; extends Subscriber&lt;T&gt;, Publisher&lt;R&gt; {}</code></pre>
+<p>Грамматика сигналов: <code>onSubscribe onNext* (onError | onComplete)?</code>. Правила спецификации (их 40+) среди прочего требуют: сигналы подписчику подаются <b>последовательно</b> (никогда параллельно), <code>onNext</code> — не больше суммы запрошенного, после терминального сигнала — тишина, <code>request(n ≤ 0)</code> — ошибка, <code>Long.MAX_VALUE</code> означает «без ограничений».</p>
+
+<h2 id="protocol"><span class="h-num">2.2</span>Протокол по шагам</h2>
+<div class="widget" id="rsW">
+  <div class="widget-title">Издатель из 5 элементов и подписчик, сам управляющий спросом</div>
+  <div class="controls">
+    <button class="btn primary" id="rsSub">subscribe()</button>
+    <button class="btn" id="rsR1">request(1)</button>
+    <button class="btn" id="rsR2">request(2)</button>
+    <button class="btn" id="rsRM">request(MAX)</button>
+    <button class="btn" id="rsCancel">cancel()</button>
+    <button class="btn" id="rsErr">источник падает</button>
+    <button class="btn" id="rsReset">сброс</button>
+  </div>
+  <div class="grid-2">
+    <div class="card"><h4>Состояние</h4><div class="out" id="rsState"></div></div>
+    <div class="card"><h4>Сигналы</h4><div class="log" id="rsLog"></div></div>
+  </div>
+  <div class="verdict" id="rsV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var st;
+  function reset() { st = { subscribed: false, demand: 0, next: 1, total: 5, done: false, log: [] }; draw("Издатель создан — пока это лишь описание. Ни одного элемента не произведено."); }
+  function log(s) { st.log.push(s); }
+  function drain() {
+    while (!st.done && st.demand > 0 && st.next <= st.total) { log("→ onNext(" + st.next + ")"); st.next++; if (st.demand !== Infinity) st.demand--; }
+    if (!st.done && st.next > st.total) { log("→ onComplete()"); st.done = true; }
+  }
+  function draw(msg, cls) {
+    $("rsState").textContent = "подписан: " + st.subscribed + "\nнепогашенный спрос: " + (st.demand === Infinity ? "Long.MAX_VALUE" : st.demand) + "\nследующий элемент: " + (st.next <= st.total ? st.next : "—") + "\nзавершён: " + st.done;
+    $("rsLog").textContent = st.log.length ? st.log.join("\n") : "(пусто)";
+    $("rsV").className = "verdict " + (cls || "ok"); $("rsV").textContent = msg;
+  }
+  function req(n) {
+    if (!st.subscribed) return draw("Нет подписки — request() вызвать не у кого.", "warn");
+    if (st.done) return draw("Подписка завершена: request() после терминального сигнала — no-op (правила 1.6 и 3.6: после терминального сигнала подписка считается отменённой).", "warn");
+    log("subscriber: request(" + (n === Infinity ? "MAX" : n) + ")");
+    st.demand = n === Infinity || st.demand === Infinity ? Infinity : st.demand + n;
+    drain(); draw(st.done ? "Все 5 элементов доставлены, получен onComplete." : "Издатель отдал ровно столько, сколько запрошено, и ждёт следующего request.");
+  }
+  $("rsSub").addEventListener("click", function () {
+    if (st.subscribed) return draw("Повторная подписка того же Subscriber запрещена (правило 2.12).", "bad");
+    st.subscribed = true; log("→ onSubscribe(subscription)"); draw("onSubscribe получен, но элементов нет: спрос равен нулю. Reactor-овские подписчики (subscribe(lambda)) сразу делают request(MAX).");
+  });
+  $("rsR1").addEventListener("click", function () { req(1); });
+  $("rsR2").addEventListener("click", function () { req(2); });
+  $("rsRM").addEventListener("click", function () { req(Infinity); });
+  $("rsCancel").addEventListener("click", function () {
+    if (!st.subscribed || st.done) return draw("Отменять нечего.", "warn");
+    log("subscriber: cancel()"); st.done = true; draw("Отмена: издатель прекращает работу и освобождает ресурсы. Терминального сигнала НЕ будет — cancel не порождает onComplete.", "warn");
+  });
+  $("rsErr").addEventListener("click", function () {
+    if (!st.subscribed || st.done) return draw("Подписка не активна.", "warn");
+    log("→ onError(IOException)"); st.done = true; draw("Ошибка — терминальный сигнал. Оставшиеся элементы не придут, даже если спрос был.", "bad");
+  });
+  $("rsReset").addEventListener("click", reset); reset();
+})();
+</script>
+
+<h2 id="lazy"><span class="h-num">2.3</span>Ничего не происходит, пока не подпишешься</h2>
+<p>Код с операторами строит <b>описание конвейера</b> (assembly time). Работа начинается при <code>subscribe()</code> (subscription time): подписка поднимается снизу вверх до источника, затем сверху вниз идут <code>onSubscribe</code>, снизу вверх — <code>request</code>, сверху вниз — данные.</p>
+<div class="widget stepper" id="lzSim">
+  <div class="widget-title">Flux.range(1,3).map(x → x*10).filter(x → x > 10).subscribe(print)</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Сборка</h5><div class="items"><span class="chip" id="lzA">FluxRange</span><span class="chip" id="lzB">FluxMap(source=range)</span><span class="chip" id="lzC">FluxFilter(source=map)</span></div></div>
+    <div class="lane"><h5>Подписка ↑</h5><div class="items"><span class="chip off" id="lzD">subscribe(LambdaSubscriber)</span><span class="chip off" id="lzE">filter → map.subscribe(FilterSubscriber)</span><span class="chip off" id="lzF">map → range.subscribe(MapSubscriber)</span></div></div>
+    <div class="lane"><h5>Сигналы ↓</h5><div class="items"><span class="chip off" id="lzG">onSubscribe ↓ по цепочке</span><span class="chip off" id="lzH">request(MAX) ↑ до range</span><span class="chip off" id="lzI">onNext 1→10 ✗, 2→20 ✓, 3→30 ✓</span><span class="chip off" id="lzJ">onComplete</span></div></div>
+  </div>
+  <section class="st-step" data-t="Сборка" data-hl="lzA lzB lzC" data-log="создано 3 объекта-оператора, каждый хранит ссылку на источник; никакого range ещё не выполнено"><p>Каждый оператор — неизменяемая обёртка над предыдущим издателем. Конвейер можно переиспользовать: каждая подписка запустит его заново.</p></section>
+  <section class="st-step" data-t="subscribe" data-hl="lzD" data-log="LambdaSubscriber(print) передан FluxFilter.subscribe"><p>Терминальная операция. В WebFlux её делает сам фреймворк, когда вы возвращаете Mono/Flux из контроллера.</p></section>
+  <section class="st-step" data-t="Подписка вверх" data-hl="lzE lzF" data-log="каждый оператор оборачивает подписчика в свой и подписывается на источник"><p>Подписка идёт снизу вверх: filter создаёт FilterSubscriber(actual=lambda) и подписывает его на map; map — MapSubscriber на range.</p></section>
+  <section class="st-step" data-t="onSubscribe" data-hl="lzG" data-log="range вызывает MapSubscriber.onSubscribe(rangeSubscription) → проброс вниз до LambdaSubscriber"><p>Источник отдаёт подписку, операторы пробрасывают её вниз (иногда оборачивая).</p></section>
+  <section class="st-step" data-t="request" data-hl="lzH" data-log="LambdaSubscriber.request(Long.MAX_VALUE) → filter → map → range"><p>Спрос поднимается вверх. Filter умнее: если элемент отброшен, он сам запрашивает ещё один у источника (request(1)), чтобы не «съесть» спрос подписчика.</p></section>
+  <section class="st-step" data-t="Данные" data-hl="lzI lzJ" data-log="print(20), print(30), затем onComplete"><p>Элементы текут вниз синхронно, в потоке, вызвавшем subscribe (планировщиков нет). Потом — терминальный сигнал.</p></section>
+</div>
+
+<h2 id="reactor"><span class="h-num">2.4</span>Reactor поверх спецификации</h2>
+<div class="table-wrap"><table>
+<tr><th>Понятие</th><th>Reactor</th><th>Комментарий</th></tr>
+<tr><td>Publisher 0..N</td><td><code>Flux&lt;T&gt;</code></td><td>поток, список, бесконечный стрим</td></tr>
+<tr><td>Publisher 0..1</td><td><code>Mono&lt;T&gt;</code></td><td>аналог CompletableFuture, но ленивый и отменяемый</td></tr>
+<tr><td>Subscriber</td><td><code>CoreSubscriber</code>, <code>BaseSubscriber</code></td><td>CoreSubscriber несёт Context (тема 09)</td></tr>
+<tr><td>Processor</td><td><code>Sinks</code> (тема 08)</td><td>Processor-ы (FluxProcessor, EmitterProcessor…) устарели с 3.4</td></tr>
+<tr><td>JDK Flow</td><td><code>JdkFlowAdapter</code></td><td>мост к java.util.concurrent.Flow</td></tr>
+</table></div>
+<pre data-title="BaseSubscriber: ручное управление спросом"><code class="java">Flux.range(1, 100).subscribe(new BaseSubscriber&lt;Integer&gt;() {
+    @Override protected void hookOnSubscribe(Subscription s) { request(2); }
+    @Override protected void hookOnNext(Integer v) {
+        process(v);
+        request(1);                    // по одному: «тянуть» вместо «толкать»
+    }
+    @Override protected void hookOnComplete() { log.info("done"); }
+});</code></pre>
+<div class="callout warn"><span class="c-title">Сигналы — последовательны, но не привязаны к потоку</span>
+Спецификация гарантирует happens-before между сигналами, но не то, что все они придут в одном потоке. onNext(1) может прийти в reactor-http-nio-2, а onNext(2) — в parallel-3. Не храните состояние в ThreadLocal — для этого есть Context.
+</div>
+
+<h2 id="quiz"><span class="h-num">2.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что произойдёт после <code>Flux.range(1,5).map(this::save);</code> без subscribe?</p><ul><li>5 вызовов save</li><li>1 вызов save</li><li>Ничего: конвейер только собран</li><li>Исключение</li></ul><div class="why">Холодный издатель ленив: работа начинается только при подписке.</div></div>
+<div class="mcq" data-ok="1"><p>Подписчик запросил request(3), а источник имеет 10 элементов. Сколько onNext придёт до следующего request?</p><ul><li>10</li><li>3</li><li>1</li><li>0</li></ul><div class="why">Правило 1.1: не больше запрошенного.</div></div>
+<div class="mcq" data-ok="3"><p>Что происходит после cancel()?</p><ul><li>onComplete</li><li>onError(CancellationException)</li><li>onNext(null)</li><li>Издатель прекращает отдавать элементы, терминального сигнала нет</li></ul><div class="why">Отмена — путь вверх, сигналов вниз не порождает (кроме doOnCancel-хуков).</div></div>
+<div class="mcq" data-ok="0"><p>Может ли onNext вызываться из двух потоков одновременно?</p><ul><li>Нет, сигналы последовательны (правило 1.3)</li><li>Да, для Flux.parallel</li><li>Да, если издатель горячий</li><li>Да, после publishOn</li></ul><div class="why">Даже ParallelFlux — это N отдельных последовательных «рельсов».</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем Mono отличается от CompletableFuture?</summary><div class="a"><p>CompletableFuture — жадный (вычисление уже запущено), кэширует результат, не поддерживает отмену источника и противодавление, композиция смешивает потоки исполнения. Mono ленив, может быть пере-подписан (каждый раз заново выполнит работу), отмена распространяется вверх до источника (WebClient закроет соединение), есть Context и богатая библиотека операторов. Перейти: <code>Mono.fromFuture(() -&gt; cf)</code> (supplier — чтобы сохранить ленивость), обратно — <code>toFuture()</code>.</p></div></details>
+<details class="q"><summary>Зачем Reactive Streams, если есть Iterator?</summary><div class="a"><p>Iterator — pull-модель с блокировкой: hasNext() ждёт данные. Reactive Streams — асинхронный push с pull-управлением спросом: потребитель говорит «готов к n», производитель толкает, когда данные есть, и никто не блокирует поток. Это позволяет связывать асинхронные системы с противодавлением через границы потоков и сети (RSocket переносит request(n) по сети).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

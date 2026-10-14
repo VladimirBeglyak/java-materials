@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · ReentrantLock: честность и захват</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.tl { position: relative; height: 150px; border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; background: var(--bg-sunk); overflow: hidden; }
+.tl i { position: absolute; height: 18px; border-radius: 4px; font: 10px/18px var(--font-mono); color: #111; padding-left: 3px; overflow: hidden; white-space: nowrap; }
+</style>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · LOCKS</div>
+  <h1>ReentrantLock: честность и захват</h1>
+  <p class="lead"><code>ReentrantLock</code> — это AQS, где state — число повторных захватов владельцем. Главное архитектурное решение — режим честности: нечестная блокировка позволяет только что пришедшему потоку «влезть без очереди» (barging), пока разбуженный поток ещё просыпается. Это нечестно, но в разы быстрее. Симулятор временной шкалы покажет обе стратегии, а затем — весь API: tryLock с таймаутом, прерываемый захват, диагностика.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">реентерабельность</span><span class="tag">fair vs nonfair</span><span class="tag">barging</span><span class="tag">tryLock</span><span class="tag">lockInterruptibly</span><span class="tag">vs synchronized</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="impl"><span class="h-num">9.1</span>Реализация</h2>
+<pre data-title="ReentrantLock.Sync (упрощённо, JDK 17+)"><code class="java">abstract static class Sync extends AbstractQueuedSynchronizer {
+    final boolean tryLock() {                                   // и для nonfair lock()
+        Thread current = Thread.currentThread();
+        int c = getState();
+        if (c == 0) { if (compareAndSetState(0, 1)) { setExclusiveOwnerThread(current); return true; } }
+        else if (getExclusiveOwnerThread() == current) {        // повторный вход
+            if (++c &lt; 0) throw new Error("Maximum lock count exceeded");
+            setState(c); return true;                           // без CAS: владеет только текущий поток
+        }
+        return false;
+    }
+    protected final boolean tryRelease(int releases) {
+        int c = getState() - releases;
+        if (getExclusiveOwnerThread() != Thread.currentThread()) throw new IllegalMonitorStateException();
+        boolean free = (c == 0);
+        if (free) setExclusiveOwnerThread(null);
+        setState(c);                                            // volatile-запись публикует изменения критической секции
+        return free;
+    }
+}
+static final class FairSync extends Sync {
+    protected final boolean tryAcquire(int acquires) {
+        if (getState() == 0 &amp;&amp; !hasQueuedPredecessors()         // ← честность: не обгонять очередь
+            &amp;&amp; compareAndSetState(0, acquires)) { setExclusiveOwnerThread(Thread.currentThread()); return true; }
+        return false;   // + реентерабельность, как выше
+    }
+}</code></pre>
+
+<h2 id="fair"><span class="h-num">9.2</span>Честная против нечестной</h2>
+<div class="widget" id="frW">
+  <div class="widget-title">Временная шкала: 6 потоков, критическая секция 10 мкс</div>
+  <div class="controls">
+    <label>режим<select id="frM"><option value="nf">new ReentrantLock() — нечестный</option><option value="f">new ReentrantLock(true) — честный</option></select></label>
+    <label>пробуждение потока (unpark → работает), мкс<input type="number" id="frW2" value="15" min="1" max="100"></label>
+    <label>пауза между захватами в потоке, мкс<input type="number" id="frG" value="2" min="0" max="50"></label>
+  </div>
+  <div class="tl" id="frTl"></div>
+  <div class="out" id="frOut"></div>
+  <div class="verdict" id="frV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, COL = ["#9cc3e6", "#f4c27a", "#a6dcb4", "#e8a7b0", "#c8b4e8", "#e3d08a"];
+  function run() {
+    var fair = $("frM").value === "f", wake = Math.max(1, +$("frW2").value), gap = Math.max(0, +$("frG").value), CS = 10, END = 400, N = 6;
+    var ready = [], queue = [], bars = [], counts = new Array(N).fill(0), waits = new Array(N).fill(0), t = 0, owner = -1, freeAt = 0, handoffs = 0, barges = 0, idle = 0;
+    for (var i = 0; i < N; i++) ready.push({ id: i, at: i * 1.5, since: i * 1.5 });
+    while (t < END) {
+      ready.sort(function (x, y) { return x.at - y.at; });
+      var woken = queue.length ? queue[0] : null, first = ready[0] || null, chosen = null, start;
+      if (woken) {
+        var wakeAt = freeAt + (woken.parked ? wake : 0);
+        if (!fair && first && first.at < wakeAt) {            // нечестно: работающий поток успевает раньше просыпающегося
+          chosen = first; start = Math.max(freeAt, first.at); ready.shift(); barges++;
+        } else { chosen = woken; start = wakeAt; queue.shift(); handoffs++; }
+      } else if (first) { chosen = first; start = Math.max(freeAt, first.at); ready.shift(); }
+      else break;
+      idle += Math.max(0, start - freeAt);
+      // все, кто пришёл до начала захвата, встают в очередь и паркуются
+      for (var q = ready.length - 1; q >= 0; q--) if (ready[q].at <= start) { var r = ready.splice(q, 1)[0]; r.parked = true; queue.push(r); }
+      queue.sort(function (x, y) { return x.since - y.since; });
+      waits[chosen.id] = Math.max(waits[chosen.id], start - chosen.since);
+      bars.push([chosen.id, start, start + CS]); counts[chosen.id]++;
+      freeAt = start + CS; t = freeAt;
+      ready.push({ id: chosen.id, at: freeAt + gap, since: freeAt + gap, parked: false });
+    }
+    queue.forEach(function (q) { waits[q.id] = Math.max(waits[q.id], END - q.since); });
+    var W = 100 / END;
+    $("frTl").innerHTML = bars.filter(function (b) { return b[1] < END; }).map(function (b) { return '<i style="left:' + b[1] * W + "%;width:" + (CS * W - 0.3) + "%;top:" + (8 + b[0] * 23) + "px;background:" + COL[b[0]] + '">T' + (b[0] + 1) + "</i>"; }).join("");
+    var tot = counts.reduce(function (a, b) { return a + b; }, 0), busy = tot * CS;
+    $("frOut").textContent = "захватов за " + END + " мкс: " + tot + "  ·  блокировка простаивала: " + Math.round(idle) + " мкс (" + Math.round(idle / END * 100) + "%)\nпо потокам: " + counts.map(function (c, i) { return "T" + (i + 1) + "=" + c; }).join(" ") + "\nмаксимальное ожидание: " + Math.round(Math.max.apply(null, waits)) + " мкс" + (fair ? "" : "  ·  «обгонов» очереди: " + barges);
+    var v = $("frV");
+    if (fair) { v.className = "verdict warn"; v.textContent = "Честный режим: блокировка передаётся строго по очереди, но каждый раз ждёт, пока разбуженный поток проснётся (" + wake + " мкс) — в это время блокировка свободна, а пропускная способность падает. Распределение между потоками ровное, ожидание предсказуемое."; }
+    else { v.className = "verdict ok"; v.textContent = "Нечестный режим: поток, который уже работает на CPU и снова просит блокировку, захватывает её немедленно, не дожидаясь пробуждения спящего. Меньше простоев и выше пропускная способность, но распределение может быть неравномерным, а отдельный поток — ждать долго. По умолчанию — нечестный (так же ведёт себя synchronized)."; }
+  }
+  ["frM", "frW2", "frG"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p class="hint">Модель упрощена: показывает механику передачи блокировки, а не реальные числа.</p>
+
+<h2 id="api"><span class="h-num">9.3</span>API</h2>
+<pre data-title="обязательная идиома и варианты захвата"><code class="java">lock.lock();
+try {
+    // критическая секция
+} finally {
+    lock.unlock();                        // всегда в finally; lock() — ДО try (иначе unlock без lock → IllegalMonitorStateException)
+}
+
+if (lock.tryLock()) { try { … } finally { lock.unlock(); } }          // без ожидания; НЕ уважает честность (может обогнать очередь)
+if (lock.tryLock(200, TimeUnit.MILLISECONDS)) { … } else { отказ }    // с таймаутом — защита от взаимных блокировок
+lock.lockInterruptibly();                                             // ожидание можно прервать Thread.interrupt()
+
+// диагностика (не для логики!)
+lock.isHeldByCurrentThread(); lock.getHoldCount(); lock.isLocked(); lock.hasQueuedThreads(); lock.getQueueLength();</code></pre>
+
+<h2 id="vs"><span class="h-num">9.4</span>ReentrantLock против synchronized</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>synchronized</th><th>ReentrantLock</th></tr>
+<tr><td>Освобождение</td><td>автоматически при выходе из блока</td><td>вручную в finally</td></tr>
+<tr><td>Таймаут, неблокирующая попытка, прерываемость</td><td>нет</td><td>tryLock, tryLock(timeout), lockInterruptibly</td></tr>
+<tr><td>Условия</td><td>одна очередь wait/notify на объект</td><td>несколько Condition (тема 10)</td></tr>
+<tr><td>Честность</td><td>нет</td><td>опционально</td></tr>
+<tr><td>Захват и освобождение в разных методах</td><td>нет (только блок)</td><td>да (hand-over-hand locking)</td></tr>
+<tr><td>Производительность</td><td>сопоставима; JIT умеет укрупнять и удалять блокировки</td><td>сопоставима</td></tr>
+<tr><td>Виртуальные потоки</td><td>до Java 24 закреплял носитель при блокировке внутри</td><td>всегда размонтирует носитель</td></tr>
+<tr><td>Дамп потоков</td><td>«waiting to lock», детектор deadlock</td><td>«parking to wait for … ReentrantLock$NonfairSync», детектор тоже видит</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">9.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему нечестная блокировка обычно даёт большую пропускную способность?</p><ul><li>Она не использует CAS</li><li>Она не ставит потоки в очередь</li><li>Работающий поток захватывает освободившуюся блокировку сразу, не ожидая пробуждения спящего — меньше простоев</li><li>Она использует несколько очередей</li></ul><div class="why">Цена — возможная неравномерность и долгое ожидание отдельных потоков.</div></div>
+<div class="mcq" data-ok="0"><p>Что хранит state у ReentrantLock?</p><ul><li>Число повторных захватов владельцем (0 — свободна)</li><li>Число ожидающих потоков</li><li>id владельца</li><li>Признак честности</li></ul><div class="why">Владелец — в exclusiveOwnerThread.</div></div>
+<div class="mcq" data-ok="1"><p>Уважает ли tryLock() без аргументов честность честной блокировки?</p><ul><li>Да</li><li>Нет — захватывает, если свободна, даже при наличии очереди; tryLock(0, …) уважает</li><li>Только в Java 21</li><li>tryLock недоступен у честной блокировки</li></ul><div class="why">Это явно описано в Javadoc.</div></div>
+<div class="mcq" data-ok="3"><p>Почему lock() пишут перед try, а не внутри?</p><ul><li>Так быстрее</li><li>Так требует компилятор</li><li>Чтобы finally не выполнился</li><li>Если lock() бросит исключение (например, прерывание у lockInterruptibly), finally не должен вызывать unlock без захвата</li></ul><div class="why">Иначе IllegalMonitorStateException замаскирует исходную ошибку.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда выбрать ReentrantLock вместо synchronized в новом коде?</summary><div class="a"><p>Когда нужны таймауты или неблокирующая попытка (защита от взаимных блокировок), прерываемое ожидание, несколько условий ожидания, честность, захват в одном методе и освобождение в другом, или код на виртуальных потоках до Java 24 с блокирующими операциями внутри критической секции. Иначе synchronized проще и безопаснее (не забыть unlock).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

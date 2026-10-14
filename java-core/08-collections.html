@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Коллекции: List, Queue, Deque</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ТИПЫ И КОЛЛЕКЦИИ</div>
+  <h1>Коллекции: List, Queue, Deque</h1>
+  <p class="lead">Выбор коллекции — это выбор структуры данных, а значит, сложности операций и расхода памяти. Глава о линейных коллекциях: как устроен <code>ArrayList</code>, почему <code>LinkedList</code> почти никогда не нужен, чем <code>List.of</code> отличается от <code>Arrays.asList</code> и откуда берётся <code>ConcurrentModificationException</code> в однопоточном коде.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">ArrayList</span><span class="tag">ArrayDeque</span><span class="tag">fail-fast</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="hierarchy"><span class="h-num">8.1</span>Интерфейсы и реализации</h2>
+<div class="table-wrap"><table>
+<tr><th>Интерфейс</th><th>Что гарантирует</th><th>Основные реализации</th></tr>
+<tr><td><code>Collection</code></td><td>Группа элементов: добавить, удалить, обойти, размер</td><td>— (общий предок; наследует <code>Iterable</code>)</td></tr>
+<tr><td><code>List</code></td><td>Порядок и доступ по индексу; дубликаты разрешены</td><td><code>ArrayList</code>, <code>LinkedList</code></td></tr>
+<tr><td><code>Set</code></td><td>Уникальность элементов</td><td><code>HashSet</code>, <code>LinkedHashSet</code>, <code>TreeSet</code> (<a href="09-hashmap.html#sets">тема 09</a>)</td></tr>
+<tr><td><code>Queue</code></td><td>Очередь: добавить в конец, взять из начала</td><td><code>ArrayDeque</code>, <code>PriorityQueue</code>, <code>LinkedList</code></td></tr>
+<tr><td><code>Deque</code></td><td>Двусторонняя очередь: операции с обоих концов</td><td><code>ArrayDeque</code>, <code>LinkedList</code></td></tr>
+<tr><td><code>Map</code></td><td>Пары «ключ → значение»; <b>не</b> наследует <code>Collection</code></td><td><code>HashMap</code>, <code>LinkedHashMap</code>, <code>TreeMap</code> (<a href="09-hashmap.html">тема 09</a>)</td></tr>
+</table></div>
+<p>Переменные и параметры объявляют типом интерфейса (<code>List&lt;Order&gt; orders = new ArrayList&lt;&gt;()</code>): реализацию можно заменить, не трогая остальной код. Потокобезопасные коллекции — отдельная тема в <a href="../java-concurrency/07-collections.html">Java Concurrency, тема 07</a>.</p>
+
+<h2 id="complexity"><span class="h-num">8.2</span>Сложность операций</h2>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>ArrayList</th><th>LinkedList</th><th>ArrayDeque</th></tr>
+<tr><td>Доступ по индексу <code>get(i)</code></td><td><b>O(1)</b></td><td>O(n)</td><td>—</td></tr>
+<tr><td>Добавить в конец</td><td>O(1) амортизированно</td><td>O(1)</td><td>O(1) амортизированно</td></tr>
+<tr><td>Добавить или удалить в начале</td><td>O(n) — сдвиг всех элементов</td><td>O(1)</td><td><b>O(1)</b></td></tr>
+<tr><td>Вставить или удалить в середине</td><td>O(n) — сдвиг хвоста</td><td>O(n) — дойти до места</td><td>—</td></tr>
+<tr><td>Поиск <code>contains</code></td><td>O(n)</td><td>O(n)</td><td>O(n)</td></tr>
+<tr><td>Память на элемент сверх самого объекта</td><td>4 байта (ссылка) + запас массива</td><td>~24 байта (узел)</td><td>4 байта + запас</td></tr>
+</table></div>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>HashSet</th><th>TreeSet</th><th>PriorityQueue</th></tr>
+<tr><td>Добавить</td><td>O(1) в среднем</td><td>O(log n)</td><td>O(log n)</td></tr>
+<tr><td>Поиск</td><td>O(1) в среднем</td><td>O(log n)</td><td>O(n)</td></tr>
+<tr><td>Взять минимальный</td><td>O(n)</td><td>O(log n)</td><td>O(1) посмотреть, O(log n) извлечь</td></tr>
+<tr><td>Порядок обхода</td><td>Не определён</td><td>Отсортирован</td><td>Не отсортирован</td></tr>
+</table></div>
+
+<h2 id="arraylist"><span class="h-num">8.3</span>ArrayList изнутри</h2>
+<p>Внутри — обычный массив <code>Object[] elementData</code> и счётчик <code>size</code>. Ёмкость массива больше числа элементов; когда место кончается, создаётся массив в 1,5 раза больше, и элементы копируются.</p>
+<pre><code class="java">List&lt;String&gt; list = new ArrayList&lt;&gt;();     // массив ещё не выделен
+list.add("a");                            // выделен массив на 10 элементов
+// рост ёмкости: 10 → 15 → 22 → 33 → 49 → …  (old + old / 2)
+
+List&lt;String&gt; big = new ArrayList&lt;&gt;(100_000);   // размер известен — избежать двух десятков перевыделений
+list.remove(0);                           // System.arraycopy: все элементы сдвигаются влево</code></pre>
+<ul>
+  <li><b>Амортизированная O(1).</b> Отдельное добавление иногда стоит O(n) (копирование), но за счёт роста в геометрической прогрессии среднее время остаётся постоянным.</li>
+  <li><b>Массив не уменьшается сам.</b> Список, выросший до миллиона элементов и очищенный, продолжает держать массив на миллион ссылок. <code>trimToSize()</code> или новый список.</li>
+  <li><b>Удаление многих элементов</b> через <code>remove(i)</code> в цикле — O(n²). <code>removeIf(predicate)</code> делает это за один проход.</li>
+</ul>
+
+<h2 id="linkedlist"><span class="h-num">8.4</span>ArrayList или LinkedList</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 200" role="img" aria-label="Расположение в памяти: массив против связанных узлов">
+  <defs><marker id="c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="20" y="22" font-weight="700" font-size="13">ArrayList: один непрерывный массив ссылок</text>
+  <g class="mono" font-size="12">
+    <rect x="20" y="34" width="60" height="36" class="box-ok"/><text x="50" y="57" text-anchor="middle">[0]</text>
+    <rect x="80" y="34" width="60" height="36" class="box-ok"/><text x="110" y="57" text-anchor="middle">[1]</text>
+    <rect x="140" y="34" width="60" height="36" class="box-ok"/><text x="170" y="57" text-anchor="middle">[2]</text>
+    <rect x="200" y="34" width="60" height="36" class="box-ok"/><text x="230" y="57" text-anchor="middle">[3]</text>
+    <rect x="260" y="34" width="60" height="36" class="box"/><text x="290" y="57" text-anchor="middle">—</text>
+    <rect x="320" y="34" width="60" height="36" class="box"/><text x="350" y="57" text-anchor="middle">—</text>
+  </g>
+  <text x="400" y="50" font-size="12.5">соседние элементы лежат рядом —</text>
+  <text x="400" y="68" font-size="12.5">процессор подгружает их в кэш заранее</text>
+  <text x="20" y="112" font-weight="700" font-size="13">LinkedList: отдельный объект-узел на каждый элемент</text>
+  <g class="mono" font-size="11.5">
+    <rect x="20" y="126" width="120" height="44" rx="6" class="box-warn"/><text x="80" y="152" text-anchor="middle">prev|item|next</text>
+    <rect x="200" y="126" width="120" height="44" rx="6" class="box-warn"/><text x="260" y="152" text-anchor="middle">prev|item|next</text>
+    <rect x="380" y="126" width="120" height="44" rx="6" class="box-warn"/><text x="440" y="152" text-anchor="middle">prev|item|next</text>
+  </g>
+  <path d="M140 140 H196" class="ln" marker-end="url(#c1)"/><path d="M200 158 H144" class="ln" marker-end="url(#c1)"/>
+  <path d="M320 140 H376" class="ln" marker-end="url(#c1)"/><path d="M380 158 H324" class="ln" marker-end="url(#c1)"/>
+  <text x="520" y="142" font-size="12.5">узлы разбросаны по куче —</text>
+  <text x="520" y="160" font-size="12.5">каждый переход по ссылке может</text>
+  <text x="520" y="178" font-size="12.5">оказаться промахом кэша</text>
+</svg>
+</figure>
+<div class="callout ok"><span class="c-title">Практический вывод: ArrayList по умолчанию, LinkedList — почти никогда</span>
+<ul>
+  <li><b>«Вставка в середину за O(1)»</b> у связного списка верна, только если вы уже стоите на нужном узле. Чтобы до него дойти, нужно O(n) переходов по ссылкам — медленнее, чем сдвиг массива одной командой копирования памяти.</li>
+  <li><b>Память.</b> Узел — 24 байта плюс нагрузка на сборщик мусора от миллионов мелких объектов.</li>
+  <li><b>Очередь и стек</b> — единственная ниша, где нужны быстрые операции с начала, — лучше обслуживает <code>ArrayDeque</code>.</li>
+</ul>
+Автор <code>LinkedList</code> Джошуа Блох сам признавался, что не пользуется этим классом.
+</div>
+
+<h2 id="queues"><span class="h-num">8.5</span>Очереди, стек, куча</h2>
+<div class="table-wrap"><table>
+<tr><th>Действие</th><th>Бросает исключение</th><th>Возвращает особое значение</th></tr>
+<tr><td>Добавить</td><td><code>add(e)</code></td><td><code>offer(e)</code> → <code>false</code></td></tr>
+<tr><td>Извлечь из начала</td><td><code>remove()</code></td><td><code>poll()</code> → <code>null</code></td></tr>
+<tr><td>Посмотреть начало</td><td><code>element()</code></td><td><code>peek()</code> → <code>null</code></td></tr>
+</table></div>
+<pre><code class="java">Deque&lt;String&gt; stack = new ArrayDeque&lt;&gt;();     // стек: LIFO
+stack.push("a"); stack.push("b");
+stack.pop();                                  // "b"
+
+Deque&lt;String&gt; queue = new ArrayDeque&lt;&gt;();     // очередь: FIFO
+queue.offer("a"); queue.offer("b");
+queue.poll();                                 // "a"</code></pre>
+<p><code>ArrayDeque</code> — кольцевой буфер на массиве: оба конца двигаются без копирования. Не допускает <code>null</code> (он служит признаком «пусто»). Классы <code>Stack</code> и <code>Vector</code> — наследие Java 1.0 с синхронизацией на каждом методе; в новом коде их не используют.</p>
+<h3>PriorityQueue</h3>
+<p>Двоичная куча в массиве: в начале всегда наименьший элемент (по <code>Comparable</code> или переданному компаратору). Остальные элементы <b>не отсортированы</b> — обход через <code>for</code> или <code>toString()</code> выдаст их в порядке внутреннего массива.</p>
+<pre data-title="классическая задача: K наибольших элементов за O(n log K)"><code class="java">PriorityQueue&lt;Integer&gt; heap = new PriorityQueue&lt;&gt;();      // минимальная куча размером не больше K
+for (int x : data) {
+    heap.offer(x);
+    if (heap.size() &gt; k) heap.poll();                     // выбросить наименьший из отобранных
+}
+// в куче остались K наибольших; сортировка всего массива стоила бы O(n log n)
+
+var maxHeap = new PriorityQueue&lt;Integer&gt;(Comparator.reverseOrder());</code></pre>
+
+<h2 id="iterators"><span class="h-num">8.6</span>Итераторы и ConcurrentModificationException</h2>
+<p>Цикл <code>for-each</code> — это скрытый <code>Iterator</code>. Коллекции хранят счётчик структурных изменений <code>modCount</code>; итератор запоминает его при создании и сверяет на каждом шаге. Несовпадение означает, что коллекцию изменили в обход итератора, — и он бросает исключение. Это поведение называют <b>fail-fast</b>.</p>
+<pre data-title="исключение в одном потоке" class="bad-code"><code class="java">for (String s : list) {
+    if (s.isBlank()) list.remove(s);       // ConcurrentModificationException на следующей итерации
+}</code></pre>
+<pre class="good-code"><code class="java">list.removeIf(String::isBlank);            // лучший вариант
+
+for (Iterator&lt;String&gt; it = list.iterator(); it.hasNext(); ) {
+    if (it.next().isBlank()) it.remove();  // удаление через сам итератор разрешено
+}
+
+List&lt;String&gt; kept = list.stream().filter(s -&gt; !s.isBlank()).toList();   // новая коллекция</code></pre>
+<div class="callout warn"><span class="c-title">Fail-fast — диагностика, а не гарантия</span>
+Проверка выполняется «по возможности». Известный курьёз: удаление предпоследнего элемента в <code>for-each</code> исключения не вызывает — цикл просто завершается на шаг раньше, пропустив последний элемент. Полагаться на исключение нельзя; в многопоточном коде нужны потокобезопасные коллекции, итераторы которых не бросают его вовсе.
+</div>
+
+<h2 id="immutable"><span class="h-num">8.7</span>Неизменяемые коллекции и представления</h2>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Что получается</th><th>add / remove</th><th>set</th><th>null</th><th>Связь с источником</th></tr>
+<tr><td><code>List.of(a, b)</code></td><td>Неизменяемый список</td><td>✗</td><td>✗</td><td>✗ — NPE</td><td>—</td></tr>
+<tr><td><code>List.copyOf(c)</code></td><td>Неизменяемая копия</td><td>✗</td><td>✗</td><td>✗ — NPE</td><td>Независима</td></tr>
+<tr><td><code>Arrays.asList(arr)</code></td><td>Список фиксированного размера поверх массива</td><td>✗</td><td>✓</td><td>✓</td><td><b>Общие данные с массивом</b></td></tr>
+<tr><td><code>Collections.unmodifiableList(l)</code></td><td>Представление «только чтение»</td><td>✗</td><td>✗</td><td>✓</td><td><b>Изменения источника видны</b></td></tr>
+<tr><td><code>stream.toList()</code> (16)</td><td>Неизменяемый список</td><td>✗</td><td>✗</td><td>✓</td><td>—</td></tr>
+<tr><td><code>list.subList(a, b)</code></td><td>Представление части списка</td><td>✓ — меняет исходный</td><td>✓</td><td>✓</td><td><b>Общие данные</b></td></tr>
+</table></div>
+<pre data-title="три ловушки"><code class="java">List&lt;Integer&gt; fixed = Arrays.asList(1, 2, 3);
+fixed.add(4);                                  // UnsupportedOperationException
+
+int[] primitives = {1, 2, 3};
+Arrays.asList(primitives).size();              // 1! это List&lt;int[]&gt; из одного элемента
+Arrays.stream(primitives).boxed().toList();    // так получается List&lt;Integer&gt;
+
+List&lt;String&gt; source = new ArrayList&lt;&gt;(List.of("a"));
+List&lt;String&gt; view = Collections.unmodifiableList(source);
+source.add("b");
+view.size();                                   // 2 — «неизменяемый» список изменился</code></pre>
+<p>Правило для API: метод, отдающий внутреннюю коллекцию, возвращает <code>List.copyOf(...)</code> или изначально хранит неизменяемую; метод, принимающий коллекцию на хранение, копирует её (<a href="05-object-contract.html#immutable">тема 05</a>).</p>
+
+<h2 id="traps"><span class="h-num">8.8</span>Ловушки и полезное</h2>
+<pre data-title="remove(int) против remove(Object)"><code class="java">List&lt;Integer&gt; nums = new ArrayList&lt;&gt;(List.of(10, 20, 30));
+nums.remove(1);                       // удалит элемент по ИНДЕКСУ 1 → [10, 30]
+nums.remove(Integer.valueOf(10));     // удалит ЗНАЧЕНИЕ 10 → [30]</code></pre>
+<ul>
+  <li><b><code>list.contains(x)</code> в цикле — O(n²).</b> Если нужна проверка принадлежности, сложите элементы в <code>HashSet</code>.</li>
+  <li><b>Сортировка</b> <code>list.sort(cmp)</code> — алгоритм TimSort: O(n log n), <b>устойчивый</b> (равные элементы сохраняют взаимный порядок), очень быстрый на частично упорядоченных данных. Устойчивость позволяет сортировать последовательно по нескольким признакам.</li>
+  <li><b>В массив</b>: <code>list.toArray(new String[0])</code> или <code>list.toArray(String[]::new)</code>. Без аргумента вернётся <code>Object[]</code>.</li>
+  <li><b>Пустой результат</b> — <code>List.of()</code>, а не <code>null</code>: вызывающему не нужна проверка.</li>
+  <li><b>Sequenced Collections (Java 21).</b> У <code>List</code>, <code>Deque</code>, <code>LinkedHashSet</code>, <code>LinkedHashMap</code> появился общий интерфейс с методами <code>getFirst()</code>, <code>getLast()</code>, <code>addFirst()</code>, <code>removeLast()</code>, <code>reversed()</code> — вместо <code>list.get(list.size() - 1)</code>.</li>
+</ul>
+<h3>Как выбрать</h3>
+<div class="table-wrap"><table>
+<tr><th>Нужно</th><th>Коллекция</th></tr>
+<tr><td>Последовательность, доступ по индексу, обход</td><td><code>ArrayList</code></td></tr>
+<tr><td>Стек или очередь в одном потоке</td><td><code>ArrayDeque</code></td></tr>
+<tr><td>Всегда брать наименьший или наибольший</td><td><code>PriorityQueue</code></td></tr>
+<tr><td>Уникальность и быстрая проверка принадлежности</td><td><code>HashSet</code></td></tr>
+<tr><td>Уникальность + порядок добавления</td><td><code>LinkedHashSet</code></td></tr>
+<tr><td>Уникальность + сортировка, поиск ближайшего</td><td><code>TreeSet</code></td></tr>
+<tr><td>Поиск по ключу</td><td><code>HashMap</code></td></tr>
+<tr><td>Фиксированный набор значений, известный заранее</td><td><code>List.of</code>, <code>Set.of</code>, <code>EnumSet</code></td></tr>
+</table></div>
+
+<h2 id="lab"><span class="h-num">8.9</span>Интерактив: рост ArrayList и fail-fast итератор</h2>
+<div class="widget" id="alW">
+  <div class="widget-title">Симулятор: внутренний массив ArrayList</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="add">add(x)</button>
+    <button class="btn primary" type="button" data-a="add10">add × 10</button>
+    <button class="btn" type="button" data-a="add0">add(0, x) — в начало</button>
+    <button class="btn" type="button" data-a="rem0">remove(0)</button>
+    <button class="btn" type="button" data-a="remLast">remove(size-1)</button>
+    <button class="btn" type="button" data-a="trim">trimToSize()</button>
+    <button class="btn" type="button" data-a="reset">↺ new ArrayList&lt;&gt;()</button>
+  </div>
+  <div class="buckets" id="alCells" style="grid-template-columns:repeat(auto-fill,minmax(34px,1fr))"></div>
+  <div class="tpe-stats" style="display:flex;gap:18px;flex-wrap:wrap;font-size:14px;margin:10px 0"><span>size: <b id="alSize">0</b></span><span>capacity: <b id="alCap">0</b></span><span>modCount: <b id="alMod">0</b></span><span>скопировано элементов всего: <b id="alCopied">0</b></span></div>
+  <div class="log" id="alLog"></div>
+</div>
+<div class="widget" id="cmW">
+  <div class="widget-title">Симулятор: удаление во время обхода</div>
+  <p class="hint">Список <code>[1, 2, 3, 4, 5, 6]</code>, нужно удалить чётные числа.</p>
+  <div class="controls"><label>способ<select id="cmHow"><option value="foreach">for (Integer x : list) if (x % 2 == 0) list.remove(x);</option><option value="index">for (int i = 0; i &lt; list.size(); i++) if (чётное) list.remove(i);</option><option value="iter">Iterator it … if (чётное) it.remove();</option><option value="removeIf">list.removeIf(x -&gt; x % 2 == 0);</option><option value="pair">список [1, 2, 3]: for-each и удаление предпоследнего (2)</option></select></label></div>
+  <div class="log" id="cmLog"></div>
+  <div class="verdict" id="cmOut"></div>
+</div>
+<script>
+(function () {
+  var cap, size, mod, copied, log, n;
+  var $ = function (id) { return document.getElementById(id); };
+  function reset() { cap = 0; size = 0; mod = 0; copied = 0; n = 0; log = ["new ArrayList<>() — пустой общий массив, capacity 0: память под элементы выделится при первом add"]; }
+  function grow() {
+    var old = cap, nw = cap === 0 ? 10 : cap + (cap >> 1);
+    copied += size; cap = nw;
+    log.unshift("  массив заполнен → grow(): новый массив " + nw + (old ? " (старый " + old + " × 1,5)" : " (ёмкость по умолчанию)") + ", Arrays.copyOf скопировал " + size + " эл.");
+  }
+  function act(a) {
+    if (a === "reset") reset();
+    else if (a === "add" || a === "add10") { for (var i = 0; i < (a === "add" ? 1 : 10); i++) { if (size === cap) grow(); size++; mod++; n++; } log.unshift("add: запись в elementData[" + (size - 1) + "] — O(1) амортизированно"); }
+    else if (a === "add0") { if (size === cap) grow(); copied += size; log.unshift("add(0, x): System.arraycopy сдвинул " + size + " эл. вправо — O(n)"); size++; mod++; }
+    else if (a === "rem0") { if (!size) return; size--; mod++; copied += size; log.unshift("remove(0): System.arraycopy сдвинул " + size + " эл. влево — O(n). Ёмкость не уменьшается"); }
+    else if (a === "remLast") { if (!size) return; size--; mod++; log.unshift("remove(size-1): сдвигать нечего — O(1)"); }
+    else if (a === "trim") { cap = size; mod++; log.unshift("trimToSize(): массив урезан до " + size); }
+    render();
+  }
+  function render() {
+    var h = ""; for (var i = 0; i < cap; i++) h += '<div class="bucket ' + (i < size ? "used" : "") + '" style="min-height:26px;text-align:center;padding:3px">' + (i < size ? "●" : "") + "</div>";
+    $("alCells").innerHTML = h || '<div class="bucket" style="grid-column:1/-1">массив ещё не выделен</div>';
+    $("alSize").textContent = size; $("alCap").textContent = cap; $("alMod").textContent = mod; $("alCopied").textContent = copied;
+    $("alLog").textContent = log.slice(0, 20).join("\n");
+  }
+  document.querySelectorAll("#alW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  reset(); render();
+
+  var C = {
+    foreach: ["it.next() → 1   (expectedModCount = 6, modCount = 6)\nit.next() → 2   чётное → list.remove(2): modCount = 7\nit.next() → checkForComodification(): modCount(7) != expectedModCount(6)\n→ ConcurrentModificationException", "bad", "for-each использует итератор. Изменение списка мимо итератора обнаруживается при следующем next() — fail-fast. Это защита от неопределённого поведения, а не гарантия."],
+    index: ["i=0: 1 нечётное\ni=1: 2 чётное → remove(1) → [1,3,4,5,6]\n     (элемент 3 сдвинулся на место i=1 и НЕ проверялся — цикл уже ушёл на i=2)\ni=2: 4 чётное → remove(2) → [1,3,5,6]\ni=3: 6 чётное → remove(3) → [1,3,5]\nрезультат: [1, 3, 5]", "warn", "Исключения нет, и здесь повезло. Но после remove(i) элементы сдвигаются, а i увеличивается — следующий элемент пропускается. На [2, 4, 6] результат будет [4]. Плюс remove(int index) и remove(Object) легко перепутать для List<Integer>."],
+    iter: ["it.next() → 1\nit.next() → 2 → it.remove(): удаляет и синхронизирует expectedModCount = modCount\nit.next() → 3\n…\nрезультат: [1, 3, 5]", "ok", "Корректно: итератор сам знает об удалении. Сложность O(n²) для ArrayList — каждый remove сдвигает хвост."],
+    removeIf: ["removeIf: один проход, отметка удаляемых в битовой маске, один сдвиг\nрезультат: [1, 3, 5], modCount увеличен один раз", "ok", "Лучший вариант: коротко и O(n). Для неизменяемого результата — stream().filter(…).toList()."],
+    pair: ["список [1, 2, 3]\nit.next() → 1\nit.next() → 2 → list.remove(2) → [1, 3], size = 2\nhasNext(): cursor(2) != size(2) → false — цикл ЗАВЕРШАЕТСЯ без исключения\nэлемент 3 не обработан", "bad", "Знаменитый случай: удаление предпоследнего элемента не даёт ConcurrentModificationException, потому что hasNext() не проверяет modCount. Ошибка есть, а исключения нет — fail-fast не гарантирован."]
+  };
+  var sel = $("cmHow");
+  function run2() { var c = C[sel.value]; $("cmLog").textContent = c[0]; $("cmOut").className = "verdict " + c[1]; $("cmOut").textContent = c[2]; }
+  sel.addEventListener("change", run2); run2();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">8.10</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Во сколько раз растёт внутренний массив ArrayList при переполнении?</p><ul><li>В 2 раза</li><li>На 10 элементов</li><li>В 1,5 раза: newCapacity = old + (old &gt;&gt; 1)</li><li>На 1 элемент</li></ul><div class="why">Геометрический рост даёт амортизированную O(1) для add. Если размер известен заранее — <code>new ArrayList&lt;&gt;(n)</code> избавит от копирований.</div></div>
+<div class="mcq" data-ok="0"><p>Что выбрать для очереди и стека в однопоточном коде?</p><ul><li>ArrayDeque — кольцевой массив, быстрее LinkedList и Stack</li><li>Stack — он для этого создан</li><li>LinkedList — вставка O(1)</li><li>Vector</li></ul><div class="why">Stack и Vector синхронизированы и устарели; LinkedList тратит объект-узел на элемент и плохо дружит с кэшем процессора.</div></div>
+<div class="mcq" data-ok="1"><p>Что произойдёт: <code>List&lt;String&gt; l = List.of("a", "b"); l.add("c");</code>?</p><ul><li>Список станет [a, b, c]</li><li>UnsupportedOperationException — List.of возвращает неизменяемый список</li><li>Ошибка компиляции</li><li>NullPointerException</li></ul><div class="why">Неизменяемость здесь проверяется только во время выполнения: интерфейс List один и тот же.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как растёт ArrayList и почему добавление в конец считается O(1)?</summary><div class="a"><p>При заполнении создаётся массив в 1,5 раза больше, элементы копируются — это O(n). Но копирования случаются всё реже: суммарная работа на n добавлений пропорциональна n, поэтому в среднем на одно добавление приходится постоянное время (амортизированная O(1)).</p></div></details>
+<details class="q"><summary>В каком случае LinkedList быстрее ArrayList?</summary><div class="a"><p>Теоретически — при частых вставках и удалениях в начале списка или в позиции, на которой уже стоит итератор. На практике для операций с концов быстрее <code>ArrayDeque</code>, а вставка в произвольное место требует O(n) переходов по ссылкам с промахами кэша и проигрывает сдвигу массива. Реальных задач, где <code>LinkedList</code> выигрывает, почти нет.</p></div></details>
+<details class="q"><summary>Почему удаление элемента в цикле for-each вызывает ConcurrentModificationException без единого дополнительного потока?</summary><div class="a"><p><code>for-each</code> использует итератор, который запомнил счётчик изменений коллекции. <code>list.remove()</code> увеличивает счётчик в обход итератора, и следующий вызов <code>next()</code> обнаруживает расхождение. Название исключения означает «одновременное изменение» в смысле «во время обхода», а не «из другого потока». Удалять нужно через <code>iterator.remove()</code> или <code>removeIf</code>.</p></div></details>
+<details class="q"><summary>Чем <code>Arrays.asList</code>, <code>List.of</code> и <code>Collections.unmodifiableList</code> отличаются друг от друга?</summary><div class="a"><p><code>Arrays.asList</code> — список фиксированного размера поверх массива: менять элементы можно, добавлять и удалять нельзя, изменения видны в массиве. <code>List.of</code> — полностью неизменяемый список без <code>null</code>. <code>unmodifiableList</code> — доступное только для чтения представление другого списка: сам он не меняется через эту ссылку, но изменения оригинала в нём видны.</p></div></details>
+<details class="q"><summary>Что выведет обход PriorityQueue циклом for?</summary><div class="a"><p>Элементы в порядке внутреннего массива кучи, а не по возрастанию. Гарантируется только то, что <code>peek()</code> и <code>poll()</code> возвращают наименьший. Чтобы получить отсортированную последовательность, нужно извлекать элементы через <code>poll()</code>, пока очередь не опустеет.</p></div></details>
+<details class="q"><summary><code>List&lt;Integer&gt; list</code> содержит [5, 6, 7]. Что останется после <code>list.remove(5)</code>?</summary><div class="a"><p>Будет <code>IndexOutOfBoundsException</code>: выбрана перегрузка <code>remove(int index)</code>, а индекса 5 нет. Чтобы удалить значение, нужно передать объект: <code>list.remove(Integer.valueOf(5))</code>.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

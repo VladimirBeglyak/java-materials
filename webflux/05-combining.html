@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Комбинирование: zip, merge, concat, buffer, groupBy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · REACTOR</div>
+  <h1>Комбинирование: zip, merge, concat, buffer, groupBy</h1>
+  <p class="lead">Реальный эндпоинт редко делает один вызов: профиль собирается из трёх сервисов, события двух топиков сливаются в один стрим, записи пишутся в базу пачками. Разбираем операторы, объединяющие несколько издателей, и операторы, нарезающие один поток на группы и окна, — с поведением при ошибках и завершении.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Mono.zip</span><span class="tag">merge / concat</span><span class="tag">combineLatest</span><span class="tag">firstWithSignal</span><span class="tag">buffer / window</span><span class="tag">groupBy</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="parallel"><span class="h-num">5.1</span>Параллельные вызовы: Mono.zip</h2>
+<pre data-title="Агрегация профиля из трёх сервисов" class="good-code"><code class="java">Mono&lt;Profile&gt; profile(String id) {
+    Mono&lt;User&gt;          user   = userClient.get(id);
+    Mono&lt;List&lt;Order&gt;&gt;   orders = orderClient.recent(id).collectList();
+    Mono&lt;Loyalty&gt;       points = loyaltyClient.get(id)
+                                   .onErrorReturn(Loyalty.UNKNOWN);   // некритичный — не валит весь ответ
+    return Mono.zip(user, orders, points)                             // подписка на все три сразу
+               .map(t -&gt; new Profile(t.getT1(), t.getT2(), t.getT3()));
+}   // время ответа = max(задержек), а не сумма</code></pre>
+<div class="callout warn"><span class="c-title">Пустой Mono обнуляет zip</span>
+Если любой из Mono в <code>zip</code> завершится пусто, результат тоже пустой, а остальные отменяются. Для необязательных частей — <code>defaultIfEmpty</code> или <code>map(Optional::of).defaultIfEmpty(Optional.empty())</code>. <code>Mono.when(...)</code> ждёт завершения без значений, <code>zipWhen</code> — вызов, зависящий от результата первого.
+</div>
+
+<h2 id="combine"><span class="h-num">5.2</span>Объединение двух потоков</h2>
+<div class="widget" id="cbW">
+  <div class="widget-title">A: 1, 2, 3 &nbsp;·&nbsp; B: x, y</div>
+  <div class="controls">
+    <label>Оператор<select id="cbOp">
+      <option value="merge">Flux.merge(A, B)</option>
+      <option value="concat">Flux.concat(A, B)</option>
+      <option value="zip">Flux.zip(A, B)</option>
+      <option value="combineLatest">Flux.combineLatest(A, B)</option>
+      <option value="withLatestFrom">A.withLatestFrom(B)</option>
+      <option value="first">Flux.firstWithSignal(A, B)</option>
+      <option value="mergeDelayError">Flux.mergeDelayError(A, B)</option>
+    </select></label>
+    <label>B<select id="cbErr"><option value="ok">завершается нормально</option><option value="err">падает вместо y</option></select></label>
+  </div>
+  <div id="cbM"></div>
+  <div class="verdict" id="cbV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var op = $("cbOp").value, err = $("cbErr").value === "err";
+    var A = [{ t: 10, v: "1", c: 0 }, { t: 40, v: "2", c: 0 }, { t: 70, v: "3", c: 0 }], aEnd = 75;
+    var B = err ? [{ t: 25, v: "x", c: 1 }] : [{ t: 25, v: "x", c: 1 }, { t: 50, v: "y", c: 1 }], bEnd = 55, bErr = err ? 50 : null;
+    var out = [], term = null, msg = "", bLane = B.slice(), bShift = 0;
+    function endB(off) { return bErr !== null ? { t: bErr + off, type: "error", v: "boom" } : { t: bEnd + off, type: "complete" }; }
+    if (op === "merge" || op === "mergeDelayError") {
+      out = A.concat(B).sort(function (a, b) { return a.t - b.t; });
+      if (bErr !== null && op === "merge") { out = out.filter(function (e) { return e.t < bErr; }); term = { t: bErr, type: "error", v: "boom" }; msg = "merge подписывается на всех сразу и выдаёт элементы по мере появления. Ошибка любого источника немедленно завершает результат и отменяет остальных — элемент 3 потерян."; }
+      else if (bErr !== null) { term = { t: aEnd, type: "error", v: "boom" }; msg = "mergeDelayError доводит до конца остальные источники и сообщает об ошибке в самом конце."; }
+      else { term = { t: aEnd, type: "complete" }; msg = "Элементы чередуются по времени; результат завершается, когда завершились все источники."; }
+    } else if (op === "concat") {
+      bShift = aEnd;
+      out = A.concat(B.map(function (e) { return { t: e.t + bShift, v: e.v, c: e.c }; }));
+      term = endB(bShift);
+      msg = "concat подписывается на B только после завершения A — B (холодный) стартует в момент " + aEnd + ". Порядок строго A, затем B. Для горячего B элементы, произошедшие до подписки, будут потеряны.";
+    } else if (op === "zip") {
+      for (var i = 0; i < Math.min(A.length, B.length); i++) out.push({ t: Math.max(A[i].t, B[i].t), v: A[i].v + B[i].v, c: 2 });
+      term = bErr !== null ? { t: bErr, type: "error", v: "boom" } : { t: bEnd, type: "complete" };
+      msg = "zip ждёт по одному элементу от каждого и выдаёт пары. Завершается, как только один источник завершился и пар больше быть не может — элемент 3 остаётся без пары и отбрасывается, A отменяется.";
+    } else if (op === "combineLatest") {
+      var la = null, lb = null, evs = A.map(function (e) { return { t: e.t, s: "a", v: e.v }; }).concat(B.map(function (e) { return { t: e.t, s: "b", v: e.v }; })).sort(function (a, b) { return a.t - b.t; });
+      evs.forEach(function (e) { if (bErr !== null && e.t >= bErr) return; if (e.s === "a") la = e.v; else lb = e.v; if (la && lb) out.push({ t: e.t, v: la + lb, c: 3 }); });
+      term = bErr !== null ? { t: bErr, type: "error", v: "boom" } : { t: aEnd, type: "complete" };
+      msg = "При каждом новом элементе любого источника — комбинация с последним значением другого. Первый результат — только когда у всех есть хотя бы одно значение. Подходит для «состояние = f(фильтры, данные)».";
+    } else if (op === "withLatestFrom") {
+      A.forEach(function (e) { if (bErr !== null && e.t >= bErr) return; var lb = null; B.forEach(function (b) { if (b.t <= e.t) lb = b.v; }); if (lb) out.push({ t: e.t, v: e.v + lb, c: 4 }); });
+      term = bErr !== null ? { t: bErr, type: "error", v: "boom" } : { t: aEnd, type: "complete" };
+      msg = "Ведущий — A: результат выдаётся только на элементы A, с последним значением B. Элемент 1 отброшен — у B ещё нет значения. Элементы B сами ничего не порождают.";
+    } else if (op === "first") {
+      out = A.slice(); term = { t: aEnd, type: "complete" };
+      msg = "Побеждает источник, первым подавший любой сигнал (A — в момент 10); B отменяется. firstWithValue — первый со значением (ошибки и пустые завершения пропускаются; если значения нет ни у кого — NoSuchElementException). Применение: hedged requests к нескольким репликам.";
+      bLane = []; bErr = -1;
+    }
+    var bEv = bLane.map(function (e) { return e.type ? e : { t: e.t + bShift, v: e.v, c: e.c }; });
+    if (op !== "first") bEv.push(endB(bShift));
+    var lanes = [{ label: "A", events: A.concat([{ t: aEnd, type: "complete" }]) }, { label: "B", events: bEv, note: op === "concat" ? "подписка после завершения A" : op === "first" ? "отменён в момент 10, не успев ничего выдать" : "" }, { label: "результат", events: out.concat([term]) }];
+    Marble.render("cbM", lanes, { T: op === "concat" ? 135 : 100 });
+    $("cbV").className = "verdict " + (term.type === "error" ? "bad" : "ok"); $("cbV").textContent = msg;
+  }
+  $("cbOp").addEventListener("change", run); $("cbErr").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="slicing"><span class="h-num">5.3</span>Нарезка: buffer, window, groupBy</h2>
+<div class="widget" id="bfW">
+  <div class="widget-title">Источник 1…7 с неравномерными паузами</div>
+  <div class="controls"><label>Оператор<select id="bfOp">
+    <option value="b3">buffer(3)</option>
+    <option value="bt">buffer(Duration.ofMillis(30))</option>
+    <option value="bto">bufferTimeout(3, Duration.ofMillis(25))</option>
+    <option value="gb">groupBy(x -&gt; x % 2)</option>
+  </select></label></div>
+  <div id="bfM"></div>
+  <div class="verdict" id="bfV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var S = [[5, 1], [9, 2], [13, 3], [38, 4], [42, 5], [68, 6], [91, 7]], END = 95;
+  function run() {
+    var op = $("bfOp").value, src = S.map(function (p) { return { t: p[0], v: String(p[1]), c: (p[1] - 1) % 6 }; }), lanes = [{ label: "источник", events: src.concat([{ t: END, type: "complete" }]) }], msg;
+    function emit(groups) { return groups.map(function (g, i) { return { t: g[0], v: g[1], c: i % 6 }; }); }
+    if (op === "b3") { lanes.push({ label: "buffer(3)", events: emit([[13, "123"], [68, "456"], [END - 1, "7"]]).concat([{ t: END, type: "complete" }]) }); msg = "Списки по 3 элемента. Хвост [7] выдаётся при завершении источника. Если источник бесконечный и редкий, последний неполный список может ждать вечно — тогда нужен bufferTimeout."; }
+    if (op === "bt") { lanes.push({ label: "buffer(30ms)", events: emit([[30, "123"], [60, "45"], [90, "6"], [END - 1, "7"]]).concat([{ t: END, type: "complete" }]) }); msg = "Окна фиксированной длительности по таймеру: пустые интервалы пропускаются — пустой список не выдаётся. Размер пачки не ограничен — при всплеске нагрузки список может быть огромным."; }
+    if (op === "bto") { lanes.push({ label: "bufferTimeout", events: emit([[13, "123"], [63, "45"], [END - 1, "67"]]).concat([{ t: END, type: "complete" }]) }); msg = "Пачка выдаётся, когда набралось 3 ИЛИ прошло 25 мс с первого элемента пачки. Классика для пакетной записи в БД/Kafka: ограничены и размер, и задержка. С 3.5.7 есть bufferTimeout(n, d, true) — предвыборка maxSize×4, пачки выдаются по спросу подписчика."; }
+    if (op === "gb") {
+      lanes.push({ label: "groupBy", events: [{ t: 5, v: "G1", c: 0 }, { t: 9, v: "G0", c: 1 }, { t: END, type: "complete" }], note: "Flux<GroupedFlux<Integer,Integer>>" });
+      lanes.push({ label: "  key=1", events: src.filter(function (e) { return +e.v % 2; }).map(function (e) { return { t: e.t, v: e.v, c: 0 }; }).concat([{ t: END, type: "complete" }]) });
+      lanes.push({ label: "  key=0", events: src.filter(function (e) { return +e.v % 2 === 0; }).map(function (e) { return { t: e.t, v: e.v, c: 1 }; }).concat([{ t: END, type: "complete" }]) });
+      msg = "groupBy выдаёт по одному GroupedFlux на ключ. На каждую группу нужно подписаться (обычно flatMap(g -> g.reduce(...))). Если групп больше, чем concurrency flatMap (256), а группы не завершаются, — зависание: groupBy ждёт спроса, которого не будет.";
+    }
+    Marble.render("bfM", lanes, { T: 100 });
+    $("bfV").className = "verdict " + (op === "gb" ? "warn" : "ok"); $("bfV").textContent = msg;
+  }
+  $("bfOp").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="Пакетная вставка с ограничением параллельности"><code class="java">events.bufferTimeout(500, Duration.ofSeconds(1))     // до 500 штук или раз в секунду
+      .concatMap(batch -&gt; repo.saveAll(batch).then())  // пачки по одной, в порядке
+      .subscribe();</code></pre>
+<p><code>window(…)</code> делает то же, что buffer, но выдаёт не списки, а вложенные <code>Flux</code> — элементы не копятся в памяти, обработка идёт по мере поступления. Используйте, когда окно большое.</p>
+
+<h2 id="reference"><span class="h-num">5.4</span>Справочник</h2>
+<div class="table-wrap"><table>
+<tr><th>Оператор</th><th>Подписка</th><th>Выдаёт</th><th>Ошибка источника</th></tr>
+<tr><td><code>merge / mergeWith</code></td><td>все сразу</td><td>по времени</td><td>сразу завершает</td></tr>
+<tr><td><code>mergeDelayError</code></td><td>все сразу</td><td>по времени</td><td>в конце</td></tr>
+<tr><td><code>concat / concatWith</code></td><td>по очереди</td><td>A, затем B</td><td>сразу (concatDelayError — в конце)</td></tr>
+<tr><td><code>zip / zipWith</code></td><td>все сразу</td><td>кортежи по индексу</td><td>сразу</td></tr>
+<tr><td><code>combineLatest</code></td><td>все сразу</td><td>на каждый элемент любого</td><td>сразу</td></tr>
+<tr><td><code>withLatestFrom</code></td><td>оба</td><td>на элемент ведущего</td><td>сразу</td></tr>
+<tr><td><code>firstWithSignal / firstWithValue</code></td><td>все, затем отмена проигравших</td><td>зеркало победителя</td><td>firstWithValue пропускает ошибки и пустые источники</td></tr>
+<tr><td><code>startWith, then, thenMany</code></td><td>последовательно</td><td>префикс / продолжение</td><td>—</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">5.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Три независимых вызова по 100, 200 и 300 мс объединены через <code>Mono.zip</code>. Время ответа?</p><ul><li>600 мс</li><li>≈300 мс</li><li>100 мс</li><li>Зависит от порядка аргументов</li></ul><div class="why">zip подписывается на все сразу.</div></div>
+<div class="mcq" data-ok="3"><p>Один из Mono в zip завершился пусто. Результат?</p><ul><li>Кортеж с null</li><li>Ошибка NoSuchElementException</li><li>zip ждёт таймаута</li><li>Пустой Mono, остальные источники отменяются</li></ul><div class="why">Пустой источник — нет полного кортежа.</div></div>
+<div class="mcq" data-ok="0"><p>Чем concat(A, B) отличается от merge(A, B) для холодных источников?</p><ul><li>concat подписывается на B только после завершения A</li><li>Ничем</li><li>merge сохраняет порядок источников</li><li>concat параллелен</li></ul><div class="why">Поэтому concat даёт строгий порядок, а merge — минимальную задержку.</div></div>
+<div class="mcq" data-ok="2"><p>Пачки по 100 записей для вставки в БД, но не реже раза в 2 секунды. Оператор?</p><ul><li>buffer(100)</li><li>window(Duration)</li><li>bufferTimeout(100, Duration.ofSeconds(2))</li><li>groupBy</li></ul><div class="why">Ограничены и размер, и максимальная задержка.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как вызвать сервис B, которому нужен результат сервиса A, и вернуть оба результата?</summary><div class="a"><p><code>a.zipWhen(ra -&gt; serviceB.call(ra.id()))</code> вернёт <code>Tuple2&lt;A, B&gt;</code>, или <code>a.flatMap(ra -&gt; serviceB.call(ra.id()).map(rb -&gt; new Result(ra, rb)))</code>. Это последовательные вызовы — время ответа складывается.</p></div></details>
+<details class="q"><summary>Почему groupBy может зависнуть?</summary><div class="a"><p>groupBy не может выдать элемент новой группы, пока подписчик не запросит новую GroupedFlux, а элементы существующей группы, пока на неё не подписались, копятся в очереди с ограниченным prefetch. Если число одновременно открытых групп превышает concurrency flatMap (по умолчанию 256), а группы не завершаются (бесконечный источник), спрос заканчивается — поток встаёт. Решения: ограничить число ключей, увеличить concurrency, завершать группы через take/timeout.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

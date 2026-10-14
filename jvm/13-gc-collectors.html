@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Сборщики: Serial, Parallel, G1, ZGC, Shenandoah</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.rg { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; margin: 10px 0; }
+.rg span { font: 11px var(--font-mono); text-align: center; padding: 7px 0 3px; border-radius: 4px; background: var(--bg-sunk); border: 1.5px solid transparent; position: relative; }
+.rg span small { display: block; font-size: 9px; opacity: .75; }
+.rg .E { background: var(--info-soft); } .rg .S { background: var(--ok-soft); } .rg .O { background: var(--warn-soft); } .rg .H { background: var(--bad-soft); }
+.rg .cs { border-color: var(--accent); }
+@media (max-width: 640px) { .rg { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+</style>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · СБОРКА МУСОРА</div>
+  <h1>Сборщики: Serial, Parallel, G1, ZGC, Shenandoah</h1>
+  <p class="lead">В HotSpot пять продуктовых сборщиков, и каждый — свой компромисс между пропускной способностью, задержками и памятью. Разбираем, как устроен каждый: G1 с регионами и смешанными сборками — в живом симуляторе; ZGC с цветными указателями и барьерами чтения, дающий паузы меньше миллисекунды на терабайтных кучах; Shenandoah; Parallel для пакетной обработки. В конце — мастер выбора сборщика.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">Serial/Parallel</span><span class="tag">G1: регионы</span><span class="tag">mixed GC</span><span class="tag">ZGC</span><span class="tag">цветные указатели</span><span class="tag">Shenandoah</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="triangle"><span class="h-num">13.1</span>Треугольник компромиссов</h2>
+<div class="grid-3">
+  <div class="card"><h4>Пропускная способность</h4><p>Доля времени CPU на полезную работу, а не на GC. Максимум — у сборщиков с остановкой мира: никаких барьеров и конкурентных потоков.</p></div>
+  <div class="card"><h4>Задержка</h4><p>Длина пауз (p99, max). Минимум — у конкурентных сборщиков, которые почти всё делают параллельно с приложением.</p></div>
+  <div class="card"><h4>Память</h4><p>Сколько кучи и служебных структур нужно сверх живых данных. Конкурентным сборщикам нужен запас: приложение выделяет память, пока идёт сборка.</p></div>
+</div>
+
+<h2 id="classic"><span class="h-num">13.2</span>Serial и Parallel</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Serial (<code>-XX:+UseSerialGC</code>)</th><th>Parallel (<code>-XX:+UseParallelGC</code>)</th></tr>
+<tr><td>Молодое поколение</td><td>копирование, один поток, STW</td><td>копирование, много потоков, STW</td></tr>
+<tr><td>Старое поколение</td><td>mark-compact, один поток, STW</td><td>параллельный mark-compact, STW</td></tr>
+<tr><td>Когда</td><td>маленькие кучи (до сотен МБ), 1 CPU, утилиты, контейнеры-сайдкары; выбирается эргономикой на «клиентских» машинах</td><td>пакетная обработка, где важен общий итог, а паузы в секунды допустимы</td></tr>
+</table></div>
+
+<h2 id="g1"><span class="h-num">13.3</span>G1: регионы и смешанные сборки</h2>
+<p>G1 (по умолчанию с Java 9) делит кучу на ~2048 регионов одинакового размера (1–32 МБ). Регион в каждый момент — eden, survivor, old, humongous или свободен. Поколения — это просто множества регионов. Каждая пауза эвакуирует (копирует живое) из набора регионов — <b>collection set</b>, подобранного так, чтобы уложиться в цель <code>-XX:MaxGCPauseMillis</code> (200 мс по умолчанию).</p>
+<div class="widget" id="g1W">
+  <div class="widget-title">Симулятор G1 (48 регионов)</div>
+  <div class="controls">
+    <button class="btn primary" type="button" id="g1A">Приложение работает (выделение)</button>
+    <button class="btn" type="button" id="g1H">Выделить огромный массив</button>
+    <button class="btn" type="button" id="g1Y">Молодая сборка</button>
+    <button class="btn" type="button" id="g1M">Конкурентная пометка</button>
+    <button class="btn" type="button" id="g1X">Смешанная сборка</button>
+    <button class="btn" type="button" id="g1R">↺</button>
+  </div>
+  <div class="rg" id="g1G"></div>
+  <div class="hint">E — eden, S — survivor, O — old (число — % живых данных после пометки), H — humongous; рамка — регион в collection set</div>
+  <div class="out" id="g1Out"></div>
+  <div class="log" id="g1Log"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, R, log, marked, pauses;
+  function reset() { R = []; for (var i = 0; i < 48; i++) R.push({ t: "", live: 0 }); for (var j = 0; j < 8; j++) R[40 + j] = { t: "O", live: 60 + (j * 7) % 35 }; log = ["Куча 48 регионов по 4 МБ. Старое поколение уже содержит 8 регионов."]; marked = false; pauses = []; draw(); }
+  function free() { return R.filter(function (r) { return !r.t; }).length; }
+  function take(t, live) { for (var i = 0; i < R.length; i++) if (!R[i].t) { R[i] = { t: t, live: live }; return i; } return -1; }
+  function alloc() {
+    var n = 0; for (var k = 0; k < 10; k++) if (take("E", 5 + Math.floor(Math.random() * 10)) >= 0) n++;
+    for (var o = 0; o < R.length; o++) if (R[o].t === "O") R[o].live = Math.max(5, R[o].live - Math.floor(Math.random() * 12));
+    log.push("Приложение выделило " + n + " eden-регионов; часть старых объектов умерла (о чём G1 узнает только после пометки).");
+    if (!free()) log.push("⚠ Свободных регионов нет — следующее выделение вызовет эвакуацию или, при неудаче, Full GC (to-space exhausted).");
+    draw();
+  }
+  function humongous() { var a = take("H", 100), b = take("H", 100), c = take("H", 100); log.push(a < 0 || c < 0 ? "Не удалось найти 3 свободных смежных региона → вынужденная сборка" : "Массив 10 МБ > половины региона → humongous: 3 региона подряд сразу в старом поколении; освобождается только при пометке/очистке, не копируется."); draw(); }
+  function young() {
+    var cs = R.filter(function (r) { return r.t === "E" || r.t === "S"; }); if (!cs.length) { log.push("Eden пуст — молодая сборка не нужна."); draw(); return; }
+    var live = cs.reduce(function (s, r) { return s + r.live; }, 0) / 100, ms = Math.round(cs.length * 2 + live * 25);
+    R.forEach(function (r, i) { if (r.t === "E" || r.t === "S") R[i] = { t: "", live: 0 }; });
+    var sReg = Math.max(1, Math.ceil(live * 0.6)), oReg = Math.ceil(live * 0.4);
+    for (var a = 0; a < sReg; a++) take("S", 70); for (var b = 0; b < oReg; b++) take("O", 90);
+    pauses.push(ms); log.push("Молодая сборка (STW, параллельно): collection set = " + cs.length + " регионов eden/survivor, живого ≈ " + live.toFixed(1) + " региона → скопировано в " + sReg + " survivor и " + oReg + " old. Пауза ≈ " + ms + " мс.");
+    var occ = R.filter(function (r) { return r.t === "O" || r.t === "H"; }).length / 48;
+    if (occ > 0.45 && !marked) log.push("Занятость старого поколения " + Math.round(occ * 100) + "% > IHOP 45% → пора запускать конкурентную пометку.");
+    draw();
+  }
+  function mark() {
+    R.forEach(function (r) { if (r.t === "O") r.live = Math.max(3, r.live - Math.floor(Math.random() * 25)); if (r.t === "H" && Math.random() < 0.5) r.dead = true; });
+    var hd = 0; R.forEach(function (r, i) { if (r.t === "H" && r.dead) { R[i] = { t: "", live: 0 }; hd++; } });
+    marked = true; pauses.push(3, 8);
+    log.push("Конкурентная пометка: начальная пометка (вместе с молодой паузой) → сканирование параллельно с приложением (SATB) → remark (короткая пауза ≈ 8 мс) → cleanup. Теперь известна доля живых в каждом old-регионе." + (hd ? " Мёртвые humongous освобождены: " + hd + "." : ""));
+    draw();
+  }
+  function mixed() {
+    if (!marked) { log.push("Смешанная сборка возможна только после конкурентной пометки — G1 должен знать, где мусор."); draw(); return; }
+    var olds = R.map(function (r, i) { return [r, i]; }).filter(function (x) { return x[0].t === "O" && x[0].live < 85; }).sort(function (a, b) { return a[0].live - b[0].live; }).slice(0, 4);
+    var eden = R.filter(function (r) { return r.t === "E" || r.t === "S"; }).length;
+    var freed = 0, moved = 0; olds.forEach(function (x) { x[0].cs = true; }); draw();
+    olds.forEach(function (x) { moved += x[0].live / 100; R[x[1]] = { t: "", live: 0 }; freed++; });
+    R.forEach(function (r, i) { if (r.t === "E" || r.t === "S") R[i] = { t: "", live: 0 }; });
+    for (var m = 0; m < Math.ceil(moved); m++) take("O", 95);
+    var ms = Math.round(eden * 2 + moved * 30 + olds.length * 3); pauses.push(ms);
+    log.push("Смешанная сборка: молодые регионы + " + olds.length + " old-регионов с наименьшей долей живых (" + olds.map(function (x) { return x[0].live + "%"; }).join(", ") + ") — «garbage first». Живое уплотнено в " + Math.ceil(moved) + " регион(а), освобождено " + (freed - Math.ceil(moved)) + " old-регионов. Пауза ≈ " + ms + " мс.");
+    if (!R.some(function (r) { return r.t === "O" && r.live < 85; })) marked = false;
+    draw();
+  }
+  function draw() {
+    $("g1G").innerHTML = R.map(function (r) { return '<span class="' + (r.t || "") + (r.cs ? " cs" : "") + '">' + (r.t || "·") + (r.t === "O" && marked ? "<small>" + r.live + "%</small>" : "<small>&nbsp;</small>") + "</span>"; }).join("");
+    var cnt = function (t) { return R.filter(function (r) { return r.t === t; }).length; };
+    $("g1Out").textContent = "eden " + cnt("E") + " · survivor " + cnt("S") + " · old " + cnt("O") + " · humongous " + cnt("H") + " · свободно " + free() + (pauses.length ? "\nпаузы, мс: " + pauses.slice(-8).join(", ") : "");
+    $("g1Log").textContent = log.slice(-6).join("\n"); $("g1Log").scrollTop = 1e6;
+  }
+  $("g1A").addEventListener("click", alloc); $("g1H").addEventListener("click", humongous); $("g1Y").addEventListener("click", young);
+  $("g1M").addEventListener("click", mark); $("g1X").addEventListener("click", mixed); $("g1R").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<ul>
+  <li><b>Remembered sets</b>: у каждого региона — набор карт других регионов, которые на него ссылаются; позволяет эвакуировать любой набор регионов, не сканируя всю кучу. Поддерживаются барьером записи и потоками уточнения (refinement).</li>
+  <li><b>IHOP</b> (Initiating Heap Occupancy Percent) — порог занятости, при котором стартует конкурентная пометка; адаптивный по умолчанию.</li>
+  <li><b>Full GC</b> в G1 (параллельный mark-compact всей кучи) — признак проблемы: пометка не успела, эвакуации не хватило места («to-space exhausted»), фрагментация humongous.</li>
+</ul>
+
+<h2 id="zgc"><span class="h-num">13.4</span>ZGC: паузы меньше миллисекунды</h2>
+<p>ZGC (продуктовый с Java 15, <b>поколенческий</b> с Java 21, только поколенческий режим с Java 23) делает конкурентно всё, включая перемещение объектов. Паузы не зависят от размера кучи и числа живых объектов — обычно десятки–сотни микросекунд — на кучах от сотен МБ до 16 ТБ.</p>
+<div class="widget stepper" id="zSim">
+  <div class="widget-title">Как ZGC перемещает объект, пока приложение его читает</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Ссылка в поле</h5><div class="items"><span class="chip" id="zRef">0x…A000 [цвет: good]</span><span class="chip off" id="zStale">цвет устарел</span></div></div>
+    <div class="lane"><h5>Страница-источник</h5><div class="items"><span class="chip" id="zFrom">объект по адресу A</span></div></div>
+    <div class="lane"><h5>Страница-приёмник</h5><div class="items"><span class="chip off" id="zTo">копия по адресу B</span></div></div>
+    <div class="lane"><h5>Таблица пересылки</h5><div class="items"><span class="chip off" id="zFwd">A → B</span></div></div>
+  </div>
+  <section class="st-step" data-t="Цветные указатели" data-hl="zRef" data-log="в старших битах 64-битной ссылки — метаданные (цвет): помечен ли, перемещён ли, к какой фазе относится"><p>ZGC хранит метаданные GC прямо в неиспользуемых битах 64-битной ссылки — «цвет». По цвету барьер мгновенно понимает, актуальна ли ссылка для текущей фазы. Следствие: ZGC не использует сжатые указатели (ссылки 8 байт).</p></section>
+  <section class="st-step" data-t="Барьер чтения (load barrier)" data-hl="zRef" data-log="при каждой загрузке ссылки из кучи: test bits; jnz slow_path — быстрый путь — одна проверка"><p>При каждой <b>загрузке ссылки</b> из поля JIT-код проверяет её цвет. Если цвет «хороший» — продолжает без задержки (одна инструкция test + условный переход). Если нет — медленный путь барьера.</p></section>
+  <section class="st-step" data-t="Начало перемещения" data-hl="zFrom zStale" data-log="короткая пауза: смена «хорошего» цвета; все ссылки в куче мгновенно становятся «устаревшими» без их перезаписи"><p>Короткая пауза переключает, какой цвет считается хорошим — все ссылки в куче логически устаревают, ничего не перезаписывая. GC выбирает страницы с наибольшей долей мусора и начинает конкурентно копировать из них живые объекты.</p></section>
+  <section class="st-step" data-t="Кто первый — тот копирует" data-hl="zTo zFwd" data-log="поток приложения прочитал ссылку на A → барьер: объект ещё не скопирован → копирует сам, CAS в таблицу пересылки"><p>Поток приложения загрузил устаревшую ссылку на A. Барьер видит, что объект на перемещаемой странице: если GC ещё не скопировал объект — поток <b>копирует его сам</b> и регистрирует A → B в таблице пересылки (CAS: при гонке побеждает одна копия).</p></section>
+  <section class="st-step" data-t="Самолечение ссылок" data-hl="zRef zFwd" data-log="барьер записывает в поле исправленную ссылку B с хорошим цветом — следующие чтения идут по быстрому пути"><p>Барьер возвращает адрес B и <b>перезаписывает поле</b>, откуда ссылка была загружена, исправленным значением с хорошим цветом (self-healing). Остальные устаревшие ссылки исправит следующая фаза пометки. Страница-источник освобождается, как только все её живые объекты скопированы — память можно переиспользовать ещё до исправления всех ссылок.</p></section>
+</div>
+<p><b>Shenandoah</b> (Red Hat, в OpenJDK с Java 12/15) решает ту же задачу без цветных указателей: барьеры при загрузке ссылок (load reference barrier) и конкурентная эвакуация с пересылкой через заголовок объекта; поддерживает сжатые указатели, поколенческий режим — с Java 24 (экспериментально → продуктово в 25). <b>Epsilon</b> (<code>-XX:+UseEpsilonGC</code>) не собирает мусор вовсе — для тестов производительности и короткоживущих задач.</p>
+
+<h2 id="choose"><span class="h-num">13.5</span>Какой сборщик выбрать</h2>
+<div class="widget" id="chW">
+  <div class="widget-title">Мастер выбора GC</div>
+  <div class="controls">
+    <label>размер кучи<select id="chH"><option value="s">до 512 МБ</option><option value="m" selected>0,5–8 ГБ</option><option value="l">8–64 ГБ</option><option value="xl">больше 64 ГБ</option></select></label>
+    <label>что важнее<select id="chP"><option value="lat">задержки (p99.9 запросов)</option><option value="bal" selected>баланс</option><option value="thr">пропускная способность (батчи)</option></select></label>
+    <label>CPU<select id="chC"><option value="1">1</option><option value="2">2</option><option value="8" selected>4–8</option><option value="32">16+</option></select></label>
+    <label>JDK<select id="chJ"><option value="17">17</option><option value="21" selected>21+</option></select></label>
+  </div>
+  <div class="verdict" id="chV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var h = $("chH").value, p = $("chP").value, c = +$("chC").value, j = +$("chJ").value, r, why;
+    if (c === 1 || h === "s" && p !== "lat") { r = "Serial GC"; why = "Один процессор или маленькая куча: у многопоточных и конкурентных сборщиков накладные расходы больше пользы. Паузы на куче в сотни МБ — десятки миллисекунд."; }
+    else if (p === "thr") { r = "Parallel GC"; why = "Пакетная обработка: максимум пропускной способности без барьеров и конкурентной работы; паузы до секунд допустимы. G1 тоже приемлем, если паузы иногда важны."; }
+    else if (p === "lat" && (h !== "s") && c >= 2) { r = j >= 21 ? "Generational ZGC (-XX:+UseZGC)" : "ZGC (-XX:+UseZGC; поколенческий режим появился в 21) или Shenandoah"; why = "Требования к хвостам задержек: паузы &lt; 1 мс независимо от размера кучи. Нужны запас кучи (~20–30% сверх живых данных) и CPU на конкурентные потоки; немного ниже пропускная способность. Ссылки 8 байт (нет compressed oops)."; }
+    else { r = "G1 (по умолчанию)"; why = "Хороший баланс для большинства сервисов: паузы обычно 10–100 мс с целью MaxGCPauseMillis. Начните с него и переходите на ZGC, если p99 упирается в паузы GC."; }
+    if (h === "xl" && r.indexOf("ZGC") < 0 && p !== "thr") { r = "Generational ZGC"; why = "На кучах больше 64 ГБ паузы G1 на эвакуации и remark растут; ZGC масштабируется до терабайт с паузами < 1 мс."; }
+    $("chV").className = "verdict ok"; $("chV").innerHTML = "<b>" + r + "</b><br>" + why;
+  }
+  ["chH", "chP", "chC", "chJ"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th></th><th>Serial</th><th>Parallel</th><th>G1</th><th>ZGC</th><th>Shenandoah</th></tr>
+<tr><td>Паузы</td><td>длинные</td><td>длинные, но короче</td><td>10–200 мс, цель настраивается</td><td>&lt; 1 мс</td><td>&lt; 10 мс</td></tr>
+<tr><td>Пропускная способность</td><td>—</td><td>лучшая</td><td>хорошая</td><td>чуть ниже</td><td>чуть ниже</td></tr>
+<tr><td>Накладные по памяти</td><td>минимальные</td><td>малые</td><td>remsets ~5–10%</td><td>нужен запас кучи</td><td>нужен запас кучи</td></tr>
+<tr><td>Барьеры</td><td>запись (card)</td><td>запись (card)</td><td>запись (SATB + post)</td><td>чтение и запись</td><td>чтение (LRB) и запись</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">13.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему сборщик называется Garbage-First?</p><ul><li>Сначала собирает молодое поколение</li><li>Удаляет мусор до пометки</li><li>В смешанных сборках выбирает старые регионы с наибольшей долей мусора — максимум освобождённой памяти за единицу паузы</li><li>Это просто имя</li></ul><div class="why">Доля живого известна после конкурентной пометки.</div></div>
+<div class="mcq" data-ok="0"><p>Как ZGC перемещает объекты без длинной паузы?</p><ul><li>Конкурентно копирует, а барьер при загрузке ссылки находит новый адрес через таблицу пересылки и исправляет ссылку</li><li>Никогда не перемещает объекты</li><li>Останавливает только один поток</li><li>Использует подсчёт ссылок</li></ul><div class="why">Цветные указатели + load barriers + self-healing.</div></div>
+<div class="mcq" data-ok="3"><p>В логе G1 — «Pause Full (G1 Compaction Pause)». Что это значит?</p><ul><li>Нормальная молодая сборка</li><li>Конкурентная фаза</li><li>Ошибка JVM</li><li>Аварийная полная сборка: пометка или эвакуация не успели — нужна настройка (размер кучи, IHOP, утечки, humongous)</li></ul><div class="why">В здоровом G1-приложении Full GC не должно быть.</div></div>
+<div class="mcq" data-ok="1"><p>Что такое humongous-объект в G1?</p><ul><li>Объект, переживший 15 сборок</li><li>Объект больше половины региона: размещается сразу в старом поколении в смежных регионах</li><li>Объект с финализатором</li><li>Объект в metaspace</li></ul><div class="why">Большие массивы → humongous; помогает увеличение G1HeapRegionSize.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сравните G1 и ZGC для сервиса с кучей 16 ГБ и требованием p99 &lt; 50 мс.</summary><div class="a"><p>G1 с MaxGCPauseMillis=20–50 обычно укладывается, но паузы растут при большом числе живых объектов в молодом поколении и на remark; при ошибках настройки — Full GC. Generational ZGC даёт паузы &lt; 1 мс, но требует запаса кучи (конкурентная работа при высоком темпе выделения — иначе allocation stall) и немного больше CPU; ссылки 8 байт увеличат занятость кучи. Решение — нагрузочный тест обоих на реальном трафике с замером p99 и CPU.</p></div></details>
+<details class="q"><summary>Что такое allocation stall в ZGC и как его лечить?</summary><div class="a"><p>Приложение выделяет память быстрее, чем ZGC успевает конкурентно освобождать, и потоку, которому негде выделить, приходится ждать окончания цикла — фактически пауза. Лечится запасом кучи (Xmx больше), снижением темпа выделения, большим числом конкурентных потоков GC (ConcGCThreads), с JDK 21 — поколенческим режимом, который собирает молодые объекты чаще и дешевле.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

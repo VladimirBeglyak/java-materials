@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Планировщики: publishOn и subscribeOn</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · REACTOR</div>
+  <h1>Планировщики: publishOn и subscribeOn</h1>
+  <p class="lead">Reactor не создаёт потоков сам: без планировщиков весь конвейер выполняется в потоке, вызвавшем <code>subscribe()</code>, или в потоке, где источник выдал данные. <code>publishOn</code> переключает поток для операторов <b>ниже</b>, <code>subscribeOn</code> — поток, в котором происходит подписка (а значит, и работа синхронного источника), <b>где бы он ни стоял</b>. Разбираем правила на конструкторе конвейера и выясняем, какой пул для чего.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Schedulers</span><span class="tag">parallel</span><span class="tag">boundedElastic</span><span class="tag">publishOn</span><span class="tag">subscribeOn</span><span class="tag">ParallelFlux</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="types"><span class="h-num">7.1</span>Виды планировщиков</h2>
+<div class="table-wrap"><table>
+<tr><th>Планировщик</th><th>Потоки</th><th>Для чего</th></tr>
+<tr><td><code>Schedulers.immediate()</code></td><td>текущий</td><td>«без переключения» — заглушка для API</td></tr>
+<tr><td><code>Schedulers.single()</code></td><td>1 переиспользуемый (<code>single-1</code>)</td><td>последовательные лёгкие задачи</td></tr>
+<tr><td><code>Schedulers.parallel()</code></td><td>= числу ядер (<code>parallel-N</code>)</td><td>быстрые CPU-операции, таймеры (interval, delay, timeout). <b>Блокировать нельзя</b> — потоки помечены NonBlocking, block() бросит исключение</td></tr>
+<tr><td><code>Schedulers.boundedElastic()</code></td><td>до 10 × ядер, очередь до 100 000 задач на поток, простаивающие удаляются через 60 с (<code>boundedElastic-N</code>)</td><td>обёртка блокирующих вызовов: JDBC, файлы, старые SDK</td></tr>
+<tr><td><code>Schedulers.fromExecutorService(ex)</code></td><td>ваш пул</td><td>изоляция: отдельный пул для конкретной зависимости</td></tr>
+<tr><td><code>Schedulers.newParallel/newBoundedElastic(...)</code></td><td>собственный экземпляр</td><td>не забывайте dispose()</td></tr>
+</table></div>
+<p>С Reactor 3.6 на Java 21+ при <code>-Dreactor.schedulers.defaultBoundedElasticOnVirtualThreads=true</code> boundedElastic создаёт виртуальные потоки (<code>loomBoundedElastic</code>). А потоки WebFlux-сервера — это не планировщики Reactor, а event loop Netty: <code>reactor-http-nio-N</code> (или <code>-epoll-</code>).</p>
+
+<h2 id="builder"><span class="h-num">7.2</span>Конструктор: где выполняется каждый оператор</h2>
+<div class="widget" id="scW">
+  <div class="widget-title">source → [слот 1] → map → [слот 2] → filter → [слот 3] → subscribe</div>
+  <div class="controls">
+    <label>Источник<select id="scSrc"><option value="sync">Flux.range / fromCallable (синхронный)</option><option value="net">WebClient (данные приходят из Netty)</option><option value="timer">Flux.interval (таймер)</option></select></label>
+    <label>Кто подписывается<select id="scCaller"><option value="main">поток main</option><option value="nio">WebFlux: reactor-http-nio-3</option></select></label>
+  </div>
+  <div class="controls">
+    <label>Слот 1<select id="sc1"></select></label>
+    <label>Слот 2<select id="sc2"></select></label>
+    <label>Слот 3<select id="sc3"></select></label>
+  </div>
+  <div class="flow" id="scFlow"></div>
+  <div class="out" id="scLog"></div>
+  <div class="verdict" id="scV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var OPTS = [["", "—"], ["pp", "publishOn(parallel())"], ["pb", "publishOn(boundedElastic())"], ["sb", "subscribeOn(boundedElastic())"], ["sp", "subscribeOn(parallel())"]];
+  ["sc1", "sc2", "sc3"].forEach(function (id, i) { $(id).innerHTML = OPTS.map(function (o) { return '<option value="' + o[0] + '"' + ((i === 1 && o[0] === "pp") ? " selected" : "") + ">" + o[1] + "</option>"; }).join(""); });
+  var TH = { pp: "parallel-1", pb: "boundedElastic-1", sb: "boundedElastic-2", sp: "parallel-2" };
+  function run() {
+    var src = $("scSrc").value, caller = $("scCaller").value === "main" ? "main" : "reactor-http-nio-3";
+    var slots = [$("sc1").value, $("sc2").value, $("sc3").value];
+    var subTh = caller, subFrom = null, i, notes = [];
+    for (i = 2; i >= 0; i--) if (slots[i] === "sb" || slots[i] === "sp") { if (subFrom !== null) notes.push("subscribeOn в слоте " + (i + 1) + " перекрывает слот " + (subFrom + 1) + " — побеждает ближайший к источнику."); subTh = TH[slots[i]]; subFrom = i; }
+    var srcTh = src === "sync" ? subTh : src === "net" ? "reactor-http-nio-5" : "parallel-3";
+    var cur = srcTh, stages = [["source", srcTh]], names = ["map", "filter", "subscriber"];
+    for (i = 0; i < 3; i++) { if (slots[i] === "pp" || slots[i] === "pb") cur = TH[slots[i]]; stages.push([names[i], cur]); }
+    function cls(t) { return /^parallel/.test(t) ? "info" : /^bounded/.test(t) ? "warn" : /nio/.test(t) ? "acc" : "ok"; }
+    $("scFlow").innerHTML = stages.map(function (s, k) { return (k ? '<span class="to">→</span>' : "") + '<div class="node ' + cls(s[1]) + '"><b>' + s[0] + "</b><small>" + s[1] + "</small></div>"; }).join("");
+    $("scLog").textContent = "[" + caller + "] subscribe()\n" + (subFrom !== null ? "[" + subTh + "] подписка доходит до источника (subscribeOn, слот " + (subFrom + 1) + ")\n" : "") +
+      (src === "sync" ? "[" + srcTh + "] range: onNext(1)\n" : src === "net" ? "[" + srcTh + "] Netty: пришёл ответ → onNext\n" : "[" + srcTh + "] таймер interval: onNext(0)\n") +
+      stages.slice(1).map(function (s) { return "[" + s[1] + "] " + s[0] + "(1)"; }).join("\n");
+    var msg = [], bad = false;
+    if (src !== "sync" && subFrom !== null) msg.push("subscribeOn не влияет на поток, в котором асинхронный источник выдаёт данные: " + (src === "net" ? "ответ WebClient приходит в event loop Netty" : "interval работает на parallel") + ". subscribeOn меняет лишь поток вызова subscribe()/request.");
+    if (src === "sync" && subFrom !== null) msg.push("subscribeOn сдвинул подписку, и синхронный источник выдаёт элементы в " + subTh + " — вплоть до первого publishOn.");
+    if (slots.indexOf("pp") >= 0 || slots.indexOf("pb") >= 0) msg.push("publishOn переключает поток для всех операторов ниже себя (через очередь из 256 элементов по умолчанию).");
+    if (!msg.length) msg.push("Без планировщиков всё выполняется в одном потоке: " + srcTh + ".");
+    if (caller !== "main" && src === "sync" && subFrom === null && stages.every(function (s) { return /nio/.test(s[1]); })) { msg.push("Синхронный источник выполняется прямо в event loop: если это блокирующий fromCallable — сервер встанет. Нужен subscribeOn(boundedElastic())."); bad = true; }
+    $("scV").className = "verdict " + (bad ? "bad" : notes.length ? "warn" : "ok"); $("scV").textContent = notes.concat(msg).join(" ");
+  }
+  ["scSrc", "scCaller", "sc1", "sc2", "sc3"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="rules"><span class="h-num">7.3</span>Правила</h2>
+<div class="grid-2">
+  <div class="card"><h4>publishOn(s)</h4><ul><li>Влияет на операторы <b>ниже</b> по цепочке.</li><li>Можно ставить несколько раз — каждый переключает снова.</li><li>Внутри очередь (prefetch 256) и задача-воркер на планировщике: сигналы по-прежнему последовательны.</li><li>Применение: увести тяжёлую обработку ответа с event loop.</li></ul></div>
+  <div class="card"><h4>subscribeOn(s)</h4><ul><li>Влияет на подписку и запросы спроса <b>вверх</b> — значит, на поток синхронного источника.</li><li>Положение в цепочке почти не важно; из нескольких действует ближайший к источнику.</li><li>Не меняет поток уже асинхронного источника.</li><li>Применение: <code>Mono.fromCallable(blocking).subscribeOn(boundedElastic())</code>.</li></ul></div>
+</div>
+<pre data-title="Правильная обёртка блокирующего вызова" class="good-code"><code class="java">@GetMapping("/report/{id}")
+Mono&lt;Report&gt; report(@PathVariable long id) {
+    return Mono.fromCallable(() -&gt; legacyJdbcDao.load(id))   // блокирует
+               .subscribeOn(Schedulers.boundedElastic())     // ...но не event loop
+               .map(this::enrich);                           // продолжится в boundedElastic-N
+}</code></pre>
+
+<h2 id="flatmap"><span class="h-num">7.4</span>Параллелизм: flatMap и ParallelFlux</h2>
+<p>Ни publishOn, ни subscribeOn не делают обработку параллельной — элементы идут по одному. Параллельность даёт flatMap с внутренними издателями на планировщике или ParallelFlux:</p>
+<pre data-title="Два способа распараллелить CPU-работу"><code class="java">// 1. flatMap: каждый элемент — свой Mono на parallel()
+Flux.fromIterable(images)
+    .flatMap(img -&gt; Mono.fromCallable(() -&gt; resize(img))
+                        .subscribeOn(Schedulers.parallel()), 8)
+    .collectList();
+
+// 2. ParallelFlux: рельсы по числу ядер
+Flux.fromIterable(images)
+    .parallel()                     // N рельсов (по умолчанию = ядрам)
+    .runOn(Schedulers.parallel())   // каждый рельс — на своём потоке
+    .map(this::resize)
+    .sequential()                   // обратно в один Flux (порядок не сохраняется)
+    .collectList();</code></pre>
+<div class="callout info"><span class="c-title">Где продолжается цепочка после flatMap</span>
+Элементы результата flatMap приходят в тех потоках, где их выдали внутренние издатели. После <code>flatMap(id -&gt; webClient...)</code> дальнейшие операторы работают в reactor-http-nio-*, после flatMap с subscribeOn(boundedElastic) — в boundedElastic-*. Это нормально: сигналы всё равно сериализуются.
+</div>
+
+<h2 id="quiz"><span class="h-num">7.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p><code>Flux.range(1,3).map(f).publishOn(parallel()).map(g).subscribe()</code> вызван в main. Где выполняется f?</p><ul><li>parallel-1</li><li>main</li><li>boundedElastic</li><li>В разных потоках</li></ul><div class="why">publishOn влияет только на операторы ниже.</div></div>
+<div class="mcq" data-ok="2"><p>В цепочке два subscribeOn: <code>.subscribeOn(A)</code> ближе к источнику и <code>.subscribeOn(B)</code> ниже. Где работает синхронный источник?</p><ul><li>B</li><li>В вызывающем потоке</li><li>A</li><li>Поочерёдно</li></ul><div class="why">Подписка идёт снизу вверх: B переключает, затем A переключает снова — последним перед источником.</div></div>
+<div class="mcq" data-ok="0"><p>Какой планировщик подходит для обёртки JDBC-вызова?</p><ul><li>boundedElastic</li><li>parallel</li><li>single</li><li>immediate</li></ul><div class="why">parallel — для неблокирующей CPU-работы; block в нём запрещён.</div></div>
+<div class="mcq" data-ok="3"><p>Делает ли <code>publishOn(parallel())</code> обработку элементов параллельной?</p><ul><li>Да, по числу ядер</li><li>Да, если элементов больше 256</li><li>Только для Flux.range</li><li>Нет: элементы обрабатываются последовательно в одном потоке-воркере</li></ul><div class="why">Параллельность — flatMap или parallel().runOn().</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему boundedElastic ограничен 10 × ядер и что будет при исчерпании?</summary><div class="a"><p>Раньше был неограниченный elastic(): при массовой блокировке создавались тысячи потоков, и сервис падал от нехватки памяти. boundedElastic ограничивает число потоков (по умолчанию 10 × ядер, настраивается <code>reactor.schedulers.defaultBoundedElasticSize</code>) и ставит лишние задачи в очередь (до 100 000 на поток, <code>defaultBoundedElasticQueueSize</code>). При переполнении очереди — <code>RejectedExecutionException</code>. Это сигнал, что блокирующих операций слишком много для реактивного приложения.</p></div></details>
+<details class="q"><summary>Почему в WebFlux-сервисе после WebClient-вызова код выполняется в reactor-http-nio, хотя запрос пришёл в другой поток?</summary><div class="a"><p>По умолчанию сервер Reactor Netty и WebClient используют общие LoopResources. Ответ клиента обрабатывается в event loop, к которому привязано исходящее соединение, и именно там подписчик получает onNext. Все последующие операторы работают в этом потоке, пока не встретится publishOn.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

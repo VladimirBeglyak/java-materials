@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · JOIN, CTE, оконные функции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ОСНОВЫ И МОДЕЛИРОВАНИЕ</div>
+  <h1>JOIN, подзапросы, CTE и оконные функции</h1>
+  <p class="lead">Большинство разработчиков используют 20% SQL и вытаскивают данные в приложение, чтобы досчитать остальное в цикле. Между тем база умеет за один запрос и за миллисекунды делать то, на что в коде уходят десятки строк и сотни обращений: «последний заказ каждого клиента», нарастающий итог, обход дерева, «вставить или обновить». Всё из этой главы можно сразу выполнить в песочнице.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">виды JOIN</span><span class="tag">EXISTS</span><span class="tag">рекурсивные CTE</span><span class="tag">окна</span><span class="tag">UPSERT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="joins"><span class="h-num">3.1</span>Виды соединений</h2>
+<div class="widget" id="jnW">
+  <div class="widget-title">Визуализатор JOIN</div>
+  <div class="grid-2">
+    <div class="out">customers c
+id  name
+1   Анна
+2   Борис
+3   Вера
+4   Глеб</div>
+    <div class="out">orders o
+id   customer_id  status
+101  1            paid
+102  1            shipped
+103  2            paid
+109  7            paid      ← клиента 7 нет</div>
+  </div>
+  <div class="controls"><label>соединение<select id="jnType" style="max-width:100%">
+    <option value="inner">c INNER JOIN o ON o.customer_id = c.id</option>
+    <option value="left">c LEFT JOIN o ON o.customer_id = c.id</option>
+    <option value="right">c RIGHT JOIN o ON o.customer_id = c.id</option>
+    <option value="full">c FULL JOIN o ON o.customer_id = c.id</option>
+    <option value="semi">WHERE EXISTS (SELECT 1 FROM o WHERE o.customer_id = c.id) — полусоединение</option>
+    <option value="anti">WHERE NOT EXISTS (…) — антисоединение</option>
+    <option value="leftwhere">c LEFT JOIN o ON … WHERE o.status = 'paid'  (ловушка)</option>
+    <option value="lefton">c LEFT JOIN o ON … AND o.status = 'paid'</option>
+    <option value="cross">c CROSS JOIN o</option>
+  </select></label></div>
+  <div class="out" id="jnOut"></div>
+  <div class="verdict" id="jnV"></div>
+</div>
+<script>
+(function () {
+  var C = [[1, "Анна"], [2, "Борис"], [3, "Вера"], [4, "Глеб"]], O = [[101, 1, "paid"], [102, 1, "shipped"], [103, 2, "paid"], [109, 7, "paid"]];
+  function pad(s, n) { s = String(s); while (s.length < n) s += " "; return s; }
+  function row(c, o) { return pad(c ? c[0] : "NULL", 5) + pad(c ? c[1] : "NULL", 8) + pad(o ? o[0] : "NULL", 6) + pad(o ? o[2] : "NULL", 8); }
+  var N = {
+    inner: "Только пары, где условие истинно. Вера и Глеб (без заказов) и заказ 109 (без клиента) пропали.",
+    left: "Все клиенты; у кого нет заказов — с NULL в столбцах заказа. Число строк ≥ числа клиентов: у Анны две строки — по строке на каждый заказ.",
+    right: "Все заказы, включая «сироту» 109 с NULL вместо клиента. На практике RIGHT JOIN переписывают как LEFT JOIN с переставленными таблицами — так читать проще.",
+    full: "Все строки обеих таблиц: совпавшие — парами, остальные — с NULL. Удобно для сверки двух наборов данных.",
+    semi: "Каждый клиент не более одного раза, если у него ЕСТЬ заказ. В отличие от JOIN, строки не размножаются — не нужен DISTINCT. Планировщик выполняет EXISTS как semi join и останавливается на первом совпадении.",
+    anti: "Клиенты без заказов. NOT EXISTS корректно работает с NULL, в отличие от NOT IN. Альтернатива — LEFT JOIN … WHERE o.id IS NULL.",
+    leftwhere: "Условие в WHERE применяется ПОСЛЕ соединения: у Веры и Глеба o.status = NULL, условие unknown — они выброшены. LEFT JOIN фактически превратился в INNER JOIN. Частая и незаметная ошибка.",
+    lefton: "Условие внутри ON отбирает, какие заказы присоединять, а клиенты сохраняются все. Так получают «всех клиентов и их оплаченные заказы, если есть».",
+    cross: "Декартово произведение: 4 × 4 = 16 строк. Нужно редко (генерация комбинаций); случайный CROSS JOIN из-за забытого условия на больших таблицах даёт миллиарды строк."
+  };
+  var s = document.getElementById("jnType");
+  function run() {
+    var t = s.value, rows = [];
+    function m(c, o) { return o[1] === c[0]; }
+    if (t === "inner") C.forEach(function (c) { O.forEach(function (o) { if (m(c, o)) rows.push(row(c, o)); }); });
+    if (t === "left" || t === "leftwhere" || t === "full" || t === "lefton") C.forEach(function (c) { var any = false; O.forEach(function (o) { if (m(c, o) && (t !== "lefton" || o[2] === "paid")) { if (t !== "leftwhere" || o[2] === "paid") rows.push(row(c, o)); any = true; } }); if (!any && t !== "leftwhere") rows.push(row(c, null)); });
+    if (t === "full") O.forEach(function (o) { if (!C.some(function (c) { return m(c, o); })) rows.push(row(null, o)); });
+    if (t === "right") O.forEach(function (o) { var c = C.filter(function (c) { return m(c, o); })[0]; rows.push(row(c || null, o)); });
+    if (t === "semi") C.forEach(function (c) { if (O.some(function (o) { return m(c, o); })) rows.push(pad(c[0], 5) + c[1]); });
+    if (t === "anti") C.forEach(function (c) { if (!O.some(function (o) { return m(c, o); })) rows.push(pad(c[0], 5) + c[1]); });
+    if (t === "cross") C.forEach(function (c) { O.forEach(function (o) { rows.push(row(c, o)); }); });
+    var head = (t === "semi" || t === "anti") ? "c.id c.name" : "c.id c.name   o.id  o.status";
+    document.getElementById("jnOut").textContent = head + "\n" + rows.join("\n") + "\n— строк: " + rows.length;
+    var v = document.getElementById("jnV"); v.className = "verdict " + (t === "leftwhere" || t === "cross" ? "warn" : "ok"); v.textContent = N[t];
+  }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="sub"><span class="h-num">3.2</span>Подзапросы</h2>
+<pre><code class="sql">-- скалярный: одно значение
+SELECT name, (SELECT max(created_at) FROM orders o WHERE o.customer_id = c.id) AS last_order
+FROM customers c;
+
+-- коррелированный EXISTS: для каждой строки внешнего запроса — проверка
+SELECT * FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.product_id = p.id);   -- товары, которые ни разу не покупали
+
+-- LATERAL (PostgreSQL): подзапрос, видящий строку слева, — «для каждого клиента N последних заказов»
+SELECT c.name, o.*
+FROM customers c
+CROSS JOIN LATERAL (SELECT id, created_at FROM orders o
+                    WHERE o.customer_id = c.id ORDER BY created_at DESC LIMIT 3) o;</code></pre>
+<p>Современные планировщики переписывают <code>IN</code>/<code>EXISTS</code> в соединения сами, поэтому выбирайте форму по смыслу и читаемости. Исключение — <code>NOT IN</code> с NULL-ами (тема 01).</p>
+
+<h2 id="cte"><span class="h-num">3.3</span>CTE и рекурсия</h2>
+<pre><code class="sql">WITH paid AS (                                  -- именованный шаг: читается сверху вниз
+    SELECT o.customer_id, SUM(i.qty * i.price) AS total
+    FROM orders o JOIN order_items i ON i.order_id = o.id
+    WHERE o.status IN ('paid', 'shipped')
+    GROUP BY o.customer_id
+)
+SELECT c.name, p.total
+FROM paid p JOIN customers c ON c.id = p.customer_id
+WHERE p.total &gt; 10000;</code></pre>
+<p>С PostgreSQL 12 нерекурсивные CTE встраиваются в основной запрос (как подзапрос), если на них ссылаются один раз; <code>WITH x AS MATERIALIZED (…)</code> заставляет вычислить шаг отдельно. В старых версиях CTE были «барьером оптимизации».</p>
+<pre data-title="Рекурсивный CTE: всё поддерево категории"><code class="sql">WITH RECURSIVE tree AS (
+    SELECT id, name, parent_id, 1 AS depth, name AS path
+    FROM categories WHERE id = 1                                  -- якорь: стартовая строка
+  UNION ALL
+    SELECT c.id, c.name, c.parent_id, t.depth + 1, t.path || ' / ' || c.name
+    FROM categories c JOIN tree t ON c.parent_id = t.id           -- шаг: дети найденных
+)
+SELECT * FROM tree ORDER BY path;</code></pre>
+
+<h2 id="window"><span class="h-num">3.4</span>Оконные функции</h2>
+<p>Окно — это набор строк, «видимых» из текущей строки, при этом строки <b>не схлопываются</b>, как при GROUP BY: каждая строка остаётся и получает вычисленное значение.</p>
+<pre><code class="sql">SELECT customer_id, id, created_at,
+       ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn,   -- номер внутри клиента
+       LAG(created_at) OVER (PARTITION BY customer_id ORDER BY created_at) AS prev,   -- предыдущий заказ
+       COUNT(*)     OVER (PARTITION BY customer_id)                         AS orders_of_customer
+FROM orders;
+
+-- последний заказ каждого клиента (top-1 в группе): окно + фильтр снаружи
+SELECT * FROM (
+    SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn FROM orders o
+) t WHERE rn = 1;
+-- в PostgreSQL то же короче: SELECT DISTINCT ON (customer_id) * FROM orders ORDER BY customer_id, created_at DESC;
+
+-- нарастающий итог выручки по дням
+SELECT day, revenue, SUM(revenue) OVER (ORDER BY day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running
+FROM daily_revenue;</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Функция</th><th>Что даёт</th><th>При равенстве значений</th></tr>
+<tr><td><code>ROW_NUMBER()</code></td><td>1, 2, 3, 4</td><td>произвольный порядок среди равных — добавляйте в ORDER BY уникальный столбец</td></tr>
+<tr><td><code>RANK()</code></td><td>1, 2, 2, 4</td><td>пропуски после равных</td></tr>
+<tr><td><code>DENSE_RANK()</code></td><td>1, 2, 2, 3</td><td>без пропусков</td></tr>
+<tr><td><code>LAG/LEAD(x, n)</code></td><td>значение из предыдущей/следующей строки</td><td>разница между событиями, длительности</td></tr>
+<tr><td><code>SUM/AVG(x) OVER (… ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)</code></td><td>скользящие агрегаты</td><td>среднее за 7 дней</td></tr>
+<tr><td><code>FIRST_VALUE / NTH_VALUE</code></td><td>значение из начала окна</td><td>осторожно с рамкой по умолчанию (RANGE … CURRENT ROW)</td></tr>
+</table></div>
+
+<h2 id="agg"><span class="h-num">3.5</span>Агрегаты, о которых мало кто знает</h2>
+<pre><code class="sql">SELECT date_trunc('month', created_at) AS month,
+       COUNT(*)                                     AS all_orders,
+       COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,       -- условная агрегация без CASE
+       string_agg(DISTINCT city, ', ')              AS cities,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY total) AS p95_total
+FROM orders_view
+GROUP BY ROLLUP (date_trunc('month', created_at));                       -- плюс строка общего итога</code></pre>
+
+<h2 id="upsert"><span class="h-num">3.6</span>UPSERT, RETURNING и изменяющие CTE</h2>
+<pre><code class="sql">-- атомарное «вставить или обновить» — без гонки check-then-insert
+INSERT INTO daily_stats (day, product_id, sold) VALUES (current_date, 7, 1)
+ON CONFLICT (day, product_id) DO UPDATE SET sold = daily_stats.sold + EXCLUDED.sold
+RETURNING sold;
+
+-- перенести старые заказы в архив одним атомарным оператором
+WITH moved AS (
+    DELETE FROM orders WHERE created_at &lt; now() - interval '3 years' RETURNING *
+)
+INSERT INTO orders_archive SELECT * FROM moved;
+
+-- MERGE (PostgreSQL 15+): синхронизация с несколькими ветками
+MERGE INTO products p USING price_import s ON p.sku = s.sku
+WHEN MATCHED AND s.price IS NULL THEN DELETE
+WHEN MATCHED THEN UPDATE SET price = s.price
+WHEN NOT MATCHED THEN INSERT (sku, name, price) VALUES (s.sku, s.name, s.price);</code></pre>
+
+<h2 id="sandbox"><span class="h-num">3.7</span>Песочница</h2>
+<div class="sqlbox" data-schema="sql03">
+  <div class="widget-title">SQL-песочница: магазин + дерево категорий</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT c.name, o.id, o.status&#10;FROM customers c LEFT JOIN orders o ON o.customer_id = c.id AND o.status = 'paid'&#10;ORDER BY c.id;">LEFT JOIN с условием в ON</button>
+    <button data-sql="SELECT name FROM products p&#10;WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.product_id = p.id);">товары без продаж</button>
+    <button data-sql="SELECT * FROM (&#10;  SELECT o.customer_id, o.id, o.created_at,&#10;         ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.created_at DESC) AS rn&#10;  FROM orders o) t&#10;WHERE rn = 1;">последний заказ клиента</button>
+    <button data-sql="WITH daily AS (&#10;  SELECT o.created_at AS day, SUM(i.qty * i.price) AS revenue&#10;  FROM orders o JOIN order_items i ON i.order_id = o.id&#10;  WHERE o.status IN ('paid','shipped') GROUP BY o.created_at)&#10;SELECT day, revenue, SUM(revenue) OVER (ORDER BY day) AS running_total FROM daily;">нарастающий итог</button>
+    <button data-sql="SELECT p.category, p.name, SUM(i.qty) AS sold,&#10;       RANK() OVER (PARTITION BY p.category ORDER BY SUM(i.qty) DESC) AS place&#10;FROM order_items i JOIN products p ON p.id = i.product_id&#10;GROUP BY p.category, p.name;">ранг в категории</button>
+    <button data-sql="WITH RECURSIVE tree AS (&#10;  SELECT id, name, parent_id, 1 AS depth, name AS path FROM categories WHERE parent_id IS NULL&#10;  UNION ALL&#10;  SELECT c.id, c.name, c.parent_id, t.depth + 1, t.path || ' / ' || c.name&#10;  FROM categories c JOIN tree t ON c.parent_id = t.id)&#10;SELECT depth, path FROM tree ORDER BY path;">рекурсивный обход дерева</button>
+    <button data-sql="SELECT status, COUNT(*) AS cnt,&#10;       COUNT(*) FILTER (WHERE created_at &gt;= '2026-07-01') AS since_july&#10;FROM orders GROUP BY status;">COUNT … FILTER</button>
+    <button data-sql="INSERT INTO stock (product_id, qty) VALUES (2, 10)&#10;ON CONFLICT (product_id) DO UPDATE SET qty = stock.qty + excluded.qty&#10;RETURNING product_id, qty;">UPSERT (запустите дважды)</button>
+  </div>
+  <textarea>SELECT c.name, COUNT(o.id) AS orders_cnt
+FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.name ORDER BY orders_cnt DESC;</textarea>
+</div>
+<p><b>Задания:</b> (1) для каждого клиента выведите сумму его самого дорогого заказа; (2) найдите клиентов, у которых между двумя заказами прошло больше 30 дней (подсказка: <code>LAG</code> и <code>julianday()</code> в SQLite или вычитание дат в PostgreSQL); (3) посчитайте, сколько товаров в каждой ветке дерева категорий, включая подкатегории.</p>
+
+<h2 id="quiz"><span class="h-num">3.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что происходит с LEFT JOIN, если условие на правую таблицу поставить в WHERE?</p><ul><li>Ничего не меняется</li><li>Запрос не выполнится</li><li>Строки левой таблицы без пары отбрасываются — LEFT JOIN превращается во внутренний</li><li>Появляются дубликаты</li></ul><div class="why">В строках без пары правые столбцы NULL, условие даёт unknown. Условие для присоединяемых строк — в ON.</div></div>
+<div class="mcq" data-ok="0"><p>Чем ROW_NUMBER отличается от RANK при равных значениях?</p><ul><li>ROW_NUMBER даёт разные номера равным строкам (в произвольном порядке), RANK — одинаковые с пропуском следующих</li><li>Ничем</li><li>RANK работает только с числами</li><li>ROW_NUMBER не поддерживает PARTITION BY</li></ul><div class="why">Для детерминированного результата добавьте в ORDER BY окна уникальный столбец.</div></div>
+<div class="mcq" data-ok="1"><p>Почему INSERT … ON CONFLICT лучше, чем «SELECT, и если нет — INSERT»?</p><ul><li>Он короче</li><li>Он атомарен: при параллельных запросах нет гонки между проверкой и вставкой</li><li>Он не требует индекса</li><li>Он работает без транзакции</li></ul><div class="why">ON CONFLICT опирается на уникальный индекс — тот же механизм, что ловит дубликаты.</div></div>
+<div class="mcq" data-ok="3"><p>Можно ли отфильтровать по оконной функции в WHERE того же запроса?</p><ul><li>Да</li><li>Да, если указать псевдоним</li><li>Только в PostgreSQL</li><li>Нет — окна вычисляются после WHERE; нужен подзапрос или CTE (или QUALIFY в некоторых СУБД)</li></ul><div class="why">Логический порядок из темы 01.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как найти top-N строк в каждой группе?</summary><div class="a"><p>ROW_NUMBER() OVER (PARTITION BY группа ORDER BY критерий) в подзапросе + фильтр rn &lt;= N; в PostgreSQL для N = 1 — DISTINCT ON; для малого N и индекса по (группа, критерий) — LATERAL с LIMIT N, которое читает индекс точечно.</p></div></details>
+<details class="q"><summary>Как работает рекурсивный CTE?</summary><div class="a"><p>Выполняется якорь — начальный набор строк. Затем рекурсивная часть многократно выполняется над строками, полученными на предыдущем шаге, пока она возвращает новые строки; результаты объединяются (UNION ALL). Для защиты от циклов — счётчик глубины или массив пройденных id.</p></div></details>
+</div>
+
+<script type="text/plain" id="sql03">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900), (7,'Монитор','электроника',32000);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'), (104,3,'cancelled','2026-07-02'),
+  (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'), (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500), (104,6,3,900),
+  (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800), (107,5,2,600), (108,1,1,93000);
+CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+INSERT INTO categories VALUES (1,'Электроника',NULL),(2,'Компьютеры',1),(3,'Ноутбуки',2),(4,'Периферия',2),(5,'Мыши',4),(6,'Клавиатуры',4),(7,'Продукты',NULL),(8,'Напитки',7),(9,'Кофе',8),(10,'Чай',8);
+CREATE TABLE stock (product_id INTEGER PRIMARY KEY REFERENCES products(id), qty INTEGER NOT NULL);
+INSERT INTO stock VALUES (1, 3), (2, 40);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Reactor Context и пропагация контекста</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · REACTOR</div>
+  <h1>Reactor Context и пропагация контекста</h1>
+  <p class="lead">В MVC идентификатор запроса, пользователь, trace id и MDC живут в ThreadLocal: один запрос — один поток. В реактивном конвейере запрос перескакивает между потоками, и ThreadLocal «теряется». Его замена — Reactor Context: неизменяемая карта, привязанная к подписке и путешествующая <b>снизу вверх</b> по цепочке. Разбираем правила видимости, Spring Security и автоматическую пропагацию в ThreadLocal для логов и трассировки.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">contextWrite</span><span class="tag">deferContextual</span><span class="tag">ContextView</span><span class="tag">MDC</span><span class="tag">context-propagation</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">9.1</span>Почему не ThreadLocal</h2>
+<pre data-title="Потеря MDC" class="bad-code"><code class="java">MDC.put("requestId", rid);                 // поток reactor-http-nio-2
+return client.get().retrieve().bodyToMono(Price.class)
+        .map(p -&gt; { log.info("price {}", p);   // поток reactor-http-nio-7 — MDC пуст
+                    return p; });
+// к тому же nio-2 обслуживает другие запросы — в его MDC «чужой» requestId</code></pre>
+
+<h2 id="api"><span class="h-num">9.2</span>API</h2>
+<pre data-title="Запись и чтение"><code class="java">Mono&lt;String&gt; greet = Mono.deferContextual(ctx -&gt;           // чтение: ContextView (только чтение)
+        Mono.just("Hello, " + ctx.getOrDefault("user", "anonymous")));
+
+greet.contextWrite(Context.of("user", "alice"))               // запись: новая неизменяемая карта
+     .subscribe(System.out::println);                         // Hello, alice
+
+// внутри операторов
+flux.transformDeferredContextual((f, ctx) -&gt; f.map(x -&gt; x + ctx.get("tenant")));
+flux.flatMap(x -&gt; Mono.deferContextual(ctx -&gt; repo.find(ctx.get("tenant"), x)));
+flux.contextWrite(ctx -&gt; ctx.put("attempt", ctx.getOrDefault("attempt", 0) + 1));</code></pre>
+<p>Context передаётся при подписке: каждый подписчик (CoreSubscriber) отдаёт свой <code>currentContext()</code> вверх. <code>contextWrite</code> оборачивает подписчика, дополняя контекст, поэтому видят запись только операторы <b>выше</b> него.</p>
+
+<h2 id="sim"><span class="h-num">9.3</span>Кто что видит</h2>
+<div class="widget" id="cxW">
+  <div class="widget-title">Цепочка сверху вниз; подписка (и контекст) идут снизу вверх</div>
+  <div class="controls">
+    <label>Слот 1 (после source)<select id="cx1"></select></label>
+    <label>Слот 2 (после flatMap)<select id="cx2"></select></label>
+    <label>Слот 3 (перед subscribe)<select id="cx3"></select></label>
+  </div>
+  <div class="table-wrap"><table id="cxT"></table></div>
+  <div class="verdict" id="cxV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var OPTS = [["", "—"], ["alice", 'contextWrite(put("user","alice"))'], ["bob", 'contextWrite(put("user","bob"))'], ["del", 'contextWrite(c -> c.delete("user"))']];
+  var DEF = { cx1: "", cx2: "", cx3: "alice" };
+  ["cx1", "cx2", "cx3"].forEach(function (id) { $(id).innerHTML = OPTS.map(function (o) { return '<option value="' + o[0] + '"' + (DEF[id] === o[0] ? " selected" : "") + ">" + o[1] + "</option>"; }).join(""); $(id).value = DEF[id]; });
+  function run() {
+    var slots = [$("cx1").value, $("cx2").value, $("cx3").value];
+    var stages = [{ n: "Mono.deferContextual(...)  // source", slot: 0 }, { n: "[слот 1]", w: 0 }, { n: "flatMap(x -> Mono.deferContextual(...))", slot: 1 }, { n: "[слот 2]", w: 1 }, { n: "map + transformDeferredContextual(...)", slot: 2 }, { n: "[слот 3]", w: 2 }, { n: "subscribe()  // WebFlux", slot: 3 }];
+    function see(fromSlot) { var val = null; for (var j = 2; j >= fromSlot; j--) { if (slots[j] === "alice" || slots[j] === "bob") val = slots[j]; if (slots[j] === "del") val = null; } return val; }
+    var rows = "<tr><th>Оператор</th><th>ctx.getOrDefault(\"user\")</th></tr>", seen = [];
+    stages.forEach(function (s) {
+      if (s.w !== undefined) { if (slots[s.w]) rows += '<tr><td style="font-family:var(--font-mono)">↑ ' + OPTS.filter(function (o) { return o[0] === slots[s.w]; })[0][1] + "</td><td>пишет</td></tr>"; return; }
+      if (s.slot === 3) { rows += "<tr><td style=\"font-family:var(--font-mono)\">" + s.n + "</td><td>исходный контекст подписчика (пустой или из фильтров WebFlux)</td></tr>"; return; }
+      var v = see(s.slot); seen.push(v);
+      rows += '<tr><td style="font-family:var(--font-mono)">' + s.n + '</td><td style="font-family:var(--font-mono);color:' + (v ? "var(--ok)" : "var(--bad)") + '">' + (v ? '"' + v + '"' : "нет ключа → anonymous") + "</td></tr>";
+    });
+    $("cxT").innerHTML = rows;
+    var v = $("cxV"), msg;
+    if (seen.every(function (x) { return x === null; })) { v.className = "verdict bad"; msg = "Никто не видит user: запись выше читающих операторов бесполезна — контекст идёт снизу вверх. Типичная ошибка: contextWrite сразу после source."; }
+    else if (seen.some(function (x) { return x === null; })) { v.className = "verdict warn"; msg = "Часть операторов не видит значение: они ниже contextWrite. Ставьте contextWrite как можно ближе к концу цепочки (в WebFlux — в WebFilter)."; }
+    else if (seen[0] !== seen[2]) { v.className = "verdict warn"; msg = "Разные операторы видят разные значения: ближайший снизу contextWrite перекрывает более дальний — как вложенные области видимости."; }
+    else { v.className = "verdict ok"; msg = "Все операторы выше записи видят \"" + seen[0] + "\"."; }
+    v.textContent = msg;
+  }
+  ["cx1", "cx2", "cx3"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="webflux"><span class="h-num">9.4</span>Context в WebFlux</h2>
+<pre data-title="WebFilter кладёт requestId и tenant" class="good-code"><code class="java">@Component
+class RequestContextFilter implements WebFilter {
+    public Mono&lt;Void&gt; filter(ServerWebExchange ex, WebFilterChain chain) {
+        String rid = Optional.ofNullable(ex.getRequest().getHeaders().getFirst("X-Request-Id"))
+                             .orElseGet(() -&gt; UUID.randomUUID().toString());
+        return chain.filter(ex)                                    // вся обработка запроса — выше
+                    .contextWrite(Context.of("requestId", rid,
+                                             "tenant", tenantOf(ex)));
+    }
+}</code></pre>
+<p>Spring Security хранит аутентификацию именно так: <code>ReactorContextWebFilter</code> кладёт <code>Mono&lt;SecurityContext&gt;</code> в Context, а <code>ReactiveSecurityContextHolder.getContext()</code> — это <code>Mono.deferContextual</code>. Поэтому в реактивном коде нет «SecurityContextHolder.getContext()» — только Mono (тема 17).</p>
+
+<h2 id="propagation"><span class="h-num">9.5</span>Автоматическая пропагация в ThreadLocal</h2>
+<p>Библиотеки логирования и трассировки читают ThreadLocal (MDC, текущий span). Библиотека Micrometer <b>context-propagation</b> связывает два мира: зарегистрированные <code>ThreadLocalAccessor</code> восстанавливают ThreadLocal из Context перед каждым сигналом.</p>
+<div class="grid-2">
+  <div class="card"><h4>Включение</h4><pre data-title="application.yml"><code class="yaml">spring:
+  reactor:
+    context-propagation: auto   # Boot 3.2+: Hooks.enableAutomaticContextPropagation()
+management:
+  tracing:
+    sampling.probability: 1.0   # доля трасс, отправляемых в бэкенд (по умолчанию 0.1)</code></pre></div>
+  <div class="card"><h4>Что происходит</h4><ul><li>Reactor ≥ 3.5.3 при каждом сигнале через границу потоков восстанавливает зарегистрированные ThreadLocal из Context и очищает после.</li><li>ObservationThreadLocalAccessor из micrometer-observation регистрируется автоматически (ServiceLoader), а Micrometer Tracing кладёт traceId/spanId текущего Observation в MDC.</li><li>Свой ThreadLocal: <code>ContextRegistry.getInstance().registerThreadLocalAccessor("rid", RID::get, RID::set, RID::remove)</code>.</li><li>Ручной вариант: <code>contextCapture()</code> захватывает ThreadLocal в Context в точке перехода из императивного кода.</li></ul></div>
+</div>
+<div class="callout warn"><span class="c-title">Цена</span>
+Автоматическая пропагация добавляет работу на каждый сигнал. Не кладите в Context большие объекты и не используйте его как «глобальный кэш»: каждый <code>put</code> создаёт новую карту (оптимизированные Context1…Context5, дальше — ContextN).
+</div>
+
+<h2 id="quiz"><span class="h-num">9.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p><code>Mono.deferContextual(c -&gt; Mono.just(c.get("k"))).contextWrite(Context.of("k","1")).map(...).contextWrite(Context.of("k","2"))</code> — что выдаст источник?</p><ul><li>"2"</li><li>NoSuchElementException</li><li>"1"</li><li>"12"</li></ul><div class="why">Ближайший contextWrite ниже источника перекрывает дальний.</div></div>
+<div class="mcq" data-ok="0"><p>Почему contextWrite нужно ставить ближе к концу цепочки?</p><ul><li>Контекст распространяется от подписчика вверх и виден только операторам выше</li><li>Так быстрее</li><li>Иначе Context потокоопасен</li><li>Это требование Netty</li></ul><div class="why">Операторы ниже записи её не видят.</div></div>
+<div class="mcq" data-ok="3"><p>Как получить аутентификацию в реактивном сервисе?</p><ul><li>SecurityContextHolder.getContext()</li><li>ThreadLocal из фильтра</li><li>@Autowired Authentication</li><li>ReactiveSecurityContextHolder.getContext() — Mono, читающий Reactor Context</li></ul><div class="why">SecurityContext хранится в Context подписки.</div></div>
+<div class="mcq" data-ok="1"><p>Как сделать, чтобы traceId появлялся в логах реактивного приложения на Boot 3.2+?</p><ul><li>MDC.put в контроллере</li><li>spring.reactor.context-propagation=auto + Micrometer Tracing</li><li>publishOn(immediate())</li><li>Это невозможно</li></ul><div class="why">Автоматическая пропагация восстанавливает MDC из Context.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему Context неизменяемый?</summary><div class="a"><p>Один и тот же конвейер может иметь много подписок одновременно, и каждая несёт свой контекст. Если бы Context был изменяемым, запись в одной подписке протекала бы в другие, а операторы, выполняющиеся в разных потоках, требовали бы синхронизации. Неизменяемость делает put «созданием новой версии» и сохраняет потокобезопасность без блокировок. Если нужно изменяемое состояние на запрос — кладите в Context изменяемый holder (AtomicReference), понимая последствия.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

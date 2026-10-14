@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Spring Security</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .sec-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 16px; margin-top: 12px; }
+  .sec-grid .flow.col { margin: 0; gap: 3px; }
+  .sec-grid .node { font-size: 12.5px; padding: 5px 10px; }
+  @media (max-width: 760px) { .sec-grid { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · БЕЗОПАСНОСТЬ И ТЕСТЫ</div>
+  <h1>Spring Security изнутри</h1>
+  <p class="lead">Spring Security — это цепочка servlet-фильтров перед вашим приложением плюс AOP-перехватчики на методах. Каждый фильтр отвечает за одну задачу: восстановить контекст, проверить CSRF, аутентифицировать по токену, решить, пускать ли. Разобравшись в цепочке, вы ответите, откуда 401, а откуда 403, почему CORS-запрос падает до контроллера и как пользователь попадает в <code>SecurityContextHolder</code>.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">FilterChainProxy</span><span class="tag">AuthenticationManager</span><span class="tag">JWT</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="arch"><span class="h-num">13.1</span>Архитектура: как Security встраивается в запрос</h2>
+<div class="flow">
+  <div class="node"><b>Tomcat</b></div><span class="to">→</span>
+  <div class="node"><b>другие Filter-ы</b></div><span class="to">→</span>
+  <div class="node info"><b>DelegatingFilterProxy</b><small>servlet-фильтр «springSecurityFilterChain»</small></div><span class="to">→</span>
+  <div class="node acc"><b>FilterChainProxy</b><small>выбирает первую подходящую SecurityFilterChain</small></div><span class="to">→</span>
+  <div class="node"><b>SecurityFilterChain</b><small>~15 фильтров Security</small></div><span class="to">→</span>
+  <div class="node ok"><b>DispatcherServlet</b></div>
+</div>
+<ul>
+  <li><b>DelegatingFilterProxy</b> — мост между servlet-контейнером и Spring: контейнер регистрирует фильтры раньше, чем созданы бины, поэтому прокси лениво находит бин <code>springSecurityFilterChain</code> и делегирует ему.</li>
+  <li><b>FilterChainProxy</b> — единая точка входа: очищает <code>SecurityContextHolder</code> в конце запроса, применяет <code>HttpFirewall</code> (отклоняет подозрительные URL с <code>;</code>, <code>//</code>, кодированными слэшами), выбирает цепочку по <code>securityMatcher</code>. Цепочек может быть несколько: <code>/api/**</code> — stateless JWT, <code>/admin/**</code> — форма входа с сессией.</li>
+  <li>Порядок фильтров в цепочке фиксирован (класс <code>FilterOrderRegistration</code>), свои фильтры вставляются <code>addFilterBefore/After</code>.</li>
+</ul>
+
+<h2 id="config"><span class="h-num">13.2</span>Конфигурация resource server с JWT</h2>
+<pre data-title="SecurityConfig.java (Spring Security 6/7)"><code class="java">@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity                                         // @PreAuthorize на методах
+class SecurityConfig {
+
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        return http
+            .securityMatcher("/api/**")
+            .authorizeHttpRequests(a -&gt; a
+                .requestMatchers(HttpMethod.GET, "/api/products/**").permitAll()
+                .requestMatchers("/api/admin/**").hasAuthority("SCOPE_admin")
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(o -&gt; o.jwt(Customizer.withDefaults()))   // BearerTokenAuthenticationFilter + JwtDecoder
+            .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .cors(Customizer.withDefaults())                          // ищет бин CorsConfigurationSource
+            .build();
+    }
+
+    @Bean
+    CorsConfigurationSource cors() {
+        var c = new CorsConfiguration();
+        c.setAllowedOrigins(List.of("https://shop.ru"));
+        c.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE"));
+        c.setAllowedHeaders(List.of("Authorization", "Content-Type"));
+        var src = new UrlBasedCorsConfigurationSource();
+        src.registerCorsConfiguration("/api/**", c);
+        return src;
+    }
+}</code></pre>
+<pre data-title="application.yml"><code class="yaml">spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://auth.shop.ru/realms/shop     # JWKS для проверки подписи ищется через discovery</code></pre>
+
+<h2 id="walker"><span class="h-num">13.3</span>Запрос проходит цепочку</h2>
+<div class="widget" id="sw">
+  <div class="widget-title">Симулятор цепочки фильтров</div>
+  <div class="controls"><label>запрос<select id="swSc" style="max-width:100%">
+    <option value="ok">GET /api/orders с валидным JWT (SCOPE_orders.read)</option>
+    <option value="anon">GET /api/orders без Authorization</option>
+    <option value="exp">GET /api/orders с просроченным JWT</option>
+    <option value="forbid">GET /api/admin/stats с валидным JWT без SCOPE_admin</option>
+    <option value="csrf">POST /api/orders без токена, с cookie сессии, без CSRF-токена</option>
+    <option value="cors">OPTIONS /api/orders (CORS preflight, Origin: https://shop.ru)</option>
+    <option value="public">GET /api/products/42 без токена (permitAll)</option>
+  </select></label></div>
+  <div class="sec-grid">
+    <div class="flow col" id="swChain"></div>
+    <div><div class="log" id="swLog" style="max-height:420px"></div><div class="verdict" id="swOut"></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  var F = ["DisableEncodeUrlFilter", "WebAsyncManagerIntegrationFilter", "SecurityContextHolderFilter", "HeaderWriterFilter", "CorsFilter", "CsrfFilter", "LogoutFilter", "BearerTokenAuthenticationFilter", "RequestCacheAwareFilter", "SecurityContextHolderAwareRequestFilter", "AnonymousAuthenticationFilter", "ExceptionTranslationFilter", "AuthorizationFilter", "DispatcherServlet → контроллер"];
+  var base = { 2: "SecurityContextHolderFilter: загружает контекст из SecurityContextRepository (STATELESS — пусто) и гарантирует очистку ThreadLocal в finally", 3: "HeaderWriterFilter: добавит X-Content-Type-Options, X-Frame-Options, Cache-Control, HSTS (для HTTPS)" };
+  var S = {
+    ok: { stop: 13, cls: "ok", notes: { 4: "CorsFilter: не preflight, Origin разрешён (или отсутствует) → дальше", 5: "CsrfFilter: запрос с Bearer-токеном исключён из проверки (resource server добавляет такое исключение)", 7: "BearerTokenAuthenticationFilter: нашёл Bearer → AuthenticationManager → JwtAuthenticationProvider: NimbusJwtDecoder проверяет подпись по JWKS, exp, iss; JwtAuthenticationConverter: scope → SCOPE_orders.read → SecurityContextHolder.setContext(JwtAuthenticationToken)", 10: "AnonymousAuthenticationFilter: контекст уже есть → ничего не делает", 11: "ExceptionTranslationFilter: оборачивает остаток цепочки в try/catch", 12: "AuthorizationFilter: правило anyRequest().authenticated() → AuthorizationDecision(granted)", 13: "Контроллер получает @AuthenticationPrincipal Jwt из SecurityContextHolder" }, out: "200 OK. После ответа SecurityContextHolderFilter и FilterChainProxy очистят ThreadLocal — поток вернётся в пул чистым." },
+    anon: { stop: 12, handler: 11, cls: "bad", notes: { 4: "CorsFilter: не preflight → дальше", 5: "CsrfFilter: GET — безопасный метод, проверка не нужна", 7: "BearerTokenAuthenticationFilter: заголовка Authorization нет → просто пропускает дальше (аутентификация не обязательна на этом шаге)", 10: "AnonymousAuthenticationFilter: контекст пуст → AnonymousAuthenticationToken (ROLE_ANONYMOUS)", 12: "AuthorizationFilter: authenticated() для анонима → AccessDeniedException", 11: "ExceptionTranslationFilter: пользователь анонимный → это не «запрещено», а «не представился» → AuthenticationEntryPoint (BearerTokenAuthenticationEntryPoint)" }, out: "401 Unauthorized, WWW-Authenticate: Bearer. Ошибка возникла в AuthorizationFilter, но ответ сформировал ExceptionTranslationFilter, стоящий перед ним." },
+    exp: { stop: 7, cls: "bad", notes: { 4: "CorsFilter → дальше", 5: "CsrfFilter: GET → дальше", 7: "BearerTokenAuthenticationFilter: JwtDecoder → JwtValidationException: Jwt expired at … → InvalidBearerTokenException → фильтр сам вызывает AuthenticationEntryPoint и прерывает цепочку" }, out: "401 Unauthorized, WWW-Authenticate: Bearer error=\"invalid_token\", error_description=\"An error occurred while attempting to decode the Jwt: Jwt expired at …\". Невалидный токен — ошибка, а не аноним: дальше запрос не идёт." },
+    forbid: { stop: 12, handler: 11, cls: "bad", notes: { 4: "CorsFilter → дальше", 5: "CsrfFilter: GET → дальше", 7: "BearerTokenAuthenticationFilter: токен валиден → JwtAuthenticationToken с authorities [SCOPE_orders.read]", 10: "AnonymousAuthenticationFilter: контекст есть → пропускает", 12: "AuthorizationFilter: /api/admin/** → hasAuthority('SCOPE_admin') → отказ → AccessDeniedException", 11: "ExceptionTranslationFilter: пользователь аутентифицирован → AccessDeniedHandler" }, out: "403 Forbidden. Разница с 401: личность известна, но прав не хватает. Повторная аутентификация не поможет." },
+    csrf: { stop: 5, cls: "bad", notes: { 4: "CorsFilter: Origin разрешён → дальше", 5: "CsrfFilter: POST — изменяющий метод, Bearer-токена нет → нужен CSRF-токен; в запросе его нет → MissingCsrfTokenException → AccessDeniedHandler" }, out: "403 Forbidden от CsrfFilter — до аутентификации и контроллера. CSRF защищает запросы, где браузер сам прикладывает учётные данные (cookie). Для чисто stateless API с токеном в заголовке CSRF обычно отключают: csrf(c -> c.disable())." },
+    cors: { stop: 4, cls: "ok", notes: { 4: "CorsFilter: это preflight (OPTIONS + Origin + Access-Control-Request-Method). Origin https://shop.ru разрешён → фильтр сам пишет Access-Control-Allow-Origin/Methods/Headers и НЕ передаёт запрос дальше" }, out: "200 OK без вызова контроллера и без аутентификации. Если бы CorsFilter стоял после аутентификации, preflight (браузер не прикладывает к нему Authorization) получил бы 401, и браузер заблокировал бы основной запрос." },
+    "public": { stop: 13, cls: "ok", notes: { 4: "CorsFilter → дальше", 5: "CsrfFilter: GET → дальше", 7: "BearerTokenAuthenticationFilter: токена нет → дальше", 10: "AnonymousAuthenticationFilter: AnonymousAuthenticationToken", 12: "AuthorizationFilter: GET /api/products/** → permitAll() → granted", 13: "Контроллер: principal — аноним" }, out: "200 OK. permitAll не отключает фильтры — они работают, просто авторизация разрешает любого. Чтобы полностью убрать путь из Security, нужна отдельная цепочка или web.ignoring() (не рекомендуется — теряются заголовки безопасности)." }
+  };
+  var chain = document.getElementById("swChain"), sel = document.getElementById("swSc");
+  chain.innerHTML = F.map(function (f, i) { return '<div class="node" id="swF' + i + '"><b>' + f + "</b></div>"; }).join("");
+  function run() {
+    var s = S[sel.value], log = [];
+    F.forEach(function (f, i) {
+      var el = document.getElementById("swF" + i), c = "node";
+      if (i < s.stop) c += " was";
+      if (i === s.stop) c += s.cls === "ok" ? " hl" : " stop";
+      if (i > s.stop) c += " off";
+      if (s.handler === i) c = "node hl";
+      el.className = c;
+    });
+    for (var i = 0; i <= s.stop; i++) {
+      var n = s.notes[i] || base[i];
+      if (n && i !== s.handler) log.push((i + 1) + ". " + n);
+    }
+    if (s.handler !== undefined) log.push("↩ " + s.notes[s.handler]);
+    document.getElementById("swLog").textContent = log.join("\n\n");
+    var o = document.getElementById("swOut"); o.className = "verdict " + (s.cls === "ok" ? "ok" : "bad"); o.textContent = s.out;
+  }
+  sel.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="authn"><span class="h-num">13.4</span>Аутентификация</h2>
+<div class="flow">
+  <div class="node info"><b>Фильтр аутентификации</b><small>извлекает credentials → Authentication (не аутентифицирован)</small></div><span class="to">→</span>
+  <div class="node acc"><b>AuthenticationManager</b><small>ProviderManager: перебирает провайдеры</small></div><span class="to">→</span>
+  <div class="node"><b>AuthenticationProvider</b><small>DaoAuthenticationProvider / JwtAuthenticationProvider / LDAP…</small></div><span class="to">→</span>
+  <div class="node ok"><b>Authentication (аутентифицирован)</b><small>principal + authorities</small></div><span class="to">→</span>
+  <div class="node"><b>SecurityContextHolder</b><small>ThreadLocal</small></div>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Компонент</th><th>Назначение</th></tr>
+<tr><td><code>SecurityContextHolder</code></td><td>хранит <code>SecurityContext</code> текущего потока (стратегия <code>MODE_THREADLOCAL</code>). В <code>@Async</code> и своих пулах контекста нет — нужен <code>DelegatingSecurityContextExecutor</code> или <code>TaskDecorator</code></td></tr>
+<tr><td><code>Authentication</code></td><td>principal (кто), credentials (пароль/токен, стирается после проверки), authorities (что может), флаг authenticated</td></tr>
+<tr><td><code>DaoAuthenticationProvider</code></td><td>логин/пароль: <code>UserDetailsService.loadUserByUsername</code> + <code>PasswordEncoder.matches</code></td></tr>
+<tr><td><code>PasswordEncoder</code></td><td><code>DelegatingPasswordEncoder</code>: хэш с префиксом <code>{bcrypt}</code>, <code>{argon2}</code> — можно менять алгоритм без миграции всех паролей</td></tr>
+<tr><td><code>SecurityContextRepository</code></td><td>где хранить контекст между запросами: <code>HttpSessionSecurityContextRepository</code> (сессия) или ничего (stateless JWT — аутентификация на каждом запросе)</td></tr>
+</table></div>
+<pre data-title="Роли из своего claim вместо scope"><code class="java">@Bean
+JwtAuthenticationConverter jwtAuthConverter() {
+    var authorities = new JwtGrantedAuthoritiesConverter();
+    authorities.setAuthoritiesClaimName("roles");          // claim "roles": ["ADMIN","USER"]
+    authorities.setAuthorityPrefix("ROLE_");               // hasRole('ADMIN') проверяет ROLE_ADMIN
+    var c = new JwtAuthenticationConverter();
+    c.setJwtGrantedAuthoritiesConverter(authorities);
+    return c;
+}</code></pre>
+
+<h2 id="authz"><span class="h-num">13.5</span>Авторизация: URL и методы</h2>
+<div class="grid-2">
+  <div class="card"><h4>По URL</h4><p><code>AuthorizationFilter</code> + <code>RequestMatcherDelegatingAuthorizationManager</code>: правила проверяются <b>по порядку</b>, срабатывает первое совпавшее. Общие правила (<code>anyRequest</code>) — в конце. Роль — authority с префиксом <code>ROLE_</code>: <code>hasRole("ADMIN")</code> ≡ <code>hasAuthority("ROLE_ADMIN")</code>.</p></div>
+  <div class="card"><h4>По методам</h4><p><code>@EnableMethodSecurity</code> регистрирует advisors с <code>AuthorizationManagerBeforeMethodInterceptor</code>. Это AOP-прокси — те же ограничения, что у <code>@Transactional</code>: self-invocation не проверяется. <code>@PostAuthorize</code>, <code>@PreFilter</code> работают на результате/аргументах.</p></div>
+</div>
+<pre><code class="java">@Service
+class OrderQueries {
+    @PreAuthorize("hasAuthority('SCOPE_orders.read') and #customerId == authentication.name")
+    List&lt;OrderDto&gt; forCustomer(String customerId) { /* ... */ }
+
+    @PostAuthorize("returnObject.ownerId == authentication.name or hasRole('SUPPORT')")
+    OrderDto get(long id) { /* проверка ПОСЛЕ выполнения — для чтения по id */ }
+}</code></pre>
+
+<h2 id="errors"><span class="h-num">13.6</span>401 или 403: ExceptionTranslationFilter</h2>
+<div class="table-wrap"><table>
+<tr><th>Исключение после него в цепочке</th><th>Пользователь</th><th>Действие</th><th>Ответ</th></tr>
+<tr><td><code>AuthenticationException</code></td><td>любой</td><td>очистить контекст, сохранить запрос (для форм), <code>AuthenticationEntryPoint</code></td><td>401 / редирект на логин</td></tr>
+<tr><td><code>AccessDeniedException</code></td><td>аноним или «remember-me»</td><td>как AuthenticationException</td><td>401</td></tr>
+<tr><td><code>AccessDeniedException</code></td><td>аутентифицирован</td><td><code>AccessDeniedHandler</code></td><td>403</td></tr>
+</table></div>
+<p>Ошибки Security возникают в фильтрах, до DispatcherServlet, поэтому <code>@ControllerAdvice</code> их не видит (кроме исключений <code>@PreAuthorize</code>, которые летят из контроллера/сервиса — их можно перехватить, но правильнее оставить Security). Единый формат ответа — свои <code>AuthenticationEntryPoint</code> и <code>AccessDeniedHandler</code>, пишущие ProblemDetail.</p>
+
+<h2 id="testing"><span class="h-num">13.7</span>Тестирование безопасности</h2>
+<pre><code class="java">@WebMvcTest(OrderController.class)
+@Import(SecurityConfig.class)
+class OrderControllerSecurityTest {
+    @Autowired MockMvc mvc;
+    @MockitoBean OrderService orders;
+
+    @Test void anonymousGets401() throws Exception {
+        mvc.perform(get("/api/orders/1")).andExpect(status().isUnauthorized());
+    }
+    @Test void userWithoutAdminScopeGets403() throws Exception {
+        mvc.perform(get("/api/admin/stats").with(jwt().authorities(new SimpleGrantedAuthority("SCOPE_orders.read"))))
+           .andExpect(status().isForbidden());
+    }
+    @Test @WithMockUser(roles = "SUPPORT")
+    void supportCanRead() throws Exception { /* ... */ }
+}</code></pre>
+
+<h2 id="quiz"><span class="h-num">13.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Зачем нужен DelegatingFilterProxy?</p><ul><li>Для шифрования запроса</li><li>Servlet-контейнер регистрирует фильтры до создания Spring-бинов; прокси лениво находит бин springSecurityFilterChain и делегирует ему</li><li>Чтобы обойти CORS</li><li>Для асинхронных запросов</li></ul><div class="why">Он связывает жизненный цикл servlet-фильтров с контейнером Spring: сама цепочка Security — бин со всеми зависимостями.</div></div>
+<div class="mcq" data-ok="3"><p>Аноним обратился к защищённому URL. Какой фильтр выбросит исключение и какой сформирует ответ?</p><ul><li>BearerTokenAuthenticationFilter бросит, он же ответит 401</li><li>AnonymousAuthenticationFilter бросит, ExceptionTranslationFilter ответит 403</li><li>CsrfFilter бросит и ответит 403</li><li>AuthorizationFilter бросит AccessDeniedException, ExceptionTranslationFilter увидит анонима и вызовет AuthenticationEntryPoint → 401</li></ul><div class="why">ExceptionTranslationFilter стоит перед AuthorizationFilter и ловит его исключения; для анонима отказ трактуется как требование аутентификации.</div></div>
+<div class="mcq" data-ok="0"><p>@Async-метод вызывает SecurityContextHolder.getContext().getAuthentication(). Что получит?</p><ul><li>null — контекст лежит в ThreadLocal потока запроса и в поток пула не переносится без DelegatingSecurityContextExecutor</li><li>Пользователя запроса</li><li>Системного пользователя</li><li>Исключение</li></ul><div class="why">Стратегия по умолчанию — MODE_THREADLOCAL. Перенос — декоратор задач или executor-обёртка Spring Security.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как устроена цепочка фильтров Spring Security?</summary><div class="a"><p>DelegatingFilterProxy (servlet-фильтр) → FilterChainProxy (бин) → выбор SecurityFilterChain по securityMatcher → упорядоченные фильтры: контекст (SecurityContextHolderFilter), заголовки, CORS, CSRF, logout, аутентификация (Bearer/Basic/форма), request cache, anonymous, ExceptionTranslationFilter, AuthorizationFilter. В конце запроса контекст очищается.</p></div></details>
+<details class="q"><summary>Как проходит аутентификация по JWT?</summary><div class="a"><p>BearerTokenAuthenticationFilter извлекает токен → BearerTokenAuthenticationToken → AuthenticationManager → JwtAuthenticationProvider: JwtDecoder проверяет подпись (ключи JWKS по issuer), срок (exp/nbf), issuer; audience — только если задано spring.security.oauth2.resourceserver.jwt.audiences → JwtAuthenticationConverter делает authorities (по умолчанию из scope с префиксом SCOPE_) → JwtAuthenticationToken в SecurityContextHolder. Сессия не создаётся, проверка на каждом запросе.</p></div></details>
+<details class="q"><summary>Нужен ли CSRF для REST API?</summary><div class="a"><p>CSRF возможен, когда браузер автоматически прикладывает учётные данные — cookie сессии или Basic. Если API аутентифицируется только токеном в заголовке Authorization, который JavaScript добавляет явно, CSRF-атака невозможна, защиту отключают. Для SPA с cookie-сессией CSRF нужен (CookieCsrfTokenRepository + заголовок X-XSRF-TOKEN).</p></div></details>
+<details class="q"><summary>Чем hasRole отличается от hasAuthority?</summary><div class="a"><p>Authority — произвольная строка-право. Роль — соглашение: authority с префиксом ROLE_. hasRole("ADMIN") проверяет ROLE_ADMIN, hasAuthority("ADMIN") — ровно ADMIN. Scope из JWT по умолчанию становятся SCOPE_xxx.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

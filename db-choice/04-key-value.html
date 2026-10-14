@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Key-value и кэши: Redis и другие</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Key-value и кэши: Redis и другие</h1>
+  <p class="lead">Самая простая модель — значение по ключу — и самая быстрая: данные в памяти, ответ за микросекунды. Redis (и его форк Valkey) — это не только кэш, но и сервер структур данных: счётчики, множества, рейтинги, очереди, блокировки, ограничение частоты. Разбираем модель, долговечность, кластер, паттерны кэширования и типичные аварии: лавина промахов, горячие ключи, рассинхронизация с базой.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">Redis/Valkey</span><span class="tag">структуры данных</span><span class="tag">cache-aside</span><span class="tag">TTL</span><span class="tag">stampede</span><span class="tag">кластер</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">4.1</span>Модель и семейство</h2>
+<div class="table-wrap"><table>
+<tr><th>Система</th><th>Где данные</th><th>Для чего</th></tr>
+<tr><td>Redis / Valkey / KeyDB / Dragonfly</td><td>память + снимки/журнал</td><td>кэш, сессии, счётчики, рейтинги, rate limiting, лёгкие очереди и pub/sub</td></tr>
+<tr><td>Memcached</td><td>только память, многопоточный</td><td>чистый кэш строк, без структур и долговечности</td></tr>
+<tr><td>DynamoDB, Aerospike</td><td>диск/SSD, распределённо</td><td>долговечное key-value хранилище на любом масштабе (DynamoDB — подробнее в теме 06)</td></tr>
+<tr><td>etcd, Consul, ZooKeeper</td><td>диск, консенсус Raft/ZAB</td><td>конфигурация, выбор лидера, обнаружение сервисов — мало данных, строгая согласованность</td></tr>
+<tr><td>RocksDB, LMDB</td><td>встраиваемые, в процессе</td><td>движок внутри других систем (тема 15)</td></tr>
+</table></div>
+<p>Redis выполняет команды в одном потоке (ввод-вывод многопоточный с версии 6): каждая команда атомарна, а сложные операции — через <code>MULTI/EXEC</code> или Lua-скрипты. Отсюда же главное правило: <b>никаких медленных команд</b> (<code>KEYS *</code>, <code>SMEMBERS</code> на миллион элементов) — они блокируют всех.</p>
+
+<h2 id="structures"><span class="h-num">4.2</span>Структуры данных — попробуйте</h2>
+<div class="widget" id="rdW">
+  <div class="widget-title">Мини-Redis в браузере</div>
+  <p class="hint">Поддержано: SET (EX n, NX), GET, DEL, INCR, INCRBY, EXPIRE, TTL, KEYS, HSET, HGET, HGETALL, LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SMEMBERS, SISMEMBER, ZADD, ZINCRBY, ZRANGE/ZREVRANGE (WITHSCORES). Время ускорено: 1 «секунда» TTL = 1 команда.</p>
+  <div class="sql-presets controls">
+    <button class="btn" type="button" data-cmd="INCR page:views&#10;INCR page:views&#10;INCRBY page:views 10&#10;GET page:views">счётчик</button>
+    <button class="btn" type="button" data-cmd="SET session:abc user42 EX 3&#10;GET session:abc&#10;TTL session:abc&#10;GET session:abc&#10;GET session:abc&#10;GET session:abc">сессия с TTL</button>
+    <button class="btn" type="button" data-cmd="ZADD board 1500 anna 1200 boris 1800 vera&#10;ZINCRBY board 400 boris&#10;ZREVRANGE board 0 2 WITHSCORES">рейтинг</button>
+    <button class="btn" type="button" data-cmd="SET lock:report worker1 NX EX 30&#10;SET lock:report worker2 NX EX 30&#10;GET lock:report">блокировка NX</button>
+    <button class="btn" type="button" data-cmd="RPUSH jobs a b c&#10;LPOP jobs&#10;LRANGE jobs 0 -1">очередь</button>
+    <button class="btn" type="button" data-cmd="HSET user:42 name Анна city Минск&#10;HGET user:42 city&#10;HGETALL user:42">хэш</button>
+    <button class="btn" type="button" data-cmd="INCR rate:ip1:1200&#10;EXPIRE rate:ip1:1200 60&#10;INCR rate:ip1:1200&#10;INCR rate:ip1:1200&#10;GET rate:ip1:1200">rate limit</button>
+  </div>
+  <textarea id="rdIn">SET user:1 Anna
+GET user:1
+SADD tags:1 java redis sql
+SMEMBERS tags:1</textarea>
+  <div class="controls"><button class="btn primary" type="button" id="rdRun">▶ Выполнить</button><button class="btn" type="button" id="rdClr">Очистить базу</button></div>
+  <div class="out" id="rdOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var db = {}, exp = {}, clock = 0;
+  function alive(k) { if (exp[k] !== undefined && exp[k] <= clock) { delete db[k]; delete exp[k]; } return k in db; }
+  function typ(k, t) { if (alive(k) && db[k].t !== t) throw "WRONGTYPE Operation against a key holding the wrong kind of value"; }
+  function q(s) { return '"' + s + '"'; }
+  function list(a) { return a.length ? a.map(function (x, i) { return (i + 1) + ") " + q(x); }).join("\n") : "(empty array)"; }
+  function exec(a) {
+    var c = a[0].toUpperCase(), k = a[1], r;
+    clock++;
+    switch (c) {
+      case "SET":
+        var nx = a.map(function (x) { return x.toUpperCase(); }).indexOf("NX") > 0, ei = a.map(function (x) { return x.toUpperCase(); }).indexOf("EX");
+        if (nx && alive(k)) return "(nil)";
+        db[k] = { t: "s", v: a[2] }; delete exp[k]; if (ei > 0) exp[k] = clock + +a[ei + 1]; return "OK";
+      case "GET": typ(k, "s"); return alive(k) ? q(db[k].v) : "(nil)";
+      case "DEL": r = 0; a.slice(1).forEach(function (x) { if (alive(x)) { delete db[x]; delete exp[x]; r++; } }); return "(integer) " + r;
+      case "INCR": case "INCRBY":
+        typ(k, "s"); var n = alive(k) ? +db[k].v : 0; if (isNaN(n)) throw "ERR value is not an integer";
+        n += c === "INCR" ? 1 : +a[2]; if (!alive(k)) db[k] = { t: "s" }; db[k].v = String(n); return "(integer) " + n;
+      case "EXPIRE": if (!alive(k)) return "(integer) 0"; exp[k] = clock + +a[2]; return "(integer) 1";
+      case "TTL": if (!alive(k)) return "(integer) -2"; return "(integer) " + (exp[k] === undefined ? -1 : exp[k] - clock);
+      case "KEYS": return list(Object.keys(db).filter(alive));
+      case "HSET": typ(k, "h"); if (!alive(k)) db[k] = { t: "h", v: {} }; r = 0; for (var i = 2; i + 1 < a.length; i += 2) { if (!(a[i] in db[k].v)) r++; db[k].v[a[i]] = a[i + 1]; } return "(integer) " + r;
+      case "HGET": typ(k, "h"); return alive(k) && a[2] in db[k].v ? q(db[k].v[a[2]]) : "(nil)";
+      case "HGETALL": typ(k, "h"); if (!alive(k)) return "(empty array)"; r = []; for (var f in db[k].v) r.push(f, db[k].v[f]); return list(r);
+      case "LPUSH": case "RPUSH": typ(k, "l"); if (!alive(k)) db[k] = { t: "l", v: [] }; a.slice(2).forEach(function (x) { if (c === "LPUSH") db[k].v.unshift(x); else db[k].v.push(x); }); return "(integer) " + db[k].v.length;
+      case "LPOP": case "RPOP": typ(k, "l"); if (!alive(k) || !db[k].v.length) return "(nil)"; r = c === "LPOP" ? db[k].v.shift() : db[k].v.pop(); if (!db[k].v.length) delete db[k]; return q(r);
+      case "LRANGE": typ(k, "l"); if (!alive(k)) return "(empty array)"; var L = db[k].v, s = +a[2], e = +a[3]; if (s < 0) s += L.length; if (e < 0) e += L.length; return list(L.slice(s, e + 1));
+      case "SADD": typ(k, "S"); if (!alive(k)) db[k] = { t: "S", v: {} }; r = 0; a.slice(2).forEach(function (x) { if (!db[k].v[x]) { db[k].v[x] = 1; r++; } }); return "(integer) " + r;
+      case "SMEMBERS": typ(k, "S"); return alive(k) ? list(Object.keys(db[k].v)) : "(empty array)";
+      case "SISMEMBER": typ(k, "S"); return "(integer) " + (alive(k) && db[k].v[a[2]] ? 1 : 0);
+      case "ZADD": typ(k, "z"); if (!alive(k)) db[k] = { t: "z", v: {} }; r = 0; for (var j = 2; j + 1 < a.length; j += 2) { if (!(a[j + 1] in db[k].v)) r++; db[k].v[a[j + 1]] = +a[j]; } return "(integer) " + r;
+      case "ZINCRBY": typ(k, "z"); if (!alive(k)) db[k] = { t: "z", v: {} }; db[k].v[a[3]] = (db[k].v[a[3]] || 0) + +a[2]; return q(db[k].v[a[3]]);
+      case "ZRANGE": case "ZREVRANGE":
+        typ(k, "z"); if (!alive(k)) return "(empty array)";
+        var z = Object.keys(db[k].v).sort(function (x, y) { return db[k].v[x] - db[k].v[y]; }); if (c === "ZREVRANGE") z.reverse();
+        var s2 = +a[2], e2 = +a[3]; if (e2 < 0) e2 += z.length; z = z.slice(s2, e2 + 1);
+        if ((a[4] || "").toUpperCase() === "WITHSCORES") { r = []; z.forEach(function (m) { r.push(m, String(db[k].v[m])); }); return list(r); }
+        return list(z);
+      default: throw "ERR unknown command '" + a[0] + "'";
+    }
+  }
+  function run() {
+    var out = [];
+    $("rdIn").value.split("\n").forEach(function (line) {
+      line = line.trim(); if (!line) return;
+      var a = line.match(/"[^"]*"|\S+/g).map(function (x) { return x.replace(/^"|"$/g, ""); });
+      var r; try { r = exec(a); } catch (e) { r = "(error) " + e; }
+      out.push("> " + line + "\n" + r);
+    });
+    $("rdOut").textContent = out.join("\n");
+  }
+  $("rdRun").addEventListener("click", run);
+  $("rdClr").addEventListener("click", function () { db = {}; exp = {}; clock = 0; $("rdOut").textContent = "база очищена"; });
+  document.querySelectorAll("#rdW [data-cmd]").forEach(function (b) { b.addEventListener("click", function () { $("rdIn").value = b.getAttribute("data-cmd"); run(); }); });
+  run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Структура и команды</th></tr>
+<tr><td>Кэш объекта</td><td>строка (JSON/бинарь) + TTL: <code>SET k v EX 300</code></td></tr>
+<tr><td>Счётчики, лимиты</td><td><code>INCR</code> + <code>EXPIRE</code> (фиксированное окно), sorted set по времени (скользящее окно)</td></tr>
+<tr><td>Рейтинги, топ-N</td><td>sorted set: <code>ZINCRBY</code>, <code>ZREVRANGE</code> — O(log N)</td></tr>
+<tr><td>Уникальные посетители</td><td><code>PFADD/PFCOUNT</code> (HyperLogLog, 12 КБ на миллиард с погрешностью ~0.8%)</td></tr>
+<tr><td>Распределённая блокировка</td><td><code>SET lock v NX PX 30000</code> + снятие Lua-скриптом по значению; для корректности под отказами — fencing-токены или блокировки в базе</td></tr>
+<tr><td>Очереди и события</td><td>списки (<code>BLPOP</code>), Streams с группами потребителей (<code>XADD/XREADGROUP/XACK</code>), pub/sub (без хранения)</td></tr>
+<tr><td>Геопоиск</td><td><code>GEOADD/GEOSEARCH</code></td></tr>
+</table></div>
+
+<h2 id="durability"><span class="h-num">4.3</span>Долговечность и масштабирование</h2>
+<div class="grid-2">
+  <div class="card"><h4>Персистентность</h4><ul><li><b>RDB</b> — периодический снимок (fork + копирование при записи): потеря данных с последнего снимка.</li><li><b>AOF</b> — журнал команд, <code>appendfsync everysec</code>: потеря ~1 секунды.</li><li>Репликация асинхронная: при переключении (Sentinel/Cluster) подтверждённые записи могут пропасть.</li></ul><p>Вывод: Redis — хороший источник истины только для данных, потеря которых терпима.</p></div>
+  <div class="card"><h4>Redis Cluster</h4><ul><li>16384 слота, ключ → <code>CRC16(key) mod 16384</code>, слоты распределены по мастерам.</li><li>Многоключевые операции — только в одном слоте: хэш-теги <code>{user42}:cart</code> и <code>{user42}:profile</code>.</li><li>Клиент знает карту слотов и получает <code>MOVED</code> при перестройке.</li></ul></div>
+</div>
+<div class="callout warn"><span class="c-title">Память и вытеснение</span>
+Задайте <code>maxmemory</code> и политику: для кэша — <code>allkeys-lru</code> или <code>allkeys-lfu</code>; если там же лежат данные без TTL, которые нельзя терять, — <code>volatile-*</code> или, лучше, отдельный инстанс. При политике <code>noeviction</code> заполненный Redis начинает отвечать ошибками на запись.
+</div>
+
+<h2 id="caching"><span class="h-num">4.4</span>Паттерны кэширования</h2>
+<div class="table-wrap"><table>
+<tr><th>Паттерн</th><th>Как</th><th>Риски</th></tr>
+<tr><td><b>Cache-aside</b> (по умолчанию)</td><td>читаем кэш → промах → читаем базу → кладём в кэш с TTL; при записи — пишем в базу и <b>удаляем</b> ключ</td><td>окно устаревших данных; гонка «старое значение записано в кэш после удаления»</td></tr>
+<tr><td>Read-through</td><td>то же, но загрузку делает слой кэша (Caffeine LoadingCache, Spring <code>@Cacheable</code>)</td><td>те же</td></tr>
+<tr><td>Write-through</td><td>запись идёт в кэш и синхронно в базу</td><td>запись медленнее; кэш полон данных, которые никто не читает</td></tr>
+<tr><td>Write-behind</td><td>запись в кэш, в базу — асинхронно пачками</td><td>потеря данных при сбое кэша; сложная согласованность</td></tr>
+<tr><td>Инвалидация по событиям</td><td>CDC/outbox из базы удаляет или обновляет ключи (тема 16)</td><td>задержка события; нужна идемпотентность</td></tr>
+</table></div>
+
+<div class="widget" id="hrW">
+  <div class="widget-title">Сколько даст кэш: доля попаданий и средняя задержка</div>
+  <div class="controls">
+    <label>объектов, тыс.<input type="number" id="hrN" value="1000" min="1"></label>
+    <label>в кэше, % объектов<input type="number" id="hrC" value="5" min="0.1" max="100" step="0.5"></label>
+    <label>неравномерность доступа<select id="hrS"><option value="0.6">слабая</option><option value="0.9" selected>типичная (Zipf 0.9)</option><option value="1.1">сильная (соцсети, хиты)</option></select></label>
+    <label>задержка базы, мс<input type="number" id="hrD" value="8" min="0.1" step="0.5"></label>
+  </div>
+  <div id="hrBars"></div>
+  <div class="verdict" id="hrV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function H(n, s) { if (s === 1) return Math.log(n) + 0.5772; return (Math.pow(n, 1 - s) - 1) / (1 - s) + 0.5; }
+  function run() {
+    var n = Math.max(1, +$("hrN").value) * 1000, c = Math.min(100, Math.max(0.1, +$("hrC").value)) / 100, s = +$("hrS").value, d = Math.max(0.1, +$("hrD").value);
+    var hit = Math.min(1, H(n * c, s) / H(n, s)), lat = hit * 0.3 + (1 - hit) * (d + 0.3);
+    $("hrBars").innerHTML = '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>Доля попаданий</b><span style="font-family:var(--font-mono)">' + (hit * 100).toFixed(1) + '%</span></div><div class="bar ok"><i style="width:' + hit * 100 + '%"></i></div>' +
+      '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>Средняя задержка</b><span style="font-family:var(--font-mono)">' + lat.toFixed(2) + " мс (без кэша " + d + ' мс)</span></div><div class="bar"><i style="width:' + Math.min(100, lat / d * 100) + '%"></i></div>';
+    $("hrV").className = "verdict " + (hit > 0.8 ? "ok" : "warn");
+    $("hrV").textContent = "Нагрузка на базу снижается в " + (1 / Math.max(0.001, 1 - hit)).toFixed(1) + " раза. " + (hit > 0.8 ? "Небольшая доля горячих объектов даёт большую часть попаданий — кэш окупается." : "При равномерном доступе кэш помогает мало: проверьте распределение запросов прежде, чем строить кэш.") + " Но p99 определяется промахами: медленные запросы к базе всё равно нужно оптимизировать.";
+  }
+  ["hrN", "hrC", "hrS", "hrD"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="incidents"><span class="h-num">4.5</span>Аварии кэша и защита</h2>
+<div class="widget stepper" id="stSim">
+  <div class="widget-title">Лавина промахов (cache stampede)</div>
+  <div class="flow st-stage">
+    <div class="node" id="stK"><b>ключ home:feed</b><small>5000 запросов/с</small></div><span class="to">→</span>
+    <div class="node" id="stApp"><b>приложение ×20</b></div><span class="to">→</span>
+    <div class="node" id="stDb"><b>база</b><small>запрос 300 мс</small></div>
+  </div>
+  <section class="st-step" data-t="Всё хорошо" data-hl="stK" data-log="hit ratio 99.9%: база получает единицы запросов в секунду"><p>Горячий ключ главной страницы читается 5000 раз в секунду, все — попадания.</p></section>
+  <section class="st-step" data-t="TTL истёк" data-hl="stK stApp" data-log="t=0: ключ истёк → за 300 мс пересчёта приходит 1500 запросов, все промахи"><p>TTL истёк. Пока первый запрос пересчитывает значение (300 мс), приходят ещё 1500 запросов — все видят промах и тоже идут в базу.</p></section>
+  <section class="st-step" data-t="База захлёбывается" data-hl="stDb" data-log="1500 одинаковых тяжёлых запросов → база перегружена, запрос идёт 5 с, пул соединений исчерпан"><p>Полторы тысячи одинаковых тяжёлых запросов. База замедляется, пересчёт занимает уже секунды, промахов ещё больше — положительная обратная связь. Падают и другие функции, использующие базу.</p></section>
+  <section class="st-step" data-t="Защита" data-hl="stK stApp stDb" data-log="single-flight + stale-while-revalidate + TTL с разбросом + прогрев"><p>Защита: <b>один пересчёт</b> на ключ (блокировка <code>SET NX</code> или single-flight в процессе — остальные ждут или получают старое значение); <b>stale-while-revalidate</b> — хранить значение дольше TTL и обновлять в фоне; <b>вероятностное раннее обновление</b>; <b>разброс TTL</b> (±10%), чтобы тысячи ключей не истекали одновременно; прогрев после деплоя.</p></section>
+</div>
+<ul>
+  <li><b>Горячий ключ</b> — один ключ получает больше, чем может обслужить узел кластера: локальный кэш в процессе (Caffeine) на секунды, реплики чтения, разбиение ключа на N копий.</li>
+  <li><b>Проникновение кэша</b> — запросы несуществующих ключей всегда идут в базу (перебор id): кэшировать «отсутствие» с коротким TTL, Bloom-фильтр.</li>
+  <li><b>Рассинхронизация</b> — удалять ключ после коммита (не до), при сомнениях — короткий TTL как страховка; не кэшировать то, что требует строгой согласованности (баланс перед списанием).</li>
+  <li><b>Большие значения</b> — сотни КБ в одном ключе блокируют поток и сеть: дробить, сжимать, хранить ссылку.</li>
+</ul>
+<pre data-title="Spring: кэш с Redis и локальным уровнем"><code class="java">@Cacheable(cacheNames = "product", key = "#id", sync = true)   // sync: один пересчёт на ключ в пределах экземпляра
+public ProductDto find(long id) { ... }
+
+@CacheEvict(cacheNames = "product", key = "#cmd.id")           // удалить ключ после успешного обновления
+@Transactional
+public void update(UpdateProduct cmd) { ... }
+// внимание: @CacheEvict срабатывает при выходе из метода — до коммита, если транзакция внешняя;
+// надёжнее удалять по событию @TransactionalEventListener(phase = AFTER_COMMIT)</code></pre>
+
+<h2 id="quiz"><span class="h-num">4.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему <code>KEYS *</code> опасна в продакшене?</p><ul><li>Она удаляет ключи</li><li>Она не поддерживается в кластере</li><li>Она проходит все ключи, а Redis выполняет команды в одном потоке — все остальные клиенты ждут</li><li>Она сбрасывает TTL</li></ul><div class="why">Используйте SCAN с курсором.</div></div>
+<div class="mcq" data-ok="0"><p>При обновлении товара в cache-aside что делать с кэшем?</p><ul><li>Удалить ключ после коммита в базу; следующее чтение загрузит свежие данные</li><li>Обновить ключ до записи в базу</li><li>Ничего, TTL разберётся</li><li>Очистить весь кэш</li></ul><div class="why">Удаление после коммита проще и безопаснее записи нового значения.</div></div>
+<div class="mcq" data-ok="3"><p>Можно ли хранить в Redis единственную копию балансов пользователей?</p><ul><li>Да, Redis всегда долговечен</li><li>Да, если включён RDB</li><li>Да, если есть реплика</li><li>Рискованно: асинхронная репликация и AOF everysec допускают потерю подтверждённых записей</li></ul><div class="why">Для денег нужен источник истины с ACID и синхронным журналом.</div></div>
+<div class="mcq" data-ok="1"><p>Тысячи ключей кэша создаются при деплое с одинаковым TTL 1 час. Чем это грозит?</p><ul><li>Ничем</li><li>Через час все истекут одновременно — всплеск нагрузки на базу</li><li>Redis перестанет принимать запросы</li><li>Ключи никогда не истекут</li></ul><div class="why">Добавляйте случайный разброс к TTL.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как реализовать ограничение частоты запросов (rate limiting) на Redis?</summary><div class="a"><p>Фиксированное окно: <code>INCR rate:{user}:{minute}</code> + <code>EXPIRE 60</code>, отказ при превышении. Скользящее окно: sorted set с отметками времени запросов (<code>ZADD</code>, <code>ZREMRANGEBYSCORE</code> старше окна, <code>ZCARD</code>) в Lua-скрипте для атомарности. Token bucket: хэш с токенами и временем последнего пополнения, Lua-скрипт. В кластере — ключи одного пользователя с хэш-тегом.</p></div></details>
+<details class="q"><summary>Когда кэш не нужен?</summary><div class="a"><p>Когда база и так отвечает быстро для нужной нагрузки; когда доступ равномерный и доля попаданий будет низкой; когда данные должны быть строго актуальными; когда проблема в плохом запросе, который правильнее починить. Кэш — дополнительная система с инвалидацией, прогревом, авариями и устаревшими данными.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

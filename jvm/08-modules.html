@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Модули (JPMS) и слои</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ЗАГРУЗКА КЛАССОВ</div>
+  <h1>Модули (JPMS) и слои</h1>
+  <p class="lead">С Java 9 сама JDK разбита на ~70 модулей, а доступ определяется не только модификаторами <code>public/private</code>, но и тем, экспортирует ли модуль пакет. Даже если вы не пишете <code>module-info.java</code>, система модулей влияет на вас: <code>InaccessibleObjectException</code> при рефлексии, флаги <code>--add-opens</code>, <code>jlink</code> для маленьких образов. Разбираем, как JVM решает «можно ли обратиться», что такое безымянный и автоматические модули и как слои позволяют грузить две версии одной библиотеки.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">module-info</span><span class="tag">exports/opens</span><span class="tag">читаемость</span><span class="tag">unnamed module</span><span class="tag">--add-opens</span><span class="tag">jlink</span><span class="tag">ModuleLayer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="descriptor"><span class="h-num">8.1</span>Дескриптор модуля</h2>
+<pre data-title="module-info.java"><code class="java">module com.shop.orders {
+    requires com.shop.common;                    // читаемость: orders видит экспортированные пакеты common
+    requires transitive com.shop.api;            // и всем, кто читает orders, — тоже api
+    requires static lombok;                      // нужен при компиляции, необязателен в рантайме
+    requires java.sql;
+
+    exports com.shop.orders.api;                 // public-типы пакета доступны другим модулям
+    exports com.shop.orders.spi to com.shop.app; // квалифицированный экспорт
+    opens com.shop.orders.model to com.fasterxml.jackson.databind, org.hibernate.orm.core;  // глубокая рефлексия
+
+    uses com.shop.orders.spi.DiscountPolicy;     // потребитель ServiceLoader
+    provides com.shop.common.Plugin with com.shop.orders.OrdersPlugin;
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>exports</h4><p>Открывает <b>public</b>-члены public-типов пакета для компиляции и рефлексии. Без экспорта public-класс снаружи модуля недоступен.</p></div>
+  <div class="card"><h4>opens</h4><p>Разрешает <b>глубокую рефлексию</b> (<code>setAccessible(true)</code> на private-полях) — нужно Jackson, Hibernate, Spring для внедрения в поля. <code>open module</code> открывает все пакеты.</p></div>
+</div>
+
+<h2 id="access"><span class="h-num">8.2</span>Проверка доступа</h2>
+<div class="widget" id="acW">
+  <div class="widget-title">Может ли код из модуля A обратиться к классу из модуля B?</div>
+  <div class="controls">
+    <label>A читает B (requires)<select id="acR"><option value="1">да</option><option value="0">нет</option></select></label>
+    <label>B для пакета<select id="acE"><option value="none">ничего</option><option value="exports" selected>exports</option><option value="opens">opens</option><option value="both">exports + opens</option></select></label>
+    <label>чем обращаемся<select id="acK"><option value="pub">обычный вызов public-метода</option><option value="refpub">рефлексия к public-члену</option><option value="deep">setAccessible(true) к private-полю</option></select></label>
+    <label>A — это<select id="acA"><option value="named">именованный модуль</option><option value="unnamed">classpath (безымянный модуль)</option></select></label>
+    <label>B — это<select id="acB"><option value="named">именованный модуль приложения</option><option value="jdk">модуль JDK (java.base)</option></select></label>
+  </div>
+  <div class="verdict" id="acV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var r = $("acR").value === "1" || $("acA").value === "unnamed", e = $("acE").value, k = $("acK").value, jdk = $("acB").value === "jdk";
+    var exp = e === "exports" || e === "both", op = e === "opens" || e === "both", v = $("acV"), ok, why;
+    if (!r) { ok = false; why = "A не читает B: ошибка компиляции «package is not visible», в рантайме IllegalAccessError. Безымянный модуль (classpath) читает все модули автоматически."; }
+    else if (k === "pub") { ok = exp; why = exp ? "Пакет экспортирован, A читает B — обычный доступ к public разрешён." : "Пакет не экспортирован: public-тип недоступен (компиляция — «is not visible», рантайм — IllegalAccessError). opens не даёт доступа при компиляции."; }
+    else if (k === "refpub") { ok = exp || op; why = ok ? "Рефлексия к public-членам разрешена, если пакет экспортирован или открыт." : "Пакет не экспортирован и не открыт: IllegalAccessException при вызове через рефлексию."; }
+    else { ok = op; why = op ? "Пакет открыт (opens) — setAccessible(true) к private разрешён." : "InaccessibleObjectException: Unable to make field private … accessible: module " + (jdk ? "java.base does not \"opens java.lang\"" : "B does not \"opens\" package") + " to " + ($("acA").value === "unnamed" ? "unnamed module" : "module A") + ". exports не помогает — нужен opens." + (jdk ? " Для JDK с Java 17 (JEP 403) строгая инкапсуляция без исключений: только --add-opens java.base/java.lang=ALL-UNNAMED в командной строке или Add-Opens в манифесте." : ""); }
+    v.className = "verdict " + (ok ? "ok" : "bad"); v.textContent = (ok ? "✔ " : "✘ ") + why;
+  }
+  ["acR", "acE", "acK", "acA", "acB"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="unnamed"><span class="h-num">8.3</span>Classpath, безымянный и автоматические модули</h2>
+<div class="table-wrap"><table>
+<tr><th>Что</th><th>Как получается</th><th>Свойства</th></tr>
+<tr><td><b>Именованный модуль</b></td><td>jar с <code>module-info.class</code> на <code>--module-path</code></td><td>строгая инкапсуляция, явные зависимости, проверка при старте (нет модуля → ошибка запуска, а не NoClassDefFoundError через час)</td></tr>
+<tr><td><b>Автоматический модуль</b></td><td>обычный jar на module path; имя — из <code>Automatic-Module-Name</code> в манифесте или из имени файла</td><td>экспортирует и открывает всё, читает всё — мост для библиотек без module-info</td></tr>
+<tr><td><b>Безымянный модуль</b></td><td>всё, что на classpath (у каждого загрузчика свой)</td><td>читает все модули, экспортирует всё; но именованные модули его не читают. Так работает большинство приложений, включая Spring Boot fat jar</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Split packages</span>
+Один пакет не может находиться в двух модулях одного слоя: <code>Package x.y in both module a and module b</code>. На classpath это «работало» (побеждал первый jar), на module path — ошибка запуска. Частая боль при миграции старых библиотек (javax.annotation, jsr305).
+</div>
+
+<h2 id="jlink"><span class="h-num">8.4</span>jdeps и jlink: свой маленький runtime</h2>
+<pre data-title="минимальный JRE для Docker-образа"><code class="txt">jdeps --ignore-missing-deps --print-module-deps --multi-release 21 -cp 'lib/*' app.jar
+# java.base,java.logging,java.management,java.naming,java.net.http,java.sql,jdk.crypto.ec,jdk.unsupported
+
+jlink --add-modules java.base,java.logging,java.management,java.naming,java.net.http,java.sql,jdk.crypto.ec,jdk.unsupported \
+      --strip-debug --no-man-pages --no-header-files --compress=zip-6 --output /opt/jre
+# полный JDK ~ 300+ МБ → runtime ~ 50–70 МБ</code></pre>
+<p><code>jdk.unsupported</code> содержит <code>sun.misc.Unsafe</code> — его требуют Netty, старые версии многих библиотек; без него — <code>NoClassDefFoundError: sun/misc/Unsafe</code>.</p>
+
+<h2 id="layers"><span class="h-num">8.5</span>Слои модулей: две версии библиотеки</h2>
+<p><code>ModuleLayer</code> — граф модулей, связанный со своими загрузчиками. Boot layer создаётся при запуске; приложение может создавать дочерние слои — например, по слою на плагин, в каждом свою версию библиотеки. Это «правильная» модульная замена child-first загрузчикам.</p>
+<pre data-title="слой плагина"><code class="java">ModuleFinder finder = ModuleFinder.of(Path.of("plugins/acme"));
+ModuleLayer parent = ModuleLayer.boot();
+Configuration cf = parent.configuration().resolve(finder, ModuleFinder.of(), Set.of("com.acme.plugin"));
+ModuleLayer layer = parent.defineModulesWithOneLoader(cf, ClassLoader.getSystemClassLoader());
+ServiceLoader.load(layer, Plugin.class).forEach(Plugin::start);</code></pre>
+
+<h2 id="quiz"><span class="h-num">8.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Jackson не может заполнить private-поле класса из вашего модуля. Что нужно в module-info?</p><ul><li>exports пакета</li><li>requires com.fasterxml.jackson.databind</li><li>opens пакета для jackson.databind (или для всех)</li><li>uses ObjectMapper</li></ul><div class="why">Глубокая рефлексия требует opens; exports даёт только доступ к public.</div></div>
+<div class="mcq" data-ok="0"><p>Почему на Java 17 библиотека получила InaccessibleObjectException при доступе к private-полю java.lang.String?</p><ul><li>JDK строго инкапсулирует внутренности (JEP 403); нужен --add-opens java.base/java.lang=ALL-UNNAMED или обновление библиотеки</li><li>String стал final</li><li>Нужен requires java.base</li><li>Ошибка classpath</li></ul><div class="why">В Java 9–16 действовал --illegal-access=permit с предупреждением.</div></div>
+<div class="mcq" data-ok="3"><p>Как обычное приложение на classpath видится системой модулей?</p><ul><li>Как автоматический модуль</li><li>Никак, модули на него не влияют</li><li>Как модуль java.base</li><li>Как безымянный модуль: читает все модули, но его не читают именованные</li></ul><div class="why">При этом инкапсуляция JDK действует и на classpath.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Стоит ли переводить Spring Boot-приложение на модули?</summary><div class="a"><p>Обычно выгода невелика: Spring Boot fat jar работает на classpath, многие библиотеки не модуляризованы, требуются opens для рефлексии. Полезные части JPMS доступны и без этого: jlink для маленького runtime, jdeps для анализа зависимостей. Модули оправданы для библиотек (Automatic-Module-Name как минимум), для больших монолитов с требованием строгих границ (или используйте Spring Modulith / ArchUnit), для плагинных систем со слоями.</p></div></details>
+<details class="q"><summary>Что даёт JPMS по сравнению с classpath?</summary><div class="a"><p>Надёжную конфигурацию — отсутствующие и дублирующиеся модули, split packages обнаруживаются при старте; строгую инкапсуляцию — внутренние пакеты недоступны даже через рефлексию без opens; явный граф зависимостей; возможность собрать минимальный runtime (jlink); быстрее поиск классов (пакет → модуль, без перебора jar).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

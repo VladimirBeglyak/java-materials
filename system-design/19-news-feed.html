@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Разбор: лента новостей</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ПРОЕКТИРОВАНИЕ НА ПРАКТИКЕ</div>
+  <h1>Разбор: лента новостей</h1>
+  <p class="lead">Лента социальной сети — классическая задача о том, <b>когда</b> делать работу: в момент публикации (разложить пост по лентам подписчиков) или в момент чтения (собрать ленту из постов тех, на кого подписан). Ни один вариант не работает для всех пользователей сразу — и на этом строится всё решение.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">fan-out on write / on read</span><span class="tag">гибридная схема</span><span class="tag">пагинация курсором</span><span class="tag">калькулятор</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="req"><span class="h-num">19.1</span>Требования и оценка</h2>
+<p><b>Функции:</b> опубликовать пост (текст, фото); подписаться; получить ленту — посты тех, на кого подписан, от новых к старым, постранично. <b>Качество:</b> открытие ленты быстрее 200 мс; новый пост появляется у подписчиков за секунды (не мгновенно — итоговая согласованность допустима); лента доступна, даже если что-то сломано.</p>
+<p><b>Оценка:</b> 100 млн активных в сутки; каждый открывает ленту 10 раз → 1 млрд чтений ленты в сутки ≈ 12 000 в секунду (пик 40 000); публикует 0,5 поста → 50 млн постов в сутки ≈ 600 в секунду. В среднем 200 подписчиков, но распределение с тяжёлым хвостом: у единиц — десятки миллионов.</p>
+
+<h2 id="two"><span class="h-num">19.2</span>Два способа собрать ленту</h2>
+<div class="vs neutral">
+  <div class="card"><h4>Fan-out on read («вытягивание»)</h4><p>При открытии ленты: взять список подписок (200 авторов) → запросить последние посты каждого → слить и отсортировать.</p><p><b>+</b> публикация мгновенна и дёшева; нет лишней работы для неактивных пользователей.<br><b>−</b> чтение дорогое: сотни запросов и слияние на каждое открытие ленты — а чтений в 20 раз больше, чем записей.</p></div>
+  <div class="card"><h4>Fan-out on write («проталкивание»)</h4><p>При публикации: взять список подписчиков автора → дописать id поста в готовую ленту каждого (список в Redis).</p><p><b>+</b> чтение — один запрос готового списка, миллисекунды.<br><b>−</b> публикация автора с 50 млн подписчиков — 50 млн записей; работа делается и для тех, кто никогда не откроет ленту.</p></div>
+</div>
+<div class="widget" id="foW">
+  <div class="widget-title">Калькулятор: сколько стоит каждый способ</div>
+  <div class="controls">
+    <label>подписчиков у автора<input type="number" id="foFol" value="200" min="0" style="width:120px"></label>
+    <label>постов автора в сутки<input type="number" id="foPosts" value="2" min="0" step="any"></label>
+    <label>доля подписчиков, читающих ленту в сутки, %<input type="number" id="foAct" value="30" min="0" max="100"></label>
+    <label>открытий ленты читателем в сутки<input type="number" id="foOpen" value="10" min="0"></label>
+    <label>подписок у читателя<input type="number" id="foSubs" value="200" min="1"></label>
+  </div>
+  <div class="controls"><button class="btn" type="button" data-p="200,2,30,10,200">обычный пользователь</button><button class="btn" type="button" data-p="50000000,5,20,10,200">звезда: 50 млн подписчиков</button><button class="btn" type="button" data-p="1000,50,30,10,2000">активный автор, читатели с 2000 подписок</button></div>
+  <div id="foBars"></div>
+  <div class="verdict" id="foOut"></div>
+</div>
+<script>
+(function () {
+  var ids = ["foFol", "foPosts", "foAct", "foOpen", "foSubs"], $ = function (i) { return document.getElementById(i); };
+  function fmt(n) { return n >= 1e9 ? (n / 1e9).toFixed(1) + " млрд" : (n >= 1e6 ? (n / 1e6).toFixed(1) + " млн" : (n >= 1e3 ? (n / 1e3).toFixed(1) + " тыс." : Math.round(n) + "")); }
+  function run() {
+    var f = Math.max(0, +$("foFol").value), p = Math.max(0, +$("foPosts").value), a = Math.min(100, Math.max(0, +$("foAct").value)) / 100, o = Math.max(0, +$("foOpen").value), s = Math.max(1, +$("foSubs").value);
+    var push = f * p, pull = f * a * o, perPost = f, latency = f / 10000, mx = Math.max(push, pull, 1);
+    function bar(l, v, note) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px;flex-wrap:wrap"><span><b>' + l + "</b> " + note + '</span><span style="font-family:var(--font-mono)">' + fmt(v) + ' операций в сутки</span></div><div class="bar"><i style="width:' + Math.max(1, v / mx * 100) + '%"></i></div>'; }
+    $("foBars").innerHTML = bar("Push", push, "— записей в ленты из-за этого автора (подписчики × посты)") + bar("Pull", pull, "— обращений к постам автора при сборке лент (читающие × открытия)") +
+      '<div class="out">один пост при push = ' + fmt(perPost) + " записей; при 10 000 записей/с на воркер последний подписчик увидит пост через ≈ " + (latency < 1 ? "<1" : fmt(latency)) + " с\nодно открытие ленты при pull = " + s + " чтений (по числу подписок читателя) + слияние</div>";
+    var out = $("foOut");
+    if (f > 1e6) { out.className = "verdict bad"; out.textContent = "Push для такого автора — «штормовая» запись: миллионы вставок на пост, задержка доставки в минуты, большинство записей — в ленты тех, кто их не откроет. Таких авторов исключают из разбрасывания и подмешивают их посты при чтении (pull). Их немного, а посты горячие — отлично кэшируются."; }
+    else if (push <= pull * 2) { out.className = "verdict ok"; out.textContent = "Push выгоден: записей сравнимо или меньше, чем обращений при чтении, а чтение становится одним запросом готового списка. Это случай подавляющего большинства пользователей."; }
+    else { out.className = "verdict warn"; out.textContent = "Автор пишет чаще, чем его читают: push делает много работы впустую. Разбрасывайте только активным подписчикам (кто заходил за последние N дней), остальным ленту собирайте при первом входе."; }
+  }
+  ids.forEach(function (i) { $(i).addEventListener("input", run); });
+  document.querySelectorAll("#foW [data-p]").forEach(function (b) { b.addEventListener("click", function () { b.getAttribute("data-p").split(",").forEach(function (x, k) { $(ids[k]).value = x; }); run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="hybrid"><span class="h-num">19.3</span>Гибридная схема</h2>
+<div class="flow col">
+  <div class="node info"><b>Публикация</b><small>POST /posts → сервис постов → запись в хранилище постов → событие PostCreated в Kafka → ответ автору</small></div><span class="to">↓ асинхронно</span>
+  <div class="node acc"><b>Воркеры fan-out</b><small>автор «обычный» (меньше ~100 тыс. подписчиков): для каждого АКТИВНОГО подписчика LPUSH feed:{user} postId, LTRIM до 800 элементов.  Автор-«звезда»: ничего не делать</small></div><span class="to">↓</span>
+  <div class="node"><b>Кэш лент (Redis)</b><small>feed:{user} — список id постов, а не сами посты</small></div><span class="to">↓ чтение</span>
+  <div class="node ok"><b>GET /feed</b><small>1) id из feed:{user}; 2) + свежие посты «звёзд», на которых подписан (из их кэшированных списков); 3) слияние по времени; 4) «гидратация»: тела постов и авторов пачкой из кэша постов; 5) фильтрация (удалённые, заблокированные)</small></div>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Решение</th><th>Почему</th></tr>
+<tr><td>В ленте хранятся только id постов</td><td>пост один, лент миллионы: правка или удаление поста не требует обхода лент; тела — в общем кэше постов</td></tr>
+<tr><td>Лента ограничена по длине</td><td>дальше 800-го поста листают единицы; глубже — собирать вытягиванием из хранилища</td></tr>
+<tr><td>Fan-out только активным</td><td>большая часть аккаунтов неактивна; их лента строится при входе</td></tr>
+<tr><td>Fan-out асинхронный, через очередь</td><td>публикация не ждёт миллионов записей; всплески сглаживаются; воркеры масштабируются отдельно</td></tr>
+<tr><td>Порог «звезды» — настройка</td><td>граница между push и pull подбирается по стоимости, а не раз и навсегда</td></tr>
+</table></div>
+
+<h2 id="data"><span class="h-num">19.4</span>Хранилища</h2>
+<div class="table-wrap"><table>
+<tr><th>Данные</th><th>Хранилище</th><th>Ключ доступа</th></tr>
+<tr><td>Посты</td><td>wide-column (Cassandra) или шарды реляционной БД</td><td>по <code>author_id</code> + время (посты автора), по <code>post_id</code></td></tr>
+<tr><td>Граф подписок</td><td>две таблицы: «на кого подписан» и «кто подписан»</td><td>обе стороны нужны: первая — для чтения, вторая — для fan-out</td></tr>
+<tr><td>Готовые ленты</td><td>Redis (список или sorted set по времени)</td><td><code>feed:{user_id}</code>; потеря не страшна — пересобирается</td></tr>
+<tr><td>Медиа</td><td>объектное хранилище + CDN</td><td>в посте только ссылки</td></tr>
+<tr><td>Счётчики лайков и просмотров</td><td>отдельное хранилище счётчиков, обновляется пачками</td><td>приблизительная точность допустима</td></tr>
+</table></div>
+
+<h2 id="page"><span class="h-num">19.5</span>Пагинация: курсор, а не offset</h2>
+<pre class="bad-code"><code class="txt">GET /feed?offset=40&amp;limit=20
+# пока пользователь читал первую страницу, появилось 3 новых поста → вся лента сдвинулась:
+# на второй странице он снова увидит 3 поста с первой. А OFFSET 100000 заставит базу пройти 100 000 строк.</code></pre>
+<pre class="good-code"><code class="txt">GET /feed?limit=20                       → { "items": […], "next": "eyJ0IjoxNzYwMDg…" }
+GET /feed?limit=20&amp;cursor=eyJ0IjoxNzYwMDg…  → посты СТАРШЕ позиции курсора (время + id последнего показанного)
+# запрос: WHERE (created_at, id) &lt; (:t, :id) ORDER BY created_at DESC, id DESC LIMIT 20 — по индексу, за постоянное время</code></pre>
+<p>Курсор непрозрачен для клиента (закодированная пара «время, id»): можно менять внутреннее устройство, не ломая API. Новые посты сверху подгружаются отдельным запросом «новее чем».</p>
+
+<h2 id="rank"><span class="h-num">19.6</span>Ранжирование и отказоустойчивость</h2>
+<div class="grid-2">
+  <div class="card"><h4>Ранжированная лента</h4><p>Вместо хронологии — оценка релевантности. Схема та же, но в два этапа: дешёвый отбор кандидатов (несколько сотен свежих постов из push и pull) и дорогое ранжирование моделью. Результат кэшируется на минуты.</p></div>
+  <div class="card"><h4>Деградация</h4><p>Упал кэш лент — собрать ленту вытягиванием для активных, остальным показать популярное. Отстали воркеры fan-out — лента запаздывает, но открывается. Недоступен сервис ранжирования — отдать хронологическую. Лента должна открыться всегда.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">19.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему fan-out on write не подходит для автора с 50 млн подписчиков?</p><ul><li>Redis не хранит столько ключей</li><li>Посты звёзд длиннее</li><li>Один пост порождает десятки миллионов записей: долго, дорого и в основном впустую</li><li>У звёзд нет ленты</li></ul><div class="why">Их посты подмешивают при чтении: авторов мало, посты кэшируются.</div></div>
+<div class="mcq" data-ok="1"><p>Почему в ленте хранят идентификаторы постов, а не сами посты?</p><ul><li>Так медленнее читать</li><li>Пост существует в одном экземпляре: изменение и удаление не требуют обхода миллионов лент, а память экономится на порядки</li><li>Redis не умеет хранить текст</li><li>Так требует CDN</li></ul><div class="why">Тела достаются одной пакетной операцией из кэша постов.</div></div>
+<div class="mcq" data-ok="0"><p>Чем курсорная пагинация лучше offset для ленты?</p><ul><li>Стабильна при появлении новых элементов и не замедляется на глубоких страницах</li><li>Позволяет перейти на произвольную страницу</li><li>Не требует индекса</li><li>Ничем</li></ul><div class="why">Цена — нельзя прыгнуть на «страницу 57», но в ленте это и не нужно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите гибридную модель построения ленты.</summary><div class="a"><p>Обычные авторы — fan-out on write: при публикации id поста асинхронно дописывается в кэшированные ленты активных подписчиков. Авторы с огромной аудиторией — fan-out on read: их посты подмешиваются при запросе ленты. Чтение: готовый список id + посты звёзд → слияние → загрузка тел пачкой → фильтрация.</p></div></details>
+<details class="q"><summary>Что произойдёт при потере кэша лент и как восстановиться?</summary><div class="a"><p>Кэш — производные данные: источник истины — посты и граф подписок. Ленту пересобирают вытягиванием при первом обращении (ленивое восстановление) и прогревают фоном для самых активных. На время восстановления — ограничение нагрузки и упрощённая лента.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Вызовы методов и invokedynamic</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ПЛАТФОРМА И БАЙТКОД</div>
+  <h1>Вызовы методов и invokedynamic</h1>
+  <p class="lead">Пять инструкций вызова определяют, как JVM находит метод: статически, через таблицу виртуальных методов, через поиск по интерфейсу — или динамически, спросив у вашего кода. Разбираем vtable и itable, как работают <code>super</code>, <code>private</code> и конструкторы, во что превращаются лямбды и конкатенация строк, чем MethodHandle лучше рефлексии и откуда берётся <code>NoSuchMethodError</code>.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">invokevirtual</span><span class="tag">vtable/itable</span><span class="tag">invokespecial</span><span class="tag">invokedynamic</span><span class="tag">LambdaMetafactory</span><span class="tag">MethodHandle</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="five"><span class="h-num">4.1</span>Пять инструкций вызова</h2>
+<div class="table-wrap"><table>
+<tr><th>Инструкция</th><th>Для чего</th><th>Как выбирается метод</th></tr>
+<tr><td><code>invokestatic</code></td><td>статические методы</td><td>при разрешении — один конкретный метод; получателя нет</td></tr>
+<tr><td><code>invokespecial</code></td><td>конструкторы <code>&lt;init&gt;</code>, <code>super.m()</code>, (до Java 11) private-методы</td><td>без виртуальной диспетчеризации: вызывается ровно указанная реализация</td></tr>
+<tr><td><code>invokevirtual</code></td><td>обычные методы классов</td><td>по фактическому классу получателя через <b>vtable</b></td></tr>
+<tr><td><code>invokeinterface</code></td><td>методы через ссылку интерфейсного типа</td><td>по фактическому классу через <b>itable</b></td></tr>
+<tr><td><code>invokedynamic</code></td><td>лямбды, конкатенация строк, records, switch по шаблонам</td><td>при первом выполнении <b>bootstrap-метод</b> возвращает CallSite, дальше вызывается его цель</td></tr>
+</table></div>
+<p>Перегрузка (overload) решается <b>компилятором</b>: в байткоде уже записан конкретный дескриптор. Переопределение (override) — <b>JVM во время выполнения</b> по классу объекта. Поэтому <code>void f(Object o)</code> и <code>void f(String s)</code> выбираются по статическому типу аргумента, а <code>animal.speak()</code> — по реальному классу.</p>
+
+<h2 id="vtable"><span class="h-num">4.2</span>vtable: виртуальный вызов за один переход</h2>
+<p>У каждого класса в metaspace есть <b>таблица виртуальных методов</b>: массив указателей на реализации. Подкласс копирует таблицу родителя, заменяет ячейки переопределённых методов и дописывает новые в конец. Номер ячейки метода одинаков во всей иерархии — поэтому <code>invokevirtual</code> = «взять класс объекта → vtable[индекс] → перейти».</p>
+<div class="widget" id="vtW">
+  <div class="widget-title">Иерархия Animal → Dog → Puppy и Animal → Cat</div>
+  <div class="controls">
+    <label>статический тип ссылки<select id="vtS"><option>Animal</option><option>Dog</option></select></label>
+    <label>фактический объект<select id="vtR"><option>Animal</option><option selected>Dog</option><option>Puppy</option><option>Cat</option></select></label>
+    <label>вызов<select id="vtM"><option value="speak">speak()</option><option value="eat">eat()</option><option value="fetch">fetch()</option><option value="toString">toString()</option></select></label>
+  </div>
+  <div class="table-wrap"><table id="vtT"></table></div>
+  <div class="verdict" id="vtV"></div>
+</div>
+<script>
+(function () {
+  var parent = { Animal: "Object", Dog: "Animal", Puppy: "Dog", Cat: "Animal" };
+  var own = { Object: ["equals", "hashCode", "toString", "finalize"], Animal: ["speak", "eat"], Dog: ["speak", "fetch"], Puppy: ["speak", "toString"], Cat: ["speak"] };
+  var $ = function (i) { return document.getElementById(i); };
+  function vt(c) {
+    if (c === "Object") return own.Object.map(function (m) { return [m, "Object"]; });
+    var t = vt(parent[c]).map(function (x) { return x.slice(); });
+    own[c].forEach(function (m) { var i = t.findIndex(function (x) { return x[0] === m; }); if (i >= 0) t[i] = [m, c]; else t.push([m, c]); });
+    return t;
+  }
+  function isA(c, s) { while (c) { if (c === s) return true; c = parent[c]; } return false; }
+  function run() {
+    var s = $("vtS").value, r = $("vtR").value, m = $("vtM").value, cls = ["Animal", "Dog", "Puppy", "Cat"], tabs = {};
+    cls.forEach(function (c) { tabs[c] = vt(c); });
+    var rows = Math.max.apply(null, cls.map(function (c) { return tabs[c].length; }));
+    var stIdx = tabs[s].findIndex(function (x) { return x[0] === m; });
+    var h = "<tr><th>#</th>" + cls.map(function (c) { return "<th>" + c + " vtable</th>"; }).join("") + "</tr>";
+    for (var i = 0; i < rows; i++) h += "<tr><td>" + i + "</td>" + cls.map(function (c) { var x = tabs[c][i]; var hl = c === r && i === stIdx ? ' style="background:var(--accent-soft);font-weight:700"' : ""; return "<td" + hl + ">" + (x ? x[0] + " → " + x[1] : "") + "</td>"; }).join("") + "</tr>";
+    $("vtT").innerHTML = h;
+    var v = $("vtV");
+    if (!isA(r, s)) { v.className = "verdict bad"; v.textContent = "Нельзя: " + r + " не является " + s + " — присваивание не скомпилируется (а при обмане через приведение — ClassCastException на checkcast)."; return; }
+    if (stIdx < 0) { v.className = "verdict bad"; v.textContent = "Ошибка компиляции: у типа " + s + " нет метода " + m + "(). Компилятор ищет метод в статическом типе, даже если объект — " + r + "."; return; }
+    var impl = tabs[r][stIdx][1];
+    v.className = "verdict ok"; v.textContent = "javac записал invokevirtual " + s + "." + m + ":()… При разрешении вычислен индекс vtable = " + stIdx + ". Во время выполнения: класс объекта " + r + " → vtable[" + stIdx + "] → реализация из " + impl + ". Индекс одинаков для всех подклассов " + s + ".";
+  }
+  ["vtS", "vtR", "vtM"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p><b>itable</b> устроена сложнее: класс может реализовывать много интерфейсов, и у одного метода интерфейса нет фиксированного номера во всех классах. Поэтому <code>invokeinterface</code> сначала ищет в классе блок нужного интерфейса, затем ячейку в нём — чуть дороже. На практике разница почти исчезает: JIT ставит <b>inline cache</b> (запоминает класс получателя в месте вызова) и встраивает метод, если на этом месте встречается 1–2 класса (мономорфный и биморфный вызов, тема 17).</p>
+<div class="callout info"><span class="c-title">final и private</span>
+<code>final</code> на методе не ускоряет вызов в современной JVM: JIT по иерархии загруженных классов (Class Hierarchy Analysis) сам видит, что переопределений нет, и при загрузке подкласса откатывает оптимизацию. С Java 11 вызовы private-методов между вложенными классами (nestmates) компилируются в <code>invokevirtual</code>/<code>invokeinterface</code> без синтетических методов доступа <code>access$000</code>.
+</div>
+
+<h2 id="indy"><span class="h-num">4.3</span>invokedynamic</h2>
+<p>Появился в Java 7 для динамических языков, а стал главным механизмом самой Java. Идея: инструкция в байткоде указывает на <b>bootstrap-метод</b> (в атрибуте <code>BootstrapMethods</code>) и дескриптор. При первом выполнении JVM вызывает bootstrap-метод, тот возвращает <code>CallSite</code> с целевым <code>MethodHandle</code>, и место вызова навсегда связывается с этой целью. JIT видит цель как константу и встраивает её.</p>
+<div class="widget stepper" id="lamSim">
+  <div class="widget-title">Что происходит при первом выполнении <code>Runnable r = () -&gt; System.out.println("x");</code></div>
+  <div class="flow st-stage">
+    <div class="node" id="lJavac"><b>javac</b></div><span class="to">→</span>
+    <div class="node" id="lIndy"><b>invokedynamic</b></div><span class="to">→</span>
+    <div class="node" id="lBsm"><b>LambdaMetafactory</b></div><span class="to">→</span>
+    <div class="node" id="lHidden"><b>скрытый класс</b></div><span class="to">→</span>
+    <div class="node" id="lSite"><b>CallSite</b></div>
+  </div>
+  <section class="st-step" data-t="Компиляция" data-hl="lJavac" data-log="javac: тело лямбды → private static void lambda$lambda$0(); на месте лямбды — invokedynamic #1:run:()Ljava/lang/Runnable;"><p>javac выносит тело лямбды в private-метод того же класса (<code>lambda$lambda$0</code>; если лямбда захватывает <code>this</code> — экземплярный), а на месте лямбды ставит <code>invokedynamic</code> с дескриптором «вернуть Runnable», аргументы которого — захваченные переменные. Анонимного класса в jar нет.</p></section>
+  <section class="st-step" data-t="Первое выполнение" data-hl="lIndy lBsm" data-log="JVM: разрешение indy → вызов bootstrap LambdaMetafactory.metafactory(Lookup, «run», ()Runnable, ()V, MH lambda$lambda$0, ()V)"><p>JVM разрешает инструкцию: вызывает bootstrap-метод <code>LambdaMetafactory.metafactory</code> с объектом <code>Lookup</code> (правами доступа вызывающего класса), именем метода интерфейса, сигнатурами и <code>MethodHandle</code> на <code>lambda$lambda$0</code>.</p></section>
+  <section class="st-step" data-t="Генерация класса" data-hl="lHidden" data-log="InnerClassLambdaMetafactory: генерирует Ops$$Lambda/0x… implements Runnable → Lookup.defineHiddenClass"><p>Фабрика генерирует байткод класса, реализующего <code>Runnable</code>, метод <code>run</code> которого вызывает <code>lambda$lambda$0</code>, и определяет его как <b>скрытый класс</b> (hidden class, Java 15+): без имени в загрузчике, выгружаемый, недоступный по <code>Class.forName</code>.</p></section>
+  <section class="st-step" data-t="Связывание" data-hl="lSite" data-log="ConstantCallSite(target): лямбда без захвата → всегда один и тот же объект-синглтон"><p>Возвращается <code>ConstantCallSite</code>. Для лямбды без захваченных переменных цель возвращает один и тот же объект при каждом выполнении (поэтому <code>==</code> между двумя вычислениями такой лямбды обычно истинно — но полагаться на это нельзя); с захватом — новый объект с полями.</p></section>
+  <section class="st-step" data-t="Дальше — быстро" data-hl="lIndy lSite" data-log="последующие выполнения: прямой вызов цели CallSite; JIT встраивает её как константу"><p>Повторные выполнения не вызывают bootstrap: место вызова уже связано. Цена «первого раза» — генерация класса (заметна при старте: тысячи лямбд Spring-приложения; помогает CDS/AOT cache, тема 20).</p></section>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Где используется indy</th><th>Bootstrap</th></tr>
+<tr><td>лямбды и ссылки на методы</td><td><code>LambdaMetafactory.metafactory</code></td></tr>
+<tr><td>конкатенация строк (Java 9+)</td><td><code>StringConcatFactory.makeConcatWithConstants</code></td></tr>
+<tr><td><code>toString/equals/hashCode</code> records</td><td><code>ObjectMethods.bootstrap</code></td></tr>
+<tr><td>switch по шаблонам и enum (Java 21)</td><td><code>SwitchBootstraps.typeSwitch</code></td></tr>
+<tr><td>динамические константы (<code>ldc</code> CONSTANT_Dynamic)</td><td><code>ConstantBootstraps</code></td></tr>
+<tr><td>Groovy, JRuby, Kotlin, Nashorn</td><td>собственные</td></tr>
+</table></div>
+
+<h2 id="mh"><span class="h-num">4.4</span>MethodHandle против рефлексии</h2>
+<pre data-title="вызов метода по имени: два способа"><code class="java">// рефлексия: проверка доступа и упаковка аргументов на каждом вызове (до Java 18)
+Method m = Point.class.getDeclaredMethod("dist", Point.class);
+double d1 = (double) m.invoke(p1, p2);
+
+// MethodHandle: доступ проверяется один раз при поиске, вызов типизирован
+static final MethodHandle DIST = MethodHandles.lookup()
+    .findVirtual(Point.class, "dist", MethodType.methodType(double.class, Point.class));
+double d2 = (double) DIST.invokeExact(p1, p2);   // static final → JIT встраивает как прямой вызов</code></pre>
+<p>С Java 18 (JEP 416) сама рефлексия реализована поверх MethodHandle. Правило производительности: держите <code>MethodHandle</code> в <code>static final</code> поле — тогда JIT считает его константой и встраивает цель.</p>
+
+<h2 id="linkage"><span class="h-num">4.5</span>Ошибки связывания</h2>
+<div class="table-wrap"><table>
+<tr><th>Ошибка</th><th>Когда</th><th>Типичная причина</th></tr>
+<tr><td><code>NoSuchMethodError</code></td><td>при разрешении вызова</td><td>код скомпилирован против одной версии библиотеки, а в рантайме другая: метод удалён или сменился дескриптор (даже только возвращаемый тип!)</td></tr>
+<tr><td><code>NoSuchFieldError</code></td><td>при разрешении поля</td><td>то же для полей</td></tr>
+<tr><td><code>IncompatibleClassChangeError</code></td><td>при разрешении</td><td>класс стал интерфейсом или наоборот, метод стал статическим</td></tr>
+<tr><td><code>AbstractMethodError</code></td><td>при вызове</td><td>класс скомпилирован против старого интерфейса без нового метода</td></tr>
+<tr><td><code>IllegalAccessError</code></td><td>при разрешении</td><td>метод стал private, модуль не экспортирует пакет</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Бинарная совместимость</span>
+Классическая ситуация: две библиотеки зависят от разных версий третьей, Maven выбрал одну (nearest wins) — компиляция прошла, а в рантайме <code>NoSuchMethodError</code>. Диагностика: <code>mvn dependency:tree -Dverbose</code>, <code>-verbose:class</code> (откуда загружен класс), плагин maven-enforcer (dependencyConvergence).
+</div>
+
+<h2 id="quiz"><span class="h-num">4.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой инструкцией вызывается <code>super.toString()</code>?</p><ul><li>invokevirtual</li><li>invokespecial</li><li>invokestatic</li><li>invokedynamic</li></ul><div class="why">Нужна ровно реализация родителя, без виртуальной диспетчеризации.</div></div>
+<div class="mcq" data-ok="3"><p>Где выбирается перегруженный метод <code>print(Object)</code> против <code>print(String)</code>?</p><ul><li>JVM по фактическому типу аргумента</li><li>JIT</li><li>Загрузчик классов</li><li>javac по статическому типу аргумента — в байткоде уже конкретный дескриптор</li></ul><div class="why">Перегрузка — статически, переопределение — динамически.</div></div>
+<div class="mcq" data-ok="0"><p>Во что компилируется лямбда <code>() -&gt; work()</code>?</p><ul><li>Private-метод с телом + invokedynamic, который при первом выполнении создаёт скрытый класс через LambdaMetafactory</li><li>Анонимный внутренний класс в jar</li><li>Вызов рефлексии</li><li>Ничего, лямбды интерпретируются</li></ul><div class="why">Поэтому в jar нет классов вида Outer$1 для лямбд.</div></div>
+<div class="mcq" data-ok="2"><p>Приложение упало с <code>NoSuchMethodError: …Builder.build()Lcom/x/Client;</code>, хотя метод build() есть. Причина?</p><ul><li>Метод private</li><li>Не хватает памяти</li><li>В рантайме версия библиотеки, где build() возвращает другой тип — дескриптор не совпадает</li><li>Ошибка JIT</li></ul><div class="why">Дескриптор включает возвращаемый тип.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните, как работает виртуальный вызов в HotSpot от байткода до машинного кода.</summary><div class="a"><p>javac записывает invokevirtual с символической ссылкой на метод статического типа. При первом выполнении ссылка разрешается в индекс vtable. Интерпретатор берёт класс объекта (klass pointer в заголовке) → vtable[индекс] → переход. JIT собирает профиль типов получателей в этом месте: если тип один (мономорфный) — проверка класса + встроенный код метода; два — две проверки; больше (мегаморфный) — обычный переход через vtable без встраивания.</p></div></details>
+<details class="q"><summary>Зачем invokedynamic для конкатенации строк, если StringBuilder работал?</summary><div class="a"><p>Стратегия склейки зашита в байткод при StringBuilder и не может улучшаться без перекомпиляции. С indy байткод только описывает рецепт и типы аргументов, а реализацию выбирает рантайм текущей версии JDK: точный предрасчёт длины, без лишних копий и промежуточных буферов. Улучшения JDK ускоряют старые class-файлы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

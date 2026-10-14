@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Производительность TCP</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ТРАНСПОРТ · РОАДМАП m5, s6</div>
+  <h1>Производительность TCP</h1>
+  <p class="lead">Почему новое соединение медленное, а «прогретое» быстрое, откуда загадочные задержки в 40 мс, почему 1% потерь режет скорость в разы и что поменял BBR. Эта тема объясняет, зачем нужны пулы соединений, keep-alive и HTTP/2.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">симулятор cwnd</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">7.1</span>Зачем управлять перегрузкой</h2>
+<p>В 1986 году пропускная способность части ARPANET упала примерно в тысячу раз: отправители при потерях повторяли пакеты ещё агрессивнее и забивали очереди маршрутизаторов (<b>congestion collapse</b>). Ван Джекобсон добавил в TCP <b>окно перегрузки</b> (<code>cwnd</code>) — сколько неподтверждённых данных отправитель позволяет себе держать в сети. Сеть не сообщает свою ёмкость, поэтому TCP её <b>угадывает</b>: увеличивает cwnd, пока не начнутся потери (или рост задержки), и уменьшает при перегрузке.</p>
+<p>Скорость отправки ≈ <code>min(cwnd, окно получателя) / RTT</code>.</p>
+
+<h2 id="phases"><span class="h-num">7.2</span>Slow start и congestion avoidance</h2>
+<div class="table-wrap"><table>
+<tr><th>Фаза</th><th>Правило</th><th>Смысл</th></tr>
+<tr><td><b>Slow start</b></td><td>начинаем с <code>initcwnd</code> = 10 сегментов (~14 КБ, RFC 6928); +1 сегмент на каждый ACK ⇒ cwnd <b>удваивается каждый RTT</b></td><td>быстро нащупать ёмкость; «медленный» — только по сравнению с отправкой всего сразу</td></tr>
+<tr><td><b>Congestion avoidance</b></td><td>после порога <code>ssthresh</code>: +1 сегмент за RTT (линейно)</td><td>аккуратно приближаться к пределу</td></tr>
+<tr><td><b>Потеря (3 дубля ACK)</b></td><td>ssthresh = cwnd/2, cwnd = ssthresh (fast recovery)</td><td>мультипликативное уменьшение: AIMD</td></tr>
+<tr><td><b>Таймаут RTO</b></td><td>cwnd = 1, снова slow start</td><td>сеть «потерялась» — начинаем заново</td></tr>
+</table></div>
+
+<div class="widget" id="cw">
+  <div class="widget-title">Симулятор окна перегрузки (Reno-подобный)</div>
+  <div class="controls">
+    <label>RTT, мс <input type="number" id="cwRtt" value="50" min="1"></label>
+    <label>initcwnd <input type="number" id="cwInit" value="10" min="1"></label>
+    <label>ssthresh <input type="number" id="cwSs" value="64" min="2"></label>
+    <label>потери на раундах <input id="cwLoss" value="9, 17" style="width:90px;font:inherit;font-size:14px;padding:5px 8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)"></label>
+    <label>ответ, КБ <input type="number" id="cwSize" value="500" min="1"></label>
+  </div>
+  <svg id="cwSvg" viewBox="0 0 760 260" style="width:100%;height:auto;background:var(--bg);border-radius:8px"></svg>
+  <div class="log" id="cwOut" style="margin-top:10px"></div>
+</div>
+<script>
+(function(){
+  function $(i){return document.getElementById(i);}
+  function run(){
+    var rtt=+$("cwRtt").value||50, cw=+$("cwInit").value||10, ss=+$("cwSs").value||64;
+    var loss=$("cwLoss").value.split(/[ ,;]+/).map(Number).filter(function(x){return x>0;});
+    var size=(+$("cwSize").value||500)*1024, MSS=1460, rounds=24, pts=[], sent=0, doneAt=null, c=cw, s=ss;
+    for(var r=1;r<=rounds;r++){
+      pts.push({r:r,c:c,loss:loss.indexOf(r)>=0,ss:c<s});
+      sent+=c*MSS; if(doneAt===null&&sent>=size) doneAt=r;
+      if(loss.indexOf(r)>=0){ s=Math.max(2,Math.floor(c/2)); c=s; }
+      else if(c<s){ c=Math.min(c*2,s); } else { c=c+1; }
+    }
+    var max=Math.max.apply(null,pts.map(function(p){return p.c;}))*1.1, W=700, H=200, x0=50, y0=220;
+    var g='<line x1="'+x0+'" y1="'+y0+'" x2="'+(x0+W)+'" y2="'+y0+'" stroke="var(--line)"/><line x1="'+x0+'" y1="20" x2="'+x0+'" y2="'+y0+'" stroke="var(--line)"/>';
+    var ssY=y0-ss/max*H; g+='<line x1="'+x0+'" y1="'+ssY+'" x2="'+(x0+W)+'" y2="'+ssY+'" stroke="var(--warn)" stroke-dasharray="5 4"/><text x="'+(x0+W-4)+'" y="'+(ssY-5)+'" text-anchor="end" font-size="11" fill="var(--warn)">начальный ssthresh = '+ss+'</text>';
+    var path=pts.map(function(p,i){return (i?"L":"M")+(x0+(p.r-1)/(rounds-1)*W).toFixed(1)+" "+(y0-p.c/max*H).toFixed(1);}).join(" ");
+    g+='<path d="'+path+'" fill="none" stroke="var(--accent)" stroke-width="2.5"/>';
+    pts.forEach(function(p){var x=x0+(p.r-1)/(rounds-1)*W, y=y0-p.c/max*H;
+      g+='<circle cx="'+x+'" cy="'+y+'" r="'+(p.loss?6:3)+'" fill="'+(p.loss?"var(--bad)":(p.ss?"var(--info)":"var(--ok)"))+'"/>';
+      if(p.r%2===1) g+='<text x="'+x+'" y="'+(y0+16)+'" text-anchor="middle" font-size="10" fill="var(--fg-muted)">'+p.r+'</text>';});
+    if(doneAt){var dx=x0+(doneAt-1)/(rounds-1)*W; g+='<line x1="'+dx+'" y1="20" x2="'+dx+'" y2="'+y0+'" stroke="var(--ok)" stroke-dasharray="3 3"/><text x="'+(dx+4)+'" y="32" font-size="11" fill="var(--ok)">ответ доставлен</text>';}
+    g+='<text x="'+(x0-8)+'" y="24" text-anchor="end" font-size="10" fill="var(--fg-muted)">'+Math.round(max)+'</text><text x="'+(x0+W/2)+'" y="'+(y0+32)+'" text-anchor="middle" font-size="11" fill="var(--fg-muted)">раунды (RTT)   <tspan fill="var(--info)">●</tspan> slow start  <tspan fill="var(--ok)">●</tspan> avoidance  <tspan fill="var(--bad)">●</tspan> потеря</text>';
+    $("cwSvg").innerHTML=g;
+    var total=doneAt?(doneAt+1)*rtt:null;
+    $("cwOut").textContent="Ответ "+Math.round(size/1024)+" КБ = "+Math.ceil(size/MSS)+" сегментов.\n"+
+      (doneAt?"Новое соединение: 1 RTT рукопожатие TCP + "+doneAt+" RTT передачи ≈ "+total+" мс (без TLS и DNS).\n":"Не уложились в "+rounds+" раундов.\n")+
+      "Пропускная способность канала здесь не важна: время определяют RTT и рост cwnd.\nНа прогретом соединении с большим cwnd тот же ответ ушёл бы за 1 RTT = "+rtt+" мс.";
+  }
+  document.addEventListener("DOMContentLoaded",function(){["cwRtt","cwInit","cwSs","cwLoss","cwSize"].forEach(function(i){$(i).addEventListener("input",run);});run();});
+})();
+</script>
+<p><b>Выводы для бэкенда</b>: (1) новое соединение — это рукопожатия плюс медленный старт; (2) первые ~14 КБ ответа приходят за один RTT — поэтому критичный для рендеринга HTML стараются уместить в них; (3) переиспользование соединений (keep-alive, пулы, HTTP/2) экономит не только рукопожатия, но и разгон cwnd. Учтите: в Linux после простоя дольше RTO окно сбрасывается (<code>net.ipv4.tcp_slow_start_after_idle=1</code>), для долгоживущих соединений между сервисами его часто отключают.</p>
+
+<h2 id="algos"><span class="h-num">7.3</span>CUBIC и BBR</h2>
+<div class="grid-2">
+  <div class="card"><h4>CUBIC (по умолчанию в Linux)</h4><p>Loss-based: сигнал перегрузки — потеря пакета. Рост окна по кубической функции от времени с последней потери: быстро возвращается к прежнему уровню, осторожно проходит вокруг него. Минус — заполняет буферы маршрутизаторов до потери: растёт задержка (<b>bufferbloat</b>), а случайные потери (Wi-Fi, мобильные сети) ошибочно трактуются как перегрузка.</p></div>
+  <div class="card"><h4>BBR (Google)</h4><p>Model-based: оценивает пропускную способность узкого места и минимальный RTT и держит в сети примерно BDP данных, не заполняя очереди. Лучше на каналах со случайными потерями и длинных маршрутах, ниже задержка. Используется в сетях Google, YouTube, многих CDN; в Linux включается <code>net.ipv4.tcp_congestion_control=bbr</code>. Версии v2/v3 исправляют несправедливость к CUBIC-потокам.</p></div>
+</div>
+<p><b>ECN</b>: маршрутизатор вместо отбрасывания пакета ставит в IP-заголовке метку «перегрузка», получатель передаёт её отправителю, и тот снижает скорость без потерь. Широко используется в дата-центрах (DCTCP).</p>
+
+<h2 id="loss"><span class="h-num">7.4</span>Потери, BDP и буферы</h2>
+<p>Для loss-based алгоритмов действует оценка Матиса: <code>throughput ≈ MSS / (RTT · √p)</code>, где p — доля потерь. При RTT 100 мс и потерях 1% предел одного потока — порядка 1–1,5 Мбит/с, как бы широк ни был канал. Отсюда: потери губительнее для далёких серверов, и много параллельных потоков (как в торрентах или менеджерах загрузок) суммарно быстрее одного.</p>
+<p>Чтобы загрузить канал, буферы сокетов должны вмещать BDP. 1 Гбит/с × 80 мс (Европа–США) = 10 МБ. Linux по умолчанию автоматически подстраивает буферы (autotuning, пределы в <code>net.ipv4.tcp_rmem/wmem</code>). В Java явный <code>socket.setReceiveBufferSize()</code> <b>отключает</b> автоподстройку для этого сокета — без замеров лучше не трогать. Для межрегиональной репликации или Kafka MirrorMaker размеры буферов настраивают осознанно.</p>
+
+<h2 id="nagle"><span class="h-num">7.5</span>Nagle, delayed ACK и 40 мс</h2>
+<ul>
+  <li><b>Алгоритм Нейгла</b>: пока есть неподтверждённые данные, мелкие порции копятся в буфере и не отправляются — защита сети от тысяч крошечных пакетов (наследие telnet).</li>
+  <li><b>Delayed ACK</b>: получатель ждёт до ~40 мс (Linux) / 200 мс (Windows), чтобы подтвердить два сегмента одним ACK или «подвезти» ACK вместе с ответом.</li>
+  <li><b>Вместе</b>: клиент пишет запрос двумя вызовами <code>write</code> (заголовки, затем тело). Первая часть ушла, вторую держит Nagle до ACK, а получатель задерживает ACK, ожидая продолжения. Итог — лишние 40 мс на каждый запрос. Решение: <code>TCP_NODELAY</code> (в Java <code>socket.setTcpNoDelay(true)</code>; Netty, большинство HTTP-клиентов и драйверов БД включают его по умолчанию) и запись сообщения одним буфером.</li>
+</ul>
+
+<h2 id="keepalive"><span class="h-num">7.6</span>TCP keepalive</h2>
+<p><code>SO_KEEPALIVE</code> отправляет пробные пакеты по простаивающему соединению, чтобы обнаружить «мёртвого» собеседника и удержать запись в NAT/файрволе. По умолчанию в Linux первая проба — через <b>2 часа</b> простоя, что бесполезно против NAT с таймаутом в минуты. Решения: уменьшить <code>tcp_keepalive_time</code> на уровне ОС или сокета (Java 11+: <code>ExtendedSocketOptions.TCP_KEEPIDLE</code>), а чаще — прикладной heartbeat (ping/pong WebSocket, HTTP/2 PING, проверка соединений в пуле).</p>
+
+<h2 id="sim"><span class="h-num">7.7</span>Интерактив: потолок скорости TCP</h2>
+<div class="widget" id="thW">
+  <div class="widget-title">Калькулятор: что ограничивает скорость передачи</div>
+  <div class="controls">
+    <label>канал, Мбит/с<input type="number" id="thBw" value="1000" min="0.1" step="any" style="width:100px"></label>
+    <label>RTT, мс<input type="number" id="thRtt" value="80" min="0.1" step="any"></label>
+    <label>потери пакетов, %<input type="number" id="thLoss" value="0.1" min="0" max="50" step="any"></label>
+    <label>окно приёма, КБ<input type="number" id="thWin" value="64" min="1" style="width:90px"></label>
+    <label>алгоритм<select id="thAlg"><option value="cubic">CUBIC / Reno (реагирует на потери)</option><option value="bbr">BBR (оценивает полосу и RTT)</option></select></label>
+  </div>
+  <div class="controls"><button class="btn" type="button" data-p="1000,80,0.1,64">межконтинентальный канал</button><button class="btn" type="button" data-p="1000,80,0.1,4096">то же, окно 4 МБ</button><button class="btn" type="button" data-p="10000,0.5,0,4096">внутри дата-центра</button><button class="btn" type="button" data-p="50,40,2,1024">Wi-Fi с потерями 2%</button></div>
+  <div id="thBars"></div>
+  <div class="verdict" id="thOut"></div>
+</div>
+<script>
+(function () {
+  var ids = ["thBw", "thRtt", "thLoss", "thWin"], $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var bw = Math.max(0.1, +$("thBw").value), rtt = Math.max(0.1, +$("thRtt").value) / 1000, loss = Math.max(0, +$("thLoss").value) / 100, win = Math.max(1, +$("thWin").value) * 1024, bbr = $("thAlg").value === "bbr";
+    var byWin = win * 8 / rtt / 1e6, byLoss = loss > 0 ? (1460 * 8 * 1.22 / (rtt * Math.sqrt(loss))) / 1e6 : Infinity;
+    if (bbr && loss < 0.15) byLoss = Infinity;
+    var bdp = bw * 1e6 / 8 * rtt, lim = [["Полоса канала", bw], ["Окно приёма: окно / RTT", byWin], [bbr ? "Потери (BBR их почти не замечает до ~15%)" : "Потери: формула Мэтиса MSS·1,22 / (RTT·√p)", byLoss]];
+    var res = Math.min(bw, byWin, byLoss), max = bw;
+    $("thBars").innerHTML = lim.map(function (l) { var v = Math.min(l[1], bw * 1.0); return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px;flex-wrap:wrap"><span><b>' + l[0] + '</b></span><span style="font-family:var(--font-mono)">' + (l[1] === Infinity ? "не ограничивает" : l[1].toFixed(l[1] < 10 ? 2 : 0) + " Мбит/с") + '</span></div><div class="bar ' + (l[1] <= res ? "bad" : "ok") + '"><i style="width:' + Math.max(1, v / max * 100) + '%"></i></div>'; }).join("");
+    var who = res === bw ? "полоса канала" : (res === byWin ? "окно приёма" : "потери"), o = $("thOut"), tip;
+    if (who === "окно приёма") tip = "Отправитель не может держать «в полёте» больше окна, а подтверждения возвращаются через RTT. Чтобы заполнить канал, окно должно быть не меньше BDP = полоса × RTT = " + (bdp / 1024).toFixed(0) + " КБ. Проверьте масштабирование окна и net.ipv4.tcp_rmem.";
+    else if (who === "потери") tip = "Каждая потеря CUBIC/Reno считают перегрузкой и сужают окно. На длинных каналах даже 0,1% потерь режут скорость в разы. BBR не опирается на потери и на таких линиях многократно быстрее.";
+    else tip = "TCP использует канал полностью.";
+    o.className = "verdict " + (who === "полоса канала" ? "ok" : "warn");
+    o.innerHTML = "Достижимая скорость одного соединения ≈ <b>" + res.toFixed(res < 10 ? 2 : 0) + " Мбит/с</b> из " + bw + ". Ограничивает: " + who + ". " + tip;
+  }
+  ids.forEach(function (i) { $(i).addEventListener("input", run); }); $("thAlg").addEventListener("change", run);
+  document.querySelectorAll("#thW [data-p]").forEach(function (b) { b.addEventListener("click", function () { b.getAttribute("data-p").split(",").forEach(function (v, k) { $(ids[k]).value = v; }); run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">7.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сервис отправляет маленькие запросы и получает ответы с задержкой ровно ~40 мс при RTT 1 мс. Что проверить?</p><ul><li>DNS</li><li>Размер MTU</li><li>Взаимодействие алгоритма Нейгла и отложенных ACK; включить TCP_NODELAY</li><li>Версию TLS</li></ul><div class="why">Нейгл держит маленький сегмент, пока не подтверждён предыдущий, а получатель откладывает ACK на 40 мс.</div></div>
+<div class="mcq" data-ok="1"><p>Что делает TCP slow start?</p><ul><li>Медленно закрывает соединение</li><li>Начинает с малого окна перегрузки и удваивает его каждый RTT, пока не встретит потерю или порог</li><li>Замедляет передачу ночью</li><li>Ограничивает число соединений</li></ul><div class="why">Поэтому новое соединение сначала медленное: первые ~14 КБ (10 сегментов) уходят сразу, остальное ждёт подтверждений. Отсюда выигрыш от keep-alive.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем включать TCP keepalive (или прикладные пинги) на долгих соединениях?</p><ul><li>Чтобы обнаруживать «мёртвые» соединения и не давать NAT/файрволу удалить запись по простою</li><li>Чтобы ускорить передачу</li><li>Чтобы шифровать трафик</li><li>Чтобы увеличить окно</li></ul><div class="why">По умолчанию в Linux первый keepalive уходит через 2 часа — это нужно перенастраивать.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему запрос 100 КБ к сервису в соседнем регионе идёт быстрее по уже открытому соединению, даже без учёта рукопожатий?</summary><div class="a"><p>У нового соединения cwnd = 10 сегментов: 100 КБ ≈ 70 сегментов потребуют 3 RTT slow start (10 + 20 + 40). У прогретого соединения окно уже большое — ответ уходит за 1 RTT (если окно не сбросилось после простоя).</p></div></details>
+<details class="q"><summary>Чем flow control отличается от congestion control?</summary><div class="a"><p>Flow control — окно получателя (rwnd) в заголовке TCP: не переполнить буфер получателя. Congestion control — окно перегрузки (cwnd), которое отправитель вычисляет сам: не перегрузить сеть. Отправляется min(rwnd, cwnd).</p></div></details>
+<details class="q"><summary>Откуда стабильные дополнительные 40 мс на каждом запросе между двумя сервисами?</summary><div class="a"><p>Классическое сочетание Nagle и delayed ACK при записи запроса несколькими мелкими write. Проверить — tcpdump (пауза перед второй частью) и флаг TCP_NODELAY. Лечится TCP_NODELAY и сборкой сообщения в один буфер.</p></div></details>
+<details class="q"><summary>Почему BBR лучше CUBIC на мобильных сетях?</summary><div class="a"><p>В радиосетях потери часто случайные, а не из-за перегрузки. CUBIC на каждую потерю вдвое уменьшает окно и недогружает канал; BBR опирается на измеренную пропускную способность и RTT, и случайные потери на него почти не влияют. Он также не раздувает очереди, поэтому задержка ниже.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JVM изнутри — карта курса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="00">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">УЧЕБНОЕ ПОСОБИЕ · 23 ТЕМЫ · HOTSPOT JDK 17–25</div>
+  <h1>JVM изнутри: от class-файла до продакшена</h1>
+  <p class="lead">Полный разбор виртуальной машины Java для разработчика: что лежит в class-файле и как исполняется байткод, как загрузчики классов находят, связывают и инициализируют классы, как устроены объекты в памяти и как их убирают сборщики мусора, что делает JIT и почему он иногда откатывается, как работают потоки, блокировки и safepoints — и как всё это диагностировать и настраивать в контейнерах. Цель — для любого странного поведения Java-программы назвать <b>механизм JVM</b>, который его вызывает.</p>
+  <div class="meta"><span class="tag">Русский язык</span><span class="tag">Побайтовый разбор class-файла</span><span class="tag">40+ симуляторов</span><span class="tag">Тренажёр на 36 вопросов</span><span class="tag">Прогресс сохраняется в браузере</span></div>
+</header>
+
+<h2 id="map">Путь кода через JVM</h2>
+<figure class="diagram">
+<svg viewBox="0 0 820 420" role="img" aria-label="Путь кода через подсистемы JVM">
+  <rect x="20" y="15" width="180" height="60" rx="9" class="box"/>
+  <text x="110" y="40" text-anchor="middle" font-weight="700">.java → javac</text>
+  <text x="110" y="60" text-anchor="middle" class="mono" font-size="12">class-файл · 02–04</text>
+  <rect x="230" y="15" width="570" height="60" rx="9" class="box-acc"/>
+  <text x="250" y="40" font-weight="700">Загрузка классов · 05–08</text>
+  <text x="250" y="60" class="mono" font-size="12">загрузчики → верификация → подготовка → разрешение → &lt;clinit&gt; · модули</text>
+
+  <rect x="20" y="95" width="380" height="120" rx="9" class="box-info"/>
+  <text x="40" y="120" font-weight="700">Память · 09–11</text>
+  <text x="40" y="145" class="mono" font-size="12">metaspace: метаданные классов</text>
+  <text x="40" y="165" class="mono" font-size="12">куча: объекты (заголовок, поля, TLAB)</text>
+  <text x="40" y="185" class="mono" font-size="12">стеки потоков: кадры методов</text>
+  <text x="40" y="205" class="mono" font-size="12">code cache, direct, нативное</text>
+
+  <rect x="420" y="95" width="380" height="120" rx="9" class="box-ok"/>
+  <text x="440" y="120" font-weight="700">Исполнение · 03, 16–19</text>
+  <text x="440" y="145" class="mono" font-size="12">интерпретатор (уровень 0)</text>
+  <text x="440" y="165" class="mono" font-size="12">C1 + профиль → C2 (встраивание, EA)</text>
+  <text x="440" y="185" class="mono" font-size="12">деоптимизация · safepoints · мониторы</text>
+  <text x="440" y="205" class="mono" font-size="12">JNI и FFM API</text>
+
+  <rect x="20" y="235" width="780" height="70" rx="9" class="box-warn"/>
+  <text x="40" y="262" font-weight="700">Сборка мусора · 12–15</text>
+  <text x="40" y="285" class="mono" font-size="12">корни и достижимость · поколения · G1 / ZGC / Shenandoah / Parallel · логи · OOM · слабые ссылки</text>
+
+  <rect x="20" y="325" width="780" height="70" rx="9" class="box-bad"/>
+  <text x="40" y="352" font-weight="700">Эксплуатация · 01, 20–23</text>
+  <text x="40" y="375" class="mono" font-size="12">запуск и эргономика · CDS/AOT cache/CRaC/native image · jcmd/JFR/профилировщики · контейнеры</text>
+</svg>
+<figcaption>Класс загружается и связывается, его метаданные живут в metaspace, объекты — в куче; код исполняет интерпретатор или JIT, память возвращает сборщик мусора; всё это наблюдается и настраивается инструментами JDK.</figcaption>
+</figure>
+
+<h2 id="route">Маршрут</h2>
+<p>Темы 01–06 — фундамент: идите по порядку. Блоки «Память», «Сборка мусора» и «Исполнение» можно читать в любом порядке, но 12 стоит пройти до 13. Эксплуатационные темы 20–22 опираются на всё предыдущее; тема 23 — проверка себя.</p>
+<div class="roadmap">
+  <a class="rm-item" data-rm="01" href="01-architecture.html"><span class="rm-num">01</span><div><h3>Архитектура JVM и запуск</h3><p>Спецификация и HotSpot, подсистемы, запуск по шагам, эргономика, флаги. Калькулятор настроек по умолчанию</p></div><span class="tag tier j">Junior</span></a>
+  <a class="rm-item" data-rm="02" href="02-class-file.html"><span class="rm-num">02</span><div><h3>Формат class-файла</h3><p>Пул констант, дескрипторы, атрибуты. Побайтовый просмотрщик настоящего class-файла с поломками</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="03" href="03-bytecode.html"><span class="rm-num">03</span><div><h3>Байткод и стековая машина</h3><p>Кадры, стек операндов, набор инструкций, во что компилируется Java. Симулятор интерпретатора</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="04" href="04-invocation.html"><span class="rm-num">04</span><div><h3>Вызовы методов и invokedynamic</h3><p>vtable и itable, лямбды через LambdaMetafactory, MethodHandle, ошибки связывания</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="05" href="05-classloaders.html"><span class="rm-num">05</span><div><h3>Загрузчики классов</h3><p>Иерархия и делегирование, идентичность класса, CNFE против NCDFE, контекстный загрузчик. Симулятор делегирования</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="06" href="06-linking-init.html"><span class="rm-num">06</span><div><h3>Линковка и инициализация</h3><p>Верификация, ленивое разрешение, правила &lt;clinit&gt;, holder idiom, взаимоблокировка инициализации. Тренажёр</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="07" href="07-custom-loaders.html"><span class="rm-num">07</span><div><h3>Свои загрузчики и утечки</h3><p>defineClass, горячая перезагрузка, Spring Boot jar, Tomcat, ServiceLoader, утечки metaspace, агенты</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="08" href="08-modules.html"><span class="rm-num">08</span><div><h3>Модули и слои</h3><p>exports и opens, безымянный и автоматические модули, --add-opens, jlink, ModuleLayer</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="09" href="09-runtime-areas.html"><span class="rm-num">09</span><div><h3>Области памяти</h3><p>Стеки, куча, metaspace, code cache, direct, NMT. Калькулятор памяти процесса</p></div><span class="tag tier j">Junior</span></a>
+  <a class="rm-item" data-rm="10" href="10-object-layout.html"><span class="rm-num">10</span><div><h3>Объект в памяти</h3><p>Mark word, compressed oops и обрыв на 32 ГБ, compact headers, раскладка полей как в JOL</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="11" href="11-allocation.html"><span class="rm-num">11</span><div><h3>Выделение памяти</h3><p>TLAB и bump pointer, большие объекты, escape analysis, темп выделения. Симулятор eden</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="12" href="12-gc-basics.html"><span class="rm-num">12</span><div><h3>Сборка мусора: основы</h3><p>Корни, пометка и уплотнение, поколения, card table, трёхцветная пометка. Симулятор графа объектов</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="13" href="13-gc-collectors.html"><span class="rm-num">13</span><div><h3>Сборщики</h3><p>Serial, Parallel, G1 в симуляторе регионов, ZGC с цветными указателями, Shenandoah. Мастер выбора</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="14" href="14-gc-tuning.html"><span class="rm-num">14</span><div><h3>Логи GC и OOM</h3><p>Чтение логов, утечка против малой кучи, виды OutOfMemoryError, анализ дампа в MAT</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="15" href="15-references.html"><span class="rm-num">15</span><div><h3>Слабые ссылки и Cleaner</h3><p>Soft/Weak/Phantom, ReferenceQueue, ловушки WeakHashMap, finalize против Cleaner</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="16" href="16-interpreter-jit.html"><span class="rm-num">16</span><div><h3>Интерпретатор и JIT</h3><p>Уровни компиляции, пороги, OSR, PrintCompilation, прогрев. Симулятор tiered compilation</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="17" href="17-jit-optimizations.html"><span class="rm-num">17</span><div><h3>Оптимизации JIT</h3><p>Встраивание, мономорфные и мегаморфные вызовы, интринсики, SIMD, деоптимизация</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="18" href="18-threads-locks.html"><span class="rm-num">18</span><div><h3>Потоки, safepoints, блокировки</h3><p>Time-to-safepoint, handshakes, устройство synchronized, виртуальные потоки изнутри</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="19" href="19-native.html"><span class="rm-num">19</span><div><h3>JNI и Foreign Function API</h3><p>Переход Java ↔ C, ссылки JNI, FFM API, арены, jextract, судьба Unsafe</p></div><span class="tag tier s">Senior</span></a>
+  <a class="rm-item" data-rm="20" href="20-startup.html"><span class="rm-num">20</span><div><h3>Быстрый старт</h3><p>CDS, AOT cache (Java 24–25), CRaC, GraalVM Native Image — сравнение по сценариям</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="21" href="21-diagnostics.html"><span class="rm-num">21</span><div><h3>Диагностика</h3><p>jcmd, дампы потоков, расследование 100% CPU, интерактивный флеймграф, JFR</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="22" href="22-containers.html"><span class="rm-num">22</span><div><h3>JVM в контейнерах</h3><p>cgroups, генератор флагов под лимиты пода, троттлинг, образ, корректное завершение</p></div><span class="tag tier m">Middle</span></a>
+  <a class="rm-item" data-rm="23" href="23-practice.html"><span class="rm-num">23</span><div><h3>Практикум и собеседование</h3><p>Тренажёр на 36 вопросов, задачи на вывод, разбор инцидентов, итоговый тест</p></div><span class="tag tier s">Senior</span></a>
+</div>
+
+<h2 id="method">Как работать с пособием</h2>
+<ol class="steps">
+  <li><b>Смотрите своими глазами.</b> Почти каждое утверждение курса проверяется инструментами JDK: <code>javap -v</code>, <code>-Xlog:class+load</code>, <code>-XX:+PrintCompilation</code>, <code>-Xlog:gc*</code>, <code>jcmd</code>, JFR. Повторяйте примеры на своём JDK 21+.</li>
+  <li><b>Предсказывайте до шага симулятора</b> и до кнопки «Показать ответ» — так проверяется модель в голове.</li>
+  <li><b>Читайте исходники HotSpot</b> там, где интересно: <code>src/hotspot/share</code> в репозитории openjdk/jdk — classfile, oops, gc, opto (C2), runtime.</li>
+  <li><b>Пройдите тренажёр</b> темы 23 до конца и вернитесь к темам, где «Повторить».</li>
+  <li>Отмечайте темы изученными — прогресс виден в меню слева.</li>
+</ol>
+
+<div class="callout info">
+  <span class="c-title">Версии</span>
+  Основа — HotSpot JDK 21 (LTS) с отметками об изменениях в 22–25: FFM API (22), AOT cache (24–25), компактные заголовки (24–25), synchronized и виртуальные потоки (24), поколенческий ZGC (21+). Внутренние детали (пороги, размеры, имена флагов) приведены для HotSpot x86-64/AArch64 Linux и могут отличаться в других версиях и реализациях — проверяйте <code>-XX:+PrintFlagsFinal</code>.
+</div>
+
+<h2 id="sources">Первоисточники</h2>
+<div class="table-wrap"><table>
+<tr><th>Источник</th><th>Зачем</th></tr>
+<tr><td>The Java Virtual Machine Specification (JVMS), главы 2–6</td><td>Формат class-файла, загрузка, линковка, инициализация, инструкции — формально.</td></tr>
+<tr><td>Исходники OpenJDK (github.com/openjdk/jdk), HotSpot Wiki, JEP-ы</td><td>Как на самом деле; каждый JEP объясняет мотивацию изменения.</td></tr>
+<tr><td>A. Шипилёв: «JVM Anatomy Quarks», доклады о JMM, GC и JIT</td><td>Короткие точные разборы внутренностей HotSpot с экспериментами.</td></tr>
+<tr><td>S. Oaks, «Java Performance» (2-е изд.); B. Evans и др., «Optimizing Java»</td><td>GC, JIT, профилирование и настройка на практике.</td></tr>
+<tr><td>Документация Oracle «HotSpot Virtual Machine Garbage Collection Tuning Guide», JDK Mission Control</td><td>Настройка сборщиков и работа с JFR.</td></tr>
+<tr><td>Соседние пособия: Java Core, Java Concurrency, Spring</td><td>Язык и коллекции, модель памяти и конкурентность, Spring поверх загрузчиков, прокси и AOT.</td></tr>
+</table></div>
+
+</div></main>
+</div>
+</body>
+</html>

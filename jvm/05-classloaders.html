@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Загрузчики классов и делегирование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ЗАГРУЗКА КЛАССОВ</div>
+  <h1>Загрузчики классов и делегирование</h1>
+  <p class="lead">Класс попадает в JVM лениво — при первом обращении — и всегда через загрузчик. Загрузчики образуют иерархию и по умолчанию сначала спрашивают родителя. Это обеспечивает единственность <code>java.lang.String</code>, но рождает и самые запутанные ошибки: <code>ClassCastException: Foo cannot be cast to Foo</code>, <code>NoClassDefFoundError</code> при наличии класса в jar, «не тот» класс из чужой библиотеки. Симулятор делегирования покажет, кто и откуда загрузит класс.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">bootstrap/platform/app</span><span class="tag">parent-first</span><span class="tag">идентичность класса</span><span class="tag">CNFE vs NCDFE</span><span class="tag">context loader</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="phases"><span class="h-num">5.1</span>Жизненный цикл класса</h2>
+<div class="flow">
+  <div class="node acc"><b>Loading</b><small>найти байты, создать Class</small></div><span class="to">→</span>
+  <div class="node info"><b>Verification</b></div><span class="to">→</span>
+  <div class="node info"><b>Preparation</b></div><span class="to">→</span>
+  <div class="node info"><b>Resolution</b><small>часто лениво</small></div><span class="to">→</span>
+  <div class="node ok"><b>Initialization</b><small>&lt;clinit&gt;</small></div><span class="to">→</span>
+  <div class="node"><b>Use</b></div><span class="to">→</span>
+  <div class="node warn"><b>Unloading</b><small>вместе с загрузчиком</small></div>
+</div>
+<p>Эта тема — про <b>загрузку</b>: найти байты класса по имени и превратить их в объект <code>Class</code> и метаданные в metaspace. Линковка и инициализация — тема 06.</p>
+
+<h2 id="hierarchy"><span class="h-num">5.2</span>Иерархия загрузчиков (Java 9+)</h2>
+<div class="table-wrap"><table>
+<tr><th>Загрузчик</th><th>Что загружает</th><th>В Java</th></tr>
+<tr><td><b>Bootstrap</b></td><td><code>java.base</code> и другие ядровые модули (java.lang, java.util…), из <code>lib/modules</code></td><td>написан на C++, <code>String.class.getClassLoader() == null</code></td></tr>
+<tr><td><b>Platform</b> (бывший Extension)</td><td>модули платформы: java.sql, java.xml.crypto, jdk.httpserver…</td><td><code>ClassLoader.getPlatformClassLoader()</code></td></tr>
+<tr><td><b>Application / System</b></td><td>classpath (<code>-cp</code>) и module path приложения</td><td><code>ClassLoader.getSystemClassLoader()</code>, класс <code>jdk.internal.loader.ClassLoaders$AppClassLoader</code></td></tr>
+<tr><td><b>Пользовательские</b></td><td>что угодно: jar внутри jar (Spring Boot), war (Tomcat), плагины, сгенерированный код</td><td>наследники <code>ClassLoader</code>/<code>URLClassLoader</code> (тема 07)</td></tr>
+</table></div>
+<pre data-title="ClassLoader.loadClass — модель делегирования (упрощённо)"><code class="java">protected Class&lt;?&gt; loadClass(String name, boolean resolve) throws ClassNotFoundException {
+    synchronized (getClassLoadingLock(name)) {               // параллельные загрузчики — блокировка на имя
+        Class&lt;?&gt; c = findLoadedClass(name);                  // 1. уже загружал?
+        if (c == null) {
+            try {
+                c = parent != null ? parent.loadClass(name, false)   // 2. сначала родитель
+                                   : findBootstrapClassOrNull(name);
+            } catch (ClassNotFoundException ignored) { }
+            if (c == null) c = findClass(name);              // 3. только потом сам (переопределяют это)
+        }
+        if (resolve) resolveClass(c);
+        return c;
+    }
+}</code></pre>
+
+<h2 id="sim"><span class="h-num">5.3</span>Симулятор делегирования</h2>
+<div class="widget" id="clW">
+  <div class="widget-title">Кто загрузит класс?</div>
+  <div class="controls">
+    <label>запрашиваемый класс<select id="clC" class="wide">
+      <option value="java.lang.String">java.lang.String</option>
+      <option value="java.sql.Connection">java.sql.Connection</option>
+      <option value="com.shop.OrderService">com.shop.OrderService (в app.jar)</option>
+      <option value="com.fasterxml.jackson.databind.ObjectMapper">ObjectMapper (в app.jar v2.15 и в plugin.jar v2.17)</option>
+      <option value="org.example.plugin.Main">org.example.plugin.Main (только в plugin.jar)</option>
+      <option value="com.shop.Missing">com.shop.Missing (нигде нет)</option>
+      <option value="java.lang.Hacked">java.lang.Hacked (в plugin.jar)</option>
+    </select></label>
+    <label>начинаем с загрузчика<select id="clL"><option value="app">Application</option><option value="plugin" selected>PluginClassLoader (родитель — app)</option></select></label>
+    <label>стратегия плагина<select id="clS"><option value="parent">parent-first (стандарт)</option><option value="child">child-first (как в Tomcat для webapp)</option></select></label>
+  </div>
+  <div class="flow" id="clFlow"></div>
+  <div class="log" id="clLog"></div>
+  <div class="verdict" id="clV"></div>
+</div>
+<script>
+(function () {
+  var HAS = {
+    boot: { "java.lang.String": "lib/modules (java.base)" },
+    platform: { "java.sql.Connection": "lib/modules (java.sql)" },
+    app: { "com.shop.OrderService": "app.jar", "com.fasterxml.jackson.databind.ObjectMapper": "jackson-databind-2.15.jar" },
+    plugin: { "com.fasterxml.jackson.databind.ObjectMapper": "plugin.jar → jackson-databind-2.17.jar", "org.example.plugin.Main": "plugin.jar", "java.lang.Hacked": "plugin.jar" }
+  };
+  var NAME = { boot: "Bootstrap", platform: "Platform", app: "Application", plugin: "PluginClassLoader" };
+  var PARENT = { plugin: "app", app: "platform", platform: "boot", boot: null };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var c = $("clC").value, start = $("clL").value, strat = $("clS").value, log = [], used = [], res = null, err = null;
+    function find(l) { log.push(NAME[l] + ".findClass(\"" + c + "\") → " + (HAS[l][c] ? "найден в " + HAS[l][c] : "нет")); used.push(l); return HAS[l][c] ? l : null; }
+    function load(l, depth) {
+      var ind = "  ".repeat(depth);
+      log.push(ind + NAME[l] + ".loadClass: findLoadedClass → нет");
+      if (l === "plugin" && strat === "child" && !/^java\./.test(c)) {
+        log.push(ind + "child-first: сначала ищу у себя");
+        var me = find(l); if (me) return me;
+        log.push(ind + "у себя нет → делегирую родителю"); return PARENT[l] ? load(PARENT[l], depth + 1) : null;
+      }
+      if (PARENT[l]) { log.push(ind + "→ делегирую родителю " + NAME[PARENT[l]]); var r = load(PARENT[l], depth + 1); if (r) return r; log.push(ind + "родитель не нашёл → ищу сам"); }
+      return find(l);
+    }
+    if (/^java\./.test(c) && HAS.plugin[c] && !HAS.boot[c]) {
+      res = load(start, 0);
+      if (res === "plugin" || (strat === "child" && start === "plugin")) err = "java.lang.SecurityException: Prohibited package name: java.lang — пакеты java.* может определять только bootstrap/platform загрузчик";
+    } else res = load(start, 0);
+    $("clFlow").innerHTML = ["plugin", "app", "platform", "boot"].map(function (l) { var cls = res === l && !err ? "ok" : used.indexOf(l) >= 0 ? "info" : l === "plugin" && start === "app" ? "off" : ""; return '<div class="node ' + cls + '"><b>' + NAME[l] + "</b></div>"; }).join('<span class="to">→</span>');
+    $("clLog").textContent = log.join("\n");
+    var v = $("clV");
+    if (err) { v.className = "verdict bad"; v.textContent = err; }
+    else if (!res) { v.className = "verdict bad"; v.textContent = "ClassNotFoundException: " + c + " — ни один загрузчик цепочки не нашёл байты. Если же класс был доступен при компиляции другого класса, при его использовании возникнет NoClassDefFoundError."; }
+    else {
+      var note = "";
+      if (/ObjectMapper/.test(c)) note = res === "app" ? " Плагин получил Jackson 2.15 из приложения, хотя принёс свой 2.17: при parent-first побеждает родитель. Если плагин вызывает метод из 2.17 — NoSuchMethodError." : " Плагин использует свой Jackson 2.17, приложение — 2.15. Это два разных класса ObjectMapper: передать объект из плагина в приложение и привести к ObjectMapper — ClassCastException «ObjectMapper cannot be cast to ObjectMapper».";
+      if (start === "app" && /plugin/.test(c)) note = "";
+      v.className = "verdict ok"; v.textContent = "Определяющий загрузчик: " + NAME[res] + " (" + HAS[res][c] + "). Инициирующий: " + NAME[start] + "." + note;
+    }
+  }
+  ["clC", "clL", "clS"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="identity"><span class="h-num">5.4</span>Идентичность класса = имя + загрузчик</h2>
+<p>В JVM класс однозначно определяется парой <b>(полное имя, определяющий загрузчик)</b>. Один и тот же байткод, загруженный двумя загрузчиками, даёт два разных класса с разными статическими полями, и объекты одного нельзя привести к другому.</p>
+<pre data-title="ClassCastException: com.x.Foo cannot be cast to com.x.Foo"><code class="java">URL[] urls = { Path.of("lib/foo.jar").toUri().toURL() };
+try (var l1 = new URLClassLoader(urls, null); var l2 = new URLClassLoader(urls, null)) {   // родитель null → bootstrap
+    Class&lt;?&gt; a = l1.loadClass("com.x.Foo"), b = l2.loadClass("com.x.Foo");
+    System.out.println(a == b);                       // false
+    Object foo = a.getDeclaredConstructor().newInstance();
+    b.cast(foo);                                      // ClassCastException: class com.x.Foo cannot be cast to class com.x.Foo
+                                                      //   (com.x.Foo is in unnamed module of loader URLClassLoader @1b6d3586; …@4554617c)
+}</code></pre>
+<div class="callout info"><span class="c-title">Определяющий и инициирующий загрузчик</span>
+<b>Определяющий</b> (defining) — тот, кто вызвал <code>defineClass</code>; его возвращает <code>getClassLoader()</code>. <b>Инициирующий</b> (initiating) — тот, у кого спросили; при делегировании их может быть несколько. JVM проверяет <b>loader constraints</b>: если два загрузчика видят под одним именем разные классы там, где сигнатура метода их связывает, будет <code>LinkageError: loader constraint violation</code> — защита от подмены типов.
+</div>
+
+<h2 id="errors"><span class="h-num">5.5</span>ClassNotFoundException против NoClassDefFoundError</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th><code>ClassNotFoundException</code></th><th><code>NoClassDefFoundError</code></th></tr>
+<tr><td>Тип</td><td>проверяемое исключение</td><td>Error (LinkageError)</td></tr>
+<tr><td>Когда</td><td>явная загрузка по имени: <code>Class.forName</code>, <code>loadClass</code>, ServiceLoader</td><td>неявная: JVM разрешает ссылку из байткода на класс, который был при компиляции</td></tr>
+<tr><td>Причины</td><td>нет jar в classpath, опечатка в имени, не тот загрузчик</td><td>нет jar в рантайме; <b>или</b> класс есть, но его <code>&lt;clinit&gt;</code> ранее упал — тогда «Could not initialize class X» (первопричина — <code>ExceptionInInitializerError</code> выше в логе)</td></tr>
+</table></div>
+
+<h2 id="forname"><span class="h-num">5.6</span>Class.forName, loadClass и контекстный загрузчик</h2>
+<div class="table-wrap"><table>
+<tr><th>Вызов</th><th>Загрузчик</th><th>Инициализирует?</th></tr>
+<tr><td><code>Class.forName("X")</code></td><td>загрузчик вызывающего класса</td><td>да (выполнит static-блоки)</td></tr>
+<tr><td><code>Class.forName("X", false, loader)</code></td><td>указанный</td><td>нет</td></tr>
+<tr><td><code>loader.loadClass("X")</code></td><td>указанный</td><td>нет</td></tr>
+<tr><td><code>X.class</code></td><td>загрузчик текущего класса</td><td>нет</td></tr>
+</table></div>
+<p><b>Контекстный загрузчик потока</b> (<code>Thread.getContextClassLoader()</code>) решает проблему «родитель должен загрузить класс ребёнка»: библиотека, загруженная высоко (например, JDBC <code>DriverManager</code> или JAXB в bootstrap/platform), не видит классы приложения через свой загрузчик. Поэтому фреймворки берут контекстный загрузчик, который сервер приложений или Spring Boot выставляет в загрузчик приложения. Проблемы: пулы потоков с чужим контекстным загрузчиком, <code>ForkJoinPool.commonPool</code> (у его потоков — системный загрузчик), утечки в серверах приложений.</p>
+<pre data-title="откуда загружен класс"><code class="txt">java -verbose:class -jar app.jar | grep ObjectMapper
+# [class,load] com.fasterxml.jackson.databind.ObjectMapper source: jar:file:/app/lib/jackson-databind-2.15.2.jar!/
+
+jcmd &lt;pid&gt; VM.classloaders                    # дерево загрузчиков с числом классов
+jcmd &lt;pid&gt; VM.classloader_stats
+System.out.println(ObjectMapper.class.getProtectionDomain().getCodeSource().getLocation());</code></pre>
+
+<h2 id="quiz"><span class="h-num">5.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему нельзя подменить <code>java.lang.String</code>, положив свою версию в classpath?</p><ul><li>JVM проверяет подпись класса</li><li>String final</li><li>Делегирование: app-загрузчик сначала спросит родителей, и bootstrap вернёт настоящий String; к тому же определять java.* может только платформа</li><li>Classpath читается после запуска</li></ul><div class="why">Parent-first — основа безопасности и единственности ядра.</div></div>
+<div class="mcq" data-ok="0"><p><code>ClassCastException: com.x.Foo cannot be cast to com.x.Foo</code>. Причина?</p><ul><li>Класс загружен двумя разными загрузчиками — это два разных класса</li><li>Ошибка компилятора</li><li>Разные версии Java</li><li>Нехватка памяти</li></ul><div class="why">Идентичность = имя + определяющий загрузчик. Частый случай — devtools/hot reload и плагины.</div></div>
+<div class="mcq" data-ok="3"><p>NoClassDefFoundError: Could not initialize class com.x.Config. Где искать первопричину?</p><ul><li>В classpath — класса нет</li><li>В версии JDK</li><li>В правах доступа</li><li>Выше в логе: ExceptionInInitializerError при первой попытке выполнить static-инициализатор</li></ul><div class="why">После неудачной инициализации класс помечается ошибочным навсегда.</div></div>
+<div class="mcq" data-ok="1"><p>Чем <code>Class.forName("X")</code> отличается от <code>loader.loadClass("X")</code>?</p><ul><li>Ничем</li><li>forName по умолчанию инициализирует класс (static-блоки), loadClass — только загружает</li><li>loadClass не использует делегирование</li><li>forName работает только для JDK</li></ul><div class="why">Старые JDBC-драйверы регистрировались в static-блоке — отсюда Class.forName("…Driver").</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните модель делегирования и зачем иногда её нарушают.</summary><div class="a"><p>Загрузчик сначала проверяет свой кэш, затем просит родителя и только если тот не нашёл — ищет сам. Это даёт единственность классов ядра и безопасность. Нарушают (child-first) в контейнерах, где приложению нужно использовать свои версии библиотек, отличные от библиотек контейнера: веб-приложения в Tomcat, плагины, OSGi. Цена — риск двух копий одного класса и ClassCastException/LinkageError на границах.</p></div></details>
+<details class="q"><summary>Когда класс загружается, если он используется в коде?</summary><div class="a"><p>Лениво: при первом активном использовании, требующем класс — создание экземпляра, вызов статического метода, обращение к статическому полю, рефлексия, загрузка подкласса (суперкласс грузится раньше). Простое упоминание типа в сигнатуре или объявление переменной не загружает класс, хотя верификатор иногда загружает классы для проверки присваиваний. Увидеть порядок можно через -verbose:class.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

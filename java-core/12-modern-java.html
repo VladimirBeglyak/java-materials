@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Современная Java</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ФУНКЦИОНАЛЬНЫЙ СТИЛЬ</div>
+  <h1>Современная Java: records, sealed, pattern matching</h1>
+  <p class="lead">После Java 8 язык изменился сильнее, чем за предыдущие пятнадцать лет. Записи, запечатанные иерархии и сопоставление с образцом вместе дают новый способ моделировать данные — компактный и проверяемый компилятором. Глава о том, что появилось между 9-й и 25-й версиями и как этим пользоваться.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">record</span><span class="tag">sealed</span><span class="tag">switch</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="timeline"><span class="h-num">12.1</span>Что и когда появилось</h2>
+<div class="table-wrap"><table>
+<tr><th>Версия</th><th>Язык</th><th>Библиотека и платформа</th></tr>
+<tr><td>9</td><td>Приватные методы в интерфейсах</td><td>Модули; <code>List.of</code>, <code>Map.of</code>; компактные строки; G1 по умолчанию; <code>jshell</code></td></tr>
+<tr><td>10</td><td><code>var</code> для локальных переменных</td><td><code>List.copyOf</code></td></tr>
+<tr><td><b>11 LTS</b></td><td><code>var</code> в параметрах лямбд</td><td>HTTP-клиент; <code>String.isBlank</code>, <code>strip</code>, <code>lines</code>, <code>repeat</code>; <code>Files.readString</code>; запуск исходника</td></tr>
+<tr><td>14</td><td><b>switch-выражения</b></td><td>Подробные сообщения NPE</td></tr>
+<tr><td>15</td><td><b>Text blocks</b></td><td>—</td></tr>
+<tr><td>16</td><td><b>Records</b>; <code>instanceof</code> с образцом</td><td><code>Stream.toList()</code></td></tr>
+<tr><td><b>17 LTS</b></td><td><b>Sealed-классы</b></td><td>Внутренности JDK закрыты для рефлексии</td></tr>
+<tr><td>18</td><td>—</td><td>UTF-8 по умолчанию</td></tr>
+<tr><td><b>21 LTS</b></td><td><b>Образцы в switch</b>; record patterns</td><td>Виртуальные потоки; sequenced collections; поколенческий ZGC</td></tr>
+<tr><td>22</td><td>Безымянные переменные и образцы <code>_</code></td><td>Foreign Function &amp; Memory API</td></tr>
+<tr><td>24</td><td>—</td><td>Stream gatherers; <code>synchronized</code> больше не привязывает виртуальный поток</td></tr>
+<tr><td><b>25 LTS</b></td><td>Компактные исходные файлы; гибкие тела конструкторов; импорт модулей</td><td><code>ScopedValue</code>; компактные заголовки объектов</td></tr>
+</table></div>
+
+<h2 id="var"><span class="h-num">12.2</span>var</h2>
+<p><code>var</code> просит компилятор вывести тип локальной переменной из инициализатора. Это не динамическая типизация: тип определяется при компиляции раз и навсегда.</p>
+<pre><code class="java">var orders = new HashMap&lt;String, List&lt;Order&gt;&gt;();    // хорошо: тип очевиден справа, слева не дублируется
+for (var entry : orders.entrySet()) { … }
+try (var reader = Files.newBufferedReader(path)) { … }
+
+var result = service.process(data);    // плохо: читатель не знает тип, пока не откроет метод
+var list = new ArrayList&lt;&gt;();          // ловушка: выведется ArrayList&lt;Object&gt;
+var count = 1;                         // int; для long нужно 1L
+
+var x;                                 // ошибка: нет инициализатора
+var n = null;                          // ошибка: тип не выводится
+var f = () -&gt; 42;                      // ошибка: лямбде нужен целевой тип</code></pre>
+<p><code>var</code> разрешён только для локальных переменных, переменных циклов и параметров лямбд — не для полей, параметров методов и возвращаемых типов. Критерий: с <code>var</code> код должен читаться не хуже, чем без него.</p>
+
+<h2 id="switch"><span class="h-num">12.3</span>switch-выражения</h2>
+<div class="grid-2">
+<pre data-title="старый switch" class="bad-code"><code class="java">int days;
+switch (month) {
+    case FEBRUARY:
+        days = 28;
+        break;
+    case APRIL:
+    case JUNE:
+        days = 30;
+        break;       // забыли break — «провалились» дальше
+    default:
+        days = 31;
+}</code></pre>
+<pre data-title="switch-выражение" class="good-code"><code class="java">int days = switch (month) {
+    case FEBRUARY -&gt; 28;
+    case APRIL, JUNE, SEPTEMBER, NOVEMBER -&gt; 30;
+    default -&gt; {
+        log.debug("длинный месяц");
+        yield 31;      // значение из блока
+    }
+};</code></pre>
+</div>
+<ul>
+  <li><b>Стрелка <code>-&gt;</code></b> исключает «проваливание»: выполняется ровно одна ветка.</li>
+  <li><b>Выражение возвращает значение</b>, поэтому переменную можно сделать <code>final</code>.</li>
+  <li><b>Полнота.</b> Выражение обязано покрывать все варианты. Для <code>enum</code> и sealed-типов <code>default</code> можно не писать — и тогда добавление новой константы станет <b>ошибкой компиляции</b> во всех местах, где её забыли обработать. Это главная причина не писать <code>default</code> «на всякий случай».</li>
+</ul>
+
+<h2 id="records"><span class="h-num">12.4</span>Records</h2>
+<p>Запись — класс, единственное назначение которого — нести неизменяемые данные. Объявление перечисляет компоненты; остальное создаёт компилятор.</p>
+<pre><code class="java">public record Money(BigDecimal amount, String currency) {
+
+    public Money {                                   // компактный конструктор: проверка и нормализация
+        Objects.requireNonNull(currency);
+        if (amount.signum() &lt; 0) throw new IllegalArgumentException("отрицательная сумма");
+        amount = amount.setScale(2, RoundingMode.HALF_EVEN);   // присваивание полям произойдёт после блока
+    }
+
+    public static Money rub(String amount) { return new Money(new BigDecimal(amount), "RUB"); }
+    public Money plus(Money other) { return new Money(amount.add(other.amount), currency); }
+}
+
+var price = Money.rub("99.90");
+price.amount();                       // метод доступа без приставки get
+price.equals(Money.rub("99.9"));      // true — сравнение по компонентам после нормализации
+System.out.println(price);            // Money[amount=99.90, currency=RUB]</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Что создаётся автоматически</th><th>Чего у записи быть не может</th></tr>
+<tr><td><code>private final</code> поле на каждый компонент</td><td>Других полей экземпляра</td></tr>
+<tr><td>Канонический конструктор</td><td>Родительского класса (запись неявно <code>final</code> и наследует <code>Record</code>)</td></tr>
+<tr><td>Методы доступа <code>amount()</code>, <code>currency()</code></td><td>Сеттеров — поля финальны</td></tr>
+<tr><td><code>equals</code>, <code>hashCode</code>, <code>toString</code> по всем компонентам</td><td>Наследников</td></tr>
+</table></div>
+<p>Запись может реализовывать интерфейсы, иметь статические поля и методы, дополнительные конструкторы (обязанные вызывать канонический) и вложенные типы.</p>
+<div class="grid-2">
+  <div class="card"><h4>Где использовать</h4><ul><li>DTO запросов и ответов, события, сообщения.</li><li>Объекты-значения: деньги, координаты, диапазон дат.</li><li>Составные ключи <code>HashMap</code>.</li><li>Возврат нескольких значений из метода.</li><li>Проекции запросов Spring Data.</li></ul></div>
+  <div class="card"><h4>Где не подходит</h4><ul><li>Сущности JPA: нужен конструктор без параметров, изменяемость, прокси.</li><li>Объекты с изменяемым состоянием и жизненным циклом.</li><li>Классы, которым нужно скрывать представление: компоненты записи — её публичный API.</li></ul></div>
+</div>
+<div class="callout warn"><span class="c-title">Запись неизменяема поверхностно</span>
+<pre><code class="java">record Team(String name, List&lt;String&gt; members) {
+    Team { members = List.copyOf(members); }      // без этой строки список можно изменить снаружи
+}</code></pre>
+Ссылка в поле финальна, но объект по ней — нет. Изменяемые компоненты копируют в компактном конструкторе (<a href="05-object-contract.html#immutable">тема 05</a>). И ещё: массив в компоненте ломает <code>equals</code> — массивы сравниваются по ссылке.
+</div>
+
+<h2 id="sealed"><span class="h-num">12.5</span>Sealed-типы</h2>
+<p>Запечатанный класс или интерфейс перечисляет всех, кому разрешено его наследовать. Иерархия становится закрытой: компилятор знает полный список вариантов.</p>
+<pre><code class="java">public sealed interface PaymentResult permits Success, Declined, Failed { }
+
+public record Success(String txId, BigDecimal amount) implements PaymentResult { }
+public record Declined(String reason) implements PaymentResult { }
+public record Failed(Exception cause, boolean retryable) implements PaymentResult { }</code></pre>
+<p>Каждый разрешённый наследник обязан объявить, что с ним дальше: <code>final</code> (записи финальны неявно), <code>sealed</code> — со своим списком, или <code>non-sealed</code> — снова открыт. Наследники должны находиться в том же модуле (или пакете); если они объявлены в том же файле, <code>permits</code> можно опустить.</p>
+<div class="callout info"><span class="c-title">Sealed + record = алгебраические типы данных</span>
+Запись — «и»: результат успеха состоит из идентификатора <i>и</i> суммы. Запечатанный интерфейс — «или»: результат платежа — это успех, <i>или</i> отказ, <i>или</i> сбой. Вместе они позволяют описать предметную область так, что недопустимые состояния невозможно выразить, а компилятор проверяет обработку всех вариантов. Сравните с классом из десяти допускающих <code>null</code> полей и поля <code>status</code>, где осмысленны три комбинации из тысячи.
+</div>
+
+<h2 id="patterns"><span class="h-num">12.6</span>Сопоставление с образцом</h2>
+<pre data-title="instanceof с образцом (Java 16)"><code class="java">if (obj instanceof String s &amp;&amp; !s.isBlank()) {     // проверка, приведение и объявление переменной сразу
+    return s.strip();
+}
+if (!(obj instanceof Order order)) return false;   // после этой строки order доступен</code></pre>
+<pre data-title="switch по типам, образцы записей, условия (Java 21)"><code class="java">String describe(PaymentResult result) {
+    return switch (result) {
+        case Success(String txId, var amount) when amount.signum() == 0 -&gt; "нулевой платёж " + txId;
+        case Success(String txId, var amount) -&gt; "оплачено " + amount + ", транзакция " + txId;
+        case Declined(var reason)             -&gt; "отклонено: " + reason;
+        case Failed(var cause, boolean retryable) when retryable -&gt; "временный сбой, повторить";
+        case Failed(_, _)                     -&gt; "ошибка, требуется разбор";      // _ — Java 22
+    };   // default не нужен: иерархия запечатана, компилятор проверил полноту
+}</code></pre>
+<ul>
+  <li><b>Образец записи</b> раскладывает объект на компоненты; образцы вкладываются: <code>case Line(Point(var x1, var y1), Point p2)</code>.</li>
+  <li><b><code>when</code></b> — дополнительное условие ветки.</li>
+  <li><b>Порядок важен.</b> Более частный образец должен стоять раньше общего; обратный порядок — ошибка компиляции («образец поглощён предыдущим»).</li>
+  <li><b><code>null</code>.</b> Обычный <code>switch</code> бросает NPE на <code>null</code>. С образцами можно написать <code>case null -&gt; …</code> или <code>case null, default -&gt; …</code>.</li>
+  <li><b>Добавили четвёртый вариант</b> в <code>permits</code> — все <code>switch</code> без <code>default</code> перестанут компилироваться и покажут, где требуется решение.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Когда это лучше полиморфизма</span>
+Классический приём — виртуальный метод <code>describe()</code> в каждом наследнике — хорош, когда поведение принадлежит самому типу. <code>switch</code> по запечатанной иерархии лучше, когда операций много и они относятся к разным слоям (форматирование для пользователя, сериализация, расчёт): не нужно раздувать доменные классы и писать Visitor.
+</div>
+
+<h2 id="more"><span class="h-num">12.7</span>Ещё полезное</h2>
+<div class="table-wrap"><table>
+<tr><th>Возможность</th><th>Пример</th><th>Где подробнее</th></tr>
+<tr><td>Text blocks</td><td><code>"""…"""</code> для SQL, JSON</td><td><a href="03-strings.html#api">тема 03</a></td></tr>
+<tr><td>Sequenced collections</td><td><code>list.getLast()</code>, <code>map.firstEntry()</code>, <code>reversed()</code></td><td><a href="08-collections.html#traps">тема 08</a></td></tr>
+<tr><td>Stream gatherers</td><td><code>gather(Gatherers.windowFixed(100))</code></td><td><a href="11-streams.html#gatherers">тема 11</a></td></tr>
+<tr><td>Гибкие тела конструкторов (25)</td><td>Проверка аргументов до <code>super(...)</code></td><td><a href="04-oop.html#init">тема 04</a></td></tr>
+<tr><td>Виртуальные потоки, <code>ScopedValue</code></td><td><code>Executors.newVirtualThreadPerTaskExecutor()</code></td><td><a href="../java-concurrency/10-virtual-threads.html">Java Concurrency, тема 10</a></td></tr>
+<tr><td>HTTP-клиент (11)</td><td><code>HttpClient.newHttpClient().send(request, BodyHandlers.ofString())</code></td><td>—</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Что ещё не окончательно</span>
+На момент Java 25 в статусе preview остаются примитивные типы в образцах и структурированная конкурентность. Строковые шаблоны (<code>STR."…"</code>) были preview в 21–22 и отозваны на переработку — в учебниках тех лет они ещё встречаются. Value-классы проекта Valhalla пока не вошли в язык.
+</div>
+
+<h2 id="lab"><span class="h-num">12.8</span>Интерактив: полнота switch по sealed-типу</h2>
+<pre><code class="java">sealed interface Shape permits Circle, Square, Rectangle { }
+record Circle(double r) implements Shape { }
+record Square(double a) implements Shape { }
+record Rectangle(double w, double h) implements Shape { }
+
+static double area(Shape s) {
+    return switch (s) {
+        /* выберите ветки ниже */
+    };
+}</code></pre>
+<div class="widget" id="swW">
+  <div class="widget-title">Проверка компилятором: исчерпывающий ли switch</div>
+  <div class="checks col">
+    <label><input type="checkbox" id="swTotal">case Shape sh -&gt; 0;  <span style="color:var(--fg-muted)">(первой веткой)</span></label>
+    <label><input type="checkbox" id="swC" checked>case Circle c -&gt; Math.PI * c.r() * c.r();</label>
+    <label><input type="checkbox" id="swS" checked>case Square q -&gt; q.a() * q.a();</label>
+    <label><input type="checkbox" id="swG">case Rectangle(double w, double h) when w == h -&gt; w * w;</label>
+    <label><input type="checkbox" id="swR">case Rectangle(double w, double h) -&gt; w * h;</label>
+    <label><input type="checkbox" id="swNull">case null -&gt; 0;</label>
+    <label><input type="checkbox" id="swDef">default -&gt; throw new IllegalStateException();</label>
+  </div>
+  <div class="verdict" id="swOut"></div>
+</div>
+<script>
+(function () {
+  var ids = ["swTotal", "swC", "swS", "swG", "swR", "swNull", "swDef"], $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var v = {}; ids.forEach(function (i) { v[i] = $(i).checked; });
+    var o = $("swOut"), msgs = [], cls = "ok";
+    if (v.swTotal && (v.swC || v.swS || v.swG || v.swR)) { o.className = "verdict bad"; o.innerHTML = "<b>Ошибка компиляции:</b> this case label is dominated by a preceding case label. <code>case Shape sh</code> совпадает с любым значением, следующие ветки недостижимы. Более общие образцы ставятся ниже частных."; return; }
+    if (v.swTotal && v.swDef) { o.className = "verdict bad"; o.innerHTML = "<b>Ошибка компиляции:</b> switch has both an unconditional pattern and a default label."; return; }
+    var covered = v.swTotal || v.swDef || (v.swC && v.swS && v.swR);
+    if (!covered) {
+      var miss = []; if (!v.swC) miss.push("Circle"); if (!v.swS) miss.push("Square"); if (!v.swR) miss.push("Rectangle" + (v.swG ? " (ветка с when покрывает только часть значений)" : ""));
+      o.className = "verdict bad"; o.innerHTML = "<b>Ошибка компиляции:</b> the switch expression does not cover all possible input values. Не покрыто: " + miss.join(", ") + ".";
+      return;
+    }
+    if (v.swDef && v.swC && v.swS && v.swR) { cls = "warn"; msgs.push("Компилируется, но default лишний и вреден: если добавить в permits новый тип Triangle, компилятор НЕ подскажет, что его надо обработать, — ошибка всплывёт в рантайме."); }
+    else if (v.swDef) { cls = "warn"; msgs.push("Компилируется за счёт default. Вы потеряли главное преимущество sealed-типов — проверку полноты компилятором."); }
+    else if (v.swTotal) msgs.push("Компилируется: безусловный образец покрывает всё.");
+    else msgs.push("Компилируется без default: компилятор знает все подтипы sealed-интерфейса. Добавление нового подтипа сделает этот switch ошибкой компиляции — и вы не забудете его обработать.");
+    if (v.swG && v.swR) msgs.push("Ветка с when стоит выше безусловной для Rectangle — так и нужно; в обратном порядке была бы ошибка доминирования.");
+    msgs.push(v.swNull ? "null обработан явной веткой." : "При s == null switch бросит NullPointerException (case null не указан).");
+    o.className = "verdict " + cls; o.innerHTML = msgs.map(SG.esc).join("<br>");
+  }
+  $("swW").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">12.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что record генерирует автоматически?</p><ul><li>Только геттеры</li><li>Геттеры и сеттеры</li><li>Канонический конструктор, методы доступа по именам компонентов, equals, hashCode, toString</li><li>Только toString</li></ul><div class="why">Поля private final, сеттеров нет. Методы доступа называются как компоненты: <code>point.x()</code>, не <code>getX()</code>.</div></div>
+<div class="mcq" data-ok="0"><p>Где нельзя использовать <code>var</code>?</p><ul><li>В полях класса, параметрах методов и без инициализатора</li><li>В цикле for-each</li><li>Для локальной переменной с инициализатором</li><li>В try-with-resources</li></ul><div class="why">var — вывод типа только для локальных переменных с инициализатором (и параметров лямбд). Тип остаётся статическим.</div></div>
+<div class="mcq" data-ok="1"><p>Чем switch-выражение отличается от старого оператора switch?</p><ul><li>Работает только со строками</li><li>Возвращает значение, не «проваливается» между ветками со стрелкой и обязан быть исчерпывающим</li><li>Ничем, кроме синтаксиса</li><li>Не поддерживает enum</li></ul><div class="why">Ветки <code>case X -&gt; …</code> не требуют break; для блока значение возвращает <code>yield</code>.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Делает ли <code>var</code> Java динамически типизированной?</summary><div class="a"><p>Нет. Тип выводится компилятором из инициализатора и фиксируется; присвоить переменной значение другого типа нельзя. <code>var</code> — сокращение записи, применимое только к локальным переменным.</p></div></details>
+<details class="q"><summary>Что компилятор создаёт для записи и чем запись отличается от обычного класса с Lombok @Value?</summary><div class="a"><p>Финальные поля, канонический конструктор, методы доступа, <code>equals</code>, <code>hashCode</code>, <code>toString</code>. В отличие от класса с Lombok, запись — конструкция языка: не требует обработчика аннотаций, не может иметь дополнительных полей и наследования, поддерживается образцами в <code>switch</code> и <code>instanceof</code>, безопаснее сериализуется.</p></div></details>
+<details class="q"><summary>Почему в switch по sealed-типу лучше не писать default?</summary><div class="a"><p>Без <code>default</code> компилятор проверяет, что перечислены все разрешённые наследники. Когда появится новый, код перестанет компилироваться во всех местах, требующих решения. С <code>default</code> новый вариант молча попадёт в общую ветку — ошибка обнаружится в продакшене.</p></div></details>
+<details class="q"><summary>Запись <code>record Report(String title, List&lt;Row&gt; rows)</code> — неизменяема ли она?</summary><div class="a"><p>Только поверхностно. Ссылку <code>rows</code> заменить нельзя, но сам список можно изменить через ссылку, оставшуюся у создателя, или через <code>report.rows().add(...)</code>. Нужна защитная копия в компактном конструкторе: <code>rows = List.copyOf(rows)</code>.</p></div></details>
+<details class="q"><summary>Что такое guard в образце и в каком порядке должны идти ветки?</summary><div class="a"><p>Условие после <code>when</code>, уточняющее ветку: <code>case Success s when s.amount().signum() == 0</code>. Ветки проверяются сверху вниз, поэтому более частные образцы (с условием, с подтипом) ставят раньше общих; если общий стоит выше и полностью покрывает частный, компилятор сообщит об ошибке.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

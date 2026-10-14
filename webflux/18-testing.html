@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Тестирование: StepVerifier и WebTestClient</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>Тестирование: StepVerifier и WebTestClient</h1>
+  <p class="lead">Реактивный код нельзя проверить, просто вызвав метод: он вернёт описание, а ошибка «утонет» в onError, если на неё не подписаться. <code>reactor-test</code> даёт StepVerifier — декларативную проверку последовательности сигналов, виртуальное время для тестов с задержками на сутки, TestPublisher и PublisherProbe. Для HTTP-слоя — WebTestClient и <code>@WebFluxTest</code>.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">StepVerifier</span><span class="tag">withVirtualTime</span><span class="tag">TestPublisher</span><span class="tag">PublisherProbe</span><span class="tag">WebTestClient</span><span class="tag">@WebFluxTest</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="stepverifier"><span class="h-num">18.1</span>StepVerifier</h2>
+<pre data-title="Базовые проверки"><code class="java">@Test
+void pricesAreConverted() {
+    StepVerifier.create(service.prices("EUR"))
+        .expectNext(new Price("A", 10))
+        .expectNextMatches(p -&gt; p.amount() &gt; 0)
+        .assertNext(p -&gt; assertThat(p.sku()).startsWith("B"))
+        .expectNextCount(3)
+        .verifyComplete();              // = expectComplete().verify() — именно verify() подписывается!
+}
+
+@Test
+void failsOnUnknownCurrency() {
+    StepVerifier.create(service.prices("XXX"))
+        .expectErrorSatisfies(e -&gt; assertThat(e).isInstanceOf(UnknownCurrency.class)
+                                               .hasMessageContaining("XXX"))
+        .verify(Duration.ofSeconds(5)); // таймаут: без него зависший поток подвесит тест
+}</code></pre>
+
+<h2 id="sim"><span class="h-num">18.2</span>Пройдёт ли тест?</h2>
+<div class="widget" id="svW">
+  <div class="widget-title">Издатель + сценарий StepVerifier → результат</div>
+  <div class="controls">
+    <label>Издатель<select id="svP">
+      <option value="A">Flux.just(1, 2, 3)</option>
+      <option value="B">Flux.just(1, 2).concatWith(Mono.error(new IllegalStateException("boom")))</option>
+      <option value="C">Mono.delay(Duration.ofDays(1)).thenReturn("x")</option>
+      <option value="D">Flux.interval(Duration.ofSeconds(1)).take(3)</option>
+    </select></label>
+    <label>Сценарий<select id="svS">
+      <option value="s1">expectNext(1, 2, 3).verifyComplete()</option>
+      <option value="s2">expectNext(1, 2).expectError(IllegalStateException.class).verify()</option>
+      <option value="s3">expectNextCount(3).verifyComplete()</option>
+      <option value="s4">withVirtualTime: thenAwait(Duration.ofDays(1)).expectNext("x").verifyComplete()</option>
+      <option value="s5">withVirtualTime: thenAwait(Duration.ofSeconds(3)).expectNext(0, 1, 2).verifyComplete()</option>
+      <option value="s6">expectNext(1).thenCancel().verify()</option>
+    </select></label>
+  </div>
+  <div class="out" id="svOut"></div>
+  <div class="verdict" id="svV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var P = {
+    A: [["n", "1", 0], ["n", "2", 0], ["n", "3", 0], ["c", "", 0]],
+    B: [["n", "1", 0], ["n", "2", 0], ["e", "IllegalStateException: boom", 0]],
+    C: [["n", "x", 86400], ["c", "", 86400]],
+    D: [["n", "0", 1], ["n", "1", 2], ["n", "2", 3], ["c", "", 3]]
+  };
+  var S = {
+    s1: { vt: false, ex: [["n", "1"], ["n", "2"], ["n", "3"], ["c"]] },
+    s2: { vt: false, ex: [["n", "1"], ["n", "2"], ["e", "IllegalStateException"]] },
+    s3: { vt: false, ex: [["cnt", 3], ["c"]] },
+    s4: { vt: true, ex: [["await", 86400], ["n", "x"], ["c"]] },
+    s5: { vt: true, ex: [["await", 3], ["n", "0"], ["n", "1"], ["n", "2"], ["c"]] },
+    s6: { vt: false, ex: [["n", "1"], ["cancel"]] }
+  };
+  function desc(e) { return e[0] === "n" ? "onNext(" + e[1] + ")" : e[0] === "c" ? "onComplete()" : "onError(" + e[1] + ")"; }
+  function run() {
+    var pub = P[$("svP").value], sc = S[$("svS").value], i = 0, now = 0, L = [], res = null, realMax = 0;
+    if (sc.vt) L.push("VirtualTimeScheduler установлен (Schedulers.parallel и др. подменены)");
+    L.push("subscribe → request(Long.MAX_VALUE)");
+    for (var k = 0; k < sc.ex.length && !res; k++) {
+      var x = sc.ex[k];
+      if (x[0] === "await") { now += x[1]; L.push("thenAwait(" + (x[1] >= 86400 ? "1 день" : x[1] + " с") + ") — виртуальные часы: " + (now >= 86400 ? "1 день" : now + " с")); continue; }
+      if (x[0] === "cancel") { L.push("thenCancel() → cancel()"); res = ["ok", "Тест пройден: проверили первый элемент и отменили подписку — удобно для бесконечных потоков."]; break; }
+      var need = x[0] === "cnt" ? x[1] : 1;
+      for (var m = 0; m < need; m++) {
+        var ev = pub[i];
+        if (!ev) { res = ["bad", "expectation failed: ожидался сигнал, но издатель уже завершён"]; break; }
+        if (sc.vt && ev[2] > now) { res = ["bad", "Тест зависнет: событие запланировано на " + (ev[2] >= 86400 ? "1 день" : ev[2] + " с") + " виртуального времени, а часы продвинуты только до " + now + " с. verify() без таймаута будет ждать вечно."]; break; }
+        if (!sc.vt) realMax = Math.max(realMax, ev[2]);
+        var okType = x[0] === "cnt" ? ev[0] === "n" : x[0] === ev[0] && (x[0] === "c" || (x[0] === "n" ? x[1] === ev[1] : ev[1].indexOf(x[1]) === 0));
+        var exDesc = x[0] === "cnt" ? "expectNextCount(" + x[1] + ")" : x[0] === "n" ? "expectNext(" + x[1] + ")" : x[0] === "c" ? "expectComplete()" : "expectError(" + x[1] + ")";
+        if (!okType) { res = ["bad", "java.lang.AssertionError: expectation \"" + exDesc + "\" failed (expected: " + (x[0] === "cnt" ? x[1] + " × onNext" : x[0] === "n" ? "onNext(" + x[1] + ")" : x[0] === "c" ? "onComplete()" : "onError(" + x[1] + ")") + "; actual: " + desc(ev) + (x[0] === "cnt" ? " после " + m + " элементов" : "") + ")"]; L.push("✗ " + desc(ev)); break; }
+        L.push("✓ " + desc(ev) + (ev[2] ? "  [t=" + (ev[2] >= 86400 ? "1 день" : ev[2] + " с") + "]" : ""));
+        i++;
+      }
+    }
+    if (!res) {
+      if (!sc.vt && realMax >= 86400) res = ["bad", "Тест будет реально ждать сутки: Mono.delay работает на настоящем таймере. Используйте StepVerifier.withVirtualTime(() -> ...) — издатель обязательно создаётся внутри лямбды."];
+      else if (!sc.vt && realMax > 0) res = ["warn", "Тест пройдёт, но займёт " + realMax + " с реального времени. С withVirtualTime — мгновенно."];
+      else res = ["ok", "Тест пройден." + (sc.vt ? " Виртуальное время: ожидание " + (now >= 86400 ? "длиной в сутки" : now + " с") + " заняло миллисекунды." : "")];
+    }
+    $("svOut").textContent = L.join("\n"); $("svV").className = "verdict " + res[0]; $("svV").textContent = res[1];
+  }
+  $("svP").addEventListener("change", run); $("svS").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="Виртуальное время — правильно и неправильно"><code class="java">// правильно: издатель создаётся внутри Supplier, ПОСЛЕ подмены планировщиков
+StepVerifier.withVirtualTime(() -&gt; service.dailyReport())
+    .expectSubscription()
+    .expectNoEvent(Duration.ofHours(23))     // за 23 часа ничего не пришло
+    .thenAwait(Duration.ofHours(1))
+    .expectNextCount(1)
+    .verifyComplete();
+
+// неправильно: Mono.delay уже захватил настоящий parallel() при сборке
+Mono&lt;Report&gt; r = service.dailyReport();
+StepVerifier.withVirtualTime(() -&gt; r) ... // зависнет</code></pre>
+
+<h2 id="tools"><span class="h-num">18.3</span>TestPublisher и PublisherProbe</h2>
+<pre data-title="Управляемый источник и проверка, что ветка выполнилась"><code class="java">TestPublisher&lt;String&gt; src = TestPublisher.create();
+StepVerifier.create(service.normalize(src.flux()))
+    .then(() -&gt; src.emit("a", "b"))          // emit = next... + complete
+    .expectNext("A", "B")
+    .verifyComplete();
+src.assertMinRequested(1);                   // оператор действительно запрашивал данные
+
+PublisherProbe&lt;User&gt; fallback = PublisherProbe.of(Mono.just(User.GUEST));
+when(cache.get(id)).thenReturn(Mono.empty());
+when(guestProvider.get()).thenReturn(fallback.mono());
+StepVerifier.create(service.user(id)).expectNext(User.GUEST).verifyComplete();
+fallback.assertWasSubscribed();              // switchIfEmpty действительно подписался на fallback</code></pre>
+
+<h2 id="web"><span class="h-num">18.4</span>WebTestClient</h2>
+<pre data-title="Срез контроллера"><code class="java">@WebFluxTest(UserController.class)            // только web-слой: контроллеры, фильтры, кодеки, security
+class UserControllerTest {
+    @Autowired WebTestClient client;
+    @MockitoBean UserService users;          // Spring Framework 6.2+ (Boot 3.4+); @MockBean удалён в Boot 4
+
+    @Test
+    void returns404WhenMissing() {
+        when(users.find(42L)).thenReturn(Mono.empty());
+        client.get().uri("/api/users/42").exchange()
+              .expectStatus().isNotFound();
+    }
+
+    @Test
+    void streamsEvents() {
+        when(users.events()).thenReturn(Flux.just(e1, e2));
+        FluxExchangeResult&lt;Event&gt; res = client.get().uri("/api/events")
+              .accept(MediaType.TEXT_EVENT_STREAM).exchange()
+              .expectStatus().isOk()
+              .returnResult(Event.class);
+        StepVerifier.create(res.getResponseBody()).expectNext(e1, e2).verifyComplete();
+    }
+
+    @Test
+    @WithMockUser(roles = "ADMIN")           // или client.mutateWith(mockJwt().authorities(...))
+    void adminCanDelete() {
+        when(users.delete(1L)).thenReturn(Mono.empty());
+        client.mutateWith(csrf()).delete().uri("/api/users/1").exchange()
+              .expectStatus().isNoContent();
+    }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Режимы WebTestClient</h4><ul><li><code>bindToController(c)</code> / <code>bindToRouterFunction(r)</code> — без Spring-контекста</li><li><code>@WebFluxTest</code> — срез с автоконфигурацией</li><li><code>@SpringBootTest(webEnvironment = RANDOM_PORT)</code> — реальный сервер и сеть</li><li><code>bindToServer().baseUrl(...)</code> — любой живой сервер</li></ul></div>
+  <div class="card"><h4>Интеграционные тесты</h4><ul><li>Testcontainers + <code>@ServiceConnection</code> для PostgreSQL/R2DBC, Kafka, Redis</li><li>MockWebServer (OkHttp) или WireMock — для WebClient</li><li>BlockHound в тестах — ловит блокировки в event loop (тема 20)</li><li><code>@DataR2dbcTest</code> — срез репозиториев</li></ul></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">18.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Тест написан как <code>StepVerifier.create(flux).expectNext(1).expectComplete();</code>. Что не так?</p><ul><li>Нужен expectNextCount</li><li>Нет verify(): подписки не было, тест ничего не проверил</li><li>expectComplete лишний</li><li>Всё правильно</li></ul><div class="why">verify() (или verifyComplete) запускает подписку и проверку.</div></div>
+<div class="mcq" data-ok="2"><p>Почему издатель для withVirtualTime передаётся через Supplier?</p><ul><li>Так короче</li><li>Для ленивых исключений</li><li>Чтобы операторы времени при сборке захватили уже подменённый VirtualTimeScheduler</li><li>Чтобы тест был параллельным</li></ul><div class="why">Mono.delay выбирает планировщик в момент создания.</div></div>
+<div class="mcq" data-ok="0"><p>Как проверить, что fallback в switchIfEmpty действительно был вызван (подписан)?</p><ul><li>PublisherProbe.assertWasSubscribed()</li><li>Mockito.verify на методе, возвращающем Mono</li><li>log()</li><li>expectNextCount(1)</li></ul><div class="why">Mockito проверит вызов метода, но не подписку на его результат.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему verify(Duration) лучше, чем verify()?</summary><div class="a"><p>verify() блокирует до терминального сигнала. Если код содержит ошибку и никогда не завершается (забытый complete, пустой Sinks, зависший внешний вызов), тест повиснет до таймаута CI. verify(Duration) превращает это в понятную ошибку «VerifySubscriber timed out». Глобально — <code>StepVerifier.setDefaultTimeout(Duration.ofSeconds(10))</code>.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

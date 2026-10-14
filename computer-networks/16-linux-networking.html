@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Сеть в Linux: очереди, сокеты, контейнеры</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ПОД КАПОТОМ И ПРАКТИКА</div>
+  <h1>Сеть в Linux: очереди, сокеты, контейнеры</h1>
+  <p class="lead">Между сетевой картой и вызовом <code>read()</code> в вашем приложении — ядро Linux с десятком очередей и таблиц. У каждой есть размер, и когда он исчерпан, пакеты молча отбрасываются. Большинство «необъяснимых» сетевых проблем бэкенда — это переполнение одной из них. Разберём путь пакета через ядро, очереди слушающего сокета, порты, дескрипторы и то, как из тех же кирпичей собрана сеть контейнера.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">accept queue</span><span class="tag">conntrack</span><span class="tag">epoll</span><span class="tag">namespaces</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="path"><span class="h-num">16.1</span>Путь входящего пакета через ядро</h2>
+<div class="flow col">
+  <div class="node info"><b>Сетевая карта</b><small>кадр в кольцевой буфер (RX ring); переполнен — rx_dropped</small></div><span class="to">↓ прерывание → softirq (NAPI)</span>
+  <div class="node"><b>Драйвер → sk_buff</b><small>пакет оформлен в структуру ядра; очередь netdev_max_backlog</small></div><span class="to">↓</span>
+  <div class="node warn"><b>netfilter: PREROUTING</b><small>conntrack — учёт соединений; DNAT (проброс портов, Service в Kubernetes)</small></div><span class="to">↓ решение о маршруте: себе или переслать</span>
+  <div class="node warn"><b>netfilter: INPUT</b><small>правила файрвола для локальных получателей</small></div><span class="to">↓</span>
+  <div class="node acc"><b>TCP</b><small>поиск сокета по четвёрке адресов и портов; проверка номеров; ACK; данные — в буфер приёма</small></div><span class="to">↓</span>
+  <div class="node"><b>Буфер приёма сокета</b><small>SO_RCVBUF; заполнен — окно 0, отправитель останавливается</small></div><span class="to">↓ epoll будит поток</span>
+  <div class="node ok"><b>Приложение: read()</b><small>копирование из ядра в память процесса</small></div>
+</div>
+<p>Исходящий путь зеркален: <code>write()</code> копирует данные в буфер отправки и возвращается сразу; ядро само нарезает сегменты, ждёт окна, повторяет потери. Успешный <code>write()</code> не означает, что данные доставлены и даже что они покинули машину.</p>
+
+<h2 id="queues"><span class="h-num">16.2</span>Две очереди слушающего сокета</h2>
+<p>Когда приложение вызывает <code>listen(fd, backlog)</code>, ядро заводит две очереди. Рукопожатие выполняет <b>ядро</b>, без участия приложения; приложение забирает уже готовые соединения вызовом <code>accept()</code>.</p>
+<div class="widget" id="aqSim">
+  <div class="widget-title">Симулятор: очередь SYN и accept-очередь</div>
+  <p class="hint">Для наглядности accept-очередь вмещает 3 соединения, очередь SYN — 4.</p>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="syn">клиент шлёт SYN</button>
+    <button class="btn primary" type="button" data-a="ack">клиент завершает рукопожатие (ACK)</button>
+    <button class="btn primary" type="button" data-a="accept">приложение вызывает accept()</button>
+    <button class="btn" type="button" data-a="burst">всплеск: 6 клиентов сразу</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="lanes">
+    <div class="lane"><h5>Очередь SYN (полуоткрытые)</h5><div class="items" id="aqSyn"></div></div>
+    <div class="lane"><h5>Accept-очередь (готовые)</h5><div class="items" id="aqAcc"></div></div>
+    <div class="lane"><h5>У приложения</h5><div class="items" id="aqApp"></div></div>
+    <div class="lane"><h5>Счётчики ядра</h5><div class="items" id="aqCnt"></div></div>
+  </div>
+  <div class="log" id="aqLog"></div>
+</div>
+<script>
+(function () {
+  var syn, acc, app, id, over, drop, log, $ = function (i) { return document.getElementById(i); };
+  function reset() { syn = []; acc = []; app = 0; id = 0; over = 0; drop = 0; log = ["listen(fd, 3): сокет слушает."]; }
+  function act(a) {
+    if (a === "reset") reset();
+    else if (a === "syn") { if (syn.length >= 4) { drop++; log.unshift("SYN отброшен: очередь полуоткрытых соединений заполнена (при SYN flood ядро включает SYN cookies и не хранит состояние). Клиент повторит SYN через 1 с."); } else { syn.push("c" + (++id)); log.unshift("SYN от c" + id + " → ядро ответило SYN-ACK, запись в очереди SYN."); } }
+    else if (a === "ack") { if (!syn.length) log.unshift("Нет полуоткрытых соединений."); else if (acc.length >= 3) { over++; log.unshift("ACK от " + syn[0] + ", но accept-очередь ПОЛНА → ACK проигнорирован (ListenOverflows++). Клиент считает соединение установленным и шлёт запрос; сервер повторяет SYN-ACK. С точки зрения клиента — зависание на секунды, затем таймаут или RST."); } else { var c = syn.shift(); acc.push(c); log.unshift("ACK от " + c + " → соединение установлено ядром и ждёт в accept-очереди. Приложение о нём ещё не знает."); } }
+    else if (a === "accept") { if (!acc.length) log.unshift("accept(): очередь пуста — поток блокируется или epoll не сообщает о готовности."); else { var c2 = acc.shift(); app++; log.unshift("accept() → " + c2 + " передан приложению, место в очереди освободилось."); } }
+    else if (a === "burst") { for (var i = 0; i < 6; i++) { act("syn"); act("ack"); } return; }
+    render();
+  }
+  function chips(a, cls) { return a.map(function (c) { return '<span class="chip ' + cls + '">' + c + "</span>"; }).join("") || '<span class="chip">пусто</span>'; }
+  function render() {
+    $("aqSyn").innerHTML = chips(syn, "warn") + '<span class="chip">' + syn.length + "/4</span>"; $("aqAcc").innerHTML = chips(acc, "ok") + '<span class="chip ' + (acc.length >= 3 ? "bad" : "") + '">' + acc.length + "/3</span>";
+    $("aqApp").innerHTML = '<span class="chip info">обслуживается: ' + app + "</span>";
+    $("aqCnt").innerHTML = '<span class="chip ' + (over ? "bad" : "") + '">ListenOverflows ' + over + '</span><span class="chip ' + (drop ? "bad" : "") + '">SYN drops ' + drop + "</span>";
+    $("aqLog").textContent = log.slice(0, 7).join("\n");
+  }
+  document.querySelectorAll("#aqSim [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); render(); }); });
+  reset(); render();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Параметр</th><th>Что ограничивает</th><th>По умолчанию</th></tr>
+<tr><td><code>backlog</code> в <code>listen()</code></td><td>размер accept-очереди (берётся минимум с <code>somaxconn</code>)</td><td>Tomcat <code>acceptCount=100</code>, Netty <code>SO_BACKLOG</code></td></tr>
+<tr><td><code>net.core.somaxconn</code></td><td>потолок backlog для всех сокетов</td><td>4096 (в ядрах до 5.4 — 128)</td></tr>
+<tr><td><code>net.ipv4.tcp_max_syn_backlog</code></td><td>очередь полуоткрытых соединений</td><td>зависит от памяти</td></tr>
+<tr><td><code>net.ipv4.tcp_syncookies</code></td><td>защита от SYN flood без хранения состояния</td><td>1</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Как это выглядит в продакшене</span>
+Сервис под нагрузкой: потоки заняты, <code>accept()</code> вызывается редко, accept-очередь переполняется. Клиенты видят таймауты соединения и редкие RST, при этом сервис «жив» и CPU не загружен. Проверка: <code>nstat -az TcpExtListenOverflows TcpExtListenDrops</code> — растущие счётчики; <code>ss -ltn</code> — столбцы Recv-Q (сейчас в очереди) и Send-Q (её предел).
+</div>
+
+<h2 id="buffers"><span class="h-num">16.3</span>Буферы сокета и обратное давление</h2>
+<div class="grid-2">
+  <div class="card"><h4>Медленный получатель</h4><p>Приложение не успевает читать → буфер приёма заполняется → TCP объявляет окно 0 → буфер отправки на другой стороне тоже заполняется → <code>write()</code> отправителя блокируется (или возвращает 0 в неблокирующем режиме). Обратное давление TCP работает само — если приложение его не обходит неограниченной внутренней очередью.</p></div>
+  <div class="card"><h4>Размеры</h4><p>Ядро автоматически подстраивает буферы в пределах <code>net.ipv4.tcp_rmem</code> / <code>tcp_wmem</code> (минимум, начальный, максимум). Явный <code>SO_RCVBUF</code> отключает автонастройку — задавайте его, только понимая зачем. Для быстрых длинных каналов максимум должен быть не меньше BDP (тема 07).</p></div>
+</div>
+
+<h2 id="ports"><span class="h-num">16.4</span>Порты и дескрипторы — конечные ресурсы</h2>
+<div class="widget" id="epW">
+  <div class="widget-title">Калькулятор: сколько исходящих соединений возможно</div>
+  <div class="controls">
+    <label>диапазон портов<select id="epRange"><option value="28232">32768–60999 (по умолчанию, 28 232 порта)</option><option value="64511">1024–65535 (расширенный)</option></select></label>
+    <label>новых соединений в секунду к одному адресу:порту<input type="number" id="epRate" value="1000" min="1" style="width:100px"></label>
+    <label>соединение<select id="epMode"><option value="short">открыть → запрос → закрыть</option><option value="pool">пул с keep-alive (переиспользование)</option></select></label>
+    <label>net.ipv4.tcp_tw_reuse<select id="epReuse"><option value="0">0</option><option value="1">1</option></select></label>
+  </div>
+  <div class="verdict" id="epOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var ports = +$("epRange").value, rate = Math.max(1, +$("epRate").value), pool = $("epMode").value === "pool", reuse = $("epReuse").value === "1", o = $("epOut");
+    if (pool) { o.className = "verdict ok"; o.textContent = "Соединения переиспользуются: при пуле на 50 соединений занято 50 портов независимо от числа запросов. Нет рукопожатий TCP и TLS на каждый запрос, нет TIME_WAIT. Это решение в 99% случаев."; return; }
+    var hold = reuse ? 1 : 60, inUse = rate * hold, max = Math.floor(ports / hold);
+    if (inUse > ports) { o.className = "verdict bad"; o.innerHTML = "Каждое закрытое соединение держит порт в TIME_WAIT " + hold + " с. При " + rate + " соединениях/с одновременно занято " + inUse.toLocaleString("ru-RU") + " портов из " + ports.toLocaleString("ru-RU") + " → <b>EADDRNOTAVAIL: Cannot assign requested address</b>. Предел — около " + max + " соединений/с к одному адресу:порту. Исправление: пул соединений; затем расширение диапазона и tcp_tw_reuse=1 (безопасно для исходящих соединений)."; }
+    else { o.className = "verdict warn"; o.textContent = "Пока хватает: занято ~" + inUse.toLocaleString("ru-RU") + " из " + ports.toLocaleString("ru-RU") + " портов (предел ≈ " + max + " соединений/с). Но каждое соединение стоит рукопожатий TCP и TLS и медленного старта — пул быстрее и надёжнее."; }
+  }
+  ["epRange", "epRate", "epMode", "epReuse"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>Ограничение действует на <b>четвёрку</b> (адрес источника, порт источника, адрес назначения, порт назначения): к разным серверам один и тот же локальный порт использовать можно. Поэтому порты заканчиваются именно при множестве соединений к <i>одному</i> адресу — к базе, к прокси, к NAT-шлюзу.</p>
+<div class="callout warn"><span class="c-title">Too many open files</span>
+Каждый сокет — файловый дескриптор. Лимит процесса (<code>ulimit -n</code>, часто 1024 по умолчанию; в systemd — <code>LimitNOFILE</code>) исчерпывается при утечке соединений или просто при большом числе клиентов. Симптом: <code>accept()</code> падает с EMFILE, сервис перестаёт принимать соединения, а заодно не может открыть ни файл лога, ни соединение с БД. Проверка: <code>ls /proc/&lt;pid&gt;/fd | wc -l</code>, <code>cat /proc/&lt;pid&gt;/limits</code>.
+</div>
+
+<h2 id="epoll"><span class="h-num">16.5</span>epoll: как один поток обслуживает тысячи сокетов</h2>
+<pre data-title="Цикл событий — основа Netty, NIO-коннектора Tomcat, nginx, Redis"><code class="txt">epfd = epoll_create1(0)
+epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, EPOLLIN)        # «сообщи, когда появятся новые соединения»
+
+loop:
+    n = epoll_wait(epfd, events, MAX, timeout)            # спим, пока ни один сокет не готов
+    for ev in events[0..n]:
+        if ev.fd == listen_fd:
+            conn = accept(listen_fd)                      # не блокируется: соединение уже в очереди
+            epoll_ctl(epfd, EPOLL_CTL_ADD, conn, EPOLLIN)
+        else:
+            data = read(ev.fd)                            # не блокируется: данные уже в буфере приёма
+            handle(data)                                  # обработчик не должен блокировать поток!</code></pre>
+<p>Ядро ведёт список готовых сокетов и возвращает только их — стоимость не зависит от общего числа соединений (в отличие от старых <code>select</code>/<code>poll</code>, перебиравших все). В Java это <code>Selector</code> из NIO; виртуальные потоки используют тот же механизм скрытно: «блокирующий» <code>read()</code> регистрирует сокет в поллере и размонтирует поток.</p>
+
+<h2 id="netfilter"><span class="h-num">16.6</span>netfilter и conntrack</h2>
+<p><b>netfilter</b> — точки перехвата в ядре (PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING), на которые вешаются правила iptables/nftables: фильтрация, NAT, маркировка. <b>conntrack</b> — таблица отслеживаемых соединений: без неё невозможны NAT и правила «разрешить ответы на исходящие».</p>
+<div class="grid-2">
+  <div class="card"><h4>Таблица conntrack конечна</h4><p>Сообщение в <code>dmesg</code>: <code>nf_conntrack: table full, dropping packet</code> — новые соединения отбрасываются на узле (часто на узле Kubernetes или NAT-шлюзе), при том что сервисы исправны. Проверка: <code>conntrack -S</code>, <code>sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max</code>.</p></div>
+  <div class="card"><h4>Гонка DNAT в Kubernetes</h4><p>Два одновременных UDP-пакета (запросы A и AAAA к DNS) с одного сокета могут конфликтовать при вставке в conntrack — один теряется, и запрос к DNS висит 5 с. Известная причина «случайных пятисекундных задержек» в кластерах; лечится NodeLocal DNSCache или опцией <code>single-request-reopen</code>.</p></div>
+</div>
+
+<h2 id="containers"><span class="h-num">16.7</span>Сеть контейнера — из тех же деталей</h2>
+<div class="flow">
+  <div class="node acc"><b>Контейнер</b><small>свой network namespace: eth0 172.17.0.2, свои маршруты, свой lo</small></div><span class="to">⇄ veth-пара ⇄</span>
+  <div class="node"><b>Мост docker0</b><small>виртуальный коммутатор, 172.17.0.1</small></div><span class="to">→ маршрутизация + MASQUERADE →</span>
+  <div class="node info"><b>eth0 хоста</b><small>192.168.1.50</small></div>
+</div>
+<ul>
+  <li><b>Network namespace</b> — отдельный экземпляр сетевого стека: интерфейсы, таблица маршрутов, правила netfilter, порты. Поэтому два контейнера могут слушать порт 8080 одновременно.</li>
+  <li><b>veth-пара</b> — виртуальный кабель: один конец в контейнере (<code>eth0</code>), другой на хосте, воткнут в мост.</li>
+  <li><b>Исходящий трафик</b> — SNAT (MASQUERADE): адрес контейнера заменяется адресом хоста.</li>
+  <li><b>Публикация порта</b> <code>-p 8080:80</code> — правило DNAT в PREROUTING: пакеты на порт 8080 хоста переписываются на <code>172.17.0.2:80</code>.</li>
+  <li><b>Под Kubernetes</b> — несколько контейнеров в одном network namespace: они делят IP и видят друг друга через <code>localhost</code>. Связь между подами разных узлов обеспечивает CNI-плагин (overlay или маршрутизация), а Service — правила DNAT на каждом узле (тема 13).</li>
+</ul>
+<pre data-title="Посмотреть своими глазами"><code class="txt">ip netns list;  lsns -t net                     # пространства имён
+nsenter -t &lt;pid контейнера&gt; -n ip addr          # выполнить команду в сети контейнера, даже если в образе нет утилит
+ip link show type veth;  bridge link            # veth-пары и порты моста
+iptables -t nat -L -n -v | head -40             # правила DNAT/MASQUERADE Docker и kube-proxy</code></pre>
+
+<h2 id="tools"><span class="h-num">16.8</span>Шпаргалка наблюдения</h2>
+<div class="table-wrap"><table>
+<tr><th>Вопрос</th><th>Команда</th></tr>
+<tr><td>Кто слушает порт и какова очередь</td><td><code>ss -ltnp</code></td></tr>
+<tr><td>Сколько соединений в каких состояниях</td><td><code>ss -s</code>; <code>ss -tan state time-wait | wc -l</code></td></tr>
+<tr><td>Переполнения очередей, ретрансляции</td><td><code>nstat -az | grep -E "ListenOverflows|ListenDrops|RetransSegs|TCPTimeouts"</code></td></tr>
+<tr><td>Потери на сетевой карте</td><td><code>ip -s link show eth0</code>; <code>ethtool -S eth0 | grep -i drop</code></td></tr>
+<tr><td>Буферы и окно конкретного соединения</td><td><code>ss -tmi dst 10.2.3.40</code> (cwnd, rtt, retrans)</td></tr>
+<tr><td>Открытые дескрипторы процесса</td><td><code>ls /proc/&lt;pid&gt;/fd | wc -l</code></td></tr>
+<tr><td>Таблица conntrack</td><td><code>conntrack -S</code>; <code>conntrack -L | wc -l</code></td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">16.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Кто выполняет TCP-рукопожатие для входящего соединения?</p><ul><li>Приложение в вызове accept()</li><li>Сетевая карта</li><li>Ядро; приложение получает из accept-очереди уже установленное соединение</li><li>Балансировщик</li></ul><div class="why">Поэтому клиент может «подключиться» к зависшему приложению: рукопожатие пройдёт, а ответа не будет.</div></div>
+<div class="mcq" data-ok="1"><p>Сервис падает с «Cannot assign requested address» при вызовах к одному внешнему API.</p><ul><li>Закончилась память</li><li>Исчерпаны эфемерные порты: слишком много коротких соединений к одному адресу, порты висят в TIME_WAIT</li><li>Неверный DNS</li><li>Закрыт порт на файрволе</li></ul><div class="why">Нужен пул соединений с keep-alive.</div></div>
+<div class="mcq" data-ok="0"><p>Почему два контейнера на одном хосте могут одновременно слушать порт 80?</p><ul><li>У каждого свой network namespace — отдельный сетевой стек со своими портами</li><li>Docker меняет номер порта в приложении</li><li>Порт 80 особый</li><li>Не могут</li></ul><div class="why">Конфликт возникает только при публикации на один и тот же порт хоста.</div></div>
+<div class="mcq" data-ok="3"><p>В dmesg: «nf_conntrack: table full, dropping packet». Что происходит?</p><ul><li>Переполнен диск</li><li>Сетевая карта неисправна</li><li>Закончились дескрипторы</li><li>Таблица отслеживания соединений netfilter заполнена: новые соединения через этот узел отбрасываются</li></ul><div class="why">Увеличить nf_conntrack_max, сократить таймауты, уменьшить число коротких соединений.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что происходит с пакетом от сетевой карты до read() в приложении?</summary><div class="a"><p>Карта → кольцевой буфер → softirq/NAPI → sk_buff → netfilter PREROUTING (conntrack, DNAT) → маршрутизация → INPUT → TCP: поиск сокета, проверка, ACK → буфер приёма → пробуждение через epoll → read() копирует данные в процесс. На каждом этапе есть очередь с пределом.</p></div></details>
+<details class="q"><summary>Чем отличаются очередь SYN и accept-очередь и что бывает при переполнении?</summary><div class="a"><p>В первой — соединения, получившие SYN-ACK и ждущие ACK; при переполнении SYN отбрасывается или включаются SYN cookies. Во второй — установленные соединения, ждущие accept(); при переполнении финальный ACK игнорируется, клиент видит задержки и таймауты. Размер второй задаёт backlog и somaxconn.</p></div></details>
+<details class="q"><summary>Как устроена сеть Docker-контейнера?</summary><div class="a"><p>Отдельный network namespace; veth-пара соединяет его с мостом docker0 на хосте; исходящий трафик маскируется (SNAT) адресом хоста; публикация порта — правило DNAT. Под Kubernetes — общий namespace для контейнеров пода плюс CNI для связи между узлами.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

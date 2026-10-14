@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Линковка и инициализация классов</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ЗАГРУЗКА КЛАССОВ</div>
+  <h1>Линковка и инициализация классов</h1>
+  <p class="lead">Загруженный класс ещё нельзя использовать: его байткод надо проверить, под статические поля — выделить память, символические ссылки — разрешить, а статические инициализаторы — выполнить ровно один раз, даже если к классу одновременно обратились сто потоков. Здесь — верификатор, ленивое разрешение, точные правила «когда выполнится static-блок» (с тренажёром) и как инициализация классов приводит к взаимоблокировке.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">верификация</span><span class="tag">preparation</span><span class="tag">resolution</span><span class="tag">&lt;clinit&gt;</span><span class="tag">holder idiom</span><span class="tag">deadlock инициализации</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="verify"><span class="h-num">6.1</span>Верификация</h2>
+<p>Верификатор доказывает, что байткод не сломает JVM: не выйдет за пределы стека операндов, не использует int как ссылку, не прыгнет в середину инструкции, не обратится к неинициализированному объекту, вызывает методы с правильными типами. Это то, что делает безопасным исполнение байткода из любого источника.</p>
+<ul>
+  <li><b>Проверка типов</b> (class-файлы версии 50+): javac записывает в атрибут <code>StackMapTable</code> типы на стеке и в слотах в точках ветвления — верификатору остаётся проверить каждый линейный участок за один проход.</li>
+  <li>Классы bootstrap-загрузчика по умолчанию не верифицируются (им доверяют); для остальных — всегда. Флаг <code>-Xverify:none</code> / <code>-XX:-BytecodeVerificationRemote</code> устарел и опасен.</li>
+  <li>Типичные ошибки — от генераторов байткода (агенты, ASM с неверными фреймами): <code>java.lang.VerifyError: Bad type on operand stack</code>, <code>Expecting a stackmap frame at branch target</code>.</li>
+</ul>
+
+<h2 id="prepare"><span class="h-num">6.2</span>Подготовка и разрешение</h2>
+<div class="grid-2">
+  <div class="card"><h4>Preparation</h4><p>Выделяется место под статические поля (в объекте <code>java.lang.Class</code> — «зеркале» класса) и заполняется <b>значениями по умолчанию</b>: 0, false, null. Не ваши значения! <code>static int counter = 42</code> в этот момент равно 0. Исключение — <code>static final</code> константы времени компиляции (атрибут ConstantValue): они получают значение сразу.</p></div>
+  <div class="card"><h4>Resolution</h4><p>Символические ссылки пула констант (имена классов, полей, методов) превращаются в прямые: указатель на класс, смещение поля, индекс vtable или точку входа метода. HotSpot делает это <b>лениво</b> — при первом выполнении инструкции; результат кэшируется в ConstantPoolCache. Поэтому <code>NoSuchMethodError</code> возникает не при загрузке класса, а при первом вызове метода.</p></div>
+</div>
+
+<h2 id="init-rules"><span class="h-num">6.3</span>Когда выполняется инициализация</h2>
+<p>Инициализация — выполнение <code>&lt;clinit&gt;</code>: присваивания статических полей и <code>static { }</code> блоки в порядке их появления в исходнике. Происходит ровно один раз, при <b>первом активном использовании</b>:</p>
+<div class="grid-2">
+  <div class="card"><h4>Инициализирует</h4><ul><li><code>new X()</code></li><li>чтение/запись статического поля (не константы)</li><li>вызов статического метода</li><li><code>Class.forName("X")</code>, рефлексивный вызов</li><li>инициализация подкласса (сначала — суперкласс)</li><li>главный класс при запуске</li></ul></div>
+  <div class="card"><h4>Не инициализирует</h4><ul><li><code>X.class</code>, <code>loader.loadClass("X")</code></li><li>создание массива <code>new X[10]</code></li><li>чтение <code>static final</code> константы примитива или String — javac подставил значение в код</li><li>обращение к статическому полю родителя через подкласс <code>Child.parentField</code> — инициализирует только родителя</li><li>суперинтерфейсы — только если у них есть default-методы</li></ul></div>
+</div>
+
+<div class="widget" id="inW">
+  <div class="widget-title">Тренажёр: что будет напечатано?</div>
+<pre style="margin:0"><code class="java">class Parent {
+    static { System.out.print("P "); }
+    static int a = 1;
+    static final int C = 10;              // константа времени компиляции
+    static final Integer W = 5;           // не константа: Integer — объект
+    static void hello() { }
+}
+class Child extends Parent {
+    static { System.out.print("C "); }
+    static int b = 2;
+}</code></pre>
+  <div class="controls"><label>выражение в main (на «чистой» JVM)<select id="inQ" class="wide">
+    <option value="newChild">new Child();</option>
+    <option value="childA">int x = Child.a;</option>
+    <option value="childB">int x = Child.b;</option>
+    <option value="parentC">int x = Parent.C;</option>
+    <option value="parentW">Integer x = Parent.W;</option>
+    <option value="arr">Child[] arr = new Child[3];</option>
+    <option value="cls">Class&lt;?&gt; k = Child.class;</option>
+    <option value="forName">Class.forName("Child");</option>
+    <option value="hello">Child.hello();</option>
+    <option value="twice">new Child(); new Child();</option>
+  </select></label>
+  <button class="btn primary" type="button" id="inShow">Показать ответ</button></div>
+  <div class="verdict" id="inV">Сначала предскажите вывод, затем нажмите «Показать ответ».</div>
+</div>
+<script>
+(function () {
+  var A = {
+    newChild: ["P C", "Создание экземпляра Child инициализирует Child, а перед ним — суперкласс Parent."],
+    childA: ["P", "Поле a объявлено в Parent: javac пишет getstatic Child.a, но при разрешении поле находится в Parent, и инициализируется только Parent."],
+    childB: ["P C", "Поле Child.b — Child инициализируется, перед ним Parent."],
+    parentC: ["(ничего)", "C — константа времени компиляции: javac подставил 10 прямо в байткод (bipush 10). К классу Parent обращения нет вообще — он даже может не загрузиться."],
+    parentW: ["P", "Integer — не константа времени компиляции: getstatic Parent.W инициализирует Parent."],
+    arr: ["(ничего)", "Создание массива порождает класс массива [LChild;, но не инициализирует Child."],
+    cls: ["(ничего)", "Литерал класса загружает Child (и Parent), но не инициализирует."],
+    forName: ["P C", "Class.forName по умолчанию инициализирует класс."],
+    hello: ["P", "Статический метод объявлен в Parent — инициализируется только Parent, несмотря на запись через Child."],
+    twice: ["P C", "Инициализация происходит ровно один раз за жизнь класса."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  $("inShow").addEventListener("click", function () { var a = A[$("inQ").value]; $("inV").className = "verdict ok"; $("inV").textContent = "Вывод: " + a[0] + "\n" + a[1]; });
+  $("inQ").addEventListener("change", function () { $("inV").className = "verdict"; $("inV").textContent = "Предскажите вывод и нажмите «Показать ответ»."; });
+})();
+</script>
+<div class="callout warn"><span class="c-title">Ловушка констант</span>
+Если библиотека поменяла <code>public static final int VERSION = 2</code> на 3, ваш класс, скомпилированный против старой версии, продолжит видеть 2 — значение вшито в ваш байткод. Для значений, которые могут меняться, используйте не константы (методы, или поля, не являющиеся константой времени компиляции).
+</div>
+
+<h2 id="clinit"><span class="h-num">6.4</span>Потокобезопасность и порядок &lt;clinit&gt;</h2>
+<p>JVMS §5.5 описывает процедуру инициализации с блокировкой на класс: первый поток помечает класс «инициализируется», остальные ждут; рекурсивный запрос из того же потока видит класс «в процессе» и продолжает (с недоинициализированными полями!). Если <code>&lt;clinit&gt;</code> бросил исключение — класс помечается ошибочным, первый получит <code>ExceptionInInitializerError</code>, все последующие — <code>NoClassDefFoundError: Could not initialize class</code>.</p>
+<pre data-title="ленивый синглтон без синхронизации — holder idiom"><code class="java">public final class Registry {
+    private Registry() { /* дорогая инициализация */ }
+    private static final class Holder {
+        static final Registry INSTANCE = new Registry();   // выполнится при первом обращении к Holder
+    }
+    public static Registry get() { return Holder.INSTANCE; } // потокобезопасно: гарантия JVMS, без volatile и lock
+}</code></pre>
+<pre data-title="порядок имеет значение"><code class="java">class Config {
+    static final Config INSTANCE = new Config();   // конструктор выполнится, когда DEFAULT_PORT ещё 0!
+    static final Integer DEFAULT_PORT = 8080;      // Integer — не константа
+    final int port;
+    Config() { port = DEFAULT_PORT; }              // NullPointerException при распаковке null
+}</code></pre>
+
+<h2 id="deadlock"><span class="h-num">6.5</span>Взаимоблокировка при инициализации</h2>
+<div class="widget stepper" id="dlSim">
+  <div class="widget-title">Два класса ссылаются друг на друга в static-инициализаторах</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Поток 1</h5><div class="items"><span class="chip" id="t1a">обращается к A</span><span class="chip off" id="t1b">ждёт B</span></div></div>
+    <div class="lane"><h5>Класс A</h5><div class="items"><span class="chip" id="cA">не инициализирован</span></div></div>
+    <div class="lane"><h5>Класс B</h5><div class="items"><span class="chip" id="cB">не инициализирован</span></div></div>
+    <div class="lane"><h5>Поток 2</h5><div class="items"><span class="chip" id="t2a">обращается к B</span><span class="chip off" id="t2b">ждёт A</span></div></div>
+  </div>
+  <section class="st-step" data-t="Код" data-hl="cA cB" data-log="class A { static final B b = new B(); }   class B { static final A a = new A(); }"><p><code>class A { static B INSTANCE_B = B.create(); }</code> и <code>class B { static A INSTANCE_A = A.create(); }</code>. В одном потоке это работает (рекурсивная инициализация увидит класс «в процессе»), но в двух — нет.</p></section>
+  <section class="st-step" data-t="Поток 1 начинает A" data-hl="t1a cA" data-log="T1: init(A) → A помечен «инициализируется потоком T1», выполняется <clinit> A"><p>Поток 1 первым обращается к A, захватывает блокировку инициализации A и начинает выполнять его <code>&lt;clinit&gt;</code>.</p></section>
+  <section class="st-step" data-t="Поток 2 начинает B" data-hl="t2a cB" data-log="T2: init(B) → B помечен «инициализируется потоком T2», выполняется <clinit> B"><p>Одновременно поток 2 обращается к B и начинает его инициализацию.</p></section>
+  <section class="st-step" data-t="Встречные ожидания" data-hl="t1b t2b cA cB" data-log="T1 в <clinit> A обращается к B → B инициализирует T2 → ждать; T2 обращается к A → A инициализирует T1 → ждать. Взаимоблокировка."><p><code>&lt;clinit&gt;</code> A обращается к B — его инициализирует поток 2, ждём. <code>&lt;clinit&gt;</code> B обращается к A — его инициализирует поток 1, ждём. Оба потока навсегда в состоянии RUNNABLE/«in Object.wait()» в дампе с пометкой <code>waiting on the Class initialization monitor</code> (JDK 21+). Детектор deadlock в jstack это не всегда покажет как deadlock.</p></section>
+  <section class="st-step" data-t="Как избежать" data-hl="cA cB" data-log="решение: никаких циклов в static-инициализаторах; ленивые holder-ы; инициализация в одном месте при старте"><p>Не создавайте циклических зависимостей в статической инициализации; не запускайте потоки и не ждите их из <code>static</code>-блоков; переносите тяжёлую инициализацию из статики в явный жизненный цикл (бины Spring). Классический реальный случай — подкласс, на который ссылается статическое поле родителя (<code>static final Parent DEFAULT = new Child()</code>).</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">6.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чему равно <code>static int counter = 42</code> после этапа preparation?</p><ul><li>42</li><li>0 — значение по умолчанию; 42 присвоит &lt;clinit&gt;</li><li>null</li><li>не определено</li></ul><div class="why">Preparation выделяет память и обнуляет, инициализация присваивает.</div></div>
+<div class="mcq" data-ok="3"><p>Почему ленивый синглтон через вложенный класс-holder потокобезопасен?</p><ul><li>Из-за volatile</li><li>Компилятор вставляет synchronized</li><li>Holder — final</li><li>JVM гарантирует однократную инициализацию класса Holder под блокировкой при первом обращении</li></ul><div class="why">Инициализация классов — встроенный механизм ленивой и безопасной инициализации.</div></div>
+<div class="mcq" data-ok="0"><p>Когда возникнет NoSuchMethodError для отсутствующего в рантайме метода?</p><ul><li>При первом выполнении инструкции вызова (ленивое разрешение)</li><li>При загрузке класса вызывающего</li><li>При компиляции</li><li>При старте JVM</li></ul><div class="why">Поэтому ошибка может проявиться через часы работы, на редкой ветке кода.</div></div>
+<div class="mcq" data-ok="2"><p><code>int x = Child.a;</code> где a объявлено в Parent. Какие классы инициализируются?</p><ul><li>Parent и Child</li><li>Только Child</li><li>Только Parent</li><li>Никакие</li></ul><div class="why">Инициализируется класс, в котором поле объявлено.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Перечислите этапы линковки и что на каждом может пойти не так.</summary><div class="a"><p>Верификация — VerifyError (кривой сгенерированный байткод, несовместимые StackMapTable). Подготовка — практически без ошибок (кроме нехватки памяти). Разрешение — NoSuchMethodError, NoSuchFieldError, IllegalAccessError, IncompatibleClassChangeError, LinkageError при нарушении ограничений загрузчиков; происходит лениво при первом выполнении инструкции. Затем инициализация — ExceptionInInitializerError и далее NoClassDefFoundError «Could not initialize class».</p></div></details>
+<details class="q"><summary>Почему опасна тяжёлая работа в static-блоках?</summary><div class="a"><p>Она выполняется в неочевидный момент (первое обращение), под блокировкой инициализации класса — другие потоки ждут; исключение навсегда делает класс непригодным до перезапуска (и в логе останется только NoClassDefFoundError); возможны взаимоблокировки при циклах; её трудно тестировать и мокать. Лучше — явная инициализация в жизненном цикле приложения.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Слабые ссылки, Cleaner, финализация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · СБОРКА МУСОРА</div>
+  <h1>Слабые ссылки, Cleaner, финализация</h1>
+  <p class="lead">Иногда нужно ссылаться на объект, не продлевая ему жизнь: кэш, который не должен удерживать данные, метаданные «рядом» с чужими объектами, освобождение нативных ресурсов после смерти Java-объекта. Для этого в JVM есть мягкие, слабые и фантомные ссылки, очереди ссылок и <code>Cleaner</code>. Разбираем, когда каждая очищается, ловушки <code>WeakHashMap</code> и мягких кэшей, и почему <code>finalize()</code> уходит из Java.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Soft/Weak/Phantom</span><span class="tag">ReferenceQueue</span><span class="tag">WeakHashMap</span><span class="tag">Cleaner</span><span class="tag">finalize</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="kinds"><span class="h-num">15.1</span>Сила достижимости</h2>
+<div class="table-wrap"><table>
+<tr><th>Ссылка</th><th>Когда GC очищает</th><th><code>get()</code></th><th>Для чего</th></tr>
+<tr><td><b>Сильная</b> (обычная)</td><td>никогда, пока достижима</td><td>—</td><td>всё</td></tr>
+<tr><td><code>SoftReference</code></td><td>при нехватке памяти (до OOM — гарантированно); в HotSpot по эвристике: давно не использованные и пропорционально свободной куче (<code>SoftRefLRUPolicyMSPerMB</code>)</td><td>объект или null</td><td>кэши, «чувствительные к памяти» (с оговорками)</td></tr>
+<tr><td><code>WeakReference</code></td><td>при ближайшей сборке, на которой объект достижим только слабо</td><td>объект или null</td><td>канонизирующие отображения, метаданные к чужим объектам, слушатели</td></tr>
+<tr><td><code>PhantomReference</code></td><td>после того как объект стал недостижим; ставится в очередь, объект уже не воскресить</td><td>всегда null</td><td>очистка нативных ресурсов (основа <code>Cleaner</code>)</td></tr>
+</table></div>
+
+<div class="widget" id="rfW">
+  <div class="widget-title">Переживёт ли объект сборку?</div>
+  <div class="controls">
+    <label>на объект ссылаются<select id="rfK"><option value="strong">сильная ссылка из живого объекта</option><option value="soft">только SoftReference</option><option value="weak" selected>только WeakReference</option><option value="phantom">только PhantomReference</option></select></label>
+    <label>событие<select id="rfE"><option value="young">молодая сборка, памяти много</option><option value="full">полная сборка, памяти много</option><option value="pressure">куча почти полна, грозит OOM</option></select></label>
+    <label>последнее обращение к soft-ссылке<select id="rfA"><option value="1">1 с назад</option><option value="600" selected>10 мин назад</option></select></label>
+  </div>
+  <div class="verdict" id="rfV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var k = $("rfK").value, e = $("rfE").value, a = +$("rfA").value, v = $("rfV"), ok, t;
+    if (k === "strong") { ok = true; t = "Сильно достижим — не собирается никогда, сколько бы ни было слабых ссылок рядом."; }
+    else if (k === "weak") { ok = false; t = "Очищен при первой же сборке, затронувшей объект (молодой — если он в молодом поколении). get() вернёт null, ссылка (если зарегистрирована) попадёт в ReferenceQueue."; }
+    else if (k === "phantom") { ok = false; t = "Объект недостижим → PhantomReference ставится в очередь; get() всегда null. Обработчик очереди (Cleaner) освобождает связанный нативный ресурс. Память объекта освобождается после очистки фантомной ссылки (с Java 9 — автоматически)."; }
+    else {
+      var keep = e === "pressure" ? false : a < 60 || e === "young";
+      ok = keep; t = e === "pressure" ? "При угрозе OOM все мягко достижимые объекты гарантированно очищаются перед выбросом ошибки." : keep ? "Сохранён: HotSpot держит мягкие объекты, к которым обращались недавно — интервал ≈ SoftRefLRUPolicyMSPerMB (1000 мс) × свободных МБ кучи." : "Очищен по эвристике LRU: давно не использовался относительно объёма свободной кучи. Поведение зависит от сборщика и размера кучи — непредсказуемо для кэша.";
+    }
+    v.className = "verdict " + (ok ? "ok" : "warn"); v.textContent = (ok ? "Выживет. " : "Будет собран. ") + t;
+  }
+  ["rfK", "rfE", "rfA"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="queue"><span class="h-num">15.2</span>ReferenceQueue и обработка ссылок</h2>
+<p>Ссылку можно создать с очередью: <code>new WeakReference&lt;&gt;(obj, queue)</code>. Когда GC очищает ссылку, служебный поток <b>Reference Handler</b> ставит объект-ссылку в очередь, и ваш код узнаёт, что референт умер — без опроса всех ссылок. Обработка Reference-объектов — отдельная фаза каждой сборки; миллионы слабых ссылок заметно удлиняют паузы (в логах G1 — фаза «Reference Processing»).</p>
+<pre data-title="WeakHashMap внутри: очередь для удаления «мёртвых» записей"><code class="java">class Entry&lt;K, V&gt; extends WeakReference&lt;K&gt; { V value; … }   // слабый — только ключ
+private final ReferenceQueue&lt;K&gt; queue = new ReferenceQueue&lt;&gt;();
+private void expungeStaleEntries() {                          // вызывается при get/put/size
+    for (Object x; (x = queue.poll()) != null; ) { … удалить запись x из таблицы … }
+}</code></pre>
+
+<h2 id="whm"><span class="h-num">15.3</span>Ловушки WeakHashMap и мягких кэшей</h2>
+<div class="widget stepper" id="whSim">
+  <div class="widget-title">Почему WeakHashMap «не очищается»</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Ключ</h5><div class="items"><span class="chip" id="wK">Session s</span></div></div>
+    <div class="lane"><h5>Запись WeakHashMap</h5><div class="items"><span class="chip" id="wE">weak → s</span><span class="chip" id="wV">value: Context</span></div></div>
+    <div class="lane"><h5>Значение</h5><div class="items"><span class="chip" id="wC">Context { session = s }</span></div></div>
+  </div>
+  <section class="st-step" data-t="Замысел" data-hl="wK wE" data-log="map.put(session, new Context(session)) — хотим, чтобы запись исчезла, когда сессия умрёт"><p>Хотим хранить контекст для сессии, пока она жива: ключ слабый, значит, запись пропадёт вместе с сессией.</p></section>
+  <section class="st-step" data-t="Значение держит ключ" data-hl="wV wC wK" data-log="map → Entry.value (сильная) → Context → session (сильная) → ключ всегда сильно достижим"><p>Значение хранится в карте <b>сильно</b>, а значение ссылается на ключ. Путь «карта → значение → ключ» делает ключ сильно достижимым — он никогда не станет слабо достижимым, запись не удалится. Утечка.</p></section>
+  <section class="st-step" data-t="Исправление" data-hl="wC" data-log="значение не должно ссылаться на ключ (или хранить WeakReference на него); либо явное удаление по событию"><p>Значение не должно ссылаться на ключ (или ссылаться через <code>WeakReference</code>). Ещё ловушки: ключи сравниваются через <code>equals</code> — для строковых литералов и интернированных строк (сильно достижимы из пула) записи не удалятся никогда; WeakHashMap не потокобезопасна.</p></section>
+  <section class="st-step" data-t="Мягкий кэш" data-hl="wE wV" data-log="Map<K, SoftReference<V>>: при нехватке памяти GC очищает всё разом → лавина промахов + Full GC"><p>Кэш на <code>SoftReference</code> ведёт себя плохо: GC очищает мягкие ссылки по своим правилам, а не по ценности данных; при нехватке памяти — почти всё разом (лавина промахов), а пока памяти «достаточно», кэш раздувает старое поколение и удлиняет сборки. Для кэшей используйте ограниченные по размеру/времени (Caffeine), а не GC как политику вытеснения.</p></section>
+</div>
+
+<h2 id="cleaner"><span class="h-num">15.4</span>Cleaner вместо finalize</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="finalize: устарел с Java 9, к удалению (JEP 421)"><code class="java">class NativeBuffer {
+    private long address = malloc(1024);
+    @Override protected void finalize() {     // когда? в каком потоке? один раз?
+        free(address);                          // объект можно «воскресить» из finalize
+    }
+}</code></pre>
+<pre class="good-code" data-title="Cleaner + try-with-resources"><code class="java">class NativeBuffer implements AutoCloseable {
+    private static final Cleaner CLEANER = Cleaner.create();
+    private record State(long address) implements Runnable {
+        public void run() { free(address); }    // НЕ ссылается на NativeBuffer!
+    }
+    private final Cleaner.Cleanable cleanable;
+    NativeBuffer() { cleanable = CLEANER.register(this, new State(malloc(1024))); }
+    @Override public void close() { cleanable.clean(); }   // явно и детерминированно; Cleaner — страховка
+}</code></pre>
+</div>
+<ul>
+  <li>Финализируемые объекты переживают минимум одну лишнюю сборку, обрабатываются одним потоком Finalizer (медленный финализатор = утечка памяти), порядок и момент не гарантированы, исключения проглатываются. Запуск с <code>--finalization=disabled</code> проверит, зависит ли ваш код от финализации.</li>
+  <li>Cleaner основан на фантомных ссылках: действие не имеет доступа к объекту, воскресить его нельзя. Главное правило — действие (лямбда/класс) не должно ссылаться на регистрируемый объект, иначе он никогда не станет фантомно достижимым.</li>
+  <li>Освобождение ресурсов должно быть явным (<code>close()</code>, try-with-resources); GC — лишь страховка от забывчивости.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">15.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что вернёт <code>phantomRef.get()</code>?</p><ul><li>Объект, пока он жив</li><li>Объект после очистки</li><li>Всегда null</li><li>Исключение</li></ul><div class="why">Фантомная ссылка нужна только как уведомление о смерти объекта.</div></div>
+<div class="mcq" data-ok="0"><p>Почему запись в WeakHashMap может никогда не удалиться?</p><ul><li>Значение сильно ссылается на ключ, и ключ остаётся сильно достижимым через саму карту</li><li>WeakHashMap не работает в Java 17</li><li>GC не обрабатывает слабые ссылки</li><li>Ключ — Integer</li></ul><div class="why">Классическая утечка.</div></div>
+<div class="mcq" data-ok="3"><p>Чем плох кэш на SoftReference?</p><ul><li>Он не потокобезопасен по определению</li><li>Он очищается при каждой молодой сборке</li><li>SoftReference запрещены в Java 21</li><li>Вытеснение решает GC по своей эвристике: непредсказуемо, массовые промахи при нехватке памяти, раздувание старого поколения</li></ul><div class="why">Используйте кэши с явными ограничениями.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как гарантированно освободить нативный ресурс, связанный с Java-объектом?</summary><div class="a"><p>Явно: AutoCloseable и try-with-resources (или явный close в жизненном цикле). Страховка — Cleaner: регистрируем объект и действие очистки, не ссылающееся на объект; действие выполнится после того, как объект станет фантомно достижимым, если close не был вызван. Не finalize: он медленный, непредсказуемый и удаляется из платформы. В FFM API (тема 19) ресурсы привязываются к Arena с явным закрытием.</p></div></details>
+<details class="q"><summary>Где в JDK и фреймворках используются слабые ссылки?</summary><div class="a"><p>WeakHashMap и ThreadLocalMap (ключ — слабая ссылка на ThreadLocal; значение — сильная, отсюда утечки в пулах); кэши интроспекции и метаданных классов (ClassValue, Spring ConcurrentReferenceHashMap, чтобы не держать загрузчики); интернирование (Guava Interners.newWeakInterner); слушатели, которые не должны удерживать подписчика; DirectByteBuffer освобождается через Cleaner.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

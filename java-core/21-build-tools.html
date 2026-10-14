@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Сборка: classpath, JAR, Maven, Gradle</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Сборка: classpath, JAR, Maven и Gradle</h1>
+  <p class="lead">IDE скрывает сборку за зелёной кнопкой — до первого <code>NoSuchMethodError</code> на проде или «у меня локально работает». Разберём, что на самом деле делают <code>javac</code> и <code>java</code>, как устроен JAR, как Maven и Gradle находят зависимости и почему при конфликте версий они выбирают разные варианты.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">classpath</span><span class="tag">жизненный цикл Maven</span><span class="tag">конфликты версий</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="manual"><span class="h-num">21.1</span>Сборка руками: что делают инструменты</h2>
+<pre data-title="Весь процесс без Maven и Gradle"><code class="txt">javac -d out -cp "lib/*" $(find src -name "*.java")     # 1. компиляция: .java → .class, зависимости на classpath
+jar --create --file app.jar --main-class com.shop.Main -C out .   # 2. упаковка: zip + META-INF/MANIFEST.MF
+java -cp "app.jar:lib/*" com.shop.Main                    # 3. запуск: JVM ищет классы по classpath слева направо</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>classpath</h4><p>Упорядоченный список каталогов и jar-файлов, где загрузчик Application ищет классы (тема 15). Если класс есть в двух jar — берётся из первого. Разделитель — <code>:</code> в Unix, <code>;</code> в Windows.</p></div>
+  <div class="card"><h4>JAR</h4><p>ZIP-архив с классами, ресурсами и <code>META-INF/MANIFEST.MF</code> (<code>Main-Class</code>, <code>Class-Path</code>). Обычный jar не содержит зависимостей; «толстый» jar Spring Boot упаковывает их внутрь и использует свой загрузчик.</p></div>
+</div>
+<p>Системы сборки автоматизируют эти три шага и добавляют главное: <b>управление зависимостями</b> — скачивание нужных jar и их транзитивных зависимостей из репозитория (Maven Central) по координатам <code>groupId:artifactId:version</code>.</p>
+
+<h2 id="maven"><span class="h-num">21.2</span>Maven</h2>
+<pre data-title="pom.xml — минимум"><code class="txt">&lt;project&gt;
+  &lt;modelVersion&gt;4.0.0&lt;/modelVersion&gt;
+  &lt;groupId&gt;com.shop&lt;/groupId&gt; &lt;artifactId&gt;orders&lt;/artifactId&gt; &lt;version&gt;1.4.0&lt;/version&gt;
+  &lt;properties&gt;&lt;maven.compiler.release&gt;21&lt;/maven.compiler.release&gt;&lt;/properties&gt;
+
+  &lt;dependencyManagement&gt;                               &lt;!-- версии, но не сами зависимости --&gt;
+    &lt;dependencies&gt;&lt;dependency&gt;
+      &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;&lt;artifactId&gt;spring-boot-dependencies&lt;/artifactId&gt;
+      &lt;version&gt;3.5.0&lt;/version&gt;&lt;type&gt;pom&lt;/type&gt;&lt;scope&gt;import&lt;/scope&gt;      &lt;!-- BOM --&gt;
+    &lt;/dependency&gt;&lt;/dependencies&gt;
+  &lt;/dependencyManagement&gt;
+
+  &lt;dependencies&gt;
+    &lt;dependency&gt;&lt;groupId&gt;com.fasterxml.jackson.core&lt;/groupId&gt;&lt;artifactId&gt;jackson-databind&lt;/artifactId&gt;&lt;/dependency&gt;   &lt;!-- версия из BOM --&gt;
+    &lt;dependency&gt;&lt;groupId&gt;org.junit.jupiter&lt;/groupId&gt;&lt;artifactId&gt;junit-jupiter&lt;/artifactId&gt;&lt;scope&gt;test&lt;/scope&gt;&lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/project&gt;</code></pre>
+<p>Maven — декларативный: вы описываете проект, а порядок действий задан <b>жизненным циклом</b>. Вызов фазы выполняет все предыдущие.</p>
+<div class="widget" id="mvW">
+  <div class="widget-title">Симулятор: что выполнит команда</div>
+  <div class="controls"><label>команда<select id="mvCmd"><option value="2">mvn compile</option><option value="4">mvn test</option><option value="5" selected>mvn package</option><option value="6">mvn verify</option><option value="7">mvn install</option><option value="8">mvn deploy</option><option value="c5">mvn clean package</option><option value="s5">mvn package -DskipTests</option></select></label></div>
+  <div class="flow col" id="mvFlow"></div>
+  <div class="verdict" id="mvOut"></div>
+</div>
+<script>
+(function () {
+  var P = [["validate", "проверка структуры проекта", ""], ["process-resources", "копирование src/main/resources в target/classes", "resources:resources"], ["compile", "компиляция src/main/java", "compiler:compile"], ["test-compile", "компиляция src/test/java", "compiler:testCompile"], ["test", "модульные тесты (*Test)", "surefire:test"], ["package", "сборка jar/war в target/", "jar:jar"], ["verify", "интеграционные тесты (*IT), проверки качества", "failsafe:integration-test"], ["install", "копирование артефакта в локальный репозиторий ~/.m2", "install:install"], ["deploy", "публикация в удалённый репозиторий (Nexus, Artifactory)", "deploy:deploy"]];
+  var sel = document.getElementById("mvCmd"), flow = document.getElementById("mvFlow"), out = document.getElementById("mvOut");
+  function run() {
+    var v = sel.value, clean = v[0] === "c", skip = v[0] === "s", n = +v.replace(/\D/g, ""), h = "";
+    if (clean) h += '<div class="node warn"><b>clean</b><small>отдельный жизненный цикл: удаление каталога target/</small></div><span class="to">↓</span>';
+    P.forEach(function (p, i) {
+      var on = i <= n, skipped = skip && (i === 4);
+      h += '<div class="node ' + (on ? (skipped ? "off" : (i === n ? "hl" : "was")) : "off") + '"><b>' + p[0] + "</b>" + (p[2] ? " · " + p[2] : "") + "<small>" + p[1] + (skipped ? " — ПРОПУЩЕНО (-DskipTests: тесты компилируются, но не запускаются)" : "") + "</small></div>" + (i < P.length - 1 ? '<span class="to">↓</span>' : "");
+    });
+    flow.innerHTML = h;
+    var msg = { 2: "Только компиляция основного кода.", 4: "Тесты выполняются всегда перед упаковкой: упавший тест останавливает сборку.", 5: "Результат — target/orders-1.4.0.jar. Интеграционные тесты (failsafe) на этой фазе ещё не идут.", 6: "Полная проверка без установки. Именно verify стоит запускать в CI.", 7: "Артефакт появляется в ~/.m2 — теперь другие локальные проекты могут от него зависеть.", 8: "Публикация для всей команды. Версия -SNAPSHOT перезаписывается, релизная — неизменяема." }[n];
+    if (clean) msg = "clean — не фаза основного цикла, поэтому его указывают явно. Без clean в target/ могут остаться классы удалённых исходников. " + msg;
+    if (skip) msg += " -Dmaven.test.skip=true не стал бы даже компилировать тесты.";
+    out.className = "verdict ok"; out.textContent = msg;
+  }
+  sel.addEventListener("change", run); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Scope</th><th>Компиляция</th><th>Тесты</th><th>Рантайм / в артефакте</th><th>Пример</th></tr>
+<tr><td><code>compile</code> (по умолчанию)</td><td>да</td><td>да</td><td>да</td><td>jackson, spring-web</td></tr>
+<tr><td><code>provided</code></td><td>да</td><td>да</td><td>нет — даёт среда</td><td>servlet-api для war, Lombok</td></tr>
+<tr><td><code>runtime</code></td><td>нет</td><td>да</td><td>да</td><td>JDBC-драйвер, реализация логирования</td></tr>
+<tr><td><code>test</code></td><td>нет</td><td>да</td><td>нет</td><td>JUnit, Mockito, Testcontainers</td></tr>
+</table></div>
+
+<h2 id="conflicts"><span class="h-num">21.3</span>Транзитивные зависимости и конфликты версий</h2>
+<p>Вы объявляете пять зависимостей, а на classpath оказывается сто: каждая тянет свои. Одна и та же библиотека может прийти по разным путям в разных версиях — а на classpath должна быть ровно одна.</p>
+<div class="widget" id="cfW">
+  <div class="widget-title">Симулятор: какую версию guava получит приложение</div>
+  <div class="out">app
+├── lib-a:1.0
+│   └── guava:<b id="cfA1">31.0</b>
+└── lib-b:2.0
+    └── lib-c:1.5
+        └── guava:<b id="cfB1">33.0</b></div>
+  <div class="controls">
+    <label>lib-a требует guava<select id="cfA"><option>31.0</option><option>33.0</option><option>20.0</option></select></label>
+    <label>lib-c требует guava<select id="cfB"><option>33.0</option><option>31.0</option><option>20.0</option></select></label>
+    <label>в проекте дополнительно<select id="cfFix" style="max-width:100%"><option value="none">ничего</option><option value="direct">прямая зависимость guava:32.0</option><option value="mgmt">dependencyManagement / constraints: guava 32.0</option><option value="excl">exclusion guava у lib-a</option></select></label>
+  </div>
+  <div class="out" id="cfOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function cmp(a, b) { return parseFloat(a) - parseFloat(b); }
+  function run() {
+    var a = $("cfA").value, b = $("cfB").value, fix = $("cfFix").value, mvn, gr, why1, why2;
+    $("cfA1").textContent = a; $("cfB1").textContent = b;
+    if (fix === "direct") { mvn = "32.0"; why1 = "прямая зависимость на глубине 1 — ближе всех"; gr = [a, b, "32.0"].sort(cmp).pop(); why2 = "наибольшая из запрошенных (" + a + ", " + b + ", 32.0)"; }
+    else if (fix === "mgmt") { mvn = "32.0"; why1 = "dependencyManagement задаёт версию для всех транзитивных вхождений"; gr = [a, b, "32.0"].sort(cmp).pop(); why2 = "constraint участвует в выборе как ещё один запрос; побеждает наибольшая (для жёсткой фиксации — strictly или enforcedPlatform)"; }
+    else if (fix === "excl") { mvn = b; why1 = "guava от lib-a исключена, остался один путь"; gr = b; why2 = "остался один запрос"; }
+    else { mvn = a; why1 = "«ближайшее побеждает»: глубина 2 (через lib-a) против глубины 3 (через lib-c); при равной глубине — первое в pom.xml"; gr = cmp(a, b) >= 0 ? a : b; why2 = "выбирается наибольшая версия из всех запрошенных"; }
+    var L = ["Maven:  guava " + mvn + "   — " + why1, "Gradle: guava " + gr + "   — " + why2, ""];
+    var need = [a, b].sort(cmp).pop(), risk = [];
+    if (cmp(mvn, need) < 0) risk.push("Maven: библиотека, скомпилированная под guava " + need + ", получит " + mvn + " → возможен NoSuchMethodError / ClassNotFoundException во время выполнения");
+    if (cmp(gr, a) > 0 || cmp(gr, b) > 0) risk.push("Gradle: библиотека, рассчитанная на старую версию, получит " + gr + " → сломается, если в guava удалили используемые ею методы (20.0 → 33.0 — реальный случай)");
+    L.push(risk.length ? "Риски:\n  " + risk.join("\n  ") : "Все библиотеки получают версию не ниже той, под которую собраны.");
+    L.push("\nДиагностика:  mvn dependency:tree -Dverbose -Dincludes=com.google.guava      ./gradlew dependencyInsight --dependency guava");
+    $("cfOut").textContent = L.join("\n");
+  }
+  ["cfA", "cfB", "cfFix"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+<div class="callout ok"><span class="c-title">Как жить без конфликтов</span>
+Используйте <b>BOM</b> (bill of materials): набор версий, проверенных на совместимость, — <code>spring-boot-dependencies</code>, <code>jackson-bom</code>, <code>testcontainers-bom</code>. Не указывайте версии библиотек, которыми управляет BOM. Включите в CI проверку: Maven Enforcer (<code>dependencyConvergence</code>, <code>banDuplicateClasses</code>) или <code>failOnVersionConflict()</code> в Gradle.
+</div>
+
+<h2 id="gradle"><span class="h-num">21.4</span>Gradle</h2>
+<pre data-title="build.gradle.kts"><code class="txt">plugins {
+    java
+    id("org.springframework.boot") version "3.5.0"
+    id("io.spring.dependency-management") version "1.1.7"
+}
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }   // Gradle сам найдёт или скачает JDK 21
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")   // не видна потребителям этого модуля при компиляции
+    api("com.shop:common-model:2.1.0")                                    // (плагин java-library) часть публичного API модуля
+    runtimeOnly("org.postgresql:postgresql")
+    compileOnly("org.projectlombok:lombok"); annotationProcessor("org.projectlombok:lombok")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+}
+tasks.test { useJUnitPlatform() }</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>Maven</th><th>Gradle</th></tr>
+<tr><td>Модель</td><td>фиксированный жизненный цикл, плагины привязаны к фазам</td><td>граф задач (tasks) с зависимостями; выполняются только нужные</td></tr>
+<tr><td>Описание</td><td>XML, декларативно</td><td>Kotlin/Groovy DSL — это код</td></tr>
+<tr><td>Скорость</td><td>каждый раз заново (есть сторонний build cache)</td><td>инкрементальность: задача пропускается, если входы и выходы не изменились (UP-TO-DATE); build cache; демон</td></tr>
+<tr><td>Конфликт версий</td><td>ближайшая к корню</td><td>наибольшая</td></tr>
+<tr><td>Многомодульность</td><td><code>&lt;modules&gt;</code> + parent pom</td><td><code>settings.gradle</code> + convention-плагины</td></tr>
+<tr><td>Порог входа</td><td>ниже, сборки похожи друг на друга</td><td>выше, гибкость позволяет запутать сборку</td></tr>
+</table></div>
+<p><code>implementation</code> против <code>api</code>: если модуль A зависит от B через <code>implementation</code>, то потребители A не видят B при компиляции. Изменение B не заставляет перекомпилировать потребителей A, а внутренние зависимости не протекают наружу. <code>api</code> — только для типов, которые присутствуют в публичных сигнатурах модуля.</p>
+
+<h2 id="repro"><span class="h-num">21.5</span>Воспроизводимость</h2>
+<div class="grid-2">
+  <div class="card"><h4>Wrapper</h4><p><code>./mvnw</code>, <code>./gradlew</code> в репозитории фиксируют версию инструмента: у всех разработчиков и в CI сборка идёт одной версией, устанавливать ничего не нужно.</p></div>
+  <div class="card"><h4>Версия Java</h4><p><code>maven.compiler.release</code> / toolchain: компиляция под конкретный релиз с проверкой API. <code>release 17</code> на JDK 21 не даст случайно использовать методы из 21.</p></div>
+  <div class="card"><h4>Никаких плавающих версий</h4><p><code>1.+</code>, <code>LATEST</code>, диапазоны <code>[1.0,2.0)</code> делают сборку зависимой от дня запуска. SNAPSHOT — только для разработки. В Gradle — dependency locking.</p></div>
+  <div class="card"><h4>CI — источник истины</h4><p>Артефакт для продакшена собирается только в CI из чистого клона, один раз, и продвигается по окружениям без пересборки.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">21.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что выполнит <code>mvn package</code>?</p><ul><li>Только упаковку jar</li><li>Все фазы до package включительно: ресурсы, компиляцию, тесты, упаковку</li><li>Упаковку и установку в ~/.m2</li><li>Сначала clean, потом упаковку</li></ul><div class="why">Фазы жизненного цикла выполняются последовательно от первой до указанной. clean — отдельный цикл.</div></div>
+<div class="mcq" data-ok="2"><p>Библиотека X приходит транзитивно: версия 1.0 на глубине 2 и версия 3.0 на глубине 3. Что выберут Maven и Gradle?</p><ul><li>Оба — 3.0</li><li>Оба — 1.0</li><li>Maven — 1.0 (ближайшая), Gradle — 3.0 (наибольшая)</li><li>Обе версии окажутся на classpath</li></ul><div class="why">Разные стратегии разрешения — причина того, что проект ведёт себя по-разному после миграции между инструментами.</div></div>
+<div class="mcq" data-ok="0"><p>Какой scope у JDBC-драйвера PostgreSQL в типичном приложении?</p><ul><li>runtime — код компилируется против java.sql, драйвер нужен только при выполнении</li><li>compile</li><li>provided</li><li>test</li></ul><div class="why">Так исключается случайная зависимость кода от классов конкретного драйвера.</div></div>
+<div class="mcq" data-ok="3"><p>На проде <code>NoSuchMethodError</code> в классе библиотеки, локально всё работает. Вероятная причина?</p><ul><li>Нехватка памяти</li><li>Ошибка в JDK</li><li>Неверная кодировка исходников</li><li>На classpath другая версия библиотеки, чем та, под которую скомпилирован вызывающий код</li></ul><div class="why">Проверьте дерево зависимостей и то, из какого jar реально загружен класс (<code>-verbose:class</code>).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое BOM и зачем он нужен?</summary><div class="a"><p>POM-файл с секцией dependencyManagement — согласованным набором версий. Импортируется (scope import в Maven, platform() в Gradle); после этого зависимости объявляются без версий. Избавляет от конфликтов и ручного подбора совместимых версий.</p></div></details>
+<details class="q"><summary>Чем implementation отличается от api в Gradle?</summary><div class="a"><p>implementation — зависимость нужна для реализации модуля и не попадает на compile classpath его потребителей (остаётся в runtime). api — зависимость является частью публичного API и видна потребителям. implementation ускоряет сборку и защищает инкапсуляцию.</p></div></details>
+<details class="q"><summary>Как найти, откуда пришла неожиданная версия библиотеки?</summary><div class="a"><p>mvn dependency:tree -Dverbose (покажет «omitted for conflict») или gradlew dependencyInsight --dependency имя (покажет причину выбора). Затем — выровнять версией в dependencyManagement/constraints, обновить библиотеку-источник или исключить транзитивную зависимость.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

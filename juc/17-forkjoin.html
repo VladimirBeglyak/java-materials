@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · ForkJoinPool и work-stealing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.fj { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 10px 0; }
+.fj .w { border: 1px solid var(--line); border-radius: 8px; padding: 6px; min-height: 150px; display: flex; flex-direction: column; }
+.fj .w h5 { margin: 0 0 4px; font-size: 12px; } .fj .w .cur { font: 11px var(--font-mono); min-height: 20px; color: var(--accent); }
+.fj .dq { display: flex; flex-direction: column-reverse; gap: 2px; flex: 1; justify-content: flex-start; border-top: 1px dashed var(--line); padding-top: 4px; }
+.fj .dq span { font: 11px var(--font-mono); padding: 3px 4px; border-radius: 4px; background: var(--info-soft); border: 1px solid var(--info); }
+.fj .dq span.stolen { background: var(--warn-soft); border-color: var(--warn); }
+@media (max-width: 640px) { .fj { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ИСПОЛНИТЕЛИ</div>
+  <h1>ForkJoinPool и work-stealing</h1>
+  <p class="lead">ForkJoinPool создан для рекурсивного «разделяй и властвуй»: задача делится на подзадачи, пока они не станут маленькими. Ключевая идея — у каждого рабочего потока своя двусторонняя очередь: свои задачи поток берёт с одного конца (LIFO, горячие в кэше), а свободные потоки <b>крадут</b> с другого конца (FIFO, самые крупные куски). Симулятор покажет, как работа сама растекается по потокам. Этот же пул исполняет параллельные стримы, CompletableFuture по умолчанию и виртуальные потоки.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">деки задач</span><span class="tag">work-stealing</span><span class="tag">RecursiveTask</span><span class="tag">fork/join</span><span class="tag">commonPool</span><span class="tag">ManagedBlocker</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="task"><span class="h-num">17.1</span>RecursiveTask</h2>
+<pre data-title="сумма массива: классическая форма"><code class="java">final class SumTask extends RecursiveTask&lt;Long&gt; {
+    static final int THRESHOLD = 10_000;
+    final long[] a; final int lo, hi;
+    SumTask(long[] a, int lo, int hi) { this.a = a; this.lo = lo; this.hi = hi; }
+    @Override protected Long compute() {
+        if (hi - lo &lt;= THRESHOLD) { long s = 0; for (int i = lo; i &lt; hi; i++) s += a[i]; return s; }
+        int mid = (lo + hi) &gt;&gt;&gt; 1;
+        SumTask left = new SumTask(a, lo, mid);
+        left.fork();                                        // в СВОЮ деку: её может украсть другой поток
+        long right = new SumTask(a, mid, hi).compute();     // правую половину считаем сами, без лишнего fork
+        return right + left.join();                         // join: если левую не украли — выполним сами (pop)
+    }
+}
+long sum = ForkJoinPool.commonPool().invoke(new SumTask(data, 0, data.length));</code></pre>
+<div class="callout warn"><span class="c-title">Частая ошибка</span>
+<code>left.fork(); right.fork(); return left.join() + right.join();</code> — работает, но текущий поток просто ждёт, вместо того чтобы считать сам; а порядок <code>join</code> важен (сначала последний форкнутый — LIFO). Идиома: fork одну половину, compute другую, затем join.
+</div>
+
+<h2 id="sim"><span class="h-num">17.2</span>Симулятор work-stealing</h2>
+<div class="widget" id="fjW">
+  <div class="widget-title">SumTask[0, 64) на 4 потоках, порог 8 элементов</div>
+  <div class="controls">
+    <button class="btn primary" type="button" id="fjS">Шаг (все потоки)</button>
+    <button class="btn" type="button" id="fjA">До конца</button>
+    <button class="btn" type="button" id="fjR">↺</button>
+  </div>
+  <div class="fj" id="fjView"></div>
+  <div class="out" id="fjOut"></div>
+  <div class="log" id="fjLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, W, steps, log, leaves, steals, done;
+  function reset() { W = [0, 1, 2, 3].map(function (i) { return { dq: i === 0 ? [{ lo: 0, hi: 64 }] : [], cur: null, stolen: {} }; }); steps = 0; log = ["invoke: задача [0, 64) кладётся в деку W0 (внешняя отправка — в общую очередь, упрощённо)"]; leaves = [0, 0, 0, 0]; steals = 0; done = false; draw(); }
+  function step() {
+    if (done) return; steps++; var msgs = [];
+    function exec(w, i, task, via) {
+      if (task.hi - task.lo > 8) { var mid = (task.lo + task.hi) >> 1; w.dq.push({ lo: task.lo, hi: mid }); w.dq.push({ lo: mid, hi: task.hi }); msgs.push("W" + i + via + ": [" + task.lo + "," + task.hi + ") > порога → fork двух половин в свою деку"); }
+      else { leaves[i] += task.hi - task.lo; msgs.push("W" + i + via + ": [" + task.lo + "," + task.hi + ") ≤ порога → посчитал сам"); }
+    }
+    W.forEach(function (w, i) {
+      if (!w.dq.length) {   // украсть с ДНА чужой деки и сразу выполнить
+        var victims = W.map(function (v, j) { return j; }).filter(function (j) { return j !== i && W[j].dq.length > 0; });
+        if (victims.length) { var v = victims[(steps + i) % victims.length], t = W[v].dq.shift(); steals++; exec(w, i, t, " (украл с дна W" + v + ")"); w.dq.forEach(function (x) { w.stolen[x.lo + "-" + x.hi] = 1; }); }
+        return;
+      }
+      exec(w, i, w.dq.pop(), "");   // своя дека: с вершины (LIFO)
+    });
+    log.push("шаг " + steps + ": " + msgs.join("; "));
+    var total = leaves.reduce(function (a, b) { return a + b; }, 0); if (total >= 64) { done = true; log.push("все 64 элемента посчитаны; join собирает результаты вверх по дереву"); }
+    draw();
+  }
+  function draw() {
+    $("fjView").innerHTML = W.map(function (w, i) { return '<div class="w"><h5>W' + i + " · посчитал " + leaves[i] + '</h5><div class="cur">верх ↑ (свои: push/pop)</div><div class="dq">' + w.dq.map(function (t) { return '<span class="' + (w.stolen[t.lo + "-" + t.hi] ? "stolen" : "") + '">[' + t.lo + "," + t.hi + ")</span>"; }).join("") + '</div><div class="cur">дно ↓ (воры: steal)</div></div>'; }).join("");
+    $("fjOut").textContent = "шагов: " + steps + ", краж: " + steals + ", распределение работы: " + leaves.map(function (l, i) { return "W" + i + "=" + l; }).join(" ") + (done ? "  · готово" : "");
+    $("fjLog").textContent = log.slice(-5).join("\n"); $("fjLog").scrollTop = 1e6;
+  }
+  $("fjS").addEventListener("click", step); $("fjA").addEventListener("click", function () { var g = 0; while (!done && g++ < 200) step(); }); $("fjR").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Почему именно так</span>
+Владелец работает с <b>вершиной</b> деки (последняя форкнутая — самая маленькая и «горячая» в кэше) без конкуренции с ворами. Вор берёт с <b>дна</b> — самые старые и крупные задачи: одной кражи хватает надолго, краж мало. Владелец и вор конфликтуют, только когда в деке остаётся один элемент (разрешается CAS).
+</div>
+
+<h2 id="pool"><span class="h-num">17.3</span>Пул и общий пул</h2>
+<div class="table-wrap"><table>
+<tr><th>Аспект</th><th>Подробности</th></tr>
+<tr><td><code>commonPool()</code></td><td>статический общий пул: параллелизм = число процессоров − 1 (вызывающий поток тоже участвует в invoke/join); настраивается <code>-Djava.util.concurrent.ForkJoinPool.common.parallelism</code>. Используют параллельные стримы, <code>CompletableFuture.*Async</code> без executor, <code>Arrays.parallelSort</code></td></tr>
+<tr><td>Блокирующие операции</td><td>заблокированный поток FJP не берёт задачи — пул «теряет» параллелизм. <code>ForkJoinPool.managedBlock(blocker)</code> позволяет пулу временно добавить компенсирующий поток</td></tr>
+<tr><td>asyncMode = true</td><td>свои задачи — FIFO: для событийных задач, которые никогда не join (так настроен планировщик виртуальных потоков)</td></tr>
+<tr><td>Исключения</td><td>пробрасываются в join/invoke (в RuntimeException-обёртке, если проверяемые); getException()</td></tr>
+<tr><td>CountedCompleter</td><td>продолжения без блокирующего join: задача завершается, когда счётчик ожидаемых подзадач дошёл до нуля (так устроены параллельные стримы)</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Не блокируйте общий пул</span>
+I/O, sleep или ожидание блокировок в задачах параллельного стрима или <code>supplyAsync</code> без своего executor занимают потоки commonPool, общие для всего приложения: другие параллельные стримы и CompletableFuture начинают ждать. Для блокирующих задач — свой пул или виртуальные потоки.
+</div>
+
+<h2 id="quiz"><span class="h-num">17.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>С какого конца деки вор крадёт задачи и почему?</p><ul><li>С вершины — там свежие задачи</li><li>Случайно</li><li>С дна — там самые старые и крупные задачи, и вор не мешает владельцу, работающему с вершиной</li><li>Воровство запрещено</li></ul><div class="why">Минимум краж и конфликтов.</div></div>
+<div class="mcq" data-ok="0"><p>Какой параллелизм у ForkJoinPool.commonPool() на 8-ядерной машине?</p><ul><li>7 — вызывающий поток тоже выполняет задачи</li><li>8</li><li>16</li><li>1</li></ul><div class="why">Настраивается системным свойством.</div></div>
+<div class="mcq" data-ok="3"><p>Почему в compute() лучше fork() одну половину и compute() вторую, а не fork() обе?</p><ul><li>Иначе не скомпилируется</li><li>fork() дорогой</li><li>Так меньше памяти</li><li>Текущий поток сразу выполняет полезную работу вместо ожидания в join, меньше задач в деке</li></ul><div class="why">Стандартная идиома из Javadoc.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем ForkJoinPool отличается от ThreadPoolExecutor?</summary><div class="a"><p>TPE — одна общая очередь задач для всех потоков (конкуренция за неё), задачи независимы. FJP — у каждого потока своя дека и кража работы; оптимизирован для множества мелких задач, порождающих подзадачи и ждущих их (join без блокировки потока — поток в это время выполняет другие задачи). FJP плохо переносит блокирующие задачи (нужен ManagedBlocker); TPE — универсальный.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

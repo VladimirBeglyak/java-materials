@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>24 · Консенсус: кворум и Raft</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="24">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 24 · ПРОЕКТИРОВАНИЕ НА ПРАКТИКЕ</div>
+  <h1>Консенсус: кворум и Raft</h1>
+  <p class="lead">Кто сейчас лидер? Какая конфигурация кластера действует? Кому принадлежит блокировка? На такие вопросы несколько узлов обязаны отвечать одинаково — даже когда часть из них упала, а сеть разделилась. Это задача консенсуса. Вы почти никогда не будете реализовывать его сами, но etcd, ZooKeeper, контроллер Kafka, Consul и распределённые базы стоят на нём, и их поведение при сбоях объясняется двумя идеями: большинством и журналом.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">кворум</span><span class="tag">выборы лидера</span><span class="tag">репликация журнала</span><span class="tag">split brain</span><span class="tag">2 симулятора</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">24.1</span>Зачем нужен консенсус</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Что будет без согласия</th><th>Где решается</th></tr>
+<tr><td>Выбор единственного лидера</td><td>два лидера принимают записи — расходящиеся истории (split brain)</td><td>контроллер Kafka (KRaft), лидеры партиций, Patroni для PostgreSQL</td></tr>
+<tr><td>Конфигурация и членство в кластере</td><td>узлы по-разному считают, кто в кластере и где какие данные</td><td>etcd в Kubernetes, ZooKeeper</td></tr>
+<tr><td>Распределённая блокировка и лизы</td><td>двое уверены, что владеют ресурсом</td><td>etcd, ZooKeeper, Consul</td></tr>
+<tr><td>Линеаризуемое хранилище</td><td>чтение возвращает устаревшее или «откатившееся» значение</td><td>Spanner, CockroachDB, TiKV — Raft/Paxos на каждом диапазоне данных</td></tr>
+</table></div>
+<p>Все эти задачи сводятся к одной: <b>реплицированный журнал</b>. Если все узлы применяют одни и те же команды в одном и том же порядке, их состояния совпадают. Консенсус — это согласие о том, какая запись стоит на каждой позиции журнала.</p>
+
+<h2 id="quorum"><span class="h-num">24.2</span>Кворум: арифметика большинства</h2>
+<p>Решение принято, если его подтвердило <b>большинство</b> узлов: ⌊N/2⌋ + 1. Любые два большинства пересекаются хотя бы в одном узле — значит, два противоречащих решения принять невозможно, а новый лидер обязательно «встретит» узел, знающий последнее решение.</p>
+<div class="widget" id="qW">
+  <div class="widget-title">Калькулятор кворума</div>
+  <div class="controls">
+    <label>узлов в кластере (N)<input type="number" id="qN" value="5" min="1" max="11"></label>
+    <label>недоступно узлов<input type="number" id="qDown" value="2" min="0" max="11"></label>
+    <label>сеть разделилась: в меньшей части<input type="number" id="qPart" value="0" min="0" max="5"></label>
+  </div>
+  <div class="lanes" id="qLanes"></div>
+  <div class="verdict" id="qOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.min(11, Math.max(1, Math.round(+$("qN").value))), down = Math.min(n, Math.max(0, Math.round(+$("qDown").value))), part = Math.min(Math.floor((n - down) / 2), Math.max(0, Math.round(+$("qPart").value)));
+    var maj = Math.floor(n / 2) + 1, tol = n - maj, alive = n - down, big = alive - part, h = "";
+    function lane(title, cnt, cls, note) { var c = ""; for (var i = 0; i < cnt; i++) c += '<span class="chip ' + cls + '">●</span>'; return '<div class="lane"><h5>' + title + '</h5><div class="items">' + (c || '<span class="chip">—</span>') + "</div><small style=\"color:var(--fg-muted)\">" + note + "</small></div>"; }
+    h += lane("Большая часть: " + big + " из " + n, big, big >= maj ? "ok" : "warn", big >= maj ? "есть кворум: выбирает лидера, принимает записи" : "кворума нет: только чтение устаревшего или отказ");
+    if (part) h += lane("Меньшая часть: " + part, part, "warn", "кворума нет: записи отклоняются — split brain невозможен");
+    h += lane("Недоступны: " + down, down, "bad", "");
+    $("qLanes").innerHTML = h;
+    var o = $("qOut"), even = n % 2 === 0;
+    o.className = "verdict " + (big >= maj ? "ok" : "bad");
+    o.textContent = "Кворум = ⌊" + n + "/2⌋ + 1 = " + maj + ". Кластер из " + n + " узлов переживает отказ " + tol + " узлов. " + (big >= maj ? "Сейчас кластер работоспособен." : "Сейчас большинства нет ни в одной части — кластер ОСТАНОВИЛ запись. Это правильное поведение: недоступность вместо расхождения данных (выбор CP).") + (even ? " Чётное число узлов не добавляет устойчивости: " + n + " узлов переживают столько же отказов, сколько " + (n - 1) + ", но кворум больше и возможен раздел ровно пополам, когда не работает ни одна половина. Поэтому берут 3, 5 или 7." : "") + (n > 7 ? " Больше 7 узлов почти не используют: каждая запись ждёт подтверждения большинства, задержка растёт." : "");
+  }
+  ["qN", "qDown", "qPart"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">Кворумы чтения и записи</span>
+В системах без лидера (Cassandra, Dynamo) согласованность настраивается: запись подтверждают W реплик, чтение опрашивает R. Если <code>W + R &gt; N</code>, множества пересекаются, и чтение видит последнюю подтверждённую запись. N=3, W=2, R=2 — строго; W=1, R=1 — быстро, но возможно устаревшее чтение.</div>
+
+<h2 id="raft"><span class="h-num">24.3</span>Raft: выборы лидера и репликация журнала</h2>
+<p>Raft создан как «понятный консенсус». Время разбито на <b>термы</b> (terms) — номера эпох; в каждом терме не более одного лидера. Узел всегда в одной из трёх ролей: follower, candidate, leader.</p>
+<div class="widget stepper" id="raftSim">
+  <div class="widget-title">Симулятор: пять узлов, отказ лидера, запись</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="rfA"><h5>A</h5><div class="items"><span class="chip ok" data-to="2">LEADER, терм 1</span><span class="chip bad" data-from="2" data-to="9">недоступен</span><span class="chip warn" data-from="9">follower, терм 2 (лишняя запись 4 стёрта)</span><span class="chip" data-to="9">журнал: 1 2 3 [4]</span><span class="chip" data-from="9">журнал: 1 2 3 4′</span></div></div>
+    <div class="lane node" id="rfB"><h5>B</h5><div class="items"><span class="chip" data-to="3">follower, терм 1</span><span class="chip warn" data-from="3" data-to="5">CANDIDATE, терм 2</span><span class="chip ok" data-from="5">LEADER, терм 2</span><span class="chip" data-to="6">журнал: 1 2 3</span><span class="chip" data-from="6">журнал: 1 2 3 4′</span></div></div>
+    <div class="lane node" id="rfC"><h5>C</h5><div class="items"><span class="chip">follower</span><span class="chip info" data-from="4">голос за B в терме 2</span><span class="chip" data-to="7">журнал: 1 2 3</span><span class="chip" data-from="7">журнал: 1 2 3 4′</span></div></div>
+    <div class="lane node" id="rfD"><h5>D</h5><div class="items"><span class="chip">follower</span><span class="chip info" data-from="4">голос за B в терме 2</span><span class="chip" data-to="7">журнал: 1 2 3</span><span class="chip" data-from="7">журнал: 1 2 3 4′</span></div></div>
+    <div class="lane node" id="rfE"><h5>E</h5><div class="items"><span class="chip">follower (отстал)</span><span class="chip" data-to="8">журнал: 1 2</span><span class="chip" data-from="8">журнал: 1 2 3 4′</span></div></div>
+  </div>
+  <section class="st-step" data-t="Норма" data-hl="rfA"><h4>Лидер A, терм 1</h4><p>Лидер раз в ~100 мс шлёт всем heartbeat (пустой AppendEntries). Записи 1–3 подтверждены большинством. Запись 4 лидер успел записать только у себя — она <b>не закоммичена</b>, клиент ответа не получил.</p></section>
+  <section class="st-step" data-t="Лидер пропал" data-hl="rfA"><h4>A недоступен</h4><p>Follower-ы перестают получать heartbeat. У каждого свой <b>случайный</b> таймаут выборов (например, 150–300 мс) — чтобы они не стали кандидатами одновременно.</p></section>
+  <section class="st-step" data-t="B — кандидат" data-hl="rfB"><h4>Таймаут B истёк первым</h4><p>B увеличивает терм до 2, голосует за себя и рассылает RequestVote с номером терма и «меткой» своего журнала (терм и индекс последней записи).</p></section>
+  <section class="st-step" data-t="Голосование" data-hl="rfC rfD"><h4>Узлы голосуют</h4><p>Правила: один голос на терм; голос отдаётся только кандидату, чей журнал <b>не менее полон</b>, чем у голосующего. C и D согласны. E отстал, но голосовать может. Узел с неполным журналом (как E) сам лидером не станет — большинство ему откажет. Так гарантируется, что новый лидер содержит все закоммиченные записи.</p></section>
+  <section class="st-step" data-t="B — лидер" data-hl="rfB"><h4>Большинство собрано: 3 из 5</h4><p>B становится лидером терма 2 и сразу шлёт heartbeat, подавляя другие выборы. Если бы голоса разделились и никто не набрал большинства — терм закончился бы без лидера, и после новых случайных таймаутов выборы повторились бы.</p></section>
+  <section class="st-step" data-t="Запись клиента" data-hl="rfB"><h4>Клиент пишет через нового лидера</h4><p>B добавляет запись 4′ в свой журнал (терм 2) и рассылает AppendEntries. Запись пока не закоммичена.</p></section>
+  <section class="st-step" data-t="Коммит" data-hl="rfC rfD rfB"><h4>Подтверждение большинства</h4><p>C и D записали 4′ на диск и ответили. Запись на 3 узлах из 5 → <b>закоммичена</b>: лидер применяет её к состоянию и отвечает клиенту. Теперь она переживёт отказ любых двух узлов.</p></section>
+  <section class="st-step" data-t="Догоняющий" data-hl="rfE"><h4>E получает недостающее</h4><p>В каждом AppendEntries лидер указывает индекс и терм предыдущей записи. E отвечает «у меня такой нет» — лидер отступает назад, пока не найдёт общую точку, и досылает записи 3 и 4′.</p></section>
+  <section class="st-step" data-t="Старый лидер вернулся" data-hl="rfA"><h4>A видит больший терм</h4><p>A думает, что он лидер терма 1, но первый же ответ с термом 2 заставляет его стать follower-ом. Его незакоммиченная запись 4 конфликтует с 4′ и <b>удаляется</b>. Ничего подтверждённого не потеряно: клиент записи 4 не получил ответа «успешно» и должен был повторить запрос. Номер терма работает как fencing token: команды старого лидера отвергаются всеми.</p></section>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Гарантия Raft</th><th>Чем обеспечена</th></tr>
+<tr><td>Не более одного лидера в терме</td><td>один голос на терм + большинство</td></tr>
+<tr><td>Лидер содержит все закоммиченные записи</td><td>ограничение при голосовании: журнал кандидата не короче</td></tr>
+<tr><td>Журналы совпадают до точки коммита</td><td>проверка предыдущей записи в AppendEntries; follower перезаписывает расходящийся хвост</td></tr>
+<tr><td>Закоммиченное не теряется</td><td>запись на диск (fsync) у большинства до ответа клиенту</td></tr>
+</table></div>
+
+<h2 id="practice"><span class="h-num">24.4</span>Что из этого следует на практике</h2>
+<div class="grid-2">
+  <div class="card"><h4>Запись медленнее и ограничена лидером</h4><p>Каждая запись — сетевой обмен с большинством и fsync. Тысячи операций в секунду, не миллионы. Поэтому etcd и ZooKeeper хранят метаданные, а не прикладные данные, а распределённые базы делят данные на тысячи независимых Raft-групп.</p></div>
+  <div class="card"><h4>Размещение по зонам</h4><p>3 узла в 3 зонах переживают потерю зоны. 3 узла в 2 зонах — нет: в одной зоне окажется большинство. Для двух дата-центров нужен третий «свидетель».</p></div>
+  <div class="card"><h4>Чтение тоже требует осторожности</h4><p>Старый лидер, отрезанный от большинства, некоторое время считает себя лидером. Линеаризуемое чтение требует подтверждения лидерства у большинства (ReadIndex) или лизы с допущением об ограниченном расхождении часов.</p></div>
+  <div class="card"><h4>Блокировки поверх консенсуса</h4><p>Блокировка — это лиза с временем жизни. Клиент может «уснуть» и не заметить истечения — поэтому вместе с блокировкой берут монотонный номер (в etcd — revision) и проверяют его на стороне защищаемого ресурса.</p></div>
+</div>
+<div class="callout bad"><span class="c-title">Не пишите свой консенсус</span>
+Алгоритм умещается на странице, а корректная реализация — годы и формальная верификация: смена состава кластера, сжатие журнала, поведение при частичной записи на диск. Берите готовое: etcd, ZooKeeper, Consul, библиотеки Raft (Ratis, JRaft). Задача инженера — знать гарантии и ограничения, а не реализовывать.</div>
+
+<h2 id="others"><span class="h-num">24.5</span>Родственные алгоритмы</h2>
+<div class="table-wrap"><table>
+<tr><th>Алгоритм</th><th>Где</th><th>Особенность</th></tr>
+<tr><td>Paxos / Multi-Paxos</td><td>Spanner, Chubby</td><td>исторически первый; сложен в объяснении и реализации</td></tr>
+<tr><td>ZAB</td><td>ZooKeeper</td><td>близок к Raft, появился раньше</td></tr>
+<tr><td>Viewstamped Replication</td><td>академические системы, TigerBeetle</td><td>ещё один предок Raft</td></tr>
+<tr><td>Gossip (эпидемические протоколы)</td><td>Cassandra, Consul (членство)</td><td>не консенсус: слухи расходятся со временем, итоговая согласованность — для обнаружения узлов и отказов</td></tr>
+<tr><td>BFT (PBFT, Tendermint)</td><td>блокчейны</td><td>выдерживают злонамеренные узлы; нужно 3f + 1 узлов</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">24.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сколько отказов переживает кластер etcd из 5 узлов?</p><ul><li>1</li><li>2 — кворум 3 из 5</li><li>3</li><li>4</li></ul><div class="why">Большинство = 3. При трёх отказах оставшиеся два узла кворум не соберут.</div></div>
+<div class="mcq" data-ok="2"><p>Почему кластер из 4 узлов не лучше кластера из 3?</p><ul><li>Он медленнее в два раза</li><li>Четыре узла не могут выбрать лидера</li><li>Кворум 3 из 4: по-прежнему переживает только один отказ, а запись ждёт большего числа подтверждений</li><li>Raft не поддерживает чётное число</li></ul><div class="why">Чётный узел добавляет стоимость и риск раздела пополам, не добавляя устойчивости.</div></div>
+<div class="mcq" data-ok="0"><p>Как Raft предотвращает появление двух лидеров при разделе сети?</p><ul><li>Лидером может стать только узел, получивший голоса большинства, а большинство есть не более чем в одной части; старого лидера отвергают по номеру терма</li><li>С помощью синхронизации часов</li><li>Лидер назначается администратором</li><li>Никак</li></ul><div class="why">Меньшая часть не может ни выбрать лидера, ни закоммитить запись.</div></div>
+<div class="mcq" data-ok="3"><p>Когда запись в Raft считается закоммиченной?</p><ul><li>Когда лидер записал её в свой журнал</li><li>Когда её получили все узлы</li><li>Когда клиент отправил запрос</li><li>Когда она сохранена на диске у большинства узлов</li></ul><div class="why">Ждать всех нельзя — один медленный узел остановил бы систему; только у лидера — запись потеряется при его отказе.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните, как в Raft выбирается лидер.</summary><div class="a"><p>Follower не получает heartbeat в течение случайного таймаута → увеличивает терм, становится кандидатом, голосует за себя и просит голоса. Узел голосует один раз за терм и только за кандидата с журналом не короче своего. Большинство голосов → лидер, рассылает heartbeat. Разделённые голоса → новый терм после случайных таймаутов.</p></div></details>
+<details class="q"><summary>Что такое split brain и как его избегают?</summary><div class="a"><p>Ситуация, когда две части кластера одновременно считают себя главными и принимают записи. Избегают кворумом (решения только большинством), fencing (номер эпохи/терма, по которому отвергаются команды устаревшего лидера) и принудительным отключением старого лидера (STONITH) в системах без консенсуса.</p></div></details>
+<details class="q"><summary>Почему в etcd не хранят прикладные данные?</summary><div class="a"><p>Каждая запись проходит через одного лидера и ждёт fsync и подтверждения большинства; весь набор данных держится в памяти и ограничен гигабайтами. Это хранилище координации: конфигурация, выборы, блокировки. Для данных — базы, которые используют консенсус на уровне отдельных диапазонов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

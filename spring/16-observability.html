@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Actuator и наблюдаемость</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ПРОДАКШЕН</div>
+  <h1>Actuator и наблюдаемость</h1>
+  <p class="lead">Сервис в продакшене должен отвечать на три вопроса: жив ли он, готов ли принимать трафик и что у него внутри происходит. Actuator даёт health-пробы и служебные endpoints, Micrometer — метрики, Observation API и Micrometer Tracing — распределённые трейсы, Boot — структурированные логи с traceId. Разберём, как это устроено и как не убить сервис неправильной пробой.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">HealthIndicator</span><span class="tag">Micrometer</span><span class="tag">Observation</span><span class="tag">Kubernetes probes</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="actuator"><span class="h-num">16.1</span>Endpoints Actuator</h2>
+<div class="table-wrap"><table>
+<tr><th>Endpoint</th><th>Что даёт</th><th>Наружу?</th></tr>
+<tr><td><code>/actuator/health</code>, <code>/health/liveness</code>, <code>/health/readiness</code></td><td>состояние и пробы</td><td>да (без деталей)</td></tr>
+<tr><td><code>/actuator/prometheus</code>, <code>/metrics</code></td><td>метрики</td><td>только для системы мониторинга</td></tr>
+<tr><td><code>/actuator/info</code></td><td>версия, git-коммит, сборка</td><td>можно</td></tr>
+<tr><td><code>/actuator/loggers</code></td><td>посмотреть и <b>поменять уровень логирования на лету</b> (POST)</td><td>нет</td></tr>
+<tr><td><code>/actuator/env</code>, <code>/configprops</code>, <code>/beans</code>, <code>/conditions</code>, <code>/mappings</code></td><td>конфигурация и внутренности контекста</td><td>нет</td></tr>
+<tr><td><code>/actuator/threaddump</code>, <code>/heapdump</code></td><td>дампы для диагностики</td><td>никогда: heapdump содержит секреты из памяти</td></tr>
+<tr><td><code>/actuator/startup</code>, <code>/scheduledtasks</code>, <code>/httpexchanges</code></td><td>шаги старта, задачи, последние запросы</td><td>нет</td></tr>
+</table></div>
+<pre data-title="application.yml: безопасная схема"><code class="yaml">management:
+  server:
+    port: 8081                         # служебный порт, не публикуется через ingress
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,loggers,threaddump
+  endpoint:
+    health:
+      probes:
+        enabled: true                  # в Boot 4 включено по умолчанию везде (в Boot 3 — только в Kubernetes)
+      show-details: when-authorized
+      group:
+        readiness:
+          include: readinessState,db,redis
+  info:
+    git:
+      mode: simple</code></pre>
+<p>Каждый endpoint — бин с <code>@Endpoint(id = "...")</code> и методами <code>@ReadOperation</code>/<code>@WriteOperation</code>; Actuator публикует его через MVC/WebFlux (и JMX). Свой endpoint пишется так же.</p>
+
+<h2 id="health"><span class="h-num">16.2</span>Health и пробы Kubernetes</h2>
+<p>Каждый <code>HealthIndicator</code> (автоконфигурация добавляет <code>db</code>, <code>redis</code>, <code>diskSpace</code>, <code>ssl</code>, <code>mail</code>, <code>rabbit</code>…; для Kafka встроенного индикатора нет — только свой) возвращает <code>Health</code>. <code>StatusAggregator</code> сводит статусы по порядку тяжести: DOWN → OUT_OF_SERVICE → UP → UNKNOWN. DOWN и OUT_OF_SERVICE дают HTTP 503.</p>
+<div class="vs neutral">
+  <div class="card"><h4>Liveness: «процесс жив?»</h4><p>Не прошла → Kubernetes <b>перезапускает</b> под. Должна зависеть только от состояния самого процесса (<code>livenessState</code>). Boot ставит CORRECT после refresh контекста; в BROKEN её переводит само приложение (<code>AvailabilityChangeEvent.publish(ctx, LivenessState.BROKEN)</code>).</p></div>
+  <div class="card"><h4>Readiness: «готов к трафику?»</h4><p>Не прошла → под <b>убирается из балансировки</b>, но не перезапускается. Сюда — критичные зависимости, без которых запрос не обработать. Boot ставит REFUSING_TRAFFIC при остановке.</p></div>
+</div>
+<div class="widget" id="hp">
+  <div class="widget-title">Симулятор health-проб</div>
+  <p class="hint">Отметьте, какие индикаторы в состоянии DOWN, и выберите, что входит в группы.</p>
+  <div class="checks" id="hpInd"></div>
+  <div class="controls">
+    <label>группа liveness<select id="hpLive"><option value="good">livenessState</option><option value="bad">livenessState, db (ошибка!)</option></select></label>
+    <label>группа readiness<select id="hpReady"><option value="good">readinessState, db, redis</option><option value="all">все индикаторы</option></select></label>
+  </div>
+  <div class="out" id="hpOut"></div>
+  <div class="verdict" id="hpVerdict"></div>
+</div>
+<script>
+(function () {
+  var ind = [["db", "db (PostgreSQL)"], ["redis", "redis"], ["kafka", "kafka (свой HealthIndicator)"], ["diskSpace", "diskSpace"], ["mail", "mail (SMTP, некритичен)"], ["readinessState", "readinessState (идёт остановка)"]];
+  var box = document.getElementById("hpInd");
+  box.innerHTML = ind.map(function (x) { return '<label><input type="checkbox" data-k="' + x[0] + '">' + x[1] + " = DOWN</label>"; }).join("");
+  function run() {
+    var down = {}; box.querySelectorAll("input").forEach(function (c) { down[c.dataset.k] = c.checked; });
+    var all = ["db", "redis", "kafka", "diskSpace", "mail", "livenessState", "readinessState"];
+    function st(list) { return list.some(function (k) { return down[k]; }) ? "DOWN" : "UP"; }
+    var liveList = $("hpLive") === "bad" ? ["livenessState", "db"] : ["livenessState"];
+    var readyList = $("hpReady") === "all" ? all : ["readinessState", "db", "redis"];
+    function $(id) { return document.getElementById(id).value; }
+    var overall = st(all), live = st(liveList), ready = st(readyList);
+    var lines = [
+      "GET /actuator/health            → " + (overall === "UP" ? "200" : "503") + " {\"status\":\"" + overall + "\"}",
+      "GET /actuator/health/liveness   → " + (live === "UP" ? "200" : "503") + "  [" + liveList.join(", ") + "]",
+      "GET /actuator/health/readiness  → " + (ready === "UP" ? "200" : "503") + "  [" + readyList.join(", ") + "]"
+    ];
+    document.getElementById("hpOut").textContent = lines.join("\n");
+    var v = document.getElementById("hpVerdict"), msg, cls = "ok";
+    if (live === "DOWN") { cls = "bad"; msg = "Kubernetes перезапускает под. Если причина — упавшая БД, перезапустятся ВСЕ поды одновременно: БД поднимется, а сервис будет в цикле рестартов (CrashLoopBackOff), добавляя нагрузку на старте. БД не должна входить в liveness."; }
+    else if (ready === "DOWN") {
+      cls = "warn"; msg = "Под убран из балансировки, процесс продолжает работать и вернётся в ротацию, когда зависимость восстановится.";
+      if ($("hpReady") === "all" && (down.mail || down.kafka) && !down.db && !down.redis && !down.readinessState) { cls = "bad"; msg = "Некритичная зависимость (" + (down.mail ? "mail" : "kafka") + ") вывела ВСЕ поды из балансировки — полный отказ сервиса из-за SMTP. В readiness — только то, без чего запросы действительно не обработать."; }
+      if (down.readinessState) msg = "Идёт graceful shutdown: под перестал принимать новый трафик и дорабатывает активные запросы.";
+    } else { msg = overall === "UP" ? "Всё в порядке." : "Общий статус DOWN виден мониторингу, но пробы зелёные: под работает и получает трафик. Так и должно быть для некритичных зависимостей."; }
+    v.className = "verdict " + cls; v.textContent = msg;
+  }
+  document.getElementById("hp").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="Свой индикатор"><code class="java">@Component("paymentGateway")                           // имя в ответе: "paymentGateway"
+class PaymentGatewayHealth implements HealthIndicator {
+    private final PaymentClient client;
+    PaymentGatewayHealth(PaymentClient client) { this.client = client; }
+
+    @Override public Health health() {
+        try {
+            Duration d = client.ping();                  // быстрая проверка с коротким таймаутом!
+            return Health.up().withDetail("latencyMs", d.toMillis()).build();
+        } catch (Exception e) {
+            return Health.down(e).build();
+        }
+    }
+}</code></pre>
+
+<h2 id="metrics"><span class="h-num">16.3</span>Метрики: Micrometer</h2>
+<p>Micrometer — фасад метрик (как SLF4J для логов). <code>MeterRegistry</code> собирает метрики, а реализация (<code>PrometheusMeterRegistry</code>, OTLP, Datadog) отдаёт их в систему мониторинга. Boot автоматически снимает: <code>http.server.requests</code>, <code>http.client.requests</code>, <code>jvm.memory.*</code>, <code>jvm.gc.*</code>, <code>jvm.threads.*</code>, <code>hikaricp.connections.*</code>, <code>executor.*</code>, <code>cache.*</code>, <code>spring.kafka.*</code>, <code>tomcat.*</code>.</p>
+<pre><code class="java">@Service
+class CheckoutMetrics {
+    private final Counter placed;
+    private final Timer paymentTimer;
+
+    CheckoutMetrics(MeterRegistry r, OrderQueue queue) {
+        this.placed = Counter.builder("orders.placed").tag("channel", "web").register(r);
+        this.paymentTimer = Timer.builder("payment.duration").publishPercentileHistogram().register(r);
+        Gauge.builder("orders.queue.size", queue, OrderQueue::size).register(r);   // значение читается при опросе
+    }
+
+    void onPlaced() { placed.increment(); }
+    &lt;T&gt; T timePayment(Supplier&lt;T&gt; call) { return paymentTimer.record(call); }
+}</code></pre>
+<div class="callout bad"><span class="c-title">Кардинальность</span>
+Каждое уникальное сочетание тегов — отдельный временной ряд. Тег <code>userId</code> или <code>orderId</code> породит миллионы рядов и положит Prometheus. Теги — только ограниченные множества: метод, статус, канал, тип ошибки. Boot нормализует <code>uri</code> в шаблон (<code>/api/orders/{id}</code>) именно поэтому.
+</div>
+
+<h2 id="tracing"><span class="h-num">16.4</span>Observation API и трейсинг</h2>
+<p>С Boot 3 инструментирование идёт через <b>Observation API</b>: код один раз описывает наблюдаемую операцию, а зарегистрированные обработчики превращают её одновременно в метрику (таймер), в span трейса и в записи лога. Spring MVC, RestClient, JDBC (через datasource-micrometer), Kafka, <code>@Scheduled</code> уже инструментированы.</p>
+<pre><code class="java">@Service
+class FraudCheck {
+    private final ObservationRegistry registry;
+
+    Verdict check(Order o) {
+        return Observation.createNotStarted("fraud.check", registry)
+                .lowCardinalityKeyValue("channel", o.channel())       // тег метрики и span
+                .highCardinalityKeyValue("order.id", o.id().toString())  // только в span, не в метрике
+                .observe(() -&gt; engine.evaluate(o));
+    }
+
+    @Observed(name = "fraud.rules.reload")                            // декларативно: management.observations.annotations.enabled=true + spring-boot-starter-aspectj
+    void reloadRules() { /* ... */ }
+}</code></pre>
+<div class="flow">
+  <div class="node info"><b>Gateway</b><small>traceparent: 00-4bf9…-a1-01</small></div><span class="to">→ HTTP →</span>
+  <div class="node"><b>order-service</b><small>span «POST /api/orders», дочерние: jdbc, kafka send</small></div><span class="to">→ Kafka header →</span>
+  <div class="node"><b>billing-service</b><small>span «orders process»</small></div><span class="to">→</span>
+  <div class="node ok"><b>Tempo / Jaeger / Zipkin</b><small>один trace по traceId</small></div>
+</div>
+<p>Micrometer Tracing (мост к OpenTelemetry или Brave) передаёт контекст в заголовке W3C <code>traceparent</code>, кладёт <code>traceId</code>/<code>spanId</code> в MDC — они попадают в каждую строку лога. Между потоками контекст переносит библиотека context-propagation (<code>ContextSnapshot</code>, <code>ContextPropagatingTaskDecorator</code>).</p>
+<pre data-title="application.yml"><code class="yaml">management:
+  tracing:
+    sampling:
+      probability: 0.1                 # 10% запросов; в dev — 1.0
+  opentelemetry:                       # Boot 4 (+ spring-boot-starter-opentelemetry)
+    tracing:
+      export:
+        otlp:
+          endpoint: http://otel-collector:4318/v1/traces   # в Boot 3 — management.otlp.tracing.endpoint
+logging:
+  structured:
+    format:
+      console: ecs                     # JSON-логи (Boot 3.4+): ecs, logstash, gelf
+  level:
+    org.springframework.web: INFO</code></pre>
+
+<h2 id="shutdown"><span class="h-num">16.5</span>Graceful shutdown в Kubernetes</h2>
+<ol class="steps">
+  <li>Kubernetes помечает под Terminating, начинает удалять его из Endpoints и одновременно шлёт SIGTERM (сначала выполняется <code>preStop</code>).</li>
+  <li>Удаление из балансировщиков распространяется не мгновенно, поэтому <code>preStop: sleep 5–10</code> даёт время перестать слать трафик на под.</li>
+  <li>Shutdown hook JVM → <code>context.close()</code>: readiness → REFUSING_TRAFFIC, <code>ContextClosedEvent</code>.</li>
+  <li><code>SmartLifecycle</code>-фазы останавливаются по убыванию phase: веб-сервер в SmartLifecycle-фазы останавливаются по убыванию: сначала контейнеры слушателей Kafka (phase <code>Integer.MAX_VALUE - 100</code>), затем веб-сервер в режиме <code>server.shutdown=graceful</code> перестаёт принимать соединения и ждёт активные запросы до <code>spring.lifecycle.timeout-per-shutdown-phase</code>.</li>
+  <li>Уничтожаются бины: пул соединений закрывается последним, когда запросы уже завершены.</li>
+  <li>Если не уложились в <code>terminationGracePeriodSeconds</code> (по умолчанию 30) — SIGKILL.</li>
+</ol>
+
+<h2 id="quiz"><span class="h-num">16.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему проверку БД нельзя включать в liveness-пробу?</p><ul><li>Она медленная</li><li>Spring это запрещает</li><li>При сбое БД Kubernetes перезапустит все поды, что не лечит БД и вызывает каскад рестартов</li><li>Liveness не поддерживает индикаторы</li></ul><div class="why">Рестарт помогает только от проблем самого процесса (дедлок, сломанный контекст). Внешние зависимости — в readiness или только в мониторинг.</div></div>
+<div class="mcq" data-ok="0"><p>Добавили тег userId к метрике http.server.requests. Чем это грозит?</p><ul><li>Взрывом кардинальности: по ряду на пользователя, перерасход памяти приложения и Prometheus</li><li>Ничем</li><li>Метрика перестанет собираться</li><li>Утечкой персональных данных в логи</li></ul><div class="why">Высококардинальные данные — в span трейса (highCardinalityKeyValue) или логи, но не в теги метрик.</div></div>
+<div class="mcq" data-ok="1"><p>Как связать строки логов разных сервисов одного запроса?</p><ul><li>По времени</li><li>По traceId, который Micrometer Tracing передаёт в traceparent и кладёт в MDC</li><li>По имени потока</li><li>По sessionId</li></ul><div class="why">traceId сквозной для всех сервисов запроса и автоматически попадает в лог-паттерн или структурированный лог.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем liveness отличается от readiness и что включать в каждую?</summary><div class="a"><p>Liveness — жив ли процесс; провал → рестарт пода. Только внутреннее состояние (livenessState). Readiness — может ли под обслуживать трафик; провал → исключение из балансировки без рестарта. Состояние готовности и критичные зависимости. Некритичные зависимости — ни туда, ни туда, только в общий health/алерты.</p></div></details>
+<details class="q"><summary>Что такое Observation API и зачем он, если есть Micrometer метрики?</summary><div class="a"><p>Единая абстракция «наблюдаемой операции»: один раз инструментируем код, а обработчики создают и таймер, и span, и логи с корреляцией. Низкокардинальные ключи идут в метрики и спаны, высококардинальные — только в спаны. Spring-проекты инструментированы через него.</p></div></details>
+<details class="q"><summary>Как устроен graceful shutdown Spring Boot?</summary><div class="a"><p>SIGTERM → shutdown hook → context.close(): readiness REFUSING_TRAFFIC, ContextClosedEvent, остановка SmartLifecycle по фазам (веб-сервер перестаёт принимать соединения и ждёт активные запросы до timeout-per-shutdown-phase), затем уничтожение бинов. В Kubernetes дополняется preStop-задержкой и достаточным terminationGracePeriodSeconds.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

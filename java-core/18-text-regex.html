@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Текст: Unicode, форматирование, regex</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .rx-text { font: 14px/1.7 var(--font-mono); background: var(--bg-sunk); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .rx-text mark { background: var(--accent-soft); color: var(--fg); border-bottom: 2px solid var(--accent); border-radius: 3px; padding: 1px 0; }
+</style>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Текст: Unicode, форматирование и регулярные выражения</h1>
+  <p class="lead">Тема 03 объяснила, как строка устроена в памяти. Здесь — как с текстом работать правильно: почему <code>length()</code> не считает символы, как <code>toUpperCase()</code> ломает логин в турецкой локали, как писать регулярные выражения, которые не подвешивают сервер, и какие методы строк экономят десятки строк кода.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">code points</span><span class="tag">Locale</span><span class="tag">Pattern / Matcher</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="unicode"><span class="h-num">18.1</span>Unicode: символ — это не char</h2>
+<p>Unicode нумерует символы <b>кодовыми точками</b> (code points) от U+0000 до U+10FFFF. Java-строка — последовательность 16-битных <code>char</code> в кодировке UTF-16. Символы выше U+FFFF (эмодзи, редкие иероглифы) занимают <b>два</b> char — суррогатную пару. А то, что человек видит как один символ, может состоять из нескольких кодовых точек (буква + модификатор, флаг, семейство из эмодзи).</p>
+<div class="widget" id="ucW">
+  <div class="widget-title">Симулятор: из чего состоит строка</div>
+  <div class="controls"><label>строка<input type="text" id="ucIn" class="wide" value="Привет 👍"></label></div>
+  <div class="controls"><button class="btn" type="button" data-v="Привет 👍">эмодзи</button><button class="btn" type="button" data-v="й́">буква + ударение</button><button class="btn" type="button" data-v="é">é: одна или две точки?</button><button class="btn" type="button" data-v="👨‍👩‍👧">семья</button><button class="btn" type="button" data-v="straße">ß</button></div>
+  <div class="out" id="ucOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("ucIn"), out = document.getElementById("ucOut");
+  function run() {
+    var s = inp.value, cps = Array.from(s), bytes = new TextEncoder().encode(s).length, L = [];
+    var graphemes = cps.length;
+    try { graphemes = Array.from(new Intl.Segmenter("ru", { granularity: "grapheme" }).segment(s)).length; } catch (e) {}
+    L.push("s.length()                         = " + s.length + "   (число char, единиц UTF-16)");
+    L.push("s.codePointCount(0, s.length())    = " + cps.length + "   (кодовых точек)");
+    L.push("видимых символов (графем)          = " + graphemes + "   (BreakIterator / regex \\X)");
+    L.push("s.getBytes(UTF_8).length           = " + bytes + "   (байт в UTF-8)");
+    L.push("");
+    cps.slice(0, 24).forEach(function (c) { var cp = c.codePointAt(0); L.push("U+" + cp.toString(16).toUpperCase().padStart(4, "0") + "  " + (cp > 0xFFFF ? "2 char (суррогатная пара)" : "1 char") + "  " + (cp === 0x200D ? "ZERO WIDTH JOINER — склейка эмодзи" : (cp >= 0x300 && cp <= 0x36F ? "комбинируемый знак" : c))); });
+    L.push("");
+    L.push("s.toUpperCase()   = " + s.toUpperCase() + (s.toUpperCase().length !== s.length ? "   ← длина изменилась!" : ""));
+    L.push("NFC: " + s.normalize("NFC").length + " char,  NFD: " + s.normalize("NFD").length + " char" + (s.normalize("NFC") !== s.normalize("NFD") ? "   ← две формы одной и той же строки, equals вернёт false" : ""));
+    out.textContent = L.join("\n");
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#ucW [data-v]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.getAttribute("data-v"); run(); }); });
+  run();
+})();
+</script>
+<pre data-title="Практические следствия"><code class="java">"👍".length();                         // 2 — а не 1
+"👍".charAt(0);                        // половина символа (старший суррогат) — мусор при выводе
+s.substring(0, 10);                    // может разрезать суррогатную пару
+new StringBuilder("ab👍").reverse();   // reverse умеет пары, но не комбинируемые знаки
+
+s.codePoints().count();                               // число кодовых точек
+s.codePoints().mapToObj(Character::toString).toList(); // обход по кодовым точкам
+
+// Одинаковый на вид текст может не совпадать по equals: «é» = U+00E9 или e + U+0301
+String a = Normalizer.normalize(input, Normalizer.Form.NFC);   // нормализуйте перед сравнением и сохранением
+
+// Ограничение «не более 255 символов» в БД может считать байты, а не символы: VARCHAR в MySQL utf8mb4 — до 4 байт на символ</code></pre>
+
+<h2 id="locale"><span class="h-num">18.2</span>Регистр, сравнение и Locale</h2>
+<pre class="bad-code" data-title="«Турецкая проблема»"><code class="java">// Сервер в турецкой локали (или пользовательская Locale по умолчанию = tr-TR):
+"TITLE".toLowerCase();                 // "tıtle" — с «ı» без точки!
+"title".toUpperCase();                 // "TİTLE" — с «İ» с точкой
+"FILE".toLowerCase().equals("file");   // false → сломан поиск по ключам, расширениям, заголовкам HTTP</code></pre>
+<pre class="good-code"><code class="java">key.toLowerCase(Locale.ROOT);                          // для технических идентификаторов — всегда Locale.ROOT
+a.equalsIgnoreCase(b);                                 // не зависит от локали
+String.CASE_INSENSITIVE_ORDER.compare(a, b);
+
+Collator ru = Collator.getInstance(Locale.forLanguageTag("ru"));   // сортировка для людей: «ё» рядом с «е»
+names.sort(ru);                                        // String.compareTo сравнивает коды char: «Ё» окажется перед «А»</code></pre>
+<p>Правило: всё, что видит машина (ключи, enum, протоколы), — <code>Locale.ROOT</code>; всё, что видит человек (сортировка, числа, даты), — явная Locale пользователя. Методы без параметра Locale берут локаль JVM, и поведение зависит от сервера.</p>
+
+<h2 id="format"><span class="h-num">18.3</span>Форматирование</h2>
+<pre><code class="java">String.format("%-10s|%5d|%8.2f|%s", "apple", 42, 3.14159, true);   // "apple     |   42|    3,14|true" — запятая зависит от Locale!
+"Заказ %d на сумму %s".formatted(id, total);                         // то же, метод экземпляра (Java 15)
+String.format(Locale.ROOT, "%.2f", 3.14159);                         // "3.14" — для машинных форматов
+
+String json = """
+        {
+          "id": %d,
+          "name": "%s"
+        }
+        """.formatted(id, name);                                     // text block: отступ определяется закрывающими кавычками
+
+NumberFormat.getCurrencyInstance(Locale.forLanguageTag("ru-RU")).format(1234567.5);   // 1 234 567,50 ₽
+NumberFormat.getCompactNumberInstance(Locale.US, NumberFormat.Style.SHORT).format(1_250_000);  // 1M
+new DecimalFormat("#,##0.00", DecimalFormatSymbols.getInstance(Locale.ROOT)).format(1234.5);   // 1,234.50</code></pre>
+<div class="callout warn">Не собирайте JSON, SQL и HTML форматированием строк: кавычка или тег в данных ломают структуру и открывают инъекции. Для JSON — сериализатор, для SQL — параметры <code>PreparedStatement</code> (тема 22), для HTML — экранирование шаблонизатора.</div>
+
+<h2 id="api"><span class="h-num">18.4</span>Полезные методы String</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th><th>Замечание</th></tr>
+<tr><td><code>isBlank()</code>, <code>strip()</code></td><td>проверка на пробельные символы, обрезка</td><td><code>trim()</code> знает только символы ≤ U+0020; <code>strip()</code> — все пробельные Unicode</td></tr>
+<tr><td><code>lines()</code>, <code>repeat(n)</code>, <code>indent(n)</code></td><td>поток строк, повтор, отступ</td><td>Java 11–12</td></tr>
+<tr><td><code>String.join(", ", list)</code>, <code>Collectors.joining</code></td><td>склейка с разделителем</td><td>вместо цикла с проверкой «не первый ли»</td></tr>
+<tr><td><code>split(regex)</code></td><td>разбиение</td><td>аргумент — regex: <code>"a.b".split(".")</code> вернёт пустой массив; нужно <code>split("\\.")</code>. Хвостовые пустые элементы отбрасываются, если не указать лимит −1</td></tr>
+<tr><td><code>replace(a, b)</code> / <code>replaceAll(regex, b)</code></td><td>замена литерала / по regex</td><td><code>replace</code> тоже заменяет все вхождения; в <code>replaceAll</code> символы <code>$</code> и <code>\</code> в замене специальные</td></tr>
+<tr><td><code>chars()</code>, <code>codePoints()</code></td><td>стрим символов</td><td><code>chars()</code> — IntStream единиц UTF-16</td></tr>
+<tr><td><code>compareTo</code>, <code>contentEquals</code>, <code>regionMatches</code></td><td>сравнения</td><td></td></tr>
+</table></div>
+
+<h2 id="regex"><span class="h-num">18.5</span>Регулярные выражения</h2>
+<pre><code class="java">private static final Pattern ORDER = Pattern.compile(                 // компилировать ОДИН раз — это дорого
+        "(?&lt;prefix&gt;[A-Z]{2})-(?&lt;year&gt;\\d{4})-(?&lt;num&gt;\\d+)");            // именованные группы
+
+Matcher m = ORDER.matcher("Заказы: RU-2026-00042, KZ-2025-7");
+while (m.find()) {                                                     // find — следующее вхождение в тексте
+    System.out.println(m.group("prefix") + " " + m.group("year") + " " + Integer.parseInt(m.group("num")));
+}
+ORDER.matcher("RU-2026-00042").matches();                              // matches — вся строка целиком
+"a1b22c333".replaceAll("\\d+", "#");                                   // a#b#c#  (компилирует Pattern при каждом вызове!)
+ORDER.matcher(text).replaceAll(r -&gt; r.group("num"));                   // замена функцией (Java 9)
+ORDER.matcher(text).results().map(MatchResult::group).toList();        // все совпадения стримом</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Конструкция</th><th>Значение</th></tr>
+<tr><td><code>\d \w \s</code>, <code>\D \W \S</code></td><td>цифра, «словесный» символ, пробельный — и их отрицания. По умолчанию только ASCII; для Unicode — флаг <code>(?U)</code> или <code>\p{L}</code>, <code>\p{IsCyrillic}</code></td></tr>
+<tr><td><code>* + ? {n,m}</code></td><td>жадные квантификаторы: берут максимум и возвращают по одному</td></tr>
+<tr><td><code>*? +? ??</code></td><td>ленивые: берут минимум</td></tr>
+<tr><td><code>*+ ++ ?+</code>, <code>(?&gt;…)</code></td><td>сверхжадные и атомарные группы: не возвращают взятое — защита от перебора</td></tr>
+<tr><td><code>^ $ \b</code></td><td>начало, конец, граница слова; с флагом <code>(?m)</code> — начало и конец каждой строки</td></tr>
+<tr><td><code>(…)</code>, <code>(?:…)</code>, <code>(?&lt;name&gt;…)</code></td><td>группа с захватом, без захвата, именованная</td></tr>
+<tr><td><code>(?=…) (?!…) (?&lt;=…) (?&lt;!…)</code></td><td>просмотр вперёд и назад без поглощения символов</td></tr>
+<tr><td><code>(?i) (?s) (?x)</code></td><td>без учёта регистра, точка совпадает с переводом строки, режим с комментариями</td></tr>
+</table></div>
+
+<div class="widget" id="rxW">
+  <div class="widget-title">Песочница регулярных выражений</div>
+  <p class="hint">Синтаксис JavaScript в этих пределах совпадает с Java. В Java-строке каждый обратный слэш нужно удвоить: <code>\d</code> → <code>"\\d"</code>.</p>
+  <div class="controls"><label>шаблон<input type="text" id="rxP" class="wide" value="(?<user>[\w.+-]+)@(?<domain>[\w-]+(?:\.[\w-]+)+)" spellcheck="false"></label></div>
+  <div class="checks"><label><input type="checkbox" id="rxI">(?i) без учёта регистра</label><label><input type="checkbox" id="rxM">(?m) многострочный</label><label><input type="checkbox" id="rxS">(?s) точка = любой символ</label></div>
+  <label>текст<textarea id="rxT" spellcheck="false" style="min-height:84px">Пишите на ivan.petrov@shop.ru или support+java@mail.example.org.
+Не адрес: user@localhost, @nobody</textarea></label>
+  <div class="controls">
+    <button class="btn" type="button" data-p="(?<user>[\w.+-]+)@(?<domain>[\w-]+(?:\.[\w-]+)+)" data-t="Пишите на ivan.petrov@shop.ru или support+java@mail.example.org.&#10;Не адрес: user@localhost, @nobody">email</button>
+    <button class="btn" type="button" data-p="<.+>" data-t="<b>жирный</b> и <i>курсив</i>">жадный .+</button>
+    <button class="btn" type="button" data-p="<.+?>" data-t="<b>жирный</b> и <i>курсив</i>">ленивый .+?</button>
+    <button class="btn" type="button" data-p="\b\d{1,3}(?=(\d{3})+\b)" data-t="Цена 1234567 руб, код 42">lookahead</button>
+    <button class="btn" type="button" data-p="^(\d{4})-(\d{2})-(\d{2})$" data-t="2026-10-10&#10;10.10.2026&#10;2026-1-5">дата, (?m)</button>
+  </div>
+  <div class="rx-text" id="rxOut"></div>
+  <div class="log" id="rxLog" style="margin-top:10px"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var p = $("rxP").value, t = $("rxT").value, flags = "gu" + ($("rxI").checked ? "i" : "") + ($("rxM").checked ? "m" : "") + ($("rxS").checked ? "s" : ""), re;
+    try { re = new RegExp(p, flags); } catch (e) { try { re = new RegExp(p, flags.replace("u", "")); } catch (e2) { $("rxOut").textContent = t; $("rxLog").textContent = "PatternSyntaxException: " + e2.message; return; } }
+    var html = "", last = 0, L = [], m, n = 0;
+    while ((m = re.exec(t)) && n < 200) {
+      if (m[0] === "") { re.lastIndex++; continue; }
+      html += SG.esc(t.slice(last, m.index)) + "<mark>" + SG.esc(m[0]) + "</mark>"; last = m.index + m[0].length; n++;
+      var line = "find #" + n + ": \"" + m[0] + "\" [" + m.index + ", " + last + ")";
+      if (m.groups) Object.keys(m.groups).forEach(function (k) { line += "   " + k + "=\"" + m.groups[k] + "\""; });
+      else for (var i = 1; i < m.length; i++) line += "   group(" + i + ")=\"" + m[i] + "\"";
+      L.push(line);
+    }
+    $("rxOut").innerHTML = html + SG.esc(t.slice(last));
+    var full = false; try { full = new RegExp("^(?:" + p + ")$", flags.replace("g", "").replace("m", "")).test(t); } catch (e3) {}
+    L.unshift("Java: Pattern.compile(\"" + p.replace(/\\/g, "\\\\").replace(/"/g, "\\\"") + "\")", "matcher(text).matches() → " + full + "   (совпадение со ВСЕЙ строкой);   find() нашёл: " + n, "");
+    $("rxLog").textContent = L.join("\n");
+  }
+  ["rxP", "rxT"].forEach(function (id) { $(id).addEventListener("input", run); });
+  ["rxI", "rxM", "rxS"].forEach(function (id) { $(id).addEventListener("change", run); });
+  document.querySelectorAll("#rxW [data-p]").forEach(function (b) { b.addEventListener("click", function () { $("rxP").value = b.getAttribute("data-p"); $("rxT").value = b.getAttribute("data-t"); $("rxM").checked = /\(\?m\)/.test(b.textContent); run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="redos"><span class="h-num">18.6</span>Катастрофический перебор (ReDoS)</h2>
+<p>Движок <code>java.util.regex</code> — с возвратами (backtracking). Если шаблон допускает много способов разбить один и тот же текст, а в конце совпадения нет, движок перебирает их все. Число вариантов растёт экспоненциально.</p>
+<pre class="bad-code"><code class="java">Pattern p = Pattern.compile("^(a+)+$");
+p.matcher("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!").matches();   // 30 букв «a» и «!» — секунды; 40 — часы
+// Вложенные квантификаторы (a+)+, (a|aa)+, (\w+\s?)+ на пользовательском вводе = отказ в обслуживании</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Как защищаться</h4><p>Избегать вложенных и перекрывающихся квантификаторов; использовать сверхжадные <code>++</code> и атомарные группы; ограничивать длину ввода до применения regex; для недоверенных шаблонов — движок без возвратов (RE2/J).</p></div>
+  <div class="card"><h4>Когда regex не нужен</h4><p>Проверка «только цифры» — цикл или <code>chars().allMatch(Character::isDigit)</code>. Разбор JSON, XML, HTML, CSV — парсер. Email — простая проверка на «@» и письмо с подтверждением; «полный» regex по RFC нечитаем и всё равно не гарантирует, что ящик существует.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">18.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что вернёт <code>"a.b.c".split(".")</code>?</p><ul><li>["a", "b", "c"]</li><li>["a.b.c"]</li><li>Пустой массив: точка в regex означает «любой символ», все элементы пустые и отброшены</li><li>Исключение</li></ul><div class="why">Аргумент split — регулярное выражение. Нужно <code>split("\\.")</code> или <code>split(Pattern.quote("."))</code>.</div></div>
+<div class="mcq" data-ok="1"><p>Чем <code>matches()</code> отличается от <code>find()</code>?</p><ul><li>Ничем</li><li>matches требует совпадения всей строки, find ищет очередное вхождение в любом месте</li><li>find работает только с группами</li><li>matches быстрее</li></ul><div class="why"><code>"abc123".matches("\\d+")</code> → false, а find() найдёт «123».</div></div>
+<div class="mcq" data-ok="0"><p>Почему <code>key.toLowerCase()</code> без аргумента опасен для технических ключей?</p><ul><li>Результат зависит от локали JVM: в турецкой «I» превращается в «ı»</li><li>Метод медленный</li><li>Он изменяет исходную строку</li><li>Он не работает с ASCII</li></ul><div class="why">Для идентификаторов — <code>toLowerCase(Locale.ROOT)</code> или <code>equalsIgnoreCase</code>.</div></div>
+<div class="mcq" data-ok="3"><p>Чему равно <code>"👍".length()</code>?</p><ul><li>1</li><li>4</li><li>0</li><li>2 — символ вне BMP хранится суррогатной парой из двух char</li></ul><div class="why">length() считает единицы UTF-16. Кодовые точки — <code>codePointCount</code>, байты UTF-8 — 4.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем char отличается от кодовой точки и от видимого символа?</summary><div class="a"><p>char — 16-битная единица UTF-16. Кодовая точка — номер символа Unicode; выше U+FFFF занимает два char. Видимый символ (графема) может состоять из нескольких кодовых точек: буква с комбинируемым знаком, эмодзи с модификаторами. Отсюда ошибки в length, substring, reverse и ограничениях длины.</p></div></details>
+<details class="q"><summary>Почему Pattern нужно компилировать один раз?</summary><div class="a"><p>Компиляция строит автомат и стоит на порядки дороже применения. String.matches/replaceAll/split компилируют шаблон при каждом вызове. Pattern неизменяем и потокобезопасен — хранится в static final; Matcher — нет, создаётся на каждый текст.</p></div></details>
+<details class="q"><summary>Что такое катастрофический перебор и как его избежать?</summary><div class="a"><p>Экспоненциальное число вариантов разбора при вложенных/перекрывающихся квантификаторах и отсутствии совпадения. Избегать таких конструкций, применять сверхжадные квантификаторы и атомарные группы, ограничивать длину ввода, для чужих шаблонов брать движок с линейным временем.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

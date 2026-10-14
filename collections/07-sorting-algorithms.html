@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Сортировка (TimSort) и алгоритмы Collections</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.bars { display: flex; align-items: flex-end; gap: 2px; height: 130px; margin: 10px 0; }
+.bars i { flex: 1; background: var(--bg-sunk); border: 1px solid var(--line); border-radius: 3px 3px 0 0; position: relative; }
+.bars i.r0 { background: var(--info-soft); border-color: var(--info); } .bars i.r1 { background: var(--ok-soft); border-color: var(--ok); }
+.bars i.m { background: var(--accent-soft); border-color: var(--accent); }
+.bs { display: flex; flex-wrap: wrap; gap: 3px; margin: 10px 0; }
+.bs span { min-width: 32px; text-align: center; font: 12px var(--font-mono); padding: 7px 2px; border: 1.5px solid var(--line); border-radius: 4px; }
+.bs span.in { background: var(--info-soft); } .bs span.mid { background: var(--accent-soft); border-color: var(--accent); } .bs span.out { opacity: .35; }
+</style>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · СПИСКИ И ОЧЕРЕДИ</div>
+  <h1>Сортировка (TimSort) и алгоритмы Collections</h1>
+  <p class="lead"><code>list.sort()</code> для объектов — это TimSort: гибрид сортировки вставками и слиянием, который находит в данных уже упорядоченные участки и сливает их. На почти отсортированных данных он линейный. Для примитивов <code>Arrays.sort</code> использует другой алгоритм — Dual-Pivot Quicksort. Разбираем оба, стабильность, бинарный поиск с «точкой вставки» и полезные алгоритмы класса <code>Collections</code>.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">TimSort</span><span class="tag">runs и слияния</span><span class="tag">стабильность</span><span class="tag">Dual-Pivot Quicksort</span><span class="tag">binarySearch</span><span class="tag">shuffle</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="which"><span class="h-num">7.1</span>Что чем сортируется</h2>
+<div class="table-wrap"><table>
+<tr><th>Вызов</th><th>Алгоритм</th><th>Стабильна</th><th>Сложность</th></tr>
+<tr><td><code>list.sort(cmp)</code>, <code>Collections.sort</code>, <code>Arrays.sort(Object[])</code></td><td>TimSort</td><td>да</td><td>O(n log n) в худшем, O(n) на упорядоченных данных; доп. память до n/2</td></tr>
+<tr><td><code>Arrays.sort(int[]/long[]/double[]…)</code></td><td>Dual-Pivot Quicksort (с переходом на вставки и сортировку кучей против худшего случая, JDK 14+)</td><td>нет — для примитивов не важно</td><td>O(n log n), без доп. памяти</td></tr>
+<tr><td><code>Arrays.parallelSort</code></td><td>параллельная сортировка-слияние на ForkJoinPool</td><td>да (для объектов)</td><td>выигрыш от сотен тысяч элементов</td></tr>
+<tr><td><code>stream.sorted()</code></td><td>собирает в массив и сортирует как Arrays.sort</td><td>да (для упорядоченных потоков)</td><td>как выше</td></tr>
+</table></div>
+<p><code>ArrayList.sort</code> сортирует собственный массив на месте и увеличивает <code>modCount</code> (итераторы, созданные до сортировки, станут недействительными). Реализация по умолчанию <code>List.sort</code> копирует список в массив, сортирует и записывает обратно через <code>ListIterator.set</code> — поэтому сортировка LinkedList тоже O(n log n).</p>
+
+<h2 id="timsort"><span class="h-num">7.2</span>TimSort по шагам</h2>
+<div class="widget" id="tsW">
+  <div class="widget-title">TimSort на 24 элементах (minrun = 4 вместо реальных 32–64)</div>
+  <div class="controls">
+    <label>данные<select id="tsD"><option value="mixed">частично упорядоченные</option><option value="random">случайные</option><option value="sorted">уже отсортированные</option><option value="reversed">по убыванию</option></select></label>
+    <button class="btn" type="button" id="tsR">↺</button>
+    <button class="btn primary" type="button" id="tsS">Шаг ▶</button>
+    <button class="btn" type="button" id="tsA">До конца</button>
+  </div>
+  <div class="bars" id="tsBars"></div>
+  <div class="out" id="tsOut"></div>
+  <div class="log" id="tsLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, steps, si, cmps;
+  function gen(kind) {
+    var a = [], i;
+    if (kind === "sorted") for (i = 0; i < 24; i++) a.push(4 + i * 4);
+    else if (kind === "reversed") for (i = 0; i < 24; i++) a.push(100 - i * 4);
+    else if (kind === "random") for (i = 0; i < 24; i++) a.push(4 + Math.floor(Math.random() * 96));
+    else { a = [10, 18, 25, 33, 40, 52, 60, 71, 88, 30, 27, 22, 15, 9, 44, 47, 50, 12, 95, 66, 70, 5, 80, 83]; }
+    return a;
+  }
+  function build() {
+    var a = gen($("tsD").value), n = a.length, MINRUN = 4, lo = 0, stack = [], c = 0;
+    steps = [{ a: a.slice(), runs: [], m: null, msg: "Исходный массив. TimSort проходит слева направо, находя «естественные» упорядоченные участки (runs)." }];
+    function snap(msg, m) { steps.push({ a: a.slice(), runs: stack.map(function (r) { return [r[0], r[1]]; }), m: m || null, msg: msg, c: c }); }
+    function merge(i) {
+      var A = stack[i], B = stack[i + 1], left = a.slice(A[0], A[0] + A[1]), right = a.slice(B[0], B[0] + B[1]), k = A[0], p = 0, q = 0;
+      while (p < left.length && q < right.length) { c++; if (right[q] < left[p]) a[k++] = right[q++]; else a[k++] = left[p++]; }
+      while (p < left.length) a[k++] = left[p++]; while (q < right.length) a[k++] = right[q++];
+      stack.splice(i, 2, [A[0], A[1] + B[1]]);
+      snap("Слияние run-ов [" + A[0] + "…" + (A[0] + A[1] - 1) + "] и [" + B[0] + "…" + (B[0] + B[1] - 1) + "] (длины " + A[1] + " и " + B[1] + "). Меньший run копируется во временный буфер; при длинных сериях выигрышей одной стороны включается galloping — экспоненциальный поиск.", [A[0], A[1] + B[1]]);
+    }
+    function collapse() {
+      while (stack.length > 1) {
+        var n2 = stack.length - 2;
+        if (n2 > 0 && stack[n2 - 1][1] <= stack[n2][1] + stack[n2 + 1][1]) { if (stack[n2 - 1][1] < stack[n2 + 1][1]) n2--; merge(n2); }
+        else if (stack[n2][1] <= stack[n2 + 1][1]) merge(n2);
+        else break;
+      }
+    }
+    while (lo < n) {
+      var hi = lo + 1;
+      if (hi < n) { c++; if (a[hi] < a[lo]) { while (hi < n && (c++, a[hi] < a[hi - 1])) hi++; var seg = a.slice(lo, hi).reverse(); for (var r = 0; r < seg.length; r++) a[lo + r] = seg[r]; snap("Найден строго убывающий run длиной " + (hi - lo) + " — развёрнут на месте (поэтому убывающие данные тоже сортируются за O(n)).", [lo, hi - lo]); }
+        else { while (hi < n && (c++, a[hi] >= a[hi - 1])) hi++; } }
+      var len = hi - lo;
+      if (len < MINRUN) { var force = Math.min(MINRUN, n - lo); for (var x = lo + len; x < lo + force; x++) { var v = a[x], y = x - 1; while (y >= lo && (c++, a[y] > v)) { a[y + 1] = a[y]; y--; } a[y + 1] = v; } snap("Естественный run длиной " + len + " короче minrun — дополнен до " + force + " сортировкой вставками (бинарными: место ищется двоичным поиском).", [lo, force]); len = force; }
+      else snap("Естественный неубывающий run длиной " + len + " — принят как есть, без сравнений внутри.", [lo, len]);
+      stack.push([lo, len]); lo += len;
+      snap("Run положен в стек: " + stack.map(function (s) { return s[1]; }).join(", ") + ". Проверка инвариантов стека: A > B + C и B > C — иначе слияние.", null);
+      collapse();
+    }
+    while (stack.length > 1) { var t = stack.length - 2; if (t > 0 && stack[t - 1][1] < stack[t + 1][1]) t--; merge(t); }
+    snap("Готово: один run на весь массив. Сравнений: " + c + " (n·log₂n ≈ " + Math.round(n * Math.log2(n)) + ").", null);
+    si = 0; draw();
+  }
+  function draw() {
+    var s = steps[si], col = [];
+    (s.runs || []).forEach(function (r, i) { for (var k = r[0]; k < r[0] + r[1]; k++) col[k] = "r" + (i % 2); });
+    if (s.m) for (var k2 = s.m[0]; k2 < s.m[0] + s.m[1]; k2++) col[k2] = "m";
+    $("tsBars").innerHTML = s.a.map(function (v, i) { return '<i class="' + (col[i] || "") + '" style="height:' + v + '%" title="' + v + '"></i>'; }).join("");
+    $("tsOut").textContent = "шаг " + si + " из " + (steps.length - 1) + (s.c !== undefined ? "  ·  сравнений: " + s.c : "") + "\n" + s.msg;
+    $("tsLog").textContent = steps.slice(Math.max(1, si - 5), si + 1).map(function (x) { return "• " + x.msg.split(".")[0]; }).join("\n");
+  }
+  $("tsR").addEventListener("click", build); $("tsD").addEventListener("change", build);
+  $("tsS").addEventListener("click", function () { if (si < steps.length - 1) { si++; draw(); } });
+  $("tsA").addEventListener("click", function () { si = steps.length - 1; draw(); });
+  build();
+})();
+</script>
+<div class="callout info"><span class="c-title">Почему стабильность важна</span>
+Стабильная сортировка сохраняет относительный порядок равных элементов. Поэтому сортировку по нескольким ключам можно делать последовательно: сначала по имени, затем по отделу — внутри отдела имена останутся упорядоченными. И поэтому TimSort не может использовать быстрый, но нестабильный quicksort для объектов.
+</div>
+
+<h2 id="binsearch"><span class="h-num">7.3</span>Бинарный поиск и точка вставки</h2>
+<div class="widget" id="bsW">
+  <div class="widget-title">Collections.binarySearch(sorted, key)</div>
+  <div class="controls"><label>key<input type="number" id="bsK" value="37"></label><button class="btn primary" type="button" id="bsGo">Искать</button></div>
+  <div class="bs" id="bsArr"></div>
+  <div class="log" id="bsLog"></div>
+  <div class="verdict" id="bsV"></div>
+</div>
+<script>
+(function () {
+  var A = [3, 8, 12, 19, 21, 27, 33, 40, 46, 51, 58, 64, 70, 77, 85, 92];
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var key = +$("bsK").value, lo = 0, hi = A.length - 1, log = [], res = null, lastMid = -1;
+    while (lo <= hi) { var mid = (lo + hi) >>> 1; lastMid = mid; log.push("lo=" + lo + " hi=" + hi + " mid=" + mid + " → a[mid]=" + A[mid] + (A[mid] < key ? " < key → lo = mid+1" : A[mid] > key ? " > key → hi = mid−1" : " = key")); if (A[mid] < key) lo = mid + 1; else if (A[mid] > key) hi = mid - 1; else { res = mid; break; } }
+    $("bsArr").innerHTML = A.map(function (v, i) { return '<span class="' + (i === lastMid ? "mid" : i >= lo && i <= hi ? "in" : "out") + '">' + v + "</span>"; }).join("");
+    $("bsLog").textContent = log.join("\n");
+    var v = $("bsV");
+    if (res !== null) { v.className = "verdict ok"; v.textContent = "Найден: индекс " + res + " за " + log.length + " сравнений (log₂16 = 4)."; }
+    else { v.className = "verdict warn"; v.textContent = "Не найден. Возвращается −(точка вставки) − 1 = −(" + lo + ") − 1 = " + (-lo - 1) + ". Точка вставки " + lo + " — куда вставить key, сохранив порядок: list.add(-r - 1, key). «−1» нужен, чтобы отличить «не найден, вставить в 0» от «найден в 0»."; }
+  }
+  $("bsGo").addEventListener("click", run); $("bsK").addEventListener("input", run); run();
+})();
+</script>
+<p>Список должен быть отсортирован <b>тем же компаратором</b>, иначе результат не определён. <code>(lo + hi) &gt;&gt;&gt; 1</code> вместо <code>(lo + hi) / 2</code> — защита от переполнения int (знаменитый баг, найденный в JDK в 2006 году). Для LinkedList binarySearch работает итератором — O(n) переходов, но O(log n) сравнений.</p>
+
+<h2 id="collections"><span class="h-num">7.4</span>Полезные алгоритмы Collections</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th></tr>
+<tr><td><code>shuffle(list, rnd)</code></td><td>Фишер–Йейтс: каждая перестановка равновероятна, O(n); передавайте свой Random для воспроизводимости</td></tr>
+<tr><td><code>reverse</code>, <code>rotate(list, d)</code>, <code>swap</code></td><td>на месте, O(n); rotate — циклический сдвиг</td></tr>
+<tr><td><code>max/min(coll, cmp)</code></td><td>один проход, O(n) — без сортировки</td></tr>
+<tr><td><code>frequency</code>, <code>disjoint</code></td><td>сколько раз элемент встречается; нет ли общих элементов</td></tr>
+<tr><td><code>nCopies(n, x)</code></td><td>неизменяемый список из n одинаковых элементов за O(1) памяти</td></tr>
+<tr><td><code>addAll(coll, e1, e2…)</code></td><td>быстрее, чем <code>coll.addAll(Arrays.asList(…))</code></td></tr>
+<tr><td><code>emptyList/singletonList</code></td><td>неизменяемые синглтоны (тема 14)</td></tr>
+<tr><td><code>unmodifiable*/synchronized*/checked*</code></td><td>обёртки-представления (темы 14, 18)</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">7.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему Arrays.sort для int[] не стабильна, и это нормально?</p><ul><li>Это ошибка JDK</li><li>Равные примитивы неразличимы — стабильность не имеет смысла, а нестабильный Dual-Pivot Quicksort быстрее и без доп. памяти</li><li>int[] сортируется TimSort</li><li>Стабильность включается флагом</li></ul><div class="why">Для объектов стабильность различима — поэтому TimSort.</div></div>
+<div class="mcq" data-ok="3"><p>Что вернёт binarySearch для отсутствующего ключа, который должен стоять на позиции 5?</p><ul><li>5</li><li>−5</li><li>null</li><li>−6</li></ul><div class="why">−(точка вставки) − 1.</div></div>
+<div class="mcq" data-ok="0"><p>Сколько сравнений сделает TimSort на уже отсортированном массиве из n элементов?</p><ul><li>Около n − 1: один естественный run на весь массив</li><li>n log n</li><li>n²</li><li>0</li></ul><div class="why">Адаптивность — главное свойство TimSort.</div></div>
+<div class="mcq" data-ok="2"><p>Что произойдёт с итератором ArrayList, созданным до вызова list.sort(...)?</p><ul><li>Он продолжит обход в новом порядке</li><li>Ничего</li><li>Следующий next() бросит ConcurrentModificationException — сортировка увеличивает modCount</li><li>Он вернёт старый порядок</li></ul><div class="why">ArrayList.sort считается структурным изменением.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните идею TimSort.</summary><div class="a"><p>Реальные данные часто частично упорядочены. TimSort проходит массив, выделяя естественные runs (неубывающие или строго убывающие — последние разворачиваются), короткие runs дополняет до minrun (32–64) бинарной сортировкой вставками, кладёт runs в стек и сливает их, поддерживая инварианты длин (A > B + C, B > C), чтобы слияния были сбалансированы. Слияние использует временный буфер размером с меньший run и режим galloping при длинных сериях. Стабильна, O(n log n) в худшем случае и O(n) на упорядоченных данных.</p></div></details>
+<details class="q"><summary>Как найти k наибольших элементов из миллиона без полной сортировки?</summary><div class="a"><p>PriorityQueue (мин-куча) размера k: добавлять элементы, при превышении k — удалять минимум; итог — k наибольших за O(n log k) и O(k) памяти (тема 13). Для k порядка n — частичная сортировка или quickselect.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

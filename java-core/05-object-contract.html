@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · equals, hashCode, иммутабельность</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ОСНОВА ЯЗЫКА</div>
+  <h1>equals, hashCode, иммутабельность</h1>
+  <p class="lead">Каждый класс наследует от <code>Object</code> несколько методов с контрактами, на которые опирается вся стандартная библиотека. Нарушение контракта не вызывает ошибку компиляции — объект просто «теряется» в <code>HashMap</code> или дублируется в <code>Set</code>. Самая спрашиваемая тема Java Core.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">контракт</span><span class="tag">Comparable</span><span class="tag">immutable</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="object"><span class="h-num">5.1</span>Методы класса Object</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Поведение по умолчанию</th><th>Когда переопределять</th></tr>
+<tr><td><code>equals(Object)</code></td><td>Сравнение ссылок (<code>this == o</code>)</td><td>У объектов-значений: деньги, координаты, идентификаторы</td></tr>
+<tr><td><code>hashCode()</code></td><td>Число, присвоенное объекту JVM</td><td><b>Всегда вместе с <code>equals</code></b></td></tr>
+<tr><td><code>toString()</code></td><td><code>Имя@хэш</code></td><td>Почти всегда — ради логов и отладки</td></tr>
+<tr><td><code>getClass()</code></td><td>Фактический класс объекта; <code>final</code></td><td>—</td></tr>
+<tr><td><code>clone()</code></td><td>Поверхностная копия; <code>protected</code></td><td>Практически никогда (см. <a href="#copy">5.6</a>)</td></tr>
+<tr><td><code>wait</code>, <code>notify</code>, <code>notifyAll</code></td><td>Координация потоков на мониторе</td><td>— (<a href="../java-concurrency/03-synchronized.html">Java Concurrency, тема 03</a>)</td></tr>
+<tr><td><code>finalize()</code></td><td>Вызывался перед сборкой объекта</td><td>Никогда: устарел и готовится к удалению</td></tr>
+</table></div>
+
+<h2 id="equals"><span class="h-num">5.2</span>equals</h2>
+<p>Метод определяет <b>логическое</b> равенство. Контракт требует, чтобы оно было отношением эквивалентности:</p>
+<div class="table-wrap"><table>
+<tr><th>Свойство</th><th>Требование</th></tr>
+<tr><td>Рефлексивность</td><td><code>x.equals(x)</code> — true</td></tr>
+<tr><td>Симметричность</td><td><code>x.equals(y)</code> ⇔ <code>y.equals(x)</code></td></tr>
+<tr><td>Транзитивность</td><td><code>x.equals(y)</code> и <code>y.equals(z)</code> ⇒ <code>x.equals(z)</code></td></tr>
+<tr><td>Согласованность</td><td>Повторные вызовы дают тот же результат, пока объекты не менялись</td></tr>
+<tr><td>Сравнение с null</td><td><code>x.equals(null)</code> — false, без исключения</td></tr>
+</table></div>
+<pre data-title="эталонная реализация"><code class="java">public final class Money {
+    private final long amount;
+    private final String currency;
+
+    @Override
+    public boolean equals(Object o) {               // параметр — именно Object
+        if (this == o) return true;                 // быстрый путь
+        if (!(o instanceof Money other)) return false;   // заодно отсекает null
+        return amount == other.amount &amp;&amp; currency.equals(other.currency);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(amount, currency);      // те же поля, что и в equals
+    }
+}</code></pre>
+<div class="callout bad"><span class="c-title">Типичные ошибки</span>
+<ul>
+  <li><b><code>public boolean equals(Money other)</code></b> — это перегрузка, а не переопределение. Коллекции вызывают <code>equals(Object)</code> и получат версию из <code>Object</code>. <code>@Override</code> превращает эту ошибку в ошибку компиляции.</li>
+  <li><b><code>double</code> и <code>float</code></b> сравнивают через <code>Double.compare(a, b) == 0</code>: оператор <code>==</code> считает <code>NaN</code> не равным себе, что нарушает рефлексивность.</li>
+  <li><b>Массивы</b> — через <code>Arrays.equals</code> и <code>Arrays.hashCode</code>; у самого массива <code>equals</code> сравнивает ссылки.</li>
+  <li><b>Поля, допускающие <code>null</code></b>, — через <code>Objects.equals(a, b)</code>.</li>
+</ul>
+</div>
+<h3>instanceof или getClass</h3>
+<p><code>instanceof</code> считает равными объект класса и объект его наследника; <code>getClass() != o.getClass()</code> — только объекты строго одного класса. С <code>instanceof</code> наследник, добавляющий в сравнение своё поле, неизбежно нарушит симметричность: <code>point.equals(colorPoint)</code> — true, а <code>colorPoint.equals(point)</code> — false. Надёжные варианты: сделать класс <code>final</code> (как в примере) или использовать <code>getClass()</code>. Нельзя корректно расширить класс-значение, добавив поле в сравнение, — это ещё один довод в пользу композиции.</p>
+
+<h2 id="hashcode"><span class="h-num">5.3</span>hashCode</h2>
+<div class="callout ok"><span class="c-title">Контракт в трёх строках</span>
+<ol style="margin:6px 0 0">
+  <li>Равные по <code>equals</code> объекты <b>обязаны</b> иметь одинаковый <code>hashCode</code>.</li>
+  <li>Разные объекты <b>могут</b> иметь одинаковый <code>hashCode</code> (коллизия) — это допустимо, но вредит производительности.</li>
+  <li>Значение не меняется, пока не изменились поля, участвующие в <code>equals</code>.</li>
+</ol>
+</div>
+<p>Хэш-коллекции ищут объект в два шага: по <code>hashCode</code> находят ячейку, затем внутри ячейки сравнивают через <code>equals</code> (<a href="09-hashmap.html#internals">тема 09</a>). Если равные объекты дают разные хэши, поиск идёт не в ту ячейку.</p>
+<pre data-title="equals переопределён, hashCode — нет" class="bad-code"><code class="java">Set&lt;Money&gt; set = new HashSet&lt;&gt;();
+set.add(new Money(100, "RUB"));
+set.contains(new Money(100, "RUB"));   // false: у двух объектов разные хэши по умолчанию
+set.add(new Money(100, "RUB"));
+set.size();                            // 2 «одинаковых» элемента в множестве</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Что переопределено</th><th>Поведение в HashMap / HashSet</th></tr>
+<tr><td>Ничего</td><td>Работает, но равенство — только тождество объектов</td></tr>
+<tr><td>Только <code>equals</code></td><td><b>Сломано</b>: равные объекты не находятся, появляются дубликаты</td></tr>
+<tr><td>Только <code>hashCode</code></td><td>Объекты попадают в одну ячейку, но не считаются равными — дубликаты</td></tr>
+<tr><td><code>hashCode</code> возвращает константу</td><td>Корректно, но все элементы в одной ячейке — поиск вырождается</td></tr>
+<tr><td>Оба, по одним и тем же полям</td><td>Правильно</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Изменяемый ключ</span>
+<pre><code class="java">Set&lt;Point&gt; set = new HashSet&lt;&gt;();
+Point p = new Point(1, 2);
+set.add(p);
+p.x = 5;                 // хэш изменился, а элемент остался в старой ячейке
+set.contains(p);         // false
+set.remove(p);           // false — элемент нельзя ни найти, ни удалить: утечка памяти
+set.size();              // 1</code></pre>
+Ключи <code>HashMap</code> и элементы <code>HashSet</code> должны быть неизменяемыми — как минимум в части полей, участвующих в <code>equals</code> и <code>hashCode</code>.
+</div>
+<ul>
+  <li><b>Хэш по умолчанию — не адрес в памяти.</b> Объекты перемещаются сборщиком мусора, а хэш обязан сохраняться. HotSpot генерирует псевдослучайное число при первом вызове и хранит его в заголовке объекта.</li>
+  <li><b>Множитель 31</b> в ручных реализациях (<code>31 * result + field</code>) — нечётное простое число, дающее хорошее рассеивание; <code>Objects.hash</code> делает то же самое.</li>
+  <li><b>Record</b> генерирует <code>equals</code>, <code>hashCode</code> и <code>toString</code> по всем компонентам — для объектов-значений это лучший вариант (<a href="12-modern-java.html#records">тема 12</a>).</li>
+</ul>
+<div class="callout warn"><span class="c-title">Сущности JPA — особый случай</span>
+У сущности нет стабильного набора полей для сравнения: идентификатор появляется только после сохранения, остальные поля меняются. Генерация <code>equals</code>/<code>hashCode</code> по всем полям (Lombok <code>@Data</code>) ломает коллекции и вызывает ленивую загрузку связей. Распространённое решение — сравнивать по идентификатору, считая несохранённые сущности неравными, а <code>hashCode</code> возвращать постоянным для класса.
+</div>
+
+<h2 id="tostring"><span class="h-num">5.4</span>toString</h2>
+<p>Строковое представление нужно людям: в логах, сообщениях исключений, отладчике. Строка <code>Order@1b6d3586</code> в журнале инцидента бесполезна. Включайте поля, достаточные для идентификации, и <b>исключайте секреты и персональные данные</b> — пароли, токены, номера карт попадают в логи именно через <code>toString</code>. Не вызывайте в нём ленивые связи и тяжёлые вычисления: он может быть вызван неявно при конкатенации.</p>
+
+<h2 id="compare"><span class="h-num">5.5</span>Comparable и Comparator</h2>
+<div class="grid-2">
+  <div class="card"><h4>Comparable&lt;T&gt;</h4><p>«Естественный» порядок, заданный самим классом: метод <code>compareTo</code>. Один на класс. Есть у <code>String</code>, чисел, дат, enum.</p></div>
+  <div class="card"><h4>Comparator&lt;T&gt;</h4><p>Внешнее правило сравнения. Сколько угодно разных; можно сравнивать чужие классы.</p></div>
+</div>
+<pre><code class="java">record Employee(String name, String dept, int salary, LocalDate hired) { }
+
+Comparator&lt;Employee&gt; byDeptThenSalaryDesc =
+        Comparator.comparing(Employee::dept)
+                  .thenComparing(Employee::salary, Comparator.reverseOrder())
+                  .thenComparing(Employee::hired, Comparator.nullsLast(Comparator.naturalOrder()));
+
+employees.sort(byDeptThenSalaryDesc);</code></pre>
+<div class="callout bad"><span class="c-title">Сравнение вычитанием</span>
+<pre><code class="java">(a, b) -&gt; a.salary() - b.salary()          // переполнение: 2_000_000_000 - (-2_000_000_000) &lt; 0
+(a, b) -&gt; Integer.compare(a.salary(), b.salary())   // правильно
+Comparator.comparingInt(Employee::salary)            // ещё лучше</code></pre>
+</div>
+<p><b>Согласованность с equals.</b> Рекомендуется, чтобы <code>compareTo</code> возвращал 0 тогда и только тогда, когда <code>equals</code> — true. Сортированные коллекции (<code>TreeSet</code>, <code>TreeMap</code>) определяют «тот же элемент» именно по сравнению, а не по <code>equals</code>:</p>
+<pre><code class="java">var a = new BigDecimal("2.0");  var b = new BigDecimal("2.00");
+new HashSet&lt;&gt;(List.of(a, b)).size();   // 2: equals учитывает масштаб
+new TreeSet&lt;&gt;(List.of(a, b)).size();   // 1: compareTo вернул 0 — «дубликат»</code></pre>
+
+<h2 id="copy"><span class="h-num">5.6</span>Копирование объектов</h2>
+<p><b>Поверхностная копия</b> дублирует сам объект, но ссылочные поля указывают на те же вложенные объекты. <b>Глубокая</b> копирует и их. <code>Object.clone()</code> делает поверхностную копию и устроен неудачно: требует маркерного интерфейса <code>Cloneable</code>, создаёт объект в обход конструктора, не работает с <code>final</code>-полями, возвращает <code>Object</code>. Современная практика:</p>
+<pre class="good-code"><code class="java">public Order(Order other) {                       // конструктор копирования
+    this.id = other.id;
+    this.items = new ArrayList&lt;&gt;(other.items);    // новый список; сами элементы — общие, если они неизменяемы
+}
+List&lt;String&gt; snapshot = List.copyOf(source);      // неизменяемая копия коллекции</code></pre>
+<p>Для массивов <code>array.clone()</code> и <code>Arrays.copyOf</code> — допустимое и быстрое исключение из правила.</p>
+
+<h2 id="immutable"><span class="h-num">5.7</span>Неизменяемые классы</h2>
+<p>Объект, состояние которого нельзя изменить после создания, снимает сразу несколько проблем: его безопасно использовать как ключ, отдавать другим потокам без синхронизации, кэшировать и передавать в чужой код без защитного копирования.</p>
+<ol class="steps">
+  <li>Класс <code>final</code> — наследник не сможет добавить изменяемость.</li>
+  <li>Все поля <code>private final</code>, сеттеров нет.</li>
+  <li>Изменяемые аргументы <b>копируются в конструкторе</b> — иначе вызывающий изменит внутренности через сохранённую у себя ссылку.</li>
+  <li>Изменяемые поля <b>не отдаются наружу</b>: геттер возвращает копию или неизменяемое представление.</li>
+  <li>«Изменение» создаёт новый объект: <code>withAmount(...)</code>, <code>plus(...)</code>.</li>
+</ol>
+<pre><code class="java">public final class Schedule {
+    private final String name;
+    private final List&lt;LocalDate&gt; dates;
+
+    public Schedule(String name, List&lt;LocalDate&gt; dates) {
+        this.name = Objects.requireNonNull(name);
+        this.dates = List.copyOf(dates);          // защитная копия + запрет null + неизменяемость
+    }
+    public List&lt;LocalDate&gt; dates() { return dates; }   // List.copyOf уже неизменяем — отдавать безопасно
+
+    public Schedule withDate(LocalDate d) {       // «изменение» возвращает новый объект
+        var copy = new ArrayList&lt;&gt;(dates);
+        copy.add(d);
+        return new Schedule(name, copy);
+    }
+}</code></pre>
+<div class="callout warn"><span class="c-title">Три ложных признака неизменяемости</span>
+<ul>
+  <li><b><code>final</code>-поле</b> запрещает переприсваивание ссылки, но не изменение объекта, на который она указывает.</li>
+  <li><b><code>Collections.unmodifiableList(list)</code></b> — представление: изменения исходного списка видны через него. <code>List.copyOf</code> делает независимую копию.</li>
+  <li><b>Record</b> неизменяем поверхностно: компонент типа <code>List</code> или <code>Date</code> остаётся изменяемым, если его не скопировать в компактном конструкторе.</li>
+</ul>
+</div>
+
+<h2 id="lab"><span class="h-num">5.8</span>Интерактив: сломанный контракт equals / hashCode</h2>
+<div class="widget" id="eqW">
+  <div class="widget-title">Симулятор: что случится с HashSet и HashMap</div>
+  <p class="hint">Класс <code>Point(x, y)</code>. Кладём <code>new Point(1, 2)</code> в <code>HashSet</code>, затем ищем <b>другой</b> объект <code>new Point(1, 2)</code>.</p>
+  <div class="controls">
+    <label>что переопределено<select id="eqMode"><option value="none">ничего (методы Object)</option><option value="eq">только equals</option><option value="hash">только hashCode</option><option value="both" selected>equals и hashCode по x и y</option><option value="const">equals + hashCode() { return 42; }</option><option value="mut">оба, но после вставки меняем p.x</option><option value="sub">equals через instanceof, сравниваем с подклассом ColorPoint, у которого свой equals с цветом</option></select></label>
+  </div>
+  <div class="out" id="eqOut"></div>
+  <div class="verdict" id="eqV"></div>
+</div>
+<script>
+(function () {
+  var sel = document.getElementById("eqMode"), out = document.getElementById("eqOut"), v = document.getElementById("eqV");
+  var D = {
+    none: ["set.add(p1)            // hashCode Object: 0x1b6d → бакет 13\nset.contains(p2)       // hashCode Object: 0x4e25 → бакет 5 → пусто → false\np1.equals(p2)          // false: сравнение ссылок", "bad", "Два «одинаковых» по смыслу объекта для коллекций разные. Значимые объекты (value objects) обязаны переопределять оба метода."],
+    eq: ["set.add(p1)            // hashCode Object: 0x1b6d → бакет 13\nset.contains(p2)       // hashCode Object: 0x4e25 → бакет 5 → пусто → false (equals даже не вызван)\np1.equals(p2)          // true\nset.add(p2)            // добавится «дубликат»: в множестве 2 равных объекта", "bad", "Нарушен контракт: равные объекты обязаны иметь равные хэш-коды. HashSet/HashMap ищут сначала по хэшу, поэтому equals до сравнения не доходит."],
+    hash: ["set.add(p1)            // hashCode: 33 → бакет 1\nset.contains(p2)       // hashCode: 33 → бакет 1 → найден узел → equals Object (ссылки) → false\n                       // результат: false", "bad", "Хэши совпали, бакет найден, но equals по ссылке говорит «разные». Совпадение хэша — необходимое, но не достаточное условие."],
+    both: ["set.add(p1)            // hashCode: 33 → бакет 1\nset.contains(p2)       // hashCode: 33 → бакет 1 → equals: x и y равны → true\nmap.get(p2)            // находит значение, положенное по p1", "ok", "Контракт соблюдён. Генерируйте методы средствами IDE, Objects.equals/Objects.hash или используйте record — у него они корректны по определению."],
+    "const": ["set.add(p1)            // hashCode: 42 → бакет 10\nset.contains(p2)       // hashCode: 42 → бакет 10 → equals → true\n// 100 000 разных точек → все в бакете 10 → список, затем дерево", "warn", "Формально контракт соблюдён, и всё работает правильно. Но все ключи попадают в один бакет: операции O(log n) вместо O(1) (а до Java 8 — O(n)). Хэш должен хорошо распределять значения."],
+    mut: ["set.add(p1)            // hashCode(1,2) = 33 → бакет 1\np1.x = 5               // объект изменился, но лежит по-прежнему в бакете 1\nset.contains(p1)       // hashCode(5,2) = 157 → бакет 13 → пусто → false\nset.remove(p1)         // false — удалить нельзя\nset.size()             // 1 — объект в множестве есть, но недостижим: утечка", "bad", "Ключи хэш-коллекций должны быть неизменяемыми — или хотя бы не меняться, пока лежат в коллекции. Отсюда любовь к String, Integer, record и enum в роли ключей."],
+    sub: ["Point p = new Point(1, 2);\nColorPoint cp = new ColorPoint(1, 2, RED);\np.equals(cp)           // true:  cp instanceof Point, x и y равны\ncp.equals(p)           // false: p не ColorPoint (или нет цвета)\n// симметрия нарушена: list.contains зависит от порядка аргументов", "bad", "Требование симметрии: a.equals(b) ⇔ b.equals(a). Наследование с добавлением значимых полей несовместимо с equals через instanceof. Решения: композиция вместо наследования, сравнение getClass(), final-класс или record."]
+  };
+  function run() { var d = D[sel.value]; out.textContent = d[0]; v.className = "verdict " + d[1]; v.textContent = d[2]; }
+  sel.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">5.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>У двух объектов одинаковый hashCode. Что можно утверждать?</p><ul><li>Они равны по equals</li><li>Ничего: это может быть коллизия; равенство решает только equals</li><li>Это один и тот же объект</li><li>Контракт нарушен</li></ul><div class="why">Контракт односторонний: равные по equals ⇒ равные хэши. Обратное не требуется и при 2³² значений int невозможно гарантировать.</div></div>
+<div class="mcq" data-ok="2"><p>Чем <code>Comparable</code> отличается от <code>Comparator</code>?</p><ul><li>Ничем, это синонимы</li><li>Comparable быстрее</li><li>Comparable — «естественный порядок», реализуется самим классом (compareTo); Comparator — внешняя стратегия сравнения, их может быть много</li><li>Comparator работает только со строками</li></ul><div class="why"><code>list.sort(null)</code> использует compareTo; <code>Comparator.comparing(User::age).thenComparing(User::name)</code> задаёт порядок снаружи, не меняя класс.</div></div>
+<div class="mcq" data-ok="0"><p>Что нужно, чтобы класс был действительно неизменяемым?</p><ul><li>final-класс, private final поля, нет сеттеров, защитные копии изменяемых полей на входе и выходе</li><li>Достаточно пометить поля final</li><li>Достаточно убрать сеттеры</li><li>Реализовать Cloneable</li></ul><div class="why"><code>final List&lt;String&gt; items</code> не мешает менять сам список. Нужны <code>List.copyOf</code> в конструкторе и возврат неизменяемого представления.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сформулируйте связь equals и hashCode. В какую сторону она действует?</summary><div class="a"><p>Если <code>a.equals(b)</code>, то <code>a.hashCode() == b.hashCode()</code>. Обратное не требуется: одинаковый хэш у неравных объектов — допустимая коллизия. Поэтому оба метода переопределяют вместе и по одному набору полей.</p></div></details>
+<details class="q"><summary>Что произойдёт, если переопределить equals, но не hashCode, и положить объект в HashSet?</summary><div class="a"><p>Два равных объекта получат разные хэши по умолчанию и попадут в разные ячейки. <code>contains</code> для равного, но другого экземпляра вернёт false, а повторное добавление создаст дубликат. При этом в <code>ArrayList</code> и <code>TreeSet</code> всё будет работать — они не используют хэш, из-за чего ошибку легко не заметить.</p></div></details>
+<details class="q"><summary>Может ли hashCode всегда возвращать 1?</summary><div class="a"><p>Формально да — контракт соблюдён. Но все элементы окажутся в одной ячейке хэш-таблицы, и операции станут O(n) (O(log n), если ключи сравнимы и ячейка превратилась в дерево). Корректно, но бессмысленно.</p></div></details>
+<details class="q"><summary>Почему ключ HashMap должен быть неизменяемым?</summary><div class="a"><p>Положение записи определяется хэшем ключа в момент вставки. Если после этого изменить поле, участвующее в <code>hashCode</code>, поиск пойдёт в другую ячейку: запись нельзя ни прочитать, ни удалить, хотя она продолжает занимать память.</p></div></details>
+<details class="q"><summary>Чем Comparable отличается от Comparator и что значит «согласован с equals»?</summary><div class="a"><p><code>Comparable</code> — естественный порядок внутри самого класса, один. <code>Comparator</code> — внешнее правило, их может быть много. Согласованность: <code>compareTo(x) == 0</code> ровно тогда, когда <code>equals(x)</code>. Если она нарушена (как у <code>BigDecimal</code>), <code>TreeSet</code> и <code>HashSet</code> по-разному определяют дубликаты.</p></div></details>
+<details class="q"><summary>Класс с полями <code>private final Date start</code> и геттером <code>getStart()</code> — неизменяем ли он?</summary><div class="a"><p>Нет. <code>Date</code> изменяем: вызывающий код может сохранить ссылку на переданный в конструктор объект или получить его через геттер и вызвать <code>setTime</code>. Нужны защитные копии на входе и выходе, а лучше — неизменяемый тип (<code>Instant</code>, <code>LocalDate</code>).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

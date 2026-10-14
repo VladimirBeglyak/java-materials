@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · R2DBC и реактивный доступ к данным</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · WEBFLUX</div>
+  <h1>R2DBC и реактивный доступ к данным</h1>
+  <p class="lead">JDBC блокирует поток на каждом запросе — с ним реактивный стек теряет смысл. R2DBC — неблокирующий драйверный SPI для реляционных БД (PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, H2). Spring Data R2DBC даёт репозитории и <code>R2dbcEntityTemplate</code>, но это не JPA: нет ленивой загрузки, связей, кэша первого уровня. Разбираем модель, транзакции, пул соединений и типичные ловушки.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">R2DBC SPI</span><span class="tag">ReactiveCrudRepository</span><span class="tag">DatabaseClient</span><span class="tag">@Transactional</span><span class="tag">TransactionalOperator</span><span class="tag">r2dbc-pool</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="repo"><span class="h-num">16.1</span>Сущности и репозитории</h2>
+<pre data-title="Order.java и OrderRepository.java"><code class="java">@Table("orders")
+record Order(@Id Long id, long customerId, String status,
+             BigDecimal total, @Version Long version, @CreatedDate Instant createdAt) {}
+
+interface OrderRepository extends ReactiveCrudRepository&lt;Order, Long&gt; {
+    Flux&lt;Order&gt; findByCustomerIdOrderByCreatedAtDesc(long customerId, Pageable page);
+
+    @Query("UPDATE orders SET status = :status WHERE id = :id AND status = 'NEW'")
+    @Modifying
+    Mono&lt;Integer&gt; markPaid(long id, String status);
+}</code></pre>
+<pre data-title="DatabaseClient — SQL вручную, связи — тоже вручную"><code class="java">Flux&lt;OrderWithLines&gt; withLines = db.sql("""
+        SELECT o.id, o.status, l.sku, l.qty
+        FROM orders o JOIN order_lines l ON l.order_id = o.id
+        WHERE o.customer_id = :cid ORDER BY o.id""")
+    .bind("cid", customerId)
+    .map((row, meta) -&gt; new Row(row.get("id", Long.class), row.get("status", String.class),
+                                row.get("sku", String.class), row.get("qty", Integer.class)))
+    .all()
+    .bufferUntilChanged(Row::orderId)                 // группировка строк соседних заказов
+    .map(OrderWithLines::from);</code></pre>
+<div class="callout warn"><span class="c-title">N+1 возвращается</span>
+Связей нет, и соблазн написать <code>orders.flatMap(o -&gt; lineRepo.findByOrderId(o.id()))</code> велик: это N+1 запросов, только параллельных (до 256 одновременно — и пул в 10 соединений встанет). Используйте JOIN, <code>WHERE order_id IN (:ids)</code> пачками или ограничивайте concurrency.
+</div>
+
+<h2 id="tx"><span class="h-num">16.2</span>Транзакции</h2>
+<p>Реактивная транзакция привязана не к потоку, а к подписке: <code>R2dbcTransactionManager</code> (ReactiveTransactionManager) хранит соединение в Reactor Context. Поэтому транзакция охватывает только то, что выполняется <b>внутри</b> возвращённого издателя.</p>
+<div class="widget" id="txW">
+  <div class="widget-title">Перевод: списать со счёта A, зачислить на B (зачисление может упасть)</div>
+  <div class="controls">
+    <label>Реализация<select id="txI">
+      <option value="ok">@Transactional, возвращает Mono цепочки</option>
+      <option value="op">TransactionalOperator.transactional(mono)</option>
+      <option value="sub">@Transactional, внутри debit(...).subscribe()</option>
+      <option value="block">@Transactional на методе, возвращающем void (block внутри)</option>
+      <option value="none">без транзакции</option>
+    </select></label>
+    <label><input type="checkbox" id="txF" checked> зачисление на B падает</label>
+  </div>
+  <div class="log" id="txLog"></div>
+  <div class="verdict" id="txV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var im = $("txI").value, fail = $("txF").checked, L = [], cls = "ok", msg;
+    var D = "UPDATE accounts SET balance = balance - 100 WHERE id = 'A'", C = "UPDATE accounts SET balance = balance + 100 WHERE id = 'B'";
+    if (im === "ok" || im === "op") {
+      L.push("[conn-3] BEGIN", "[conn-3] " + D);
+      if (fail) { L.push("[conn-3] " + C + "  ✗ constraint violation", "[conn-3] ROLLBACK", "→ onError(DataIntegrityViolationException)"); msg = "Обе операции в одной транзакции на одном соединении из Context — откат полный, A и B не изменились."; }
+      else { L.push("[conn-3] " + C, "[conn-3] COMMIT", "→ onComplete"); msg = "Обе операции выполнены атомарно."; }
+      if (im === "op") msg += " TransactionalOperator — программный аналог @Transactional: удобен в функциональных эндпоинтах и когда транзакция нужна на часть цепочки (operator.transactional(mono) или .as(operator::transactional)).";
+    } else if (im === "sub") {
+      L.push("[conn-3] BEGIN", "debit(...).subscribe() — отдельная подписка БЕЗ транзакционного Context", "[conn-7] " + D + "  (autocommit!)");
+      if (fail) { L.push("[conn-3] " + C + "  ✗", "[conn-3] ROLLBACK  (откатывает только зачисление)"); cls = "bad"; msg = "Списание выполнено на другом соединении в autocommit и не откатилось: деньги исчезли. Не вызывайте subscribe() внутри транзакционных методов — встраивайте всё в возвращаемую цепочку (then/flatMap)."; }
+      else { L.push("[conn-3] " + C, "[conn-3] COMMIT"); cls = "warn"; msg = "Сейчас повезло, но списание шло вне транзакции и даже могло не завершиться к моменту COMMIT — порядок не гарантирован."; }
+    } else if (im === "block") {
+      L.push("@Transactional void transfer() { debit().block(); credit().block(); }", "TransactionInterceptor находит ReactiveTransactionManager, но тип результата не реактивный");
+      L.push("IllegalStateException: Cannot apply reactive transaction to non-reactive return type [void]", "(и даже без транзакций: block() в event loop → IllegalStateException)");
+      cls = "bad"; msg = "Реактивные транзакции работают только для методов, возвращающих Publisher (Mono/Flux) — или Kotlin suspend/Flow. Для void-метода с реактивным менеджером транзакций Spring бросает IllegalStateException.";
+    } else {
+      L.push("[conn-3] " + D + "  (autocommit)");
+      if (fail) { L.push("[conn-5] " + C + "  ✗", "→ onError; списание уже зафиксировано"); cls = "bad"; msg = "Без транзакции каждая операция фиксируется сама. Частичный результат."; }
+      else { L.push("[conn-5] " + C + "  (autocommit)"); cls = "warn"; msg = "Сработало, но атомарности нет: падение между операциями оставит рассогласованные данные."; }
+    }
+    $("txLog").textContent = L.join("\n"); $("txV").className = "verdict " + cls; $("txV").textContent = msg;
+  }
+  $("txI").addEventListener("change", run); $("txF").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="Правильный транзакционный сервис" class="good-code"><code class="java">@Transactional
+public Mono&lt;Void&gt; transfer(String from, String to, BigDecimal amount) {
+    return accounts.debit(from, amount)
+        .filter(updated -&gt; updated == 1)
+        .switchIfEmpty(Mono.error(new InsufficientFunds(from)))
+        .then(accounts.credit(to, amount))
+        .then(outbox.save(new TransferDone(from, to, amount)))   // outbox в той же транзакции
+        .then();
+}</code></pre>
+
+<h2 id="pool"><span class="h-num">16.3</span>Пул соединений</h2>
+<div class="grid-2">
+  <div class="card"><h4>r2dbc-pool</h4><pre data-title="application.yml"><code class="yaml">spring:
+  r2dbc:
+    url: r2dbc:postgresql://db:5432/shop
+    pool:
+      initial-size: 10
+      max-size: 20          # по умолчанию 10
+      max-idle-time: 30m
+      max-acquire-time: 3s  # fail fast
+      validation-query: SELECT 1</code></pre></div>
+  <div class="card"><h4>Сколько соединений нужно</h4><p>Неблокирующий драйвер не освобождает от закона Литтла: соединение занято, пока БД выполняет запрос. 20 соединений × 5 мс на запрос = 4000 запросов/с максимум. Узкое место — сама база, а не потоки приложения. Выигрыш R2DBC — в том, что ожидание соединения не держит поток.</p></div>
+</div>
+<div class="callout info"><span class="c-title">Стриминг результатов</span>
+<code>repo.findAll()</code> возвращает Flux, и драйвер PostgreSQL выдаёт строки с учётом противодавления (fetchSize/курсор в транзакции). Но <code>collectList()</code> снова собирает всё в память, а удерживаемое соединение блокирует пул на всё время стрима. Для больших выгрузок — стрим с NDJSON-ответом и ограничением времени.
+</div>
+
+<h2 id="other"><span class="h-num">16.4</span>Другие реактивные хранилища</h2>
+<div class="table-wrap"><table>
+<tr><th>Хранилище</th><th>Модуль</th><th>Замечание</th></tr>
+<tr><td>MongoDB</td><td>spring-boot-starter-data-mongodb-reactive</td><td>ReactiveMongoTemplate, tailable cursors, change streams</td></tr>
+<tr><td>Redis</td><td>spring-boot-starter-data-redis-reactive (Lettuce)</td><td>ReactiveRedisTemplate, pub/sub как Flux</td></tr>
+<tr><td>Cassandra</td><td>spring-boot-starter-data-cassandra-reactive</td><td>нативно асинхронный драйвер</td></tr>
+<tr><td>Elasticsearch</td><td>ReactiveElasticsearchClient</td><td>—</td></tr>
+<tr><td>Kafka</td><td>reactor-kafka (KafkaReceiver/Sender) — проект прекращён в мае 2025</td><td>альтернатива — Spring for Apache Kafka; противодавление там — через pause/resume партиций</td></tr>
+<tr><td>JPA / JDBC</td><td>—</td><td>только через boundedElastic; лучше — отдельный MVC-сервис или виртуальные потоки</td></tr>
+</table></div>
+<p>Миграции схемы: Flyway и Liquibase работают через JDBC — для них подключают JDBC-драйвер и настраивают <code>spring.flyway.url</code> отдельно; они выполняются один раз при старте и не влияют на реактивную работу.</p>
+
+<h2 id="quiz"><span class="h-num">16.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Где хранится транзакционное соединение в реактивной транзакции?</p><ul><li>В ThreadLocal</li><li>В Reactor Context подписки</li><li>В статическом поле</li><li>В HTTP-сессии</li></ul><div class="why">Поэтому отдельная подписка (subscribe()) выпадает из транзакции.</div></div>
+<div class="mcq" data-ok="3"><p>Поддерживает ли Spring Data R2DBC ленивую загрузку связей @OneToMany?</p><ul><li>Да, как JPA</li><li>Да, через Mono</li><li>Только с Hibernate Reactive</li><li>Нет: связей и ленивой загрузки нет, агрегаты собираются вручную</li></ul><div class="why">Spring Data R2DBC — простой маппер без ORM-сессии.</div></div>
+<div class="mcq" data-ok="0"><p>Пул R2DBC — 10 соединений. Код: <code>orders.flatMap(o -&gt; lines.findByOrderId(o.id()))</code> для 1000 заказов. Что будет?</p><ul><li>До 256 одновременных запросов в очереди к 10 соединениям; возможны таймауты получения соединения</li><li>1 запрос</li><li>Ошибка компиляции</li><li>Последовательные запросы</li></ul><div class="why">Ограничьте concurrency или используйте JOIN/IN.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем Hibernate Reactive отличается от Spring Data R2DBC?</summary><div class="a"><p>Hibernate Reactive — полноценный ORM (сущности JPA, связи, ленивая загрузка через явный fetch, сессия, кэш) поверх неблокирующих драйверов Vert.x SQL client, с API на Mutiny или CompletionStage. Spring Data R2DBC — лёгкий маппер на R2DBC SPI с репозиториями Spring Data. Spring не интегрирует Hibernate Reactive в свою транзакционную модель так же глубоко, поэтому в Spring-приложениях чаще выбирают R2DBC, а в Quarkus — Hibernate Reactive.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

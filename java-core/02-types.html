@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Типы, обёртки, передача по значению</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · ОСНОВА ЯЗЫКА</div>
+  <h1>Типы, обёртки, передача по значению</h1>
+  <p class="lead">В Java два мира: восемь примитивных типов, которые хранят само значение, и ссылочные типы, которые хранят адрес объекта. Почти все «неожиданности» начального уровня — сравнение через <code>==</code>, <code>NullPointerException</code> при распаковке, «не изменившийся» аргумент метода — следствия этого деления.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">autoboxing</span><span class="tag">Integer cache</span><span class="tag">BigDecimal</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="primitives"><span class="h-num">2.1</span>Примитивные типы</h2>
+<div class="table-wrap"><table>
+<tr><th>Тип</th><th>Размер</th><th>Диапазон</th><th>По умолчанию</th><th>Обёртка</th></tr>
+<tr><td><code>byte</code></td><td>1 байт</td><td>−128 … 127</td><td>0</td><td><code>Byte</code></td></tr>
+<tr><td><code>short</code></td><td>2</td><td>−32 768 … 32 767</td><td>0</td><td><code>Short</code></td></tr>
+<tr><td><code>int</code></td><td>4</td><td>−2³¹ … 2³¹−1 (≈ ±2,1 млрд)</td><td>0</td><td><code>Integer</code></td></tr>
+<tr><td><code>long</code></td><td>8</td><td>−2⁶³ … 2⁶³−1 (≈ ±9,2·10¹⁸)</td><td>0L</td><td><code>Long</code></td></tr>
+<tr><td><code>float</code></td><td>4</td><td>≈ 7 значащих цифр</td><td>0.0f</td><td><code>Float</code></td></tr>
+<tr><td><code>double</code></td><td>8</td><td>≈ 15–16 значащих цифр</td><td>0.0</td><td><code>Double</code></td></tr>
+<tr><td><code>char</code></td><td>2</td><td>0 … 65 535 — одна кодовая единица UTF-16</td><td>'\u0000'</td><td><code>Character</code></td></tr>
+<tr><td><code>boolean</code></td><td>зависит от JVM</td><td><code>true</code> / <code>false</code></td><td>false</td><td><code>Boolean</code></td></tr>
+</table></div>
+<ul>
+  <li><b>Значения по умолчанию есть только у полей и элементов массива.</b> Локальную переменную компилятор не даст прочитать до присваивания.</li>
+  <li><b><code>char</code> — число, а не символ.</b> Символы вне базовой плоскости Юникода (эмодзи, редкие иероглифы) занимают два <code>char</code>, поэтому <code>"😀".length() == 2</code>. Подробнее — в <a href="03-strings.html#internals">теме 03</a>.</li>
+  <li><b>Размер <code>boolean</code></b> спецификация не фиксирует. В HotSpot поле и элемент массива <code>boolean[]</code> занимают байт.</li>
+</ul>
+
+<h2 id="conversion"><span class="h-num">2.2</span>Преобразования и арифметика</h2>
+<p><b>Расширение</b> (в сторону типа с большим диапазоном) выполняется неявно: <code>byte → short → int → long → float → double</code>, <code>char → int</code>. <b>Сужение</b> требует явного приведения и молча отбрасывает старшие биты.</p>
+<pre data-title="что здесь происходит"><code class="java">int big = 200;
+byte b = (byte) big;            // -56: остались младшие 8 бит
+long l = Integer.MAX_VALUE + 1; // -2147483648: переполнение случилось в int, ДО присваивания в long
+long ok = Integer.MAX_VALUE + 1L; // 2147483648: один операнд long — вся операция в long
+
+int i = 7 / 2;                  // 3: целочисленное деление отбрасывает дробную часть
+double d = 7 / 2;               // 3.0: деление уже выполнено в int
+double d2 = 7 / 2.0;            // 3.5
+int r = -7 % 3;                 // -1: знак остатка совпадает со знаком делимого</code></pre>
+<div class="callout bad"><span class="c-title">Переполнение не вызывает ошибку</span>
+Целочисленная арифметика «заворачивается» по модулю 2³². <code>Integer.MAX_VALUE + 1 == Integer.MIN_VALUE</code>, и программа продолжает работать с неверным числом. Классические жертвы: перемножение миллисекунд (<code>24 * 60 * 60 * 1000 * 30</code> не помещается в <code>int</code>), вычисление середины <code>(lo + hi) / 2</code>, счётчики. Там, где переполнение недопустимо, — <code>Math.addExact</code>, <code>Math.multiplyExact</code>, <code>Math.toIntExact</code>: они бросают <code>ArithmeticException</code>.
+</div>
+<h3>Арифметика типов короче int</h3>
+<pre><code class="java">byte a = 10, c = 20;
+byte sum = a + c;        // ошибка компиляции: результат a + c имеет тип int
+byte sum2 = (byte) (a + c);
+a += c;                  // компилируется: составное присваивание содержит неявное приведение
+short s = 1;  s = s + 1; // ошибка компиляции        s += 1; // корректно
+char ch = 'a' + 1;       // 'b': константное выражение, помещающееся в char</code></pre>
+<p>Причина — в байткоде (<a href="01-platform.html#bytecode">тема 01</a>): отдельной арифметики для <code>byte</code>, <code>short</code> и <code>char</code> нет, операнды всегда повышаются минимум до <code>int</code>.</p>
+
+<h2 id="floating"><span class="h-num">2.3</span>Числа с плавающей точкой и деньги</h2>
+<pre><code class="java">System.out.println(0.1 + 0.2);            // 0.30000000000000004
+System.out.println(0.1 + 0.2 == 0.3);     // false
+System.out.println(1.0 / 0);              // Infinity, не исключение
+System.out.println(0.0 / 0 == 0.0 / 0);   // false: NaN не равен ничему, даже себе
+System.out.println(Double.isNaN(0.0 / 0)); // true — единственный правильный способ проверки</code></pre>
+<p><code>float</code> и <code>double</code> хранят число в двоичном виде (стандарт IEEE 754), а 0,1 в двоичной системе — бесконечная дробь, как 1/3 в десятичной. Ошибка округления неизбежна и накапливается.</p>
+<div class="callout bad"><span class="c-title">Деньги не хранят в double</span>
+Варианты: <code>long</code> в минимальных единицах (копейки) или <code>BigDecimal</code>. С <code>BigDecimal</code> три ловушки:
+<pre><code class="java">new BigDecimal(0.1);       // 0.1000000000000000055511151231257827… — унаследовал ошибку double
+new BigDecimal("0.1");     // ровно 0.1 — создавать только из строки или BigDecimal.valueOf(0.1)
+
+new BigDecimal("2.0").equals(new BigDecimal("2.00"));          // false: equals сравнивает и масштаб
+new BigDecimal("2.0").compareTo(new BigDecimal("2.00")) == 0;  // true: сравнивать через compareTo
+
+BigDecimal.ONE.divide(new BigDecimal("3"));                    // ArithmeticException: бесконечная дробь
+BigDecimal.ONE.divide(new BigDecimal("3"), 2, RoundingMode.HALF_EVEN); // 0.33 — всегда задавать округление</code></pre>
+</div>
+
+<h2 id="references"><span class="h-num">2.4</span>Ссылочные типы: стек и куча</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 230" role="img" aria-label="Примитивы хранят значение, ссылки хранят адрес объекта в куче">
+  <defs><marker id="r1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="20" y="24" font-weight="700">Стек потока: кадр метода</text>
+  <rect x="20" y="36" width="300" height="176" rx="9" class="box"/>
+  <g class="mono" font-size="13">
+    <rect x="36" y="52" width="268" height="34" rx="5" class="box-info"/><text x="48" y="74">int x = 5</text><text x="292" y="74" text-anchor="end">5</text>
+    <rect x="36" y="92" width="268" height="34" rx="5" class="box-acc"/><text x="48" y="114">Point a = new Point(1, 2)</text>
+    <rect x="36" y="132" width="268" height="34" rx="5" class="box-acc"/><text x="48" y="154">Point b = a</text>
+    <rect x="36" y="172" width="268" height="34" rx="5" class="box-warn"/><text x="48" y="194">Point c = null</text>
+  </g>
+  <text x="460" y="24" font-weight="700">Куча (heap)</text>
+  <rect x="460" y="36" width="320" height="176" rx="9" class="box" stroke-dasharray="5 4"/>
+  <rect x="520" y="86" width="200" height="74" rx="8" class="box-ok"/>
+  <text x="620" y="110" text-anchor="middle" font-weight="700" font-size="13">объект Point</text>
+  <text x="620" y="130" text-anchor="middle" class="mono" font-size="12.5">заголовок · x = 1 · y = 2</text>
+  <text x="620" y="148" text-anchor="middle" class="muted" font-size="11.5">один объект, две ссылки</text>
+  <path d="M304 109 C 400 109, 430 112, 516 116" class="ln-acc" marker-end="url(#r1)"/>
+  <path d="M304 149 C 400 149, 430 140, 516 132" class="ln-acc" marker-end="url(#r1)"/>
+</svg>
+<figcaption>Переменная примитивного типа содержит значение. Переменная ссылочного типа содержит адрес; присваивание <code>b = a</code> копирует адрес, а не объект.</figcaption>
+</figure>
+<ul>
+  <li><b><code>==</code> для ссылок сравнивает адреса</b>, то есть отвечает на вопрос «это один и тот же объект?». Сравнение содержимого — <code>equals()</code> (<a href="05-object-contract.html">тема 05</a>).</li>
+  <li><b><code>null</code></b> — ссылка, не указывающая никуда. Обращение через неё — <code>NullPointerException</code>. С Java 14 сообщение точно называет, что именно было <code>null</code>: <i>Cannot invoke "String.length()" because "user.name" is null</i>.</li>
+  <li><b>Массив — тоже объект</b> в куче, даже <code>int[]</code>. Переменная массива — ссылка.</li>
+  <li><b>«Локальные переменные в стеке, объекты в куче»</b> — рабочая модель. Оптимизатор может не создавать объект вовсе, если тот не покидает метод (<a href="14-memory-gc.html#areas">тема 14</a>), но на поведение программы это не влияет.</li>
+</ul>
+
+<h2 id="pass-by-value"><span class="h-num">2.5</span>Передача параметров — всегда по значению</h2>
+<p>В метод передаётся <b>копия значения переменной</b>. Для примитива это копия числа. Для ссылочного типа — копия ссылки: метод получает второй «указатель» на тот же объект.</p>
+<pre><code class="java">static void change(int n, Point p, Point q) {
+    n = 100;              // меняется локальная копия числа
+    p.x = 100;            // меняется объект, на который указывают обе ссылки — снаружи видно
+    q = new Point(9, 9);  // локальная копия ссылки переведена на новый объект — снаружи НЕ видно
+}
+
+int n = 1;  Point p = new Point(1, 2);  Point q = new Point(1, 2);
+change(n, p, q);
+// n == 1,  p.x == 100,  q.x == 1</code></pre>
+<div class="callout interview"><span class="c-title">Формулировка для собеседования</span>
+«В Java всё передаётся по значению. Для объектов значением является ссылка, поэтому метод может изменить состояние объекта, но не может заставить переменную вызывающего кода указывать на другой объект». Ответ «объекты передаются по ссылке» неверен: при настоящей передаче по ссылке третья строка примера изменила бы <code>q</code> снаружи. По той же причине невозможно написать метод <code>swap(a, b)</code>, меняющий местами две переменные.
+</div>
+<p><b><code>final</code> для ссылки</b> запрещает переприсваивание переменной, но не изменение объекта: <code>final List&lt;String&gt; list = new ArrayList&lt;&gt;(); list.add("x");</code> — корректно.</p>
+
+<h2 id="boxing"><span class="h-num">2.6</span>Обёртки и autoboxing</h2>
+<p>У каждого примитива есть класс-обёртка. Он нужен там, где требуется объект: в коллекциях и generics (<code>List&lt;int&gt;</code> невозможен), для значения «отсутствует» (<code>null</code>). Компилятор сам вставляет преобразования: <b>boxing</b> — <code>Integer.valueOf(i)</code>, <b>unboxing</b> — <code>obj.intValue()</code>.</p>
+<pre data-title="кэш Integer"><code class="java">Integer a = 127, b = 127;
+System.out.println(a == b);        // true
+Integer c = 128, d = 128;
+System.out.println(c == d);        // false
+System.out.println(c.equals(d));   // true</code></pre>
+<p><code>Integer.valueOf</code> возвращает заранее созданные объекты для значений от −128 до 127, а для остальных создаёт новые. Поэтому <code>==</code> «работает» на маленьких числах в тестах и ломается в продакшене на идентификаторе 128. Кэшируются также <code>Byte</code>, <code>Short</code>, <code>Long</code> (в том же диапазоне), <code>Character</code> (0–127) и <code>Boolean</code>. <b>Обёртки сравнивают только через <code>equals</code></b>.</p>
+<div class="callout bad"><span class="c-title">Четыре ловушки распаковки</span>
+<pre><code class="java">Integer count = map.get("missing");   // null
+int n = count;                        // NullPointerException: неявный count.intValue()
+
+Integer x = flag ? 1 : nullableInteger;  // NPE при flag == false и nullableInteger == null!
+// тип тернарного выражения с операндами int и Integer — int, поэтому второй операнд распаковывается
+
+Long total = 0L;
+for (int i = 0; i &lt; 1_000_000; i++) total += i;  // миллион лишних объектов: распаковка, сложение, упаковка
+
+Long id = 1;                          // ошибка компиляции: int не упаковывается в Long
+Long.valueOf(1).equals(1);            // false: 1 упаковался в Integer, а Integer не равен Long</code></pre>
+</div>
+<ul>
+  <li><b>Память.</b> <code>int</code> — 4 байта. <code>Integer</code> — 16 байт объекта плюс ссылка на него. <code>List&lt;Integer&gt;</code> на миллион элементов занимает около 20 МБ против 4 МБ у <code>int[]</code> и обходится медленнее из-за разброса объектов по памяти. В горячих местах — массивы примитивов и <code>IntStream</code>.</li>
+  <li><b>Конструкторы обёрток устарели.</b> <code>new Integer(5)</code> помечен к удалению; используйте <code>Integer.valueOf</code> или автоупаковку.</li>
+  <li><b>Разбор строк</b>: <code>Integer.parseInt("42")</code> возвращает <code>int</code>, <code>Integer.valueOf("42")</code> — <code>Integer</code>.</li>
+</ul>
+
+<h2 id="lab"><span class="h-num">2.7</span>Интерактив: приведение типов и кэш Integer</h2>
+<div class="widget" id="castW">
+  <div class="widget-title">Симулятор сужающего приведения</div>
+  <p class="hint">Введите целое число (как <code>long</code>) и посмотрите, что останется после приведения к более узкому типу: старшие биты просто отбрасываются.</p>
+  <div class="controls"><label>значение<input type="text" id="castIn" value="300"></label>
+    <button class="btn" type="button" data-v="300">300</button><button class="btn" type="button" data-v="128">128</button><button class="btn" type="button" data-v="-1">-1</button><button class="btn" type="button" data-v="65536">65536</button><button class="btn" type="button" data-v="2147483648">2³¹</button><button class="btn" type="button" data-v="3000000000">3 млрд</button></div>
+  <div class="out" id="castOut"></div>
+</div>
+<div class="widget" id="icW">
+  <div class="widget-title">Симулятор: Integer и оператор ==</div>
+  <div class="controls">
+    <label>значение a и b<input type="number" id="icVal" value="127" style="width:110px"></label>
+    <label>как созданы<select id="icHow"><option value="box">Integer a = N; Integer b = N; (autoboxing)</option><option value="new">new Integer(N) — устаревший конструктор</option><option value="mix">Integer a = N; int b = N;</option><option value="long">Integer a = N; Long b = (long) N;</option></select></label>
+  </div>
+  <div class="out" id="icOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("castIn"), out = document.getElementById("castOut");
+  function bits(v, n) { var s = (BigInt.asUintN(n, v)).toString(2); while (s.length < n) s = "0" + s; return s.replace(/(.{8})(?=.)/g, "$1 "); }
+  function run() {
+    var v;
+    try { v = BigInt(inp.value.trim().replace(/_/g, "")); } catch (e) { out.textContent = "Введите целое число"; return; }
+    v = BigInt.asIntN(64, v);
+    var L = ["long   " + v + "\n       " + bits(v, 64)];
+    [["int", 32], ["short", 16], ["byte", 8]].forEach(function (t) {
+      var r = BigInt.asIntN(t[1], v);
+      L.push("(" + t[0] + ")" + new Array(7 - t[0].length).join(" ") + r + (r !== v ? "   ← значение изменилось" : "") + "\n       " + bits(v, t[1]));
+    });
+    var c = BigInt.asUintN(16, v);
+    L.push("(char)  " + c + "  — char беззнаковый, 0…65535" + (c >= 32n && c < 55296n ? ", символ '" + String.fromCharCode(Number(c)) + "'" : ""));
+    L.push("\nКомпилятор требует явного приведения именно потому, что данные могут потеряться. Проверка с исключением: Math.toIntExact(v), Math.addExact(a, b).");
+    out.textContent = L.join("\n");
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#castW [data-v]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.getAttribute("data-v"); run(); }); });
+  run();
+
+  var val = document.getElementById("icVal"), how = document.getElementById("icHow"), o2 = document.getElementById("icOut");
+  function run2() {
+    var n = +val.value || 0, h = how.value, cached = n >= -128 && n <= 127, L = [];
+    if (h === "box") {
+      L.push("Integer a = " + n + ";   // компилятор: Integer.valueOf(" + n + ")");
+      L.push("a == b      → " + cached + (cached ? "   обе ссылки указывают на один объект из IntegerCache [-128..127]" : "   вне кэша valueOf создаёт два разных объекта; == сравнивает ссылки"));
+      L.push("a.equals(b) → true    сравниваются значения");
+    } else if (h === "new") {
+      L.push("a == b      → false   new всегда создаёт новый объект, кэш не используется");
+      L.push("a.equals(b) → true");
+      L.push("Конструктор помечен @Deprecated(forRemoval = true) с Java 9 — используйте valueOf.");
+    } else if (h === "mix") {
+      L.push("a == b      → true    Integer распаковывается (a.intValue()), сравниваются числа");
+      L.push("Осторожно: если a == null, распаковка даст NullPointerException.");
+    } else {
+      L.push("a == b      → ошибка компиляции: несравнимые типы Integer и Long");
+      L.push("a.equals(b) → false   equals сначала проверяет класс: Long не Integer, даже при равных числах");
+      L.push("Типичный баг: map.get(1) при ключах Long возвращает null.");
+    }
+    L.push("\nПравило: объекты-обёртки сравнивайте через equals или Objects.equals, примитивы — через ==.");
+    o2.textContent = L.join("\n");
+  }
+  val.addEventListener("input", run2); how.addEventListener("change", run2); run2();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">2.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что выведет <code>System.out.println((byte) 200);</code>?</p><ul><li>200</li><li>Ошибку компиляции</li><li>-56</li><li>127</li></ul><div class="why">200 = 1100 1000 в двоичном виде. В byte старший бит — знаковый: 200 − 256 = −56.</div></div>
+<div class="mcq" data-ok="1"><p>Метод <code>void change(List&lt;String&gt; list) { list.add("x"); list = new ArrayList&lt;&gt;(); }</code>. Что увидит вызывающий?</p><ul><li>Свой список без изменений</li><li>Свой список с добавленным "x"; присваивание новой ссылки снаружи не видно</li><li>Новый пустой список</li><li>null</li></ul><div class="why">В метод передаётся копия ссылки. Через неё можно изменить объект, но переприсваивание меняет только локальную копию.</div></div>
+<div class="mcq" data-ok="3"><p>Каким типом хранить денежные суммы?</p><ul><li>double — он точнее float</li><li>float</li><li>String</li><li>BigDecimal (создавая из строки) или long в минимальных единицах</li></ul><div class="why">Двоичная плавающая точка не представляет точно 0.1; ошибки накапливаются. <code>new BigDecimal("0.10")</code> точен, а <code>new BigDecimal(0.1)</code> унаследует неточность double.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему <code>Integer a = 128, b = 128; a == b</code> даёт false, а для 127 — true?</summary><div class="a"><p>Автоупаковка вызывает <code>Integer.valueOf</code>, который для диапазона −128…127 возвращает объекты из кэша, а вне его создаёт новые. <code>==</code> сравнивает ссылки: в первом случае это один объект, во втором — два разных. Сравнивать обёртки нужно через <code>equals</code>.</p></div></details>
+<details class="q"><summary>Java передаёт объекты по ссылке или по значению?</summary><div class="a"><p>По значению. Значением переменной ссылочного типа является ссылка, и копируется именно она. Метод может менять состояние объекта через свою копию ссылки, но присваивание параметру нового объекта не влияет на переменную вызывающего кода.</p></div></details>
+<details class="q"><summary>Что выведет <code>long x = Integer.MAX_VALUE + 1;</code> и почему?</summary><div class="a"><p>−2147483648. Оба операнда имеют тип <code>int</code>, сложение выполняется в <code>int</code> и переполняется; только после этого результат расширяется до <code>long</code>. Чтобы получить 2147483648, один из операндов должен быть <code>long</code>: <code>+ 1L</code>.</p></div></details>
+<details class="q"><summary>Почему <code>short s = 1; s = s + 1;</code> не компилируется, а <code>s += 1;</code> — компилируется?</summary><div class="a"><p>Операнды типа <code>short</code> повышаются до <code>int</code>, результат <code>s + 1</code> имеет тип <code>int</code> и не может быть присвоен <code>short</code> без приведения. Составное присваивание <code>s += 1</code> по определению эквивалентно <code>s = (short) (s + 1)</code> — приведение встроено.</p></div></details>
+<details class="q"><summary>Как правильно сравнить два значения BigDecimal и почему не equals?</summary><div class="a"><p>Через <code>compareTo(...) == 0</code>. Метод <code>equals</code> учитывает масштаб: 2.0 и 2.00 для него разные. По той же причине <code>BigDecimal</code> — плохой ключ для <code>HashMap</code>, если масштаб не нормализован (<code>stripTrailingZeros()</code>).</p></div></details>
+<details class="q"><summary>Где возникнет NPE: <code>Integer x = cond ? 0 : map.get(key);</code>?</summary><div class="a"><p>Когда <code>cond</code> ложно и ключа нет. Один операнд — <code>int</code>, другой — <code>Integer</code>, поэтому тип всего выражения — <code>int</code>, и <code>map.get(key)</code> распаковывается. Результат <code>null</code> вызывает исключение ещё до присваивания. Исправление — сделать оба операнда <code>Integer</code>: <code>Integer.valueOf(0)</code>.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

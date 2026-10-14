@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Микросервисы и Spring Cloud</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ИНТЕГРАЦИЯ И АРХИТЕКТУРА</div>
+  <h1>Микросервисы: Spring Cloud и устойчивость</h1>
+  <p class="lead">Когда сервисов становится много, появляются задачи, которых не было в монолите: где лежит конфигурация, как найти адрес другого сервиса, что делать, когда он не отвечает, как не уронить всё каскадом. Spring Cloud — набор библиотек, решающих эти задачи в стиле Spring Boot. Разберём, как они устроены и какие из них заменяет Kubernetes.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">Config</span><span class="tag">Gateway</span><span class="tag">LoadBalancer</span><span class="tag">Circuit Breaker</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="map"><span class="h-num">19.1</span>Карта Spring Cloud</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Проект</th><th>Альтернатива в Kubernetes</th></tr>
+<tr><td>Централизованная конфигурация</td><td>Spring Cloud Config, Vault, Consul</td><td>ConfigMap / Secret + перезапуск подов</td></tr>
+<tr><td>Обнаружение сервисов</td><td>Eureka, Consul, Spring Cloud Kubernetes</td><td>Service + DNS (<code>http://inventory:8080</code>)</td></tr>
+<tr><td>Клиентская балансировка</td><td>Spring Cloud LoadBalancer</td><td>kube-proxy / service mesh</td></tr>
+<tr><td>API Gateway</td><td>Spring Cloud Gateway</td><td>Ingress, Gateway API, Envoy</td></tr>
+<tr><td>Устойчивость</td><td>Spring Cloud CircuitBreaker + Resilience4j</td><td>частично service mesh (ретраи, таймауты)</td></tr>
+<tr><td>Декларативные HTTP-клиенты</td><td>OpenFeign (режим поддержки) → HTTP Interface из Spring Framework</td><td>—</td></tr>
+<tr><td>Обмен сообщениями</td><td>Spring Cloud Stream (абстракция над Kafka/RabbitMQ)</td><td>—</td></tr>
+<tr><td>Контрактные тесты</td><td>Spring Cloud Contract</td><td>Pact</td></tr>
+</table></div>
+<p>Версии Spring Cloud выходят «поездами» с календарным номером (например, 2025.1.x Oakwood для Boot 4.0/4.1; 2025.0.x для Boot 3.5 уже снят с поддержки), каждый совместим с определённой веткой Spring Boot. Версии модулей задаёт BOM <code>spring-cloud-dependencies</code>.</p>
+
+<h2 id="config"><span class="h-num">19.2</span>Config Server и обновление без перезапуска</h2>
+<pre data-title="Клиент: application.yml"><code class="yaml">spring:
+  application:
+    name: order-service
+  config:
+    import: "optional:configserver:http://config:8888"     # подключается как ещё один источник ConfigData</code></pre>
+<p>Config Server отдаёт свойства из git-репозитория по имени приложения и профилю. Источник встраивается в Environment с высоким приоритетом. Как изменить настройку без рестарта:</p>
+<ol class="steps">
+  <li><code>POST /actuator/refresh</code> (или событие по Spring Cloud Bus всем экземплярам) → <code>ContextRefresher</code> перечитывает источники и вычисляет изменившиеся ключи.</li>
+  <li>Публикуется <code>EnvironmentChangeEvent</code> → бины <code>@ConfigurationProperties</code> <b>перепривязываются</b> (<code>ConfigurationPropertiesRebinder</code>).</li>
+  <li>Бины в <code>@RefreshScope</code> — это scoped proxy (тема 03): кэш scope очищается, и при следующем вызове бин создаётся заново с новыми значениями.</li>
+</ol>
+<div class="callout warn">Объекты с привязкой через конструктор, включая record с <code>@ConfigurationProperties</code>, при refresh не обновляются, и <code>@RefreshScope</code> им не поможет: record — final-класс, CGLIB-прокси для него не создать. Для обновляемых настроек используйте изменяемый JavaBean-класс с сеттерами или читайте значения через <code>Environment</code>. В Kubernetes чаще выбирают простой путь: изменили ConfigMap → rolling restart.</div>
+
+<h2 id="discovery"><span class="h-num">19.3</span>Обнаружение и клиентская балансировка</h2>
+<pre><code class="java">@Configuration
+class Clients {
+    @Bean @LoadBalanced                                  // квалификатор: в builder добавится перехватчик балансировки
+    RestClient.Builder lbBuilder() { return RestClient.builder(); }
+
+    @Bean
+    RestClient inventory(@LoadBalanced RestClient.Builder b) {
+        return b.baseUrl("http://inventory-service").build();   // имя сервиса вместо хоста
+    }
+}</code></pre>
+<div class="flow">
+  <div class="node info"><b>RestClient</b><small>http://inventory-service/stock/1</small></div><span class="to">→</span>
+  <div class="node acc"><b>LoadBalancerInterceptor</b></div><span class="to">→</span>
+  <div class="node"><b>ServiceInstanceListSupplier</b><small>DiscoveryClient: Eureka / Consul / K8s API, с кэшем</small></div><span class="to">→</span>
+  <div class="node"><b>RoundRobinLoadBalancer</b><small>выбор экземпляра</small></div><span class="to">→</span>
+  <div class="node ok"><b>http://10.0.3.17:8080/stock/1</b></div>
+</div>
+<p>В Kubernetes имя Service уже разрешается DNS и балансируется платформой, поэтому Eureka и клиентская балансировка обычно не нужны. Они остаются полезны вне Kubernetes и когда нужна балансировка с учётом зон или метаданных.</p>
+
+<h2 id="resilience"><span class="h-num">19.4</span>Устойчивость к отказам</h2>
+<div class="table-wrap"><table>
+<tr><th>Паттерн</th><th>От чего защищает</th><th>Правило</th></tr>
+<tr><td>Timeout</td><td>зависший вызов держит поток и соединение</td><td>на каждом вызове; меньше, чем таймаут вашего клиента</td></tr>
+<tr><td>Retry</td><td>кратковременные сбои</td><td>только идемпотентные операции; экспоненциальная пауза + джиттер; ограниченное число</td></tr>
+<tr><td>Circuit Breaker</td><td>бесполезные вызовы упавшего сервиса, каскад</td><td>быстрый отказ + fallback, пока сервис не восстановится</td></tr>
+<tr><td>Bulkhead</td><td>один медленный downstream съедает все потоки</td><td>лимит одновременных вызовов на зависимость</td></tr>
+<tr><td>Rate Limiter</td><td>превышение квоты чужого API, перегрузка</td><td>N вызовов в интервал</td></tr>
+</table></div>
+<pre data-title="Resilience4j через аннотации (resilience4j-spring-boot4; для Boot 3 — resilience4j-spring-boot3)"><code class="java">@Service
+class InventoryGateway {
+    @Retry(name = "inventory", fallbackMethod = "stockFallback")   // внешний слой; fallback — здесь, после исчерпания повторов
+    @CircuitBreaker(name = "inventory")                            // fallback на breaker «съел» бы ошибку до Retry
+    @Bulkhead(name = "inventory")
+    Stock stock(String sku) { return client.get().uri("/stock/{sku}", sku).retrieve().body(Stock.class); }
+
+    Stock stockFallback(String sku, Throwable t) { return Stock.unknown(sku); }   // деградация вместо ошибки
+}</code></pre>
+<pre data-title="application.yml"><code class="yaml">resilience4j:
+  circuitbreaker:
+    instances:
+      inventory:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50              # %
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        slow-call-duration-threshold: 2s        # вызов дольше 2 с считается медленным
+        slow-call-rate-threshold: 50            # доля медленных ≥ 50% тоже открывает breaker (по умолчанию 100%)
+  retry:
+    instances:
+      inventory:
+        max-attempts: 3
+        wait-duration: 200ms
+        enable-exponential-backoff: true
+        enable-randomized-wait: true
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException   # не повторять то, что breaker уже отклонил</code></pre>
+<p>Порядок аспектов Resilience4j фиксирован: <code>Retry ( CircuitBreaker ( RateLimiter ( TimeLimiter ( Bulkhead ( вызов ) ) ) ) )</code>. Поэтому fallback ставят на самый внешний аспект: fallback на <code>@CircuitBreaker</code> вернёт значение раньше, чем Retry увидит исключение, и повторов не будет. В Spring Framework 7 простые повторы и ограничение параллельности есть и в ядре: <code>@Retryable</code>, <code>@ConcurrencyLimit</code> (<code>@EnableResilientMethods</code>).</p>
+
+<div class="widget" id="cb">
+  <div class="widget-title">Симулятор Circuit Breaker</div>
+  <p class="hint">Окно 10 вызовов, минимум 5 для расчёта, порог 50% ошибок, OPEN держится 10 с, в HALF_OPEN — 3 пробных вызова.</p>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="ok">вызов: успех</button>
+    <button class="btn" type="button" data-a="fail">вызов: сбой downstream</button>
+    <button class="btn" type="button" data-a="fail5">5 сбоев подряд</button>
+    <button class="btn" type="button" data-a="wait">прошло 10 секунд</button>
+    <button class="btn" type="button" data-a="reset">↺ сброс</button>
+  </div>
+  <div class="flow"><div class="node" id="cbC"><b>CLOSED</b><small>вызовы проходят</small></div><span class="to">→</span><div class="node" id="cbO"><b>OPEN</b><small>быстрый отказ</small></div><span class="to">→</span><div class="node" id="cbH"><b>HALF_OPEN</b><small>пробные вызовы</small></div></div>
+  <div class="lanes"><div class="lane"><h5>Скользящее окно</h5><div class="items" id="cbWin"></div></div><div class="lane"><h5>Счётчики</h5><div class="items" id="cbStat"></div></div></div>
+  <div class="log" id="cbLog"></div>
+</div>
+<script>
+(function () {
+  var st, win, trial, log, real, rejected;
+  function el(id) { return document.getElementById(id); }
+  function reset() { st = "CLOSED"; win = []; trial = []; log = ["CLOSED: все вызовы идут в inventory-service"]; real = 0; rejected = 0; render(); }
+  function rate(a) { return a.length ? a.filter(function (x) { return !x; }).length / a.length * 100 : 0; }
+  function call(ok) {
+    if (st === "OPEN") { rejected++; log.unshift("OPEN: CallNotPermittedException → fallback за микросекунды, downstream не тронут"); return; }
+    real++;
+    if (st === "HALF_OPEN") {
+      trial.push(ok); log.unshift("HALF_OPEN: пробный вызов " + trial.length + "/3 → " + (ok ? "успех" : "сбой"));
+      if (trial.length === 3) {
+        if (rate(trial) >= 50) { st = "OPEN"; log.unshift("HALF_OPEN → OPEN: " + rate(trial).toFixed(0) + "% ошибок в пробных, сервис ещё не восстановился"); }
+        else { st = "CLOSED"; win = []; log.unshift("HALF_OPEN → CLOSED: сервис восстановился, окно очищено"); }
+        trial = [];
+      }
+      return;
+    }
+    win.push(ok); if (win.length > 10) win.shift();
+    log.unshift("CLOSED: вызов → " + (ok ? "успех" : "сбой") + "  (ошибок " + rate(win).toFixed(0) + "% из " + win.length + ")");
+    if (win.length >= 5 && rate(win) >= 50) { st = "OPEN"; log.unshift("CLOSED → OPEN: порог 50% достигнут — следующие вызовы отклоняются без обращения к сервису"); }
+  }
+  function render() {
+    el("cbC").className = "node " + (st === "CLOSED" ? "ok" : "off");
+    el("cbO").className = "node " + (st === "OPEN" ? "stop" : "off");
+    el("cbH").className = "node " + (st === "HALF_OPEN" ? "hl" : "off");
+    var src = st === "HALF_OPEN" ? trial : win;
+    el("cbWin").innerHTML = src.map(function (x) { return '<span class="chip ' + (x ? "ok" : "bad") + '">' + (x ? "✓" : "✘") + "</span>"; }).join("") || '<span class="chip">пусто</span>';
+    el("cbStat").innerHTML = '<span class="chip info">дошло до сервиса ' + real + '</span><span class="chip warn">отклонено ' + rejected + '</span><span class="chip">ошибок в окне ' + rate(src).toFixed(0) + "%</span>";
+    el("cbLog").textContent = log.slice(0, 25).join("\n");
+  }
+  document.querySelectorAll("#cb [data-a]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var a = b.getAttribute("data-a");
+      if (a === "reset") return reset();
+      if (a === "ok") call(true);
+      else if (a === "fail") call(false);
+      else if (a === "fail5") for (var i = 0; i < 5; i++) call(false);
+      else if (a === "wait") { if (st === "OPEN") { st = "HALF_OPEN"; trial = []; log.unshift("OPEN → HALF_OPEN: время ожидания истекло, пропускаем 3 пробных вызова"); } else log.unshift("прошло 10 с — состояние не меняется"); }
+      render();
+    });
+  });
+  reset();
+})();
+</script>
+<p><b>Попробуйте:</b> «5 сбоев подряд» → OPEN; ещё несколько вызовов — они отклоняются, не нагружая упавший сервис; «прошло 10 секунд» → три успешных вызова → CLOSED.</p>
+<div class="callout bad"><span class="c-title">Ретраи усиливают аварию</span>
+Три уровня сервисов, каждый делает по 3 попытки: один запрос пользователя превращается в 27 запросов к нижнему сервису именно тогда, когда ему плохо (retry storm). Ретраи — на одном уровне, с бюджетом и джиттером, а circuit breaker их вовремя отключает.
+</div>
+
+<h2 id="gateway"><span class="h-num">19.5</span>API Gateway</h2>
+<pre data-title="Spring Cloud Gateway: маршрут = предикаты + фильтры"><code class="yaml">spring:
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: orders
+              uri: lb://order-service                 # lb: — через LoadBalancer
+              predicates:
+                - Path=/api/orders/**
+                - Method=GET,POST
+              filters:
+                - StripPrefix=1
+                - name: CircuitBreaker
+                  args: { name: orders, fallbackUri: "forward:/fallback/orders" }
+                - name: RequestRateLimiter
+                  args: { redis-rate-limiter.replenishRate: 50, redis-rate-limiter.burstCapacity: 100 }
+                - TokenRelay=                         # пробросить OAuth2-токен дальше</code></pre>
+<p>Шлюз — единая точка входа: маршрутизация, аутентификация, лимиты, CORS, агрегирование. Классический Gateway работает на WebFlux/Netty (неблокирующий — хорошо для прокси с тысячами соединений); есть вариант для Spring MVC. Не кладите в шлюз бизнес-логику.</p>
+
+<h2 id="saga"><span class="h-num">19.6</span>Согласованность данных между сервисами</h2>
+<p>Распределённой транзакции между сервисами нет (2PC/XA плохо масштабируется и не поддерживается брокерами). Применяют <b>Saga</b>: цепочку локальных транзакций, где каждая публикует событие, а при сбое выполняются <b>компенсации</b>.</p>
+<div class="vs neutral">
+  <div class="card"><h4>Хореография</h4><p>Сервисы реагируют на события друг друга: <code>OrderPlaced</code> → Payment списывает → <code>PaymentCompleted</code> → Inventory резервирует. Нет центра, но логика процесса размазана и трудно отслеживается.</p></div>
+  <div class="card"><h4>Оркестрация</h4><p>Оркестратор (свой сервис, Temporal, Camunda) явно ведёт процесс: команды сервисам, ожидание ответов, компенсации. Процесс виден в одном месте, но появляется центральный компонент.</p></div>
+</div>
+<p>Обязательные спутники саги: outbox для надёжной публикации (тема 18), идемпотентные обработчики, ключи идемпотентности в API (<code>Idempotency-Key</code>), таймауты шагов.</p>
+
+<h2 id="quiz"><span class="h-num">19.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает Circuit Breaker в состоянии OPEN?</p><ul><li>Ставит вызовы в очередь</li><li>Сразу отклоняет вызовы (fallback), не обращаясь к downstream, до истечения времени ожидания</li><li>Повторяет вызовы с паузой</li><li>Переключает на резервный экземпляр</li></ul><div class="why">Цель — не тратить потоки и время на заведомо неуспешные вызовы и дать сервису восстановиться.</div></div>
+<div class="mcq" data-ok="2"><p>Как @RefreshScope-бин получает новые значения конфигурации без рестарта?</p><ul><li>Spring меняет поля через рефлексию</li><li>Пересоздаётся весь контекст</li><li>Бин — scoped proxy; при refresh кэш scope очищается, и при следующем вызове создаётся новый экземпляр</li><li>Никак, нужен рестарт</li></ul><div class="why">RefreshScope — пользовательский scope с кэшем экземпляров, который сбрасывается событием обновления.</div></div>
+<div class="mcq" data-ok="0"><p>Какие операции можно безопасно ретраить?</p><ul><li>Идемпотентные: GET, PUT с полным состоянием, операции с ключом идемпотентности</li><li>Любые POST</li><li>Все, если есть circuit breaker</li><li>Только внутри транзакции</li></ul><div class="why">Повтор неидемпотентной операции (списание денег) может выполнить её дважды, если первый ответ потерялся.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какие компоненты Spring Cloud заменяет Kubernetes, а какие нет?</summary><div class="a"><p>Заменяет: обнаружение сервисов и балансировку (Service/DNS), частично конфигурацию (ConfigMap/Secret), вход (Ingress/Gateway API). Не заменяет: устойчивость на уровне приложения (fallback, bulkhead, семантические ретраи), декларативные клиенты, Stream, контрактное тестирование; шлюз с прикладной логикой аутентификации и лимитов часто остаётся.</p></div></details>
+<details class="q"><summary>Объясните состояния Circuit Breaker.</summary><div class="a"><p>CLOSED — вызовы идут, результаты пишутся в скользящее окно; доля ошибок/медленных выше порога → OPEN. OPEN — вызовы отклоняются немедленно; после wait-duration первый же вызов переводит breaker в HALF_OPEN (сам по себе, без вызовов, — только при automatic-transition-from-open-to-half-open-enabled=true). HALF_OPEN — пропускается ограниченное число пробных вызовов; успешны → CLOSED, иначе снова OPEN.</p></div></details>
+<details class="q"><summary>Как обеспечить согласованность данных между двумя сервисами?</summary><div class="a"><p>Saga из локальных транзакций с компенсациями (хореография или оркестрация), надёжная публикация событий через outbox, идемпотентные потребители, ключи идемпотентности. Согласованность — итоговая (eventual), промежуточные состояния надо уметь показывать пользователю (например, «заказ обрабатывается»).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

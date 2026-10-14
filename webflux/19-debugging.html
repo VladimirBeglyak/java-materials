@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Отладка реактивного кода</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>Отладка реактивного кода</h1>
+  <p class="lead">Стектрейс реактивного исключения показывает внутренности Reactor и Netty, но не то, где в вашем коде собрана упавшая цепочка: сборка и выполнение разнесены во времени и по потокам. Разбираем, как вернуть полезный контекст — checkpoint, Hooks.onOperatorDebug, ReactorDebugAgent, — а также log(), метрики операторов и наблюдаемость через Micrometer.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">стектрейсы</span><span class="tag">checkpoint</span><span class="tag">onOperatorDebug</span><span class="tag">ReactorDebugAgent</span><span class="tag">log()</span><span class="tag">tap / Micrometer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="problem"><span class="h-num">19.1</span>Почему стектрейс бесполезен</h2>
+<p>Метод <code>orderService.total(id)</code> собрал цепочку и вернул её. Через 40 мс ответ БД пришёл в поток reactor-tcp-nio-2, и в <code>map</code> случился NPE. В стеке этого момента — только драйвер, Netty и операторы Reactor: вашего метода в стеке нет, он давно завершился.</p>
+
+<h2 id="modes"><span class="h-num">19.2</span>Сравнение способов</h2>
+<div class="widget" id="dbW">
+  <div class="widget-title">Одна и та же ошибка при разных настройках отладки</div>
+  <div class="controls"><label>Режим<select id="dbM">
+    <option value="none">ничего не включено</option>
+    <option value="cp">.checkpoint("order total") в цепочке</option>
+    <option value="hook">Hooks.onOperatorDebug()</option>
+    <option value="agent">ReactorDebugAgent.init() (reactor-tools)</option>
+  </select></label></div>
+  <pre data-title="Стектрейс"><code class="txt" id="dbOut"></code></pre>
+  <div class="table-wrap"><table id="dbT"></table></div>
+  <div class="verdict" id="dbV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var BASE = "java.lang.NullPointerException: Cannot invoke \"java.math.BigDecimal.add(...)\" because \"discount\" is null\n\tat com.shop.PriceCalc.apply(PriceCalc.java:31)\n\tat reactor.core.publisher.FluxMapFuseable$MapFuseableSubscriber.onNext(FluxMapFuseable.java:113)\n\tat reactor.core.publisher.FluxFilterFuseable$FilterFuseableSubscriber.onNext(FluxFilterFuseable.java:118)\n\tat io.r2dbc.postgresql.PostgresqlResult.lambda$map$2(PostgresqlResult.java:129)\n\tat reactor.core.publisher.FluxHandle$HandleSubscriber.onNext(FluxHandle.java:128)\n\tat reactor.netty.channel.FluxReceive.drainReceiver(FluxReceive.java:294)\n\tat io.netty.channel.nio.NioEventLoop.run(NioEventLoop.java:566)\n\t… 40 more";
+  var M = {
+    none: [BASE, "ok", "low", "Видно строку лямбды (PriceCalc:31), но не видно, какой сервис и какой эндпоинт собрал цепочку — PriceCalc вызывается из десяти мест."],
+    cp: [BASE + "\n\tSuppressed: reactor.core.publisher.FluxOnAssembly$OnAssemblyException:\nError has been observed at the following site(s):\n\t*__checkpoint ⇢ order total\nOriginal Stack Trace: …", "ok", "low", "checkpoint(\"описание\") добавляет метку в подавленное исключение. Без описания (checkpoint()) — со стеком места сборки, но дороже. Стоимость — только там, где поставлен. Хорош на границах модулей."],
+    hook: [BASE + "\n\tSuppressed: reactor.core.publisher.FluxOnAssembly$OnAssemblyException:\nAssembly trace from producer [reactor.core.publisher.FluxMapFuseable] :\n\treactor.core.publisher.Flux.map(Flux.java:6271)\n\tcom.shop.OrderService.total(OrderService.java:58)\nError has been observed at the following site(s):\n\t*__Flux.map ⇢ at com.shop.OrderService.total(OrderService.java:58)\n\t|_ Flux.reduce ⇢ at com.shop.OrderService.total(OrderService.java:60)\n\t|_ Mono.map ⇢ at com.shop.OrderController.get(OrderController.java:24)", "bad", "high", "Полная трасса сборки: каждое место, через которое прошла ошибка. Но при сборке каждого оператора захватывается стек вызовов — в разы медленнее. Только для локальной отладки."],
+    agent: [BASE + "\n\tSuppressed: reactor.core.publisher.FluxOnAssembly$OnAssemblyException:\nError has been observed at the following site(s):\n\t*__Flux.map ⇢ at com.shop.OrderService.total(OrderService.java:58)\n\t|_ Flux.reduce ⇢ at com.shop.OrderService.total(OrderService.java:60)\n\t|_ Mono.map ⇢ at com.shop.OrderController.get(OrderController.java:24)", "ok", "low", "Java-агент переписывает байткод при загрузке классов и вставляет checkpoint с именем файла и строки в каждый вызов оператора — без захвата стека в рантайме. Почти бесплатно; подходит для продакшена. Boot: spring.reactor.debug-agent.enabled=true (по умолчанию, если reactor-tools в classpath)."]
+  };
+  function run() {
+    var m = M[$("dbM").value];
+    $("dbOut").textContent = m[0];
+    $("dbT").innerHTML = "<tr><th>Где ошибка в вашем коде</th><th>Стоимость</th><th>Для продакшена</th></tr><tr><td>" + ($("dbM").value === "none" ? "только лямбда" : $("dbM").value === "cp" ? "метка, которую вы поставили" : "все места сборки") + "</td><td>" + (m[2] === "high" ? "высокая (стек при каждой сборке)" : "низкая") + "</td><td>" + (m[2] === "high" ? "нет" : "да") + "</td></tr>";
+    $("dbV").className = "verdict " + m[1]; $("dbV").textContent = m[3];
+  }
+  $("dbM").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="log"><span class="h-num">19.3</span>log() и сигналы</h2>
+<pre data-title="Что печатает log()"><code class="java">userRepo.findAll()
+    .log("users", Level.FINE, SignalType.ON_NEXT, SignalType.REQUEST, SignalType.CANCEL)
+    .take(2)
+    .subscribe();</code></pre>
+<pre data-title="Вывод"><code class="txt">[reactor-tcp-nio-1] users : request(2)          ← take(2) с 3.5 ограничивает спрос
+[reactor-tcp-nio-1] users : onNext(User[id=1])
+[reactor-tcp-nio-1] users : onNext(User[id=2])
+[reactor-tcp-nio-1] users : cancel()            ← take отменил источник</code></pre>
+<p>log() — лучший способ увидеть противодавление, отмены и потоки. Ставьте его в несколько мест цепочки с разными категориями, чтобы понять, где «застревают» сигналы. Зависание без ошибки почти всегда означает: никто не подписался, спрос равен нулю или источник не завершается (пустой Sinks, забытый complete).</p>
+
+<h2 id="metrics"><span class="h-num">19.4</span>Метрики и наблюдаемость</h2>
+<pre data-title="Метрики конкретной цепочки и Observation"><code class="java">Flux&lt;Order&gt; orders = repo.findRecent()
+    .name("orders.recent")                                     // имя последовательности
+    .tag("source", "r2dbc")
+    .tap(Micrometer.metrics(meterRegistry));                   // reactor-core-micrometer:
+                                                               // orders.recent.subscribed, .requested, .flow.duration…
+
+Mono&lt;Price&gt; price = client.get().uri("/p/{id}", id).retrieve().bodyToMono(Price.class)
+    .name("pricing.get")
+    .tap(Micrometer.observation(observationRegistry));         // span + timer через Observation API</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Что смотреть в проде</h4><ul><li><code>http.server.requests</code> — латентность и ошибки WebFlux (Observation)</li><li><code>reactor.netty.connection.provider.*</code> — пул WebClient: active, idle, pending</li><li><code>reactor.netty.eventloop.pending.tasks</code> — очередь задач event loop</li><li><code>executor.*</code> для boundedElastic: <code>Schedulers.enableMetrics()</code> (устарело) → <code>Micrometer.timedScheduler</code></li><li><code>r2dbc.pool.*</code> — acquired, pending</li></ul></div>
+  <div class="card"><h4>Дампы потоков</h4><ul><li>Реактивное приложение в дампе: 8 reactor-http-nio в RUNNABLE (epoll_wait) — это норма.</li><li>Тревога: поток event loop в <code>socketRead</code>, <code>LockSupport.park</code>, <code>Thread.sleep</code> — кто-то блокирует.</li><li>Много boundedElastic в WAITING на JDBC — исчерпан пул БД.</li><li>Ищите по дампу <code>BlockingSingleSubscriber.blockingGet</code> — следы block().</li></ul></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">19.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой способ отладки подходит для продакшена и показывает все места сборки?</p><ul><li>Hooks.onOperatorDebug()</li><li>log() на каждом операторе</li><li>ReactorDebugAgent</li><li>Отладчик IDE</li></ul><div class="why">Агент инструментирует байткод при загрузке, без захвата стеков в рантайме.</div></div>
+<div class="mcq" data-ok="0"><p>Почему в стектрейсе реактивной ошибки нет вашего сервисного метода?</p><ul><li>Метод только собрал цепочку и завершился до того, как ошибка произошла в другом потоке</li><li>Reactor обрезает стек</li><li>JIT инлайнит методы</li><li>Из-за Netty</li></ul><div class="why">Сборка и выполнение разделены во времени.</div></div>
+<div class="mcq" data-ok="3"><p>Запрос «висит» без ошибок. Что проверить первым?</p><ul><li>Увеличить таймаут</li><li>Перезапустить сервис</li><li>Включить onOperatorDebug</li><li>log() в цепочке: есть ли подписка, request и терминальный сигнал</li></ul><div class="why">Зависание — это отсутствие сигнала: подписки, спроса или завершения.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как отлаживать реактивный код в IDE с точками останова?</summary><div class="a"><p>Точки останова внутри лямбд операторов работают — вы окажетесь в потоке, где выполняется сигнал. IntelliJ IDEA показывает «async stack traces» для Reactor (Reactor Debug mode в настройках отладчика), склеивая стек выполнения со стеком сборки. Помните: остановка в event loop останавливает обработку всех соединений этого потока, а таймауты продолжают тикать.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

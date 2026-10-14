@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · API и взаимодействие сервисов</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ТРАФИК И API</div>
+  <h1>API и взаимодействие сервисов</h1>
+  <p class="lead">Каким протоколом клиент разговаривает с сервером, как проектировать REST API, которым удобно пользоваться, как сделать повтор запроса безопасным и как защитить сервис от слишком настойчивых клиентов.</p>
+  <div class="meta"><span class="tag">4 конспекта</span><span class="tag">~3 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="protocols"><span class="h-num">4.1</span>Способы взаимодействия клиента и сервера<span class="sk-num">#14</span></h2>
+<p>Конспект называет их «синхронными»: клиент обращается к серверу напрямую, без посредника-очереди. Главный выбор — направление и длительность соединения: один запрос и один ответ, поток событий от сервера или постоянный двусторонний канал.</p>
+<figure class="sketch"><a href="img/14-synchronous-communication.jpg"><img src="img/14-synchronous-communication.jpg" width="1024" height="1536" loading="lazy" alt="Синхронное взаимодействие: REST, GraphQL, WebSocket, SSE, gRPC, long polling"></a><figcaption><b>Конспект #14.</b> Synchronous Communication <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Направление</th><th>Соединение</th><th>Когда выбирать</th></tr>
+<tr><td><b>REST</b></td><td>клиент → сервер</td><td>короткое</td><td>CRUD, публичные API, интеграции — вариант по умолчанию</td></tr>
+<tr><td><b>GraphQL</b></td><td>клиент → сервер</td><td>короткое</td><td>Разным клиентам нужны разные срезы данных; избавляет от over-fetching</td></tr>
+<tr><td><b>gRPC</b></td><td>клиент → сервер, потоки в обе стороны</td><td>долгое (HTTP/2)</td><td>Быстрые вызовы между внутренними сервисами, строгий контракт (Protobuf)</td></tr>
+<tr><td><b>SSE</b></td><td>сервер → клиент</td><td>долгое</td><td>Сервер шлёт обновления, клиент только слушает: лента, котировки, прогресс</td></tr>
+<tr><td><b>WebSocket</b></td><td>в обе стороны</td><td>долгое</td><td>Чат, игры, совместное редактирование</td></tr>
+<tr><td><b>Long polling</b></td><td>сервер → клиент</td><td>повторяющиеся запросы</td><td>Запасной вариант, когда WebSocket и SSE недоступны</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Уточнения к конспекту</span>
+<ul>
+  <li><b>«Синхронное» здесь — про отсутствие брокера</b>, а не про блокирующий вызов. WebSocket и SSE по своей природе событийные; противопоставление им — асинхронное взаимодействие через очередь (<a href="12-kafka-core.html#mq">тема 12</a>).</li>
+  <li><b>HTTP/2 Server Push устарел</b>: Chrome отключил его в 2022 году, в HTTP/3 им практически не пользуются. Вместо него — <code>103 Early Hints</code> и <code>&lt;link rel="preload"&gt;</code>. Строку 7 конспекта можно не учить.</li>
+  <li><b>Синхронная цепочка наследует худшее от каждого звена.</b> Если A ждёт B, а B ждёт C, задержки складываются, доступности перемножаются (<a href="01-foundations.html#ha-ft">тема 01</a>). Каждому вызову нужны таймаут, ограниченные ретраи и circuit breaker (<a href="15-microservices.html#patterns">тема 15</a>).</li>
+  <li><b>Долгие соединения усложняют масштабирование</b>: сервер хранит состояние каждого подключения, а при деплое их нужно аккуратно закрывать и переустанавливать. Устройство протоколов — в <a href="../computer-networks/11-http2-3-realtime.html">«Компьютерных сетях», тема 11</a>.</li>
+</ul>
+</div>
+
+<h2 id="rest"><span class="h-num">4.2</span>REST API: лучшие практики<span class="sk-num">#16</span></h2>
+<p>Хороший REST API предсказуем: зная один эндпоинт, можно угадать остальные. Конспект собирает двенадцать правил — от именования ресурсов до мониторинга.</p>
+<figure class="sketch"><a href="img/16-rest-api-best-practices.jpg"><img src="img/16-rest-api-best-practices.jpg" width="1024" height="1536" loading="lazy" alt="REST API: ресурсы, методы, коды, версионирование, пагинация, ошибки"></a><figcaption><b>Конспект #16.</b> REST API Best Practices <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="grid-2">
+  <div class="card"><h4>Ресурсы и адреса</h4><ul><li>Существительные во множественном числе: <code>/users</code>, а не <code>/getUsers</code>.</li><li>Иерархия: <code>/users/123/orders</code>.</li><li>Фильтры, сортировка, страницы — в query-параметрах.</li><li>Версия в пути <code>/api/v1/…</code> или в заголовке <code>Accept</code>.</li></ul></div>
+  <div class="card"><h4>Формат и поведение</h4><ul><li>JSON, единая структура ответа и ошибок.</li><li>Никогда не отдавать большой список целиком — пагинация.</li><li>HTTPS всегда, OAuth2/JWT, минимум привилегий.</li><li>Документация OpenAPI, логи и метрики по каждому эндпоинту.</li></ul></div>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Назначение</th><th>Безопасный</th><th>Идемпотентный</th><th>Типичные коды</th></tr>
+<tr><td><code>GET</code></td><td>Получить</td><td>да</td><td>да</td><td>200, 404</td></tr>
+<tr><td><code>POST</code></td><td>Создать / выполнить действие</td><td>нет</td><td><b>нет</b></td><td>201 + <code>Location</code>, 400, 409</td></tr>
+<tr><td><code>PUT</code></td><td>Заменить целиком</td><td>нет</td><td>да</td><td>200, 204</td></tr>
+<tr><td><code>PATCH</code></td><td>Изменить часть</td><td>нет</td><td>не гарантируется</td><td>200, 204</td></tr>
+<tr><td><code>DELETE</code></td><td>Удалить</td><td>нет</td><td>да</td><td>204, 404</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Дополнения к конспекту</span>
+<ul>
+  <li><b>Коды, которых нет на рисунке, но которые нужны</b>: <code>204</code> (успех без тела), <code>403</code> (аутентифицирован, но нельзя — не путать с <code>401</code>), <code>409</code> (конфликт состояния), <code>422</code> (синтаксис верен, данные не прошли валидацию), <code>429</code> (лимит).</li>
+  <li><b>Поле <code>"success": true</code> в теле дублирует код ответа.</b> Это допустимый стиль, но HTTP-код уже сообщает результат. Для ошибок есть стандарт — <b>Problem Details</b> (RFC 9457, <code>application/problem+json</code>), его поддерживает Spring 6 (<code>ProblemDetail</code>).</li>
+  <li><b>Пагинация по номеру страницы ломается на больших данных.</b> <code>OFFSET 1000000</code> заставляет БД прочитать и выбросить миллион строк, а при вставках строки дублируются между страницами. Для лент и выгрузок — курсорная (keyset) пагинация: <code>?after=&lt;id последней записи&gt;&amp;limit=20</code>.</li>
+  <li><b>«Never break existing clients»</b> на практике значит: добавлять поля можно, удалять и менять смысл — только в новой версии.</li>
+</ul>
+</div>
+
+<h2 id="idempotency"><span class="h-num">4.3</span>Идемпотентность в REST API<span class="sk-num">#34</span></h2>
+<p>Идемпотентность — свойство операции давать один и тот же результат независимо от числа повторений. Она нужна, потому что в сети нельзя отличить «запрос не дошёл» от «ответ потерялся»: клиент видит таймаут и обязан повторить. Без защиты повтор <code>POST /payments</code> спишет деньги дважды.</p>
+<figure class="sketch"><a href="img/34-idempotency-rest-api.jpg"><img src="img/34-idempotency-rest-api.jpg" width="1024" height="1536" loading="lazy" alt="Идемпотентность в REST API на примере платёжного API и заголовка Idempotency-Key"></a><figcaption><b>Конспект #34.</b> Idempotency in REST API — на примере платежей <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<ol class="steps">
+  <li>Клиент генерирует уникальный ключ (UUID) <b>на операцию</b>, а не на попытку, и передаёт в заголовке <code>Idempotency-Key</code>. При повторе ключ тот же.</li>
+  <li>Сервер ищет ключ в хранилище. Нашёл — возвращает сохранённый ответ, ничего не выполняя.</li>
+  <li>Не нашёл — выполняет операцию и сохраняет ключ вместе с ответом, статусом и идентификатором транзакции, с TTL 24–72 часа.</li>
+  <li>Неуспешные ответы тоже сохраняются — повторы должны быть согласованными.</li>
+</ol>
+<div class="callout bad"><span class="c-title">Что на схеме опущено: гонка двух одновременных запросов</span>
+Схема «проверить ключ → если нет, выполнить» содержит классическую ошибку check-then-act. Клиент не дождался ответа и повторил запрос через секунду — оба запроса не находят ключ и оба списывают деньги. Правильно:
+<ul>
+  <li><b>Захватывать ключ атомарно</b>: <code>INSERT</code> с уникальным ограничением или <code>SET key NX</code> в Redis <i>до</i> выполнения операции, со статусом «в обработке».</li>
+  <li>Второму запросу с тем же ключом, пока первый не завершён, — отвечать <code>409 Conflict</code> (или ждать).</li>
+  <li>В идеале запись ключа и бизнес-операция — <b>в одной транзакции БД</b>: тогда невозможно состояние «платёж прошёл, ключ не сохранился».</li>
+  <li>Хранить хэш тела запроса: тот же ключ с другим телом — ошибка клиента (<code>422</code>), а не повтор.</li>
+</ul>
+</div>
+<p>Идемпотентность — не обнаружение дубликатов: два намеренных платежа на одинаковую сумму должны пройти оба, у них разные ключи. Та же идея на стороне потребителя сообщений — в <a href="13-kafka-consumers.html#idempotency">теме 13</a>.</p>
+
+<h2 id="rate-limit"><span class="h-num">4.4</span>Ограничение частоты запросов<span class="sk-num">#26</span></h2>
+<p>Rate limiting ограничивает число запросов клиента за интервал времени. Он защищает от злоупотреблений и перегрузки, не даёт одному «шумному соседу» отобрать ресурсы у остальных и делает поведение системы под нагрузкой предсказуемым.</p>
+<figure class="sketch"><a href="img/26-rate-limiting.jpg"><img src="img/26-rate-limiting.jpg" width="1024" height="1536" loading="lazy" alt="Rate limiting: алгоритмы, стратегии, ответ при превышении, инструменты"></a><figcaption><b>Конспект #26.</b> Rate Limiting <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>Алгоритм</th><th>Идея</th><th>Плюсы</th><th>Минусы</th></tr>
+<tr><td><b>Fixed window</b></td><td>Счётчик на окно (например, минуту), сбрасывается на границе</td><td>Один счётчик, тривиальная реализация</td><td>Всплеск на стыке окон: до 2N запросов за короткое время</td></tr>
+<tr><td><b>Sliding log</b></td><td>Хранить метку времени каждого запроса, считать попавшие в окно</td><td>Точно</td><td>Память растёт с числом запросов</td></tr>
+<tr><td><b>Sliding window counter</b></td><td>Текущий счётчик + предыдущий с весом, равным доле перекрытия</td><td>Сглаживает стык, два числа на клиента</td><td>Приближение</td></tr>
+<tr><td><b>Token bucket</b></td><td>Токены добавляются со скоростью r, запрос забирает токен; ёмкость ведра b</td><td>Разрешает короткие всплески до b, держит среднюю скорость</td><td>Два параметра для настройки</td></tr>
+<tr><td><i>Leaky bucket</i></td><td>Запросы вытекают из очереди с постоянной скоростью</td><td>Ровный поток на выходе</td><td>Всплески превращаются в задержку</td></tr>
+</table></div>
+<p><b>По какому ключу ограничивать</b>: IP-адрес, пользователь или API-ключ, пользователь + эндпоинт, организация (tenant), глобальный предел системы. Обычно комбинируют несколько уровней.</p>
+<p><b>Ответ при превышении</b> — <code>429 Too Many Requests</code> с заголовком <code>Retry-After</code>; полезно возвращать и остаток квоты (<code>X-RateLimit-Limit</code>, <code>-Remaining</code>, <code>-Reset</code>), чтобы честный клиент мог притормозить сам.</p>
+<div class="callout info"><span class="c-title">Распределённый лимитер</span>
+Когда экземпляров сервиса много, счётчик должен быть общим — отсюда «centralized store like Redis» на конспекте. Важна атомарность: «прочитать счётчик, сравнить, увеличить» тремя командами даст гонку. Решения — одна команда <code>INCR</code> с <code>EXPIRE</code> (пример внизу конспекта) либо Lua-скрипт для token bucket и скользящего окна (<a href="11-redis-toolkit.html#lua">тема 11</a>). И заранее решите, что делать, если Redis недоступен: пропускать все запросы (fail-open) или отклонять (fail-closed).
+</div>
+
+<h2 id="sim"><span class="h-num">4.5</span>Интерактив: ограничитель частоты запросов</h2>
+<div class="widget" id="rlW">
+  <div class="widget-title">Симулятор: три алгоритма на одном потоке запросов</div>
+  <p class="hint">Лимит — 5 запросов в секунду. Отправляйте запросы и двигайте время. Каждый алгоритм решает сам.</p>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="req">1 запрос</button>
+    <button class="btn primary" type="button" data-a="burst">всплеск: 5 запросов</button>
+    <button class="btn" type="button" data-a="t200">+200 мс</button>
+    <button class="btn" type="button" data-a="t900">+900 мс</button>
+    <button class="btn" type="button" data-a="edge">сценарий «граница окна»</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="lanes">
+    <div class="lane"><h5>Фиксированное окно (счётчик на секунду)</h5><div class="items" id="rlFix"></div></div>
+    <div class="lane"><h5>Скользящий журнал (метки за последнюю секунду)</h5><div class="items" id="rlLog"></div></div>
+    <div class="lane"><h5>Token bucket (ёмкость 5, пополнение 5/с)</h5><div class="items" id="rlTb"></div></div>
+  </div>
+  <div class="log" id="rlOut"></div>
+</div>
+<script>
+(function () {
+  var t, fix, slog, tok, last, st, log, $ = function (i) { return document.getElementById(i); };
+  function reset() { t = 0; fix = { w: 0, c: 0 }; slog = []; tok = 5; last = 0; st = { fix: [0, 0], log: [0, 0], tb: [0, 0] }; log = ["t = 0 мс. Лимит 5 запросов в секунду."]; }
+  function req() {
+    var w = Math.floor(t / 1000); if (w !== fix.w) fix = { w: w, c: 0 };
+    var a = fix.c < 5; if (a) fix.c++; st.fix[a ? 0 : 1]++;
+    slog = slog.filter(function (x) { return x > t - 1000; }); var b = slog.length < 5; if (b) slog.push(t); st.log[b ? 0 : 1]++;
+    tok = Math.min(5, tok + (t - last) * 5 / 1000); last = t; var c = tok >= 1; if (c) tok -= 1; st.tb[c ? 0 : 1]++;
+    return "t=" + t + " мс: окно " + (a ? "✓" : "✘ 429") + "   журнал " + (b ? "✓" : "✘ 429") + "   bucket " + (c ? "✓" : "✘ 429");
+  }
+  function act(a) {
+    if (a === "reset") reset();
+    else if (a === "req") log.unshift(req());
+    else if (a === "burst") { for (var i = 0; i < 5; i++) log.unshift(req()); }
+    else if (a === "t200") { t += 200; log.unshift("… прошло 200 мс"); }
+    else if (a === "t900") { t += 900; log.unshift("… прошло 900 мс"); }
+    else if (a === "edge") { reset(); t = 900; for (var j = 0; j < 5; j++) req(); t = 1050; for (var k = 0; k < 5; k++) req(); log = ["Сценарий: 5 запросов в t=900 мс и ещё 5 в t=1050 мс — 10 запросов за 150 мс.", "Фиксированное окно пропустило ВСЕ 10: первые пять попали в окно [0, 1000), вторые — в [1000, 2000). На стыке окон реальная частота вдвое выше лимита.", "Скользящий журнал и token bucket вторую пачку отклонили: за последнюю секунду лимит уже исчерпан, а за 150 мс ведро успело накопить меньше одного жетона."]; }
+    render();
+  }
+  function render() {
+    function chips(s) { return '<span class="chip ok">пропущено ' + s[0] + '</span><span class="chip ' + (s[1] ? "bad" : "") + '">отклонено ' + s[1] + "</span>"; }
+    $("rlFix").innerHTML = chips(st.fix) + '<span class="chip">счётчик окна: ' + fix.c + "/5</span>";
+    $("rlLog").innerHTML = chips(st.log) + '<span class="chip">меток в журнале: ' + slog.filter(function (x) { return x > t - 1000; }).length + "</span>";
+    $("rlTb").innerHTML = chips(st.tb) + '<span class="chip">жетонов: ' + Math.min(5, tok + (t - last) * 5 / 1000).toFixed(1) + "</span>";
+    $("rlOut").textContent = "t = " + t + " мс\n" + log.slice(0, 10).join("\n");
+  }
+  document.querySelectorAll("#rlW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  reset(); render();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Алгоритм</th><th>Память на клиента</th><th>Особенность</th></tr>
+<tr><td>Фиксированное окно</td><td>один счётчик</td><td>прост (<code>INCR</code> + <code>EXPIRE</code> в Redis), но пропускает двойной всплеск на границе окон</td></tr>
+<tr><td>Скользящий журнал</td><td>метка на каждый запрос</td><td>точен, но дорог по памяти при высоких лимитах</td></tr>
+<tr><td>Скользящее окно со счётчиками</td><td>два счётчика</td><td>взвешенная сумма текущего и предыдущего окна — практичный компромисс</td></tr>
+<tr><td>Token bucket</td><td>число жетонов и время</td><td>допускает короткие всплески до ёмкости ведра, держит среднюю частоту; стандарт для API</td></tr>
+<tr><td>Leaky bucket</td><td>очередь</td><td>выравнивает поток: запросы выходят с постоянной скоростью</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">4.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Клиент повторил POST /payments из-за таймаута. Как избежать двойного списания?</p><ul><li>Запретить повторы</li><li>Использовать PUT</li><li>Ключ идемпотентности в заголовке: сервер сохраняет результат первого выполнения и возвращает его на повтор</li><li>Увеличить таймаут</li></ul><div class="why">Клиент не может знать, выполнился ли запрос, поэтому повтор должен быть безопасным.</div></div>
+<div class="mcq" data-ok="1"><p>Что вернуть клиенту, превысившему лимит запросов?</p><ul><li>500 Internal Server Error</li><li>429 Too Many Requests с заголовком Retry-After</li><li>403 Forbidden</li><li>200 с пустым телом</li></ul><div class="why">Клиент должен понять, что это временное ограничение и когда повторить.</div></div>
+<div class="mcq" data-ok="0"><p>Когда gRPC предпочтительнее REST?</p><ul><li>Внутренние вызовы между сервисами: строгий контракт, бинарный формат, потоковая передача</li><li>Публичный API для браузеров и сторонних разработчиков</li><li>Когда нужно кэширование на CDN</li><li>Никогда</li></ul><div class="why">REST выигрывает совместимостью, кэшированием и простотой отладки; gRPC — эффективностью и типизацией.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>SSE или WebSocket для уведомлений о статусе заказа?</summary><div class="a"><p>SSE. Данные идут только от сервера к клиенту, а SSE — обычный HTTP: проходит через прокси, сам переподключается, поддерживает возобновление с последнего события (<code>Last-Event-ID</code>). WebSocket нужен, когда клиент тоже активно пишет: чат, игра, совместное редактирование.</p></div></details>
+<details class="q"><summary>Какие HTTP-методы идемпотентны и почему POST — нет?</summary><div class="a"><p>GET, PUT, DELETE (и HEAD, OPTIONS): повтор приводит к тому же состоянию — ресурс прочитан, заменён тем же содержимым, удалён. POST создаёт новый ресурс или выполняет действие при каждом вызове, поэтому повтор создаёт дубликат. PATCH идемпотентен, только если описывает итоговое состояние («установить X»), а не изменение («увеличить на 1»).</p></div></details>
+<details class="q"><summary>Клиент дважды отправил платёж с одним Idempotency-Key с интервалом 50 мс. Что должно произойти?</summary><div class="a"><p>Первый запрос атомарно «занимает» ключ (уникальное ограничение в БД или <code>SET NX</code>) и начинает обработку. Второй видит занятый ключ в статусе «в обработке» и получает 409 (или дожидается результата). После завершения первого любой повтор возвращает сохранённый ответ. Проверка «ключа нет → обрабатываем» без атомарного захвата приведёт к двойному списанию.</p></div></details>
+<details class="q"><summary>Лимит 100 запросов в минуту с фиксированным окном. Сколько запросов клиент может сделать за 2 секунды?</summary><div class="a"><p>До 200: сто в последнюю секунду одного окна и сто в первую секунду следующего. Это главный недостаток fixed window. Скользящее окно со счётчиком или token bucket с ёмкостью ведра 100 и скоростью пополнения 100/мин этого не допускают.</p></div></details>
+<details class="q"><summary>Почему пагинация через offset плоха для ленты с миллионами записей?</summary><div class="a"><p>БД вынуждена прочитать и отбросить все пропускаемые строки — время растёт линейно с номером страницы. Кроме того, если между запросами появились новые записи, страницы «съезжают»: записи дублируются или пропускаются. Курсорная пагинация (<code>WHERE id &lt; :last ORDER BY id DESC LIMIT 20</code>) использует индекс и стабильна.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

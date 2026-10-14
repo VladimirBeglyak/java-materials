@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Java Memory Model</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .il-grid { display: grid; grid-template-columns: 1fr 120px 1fr; gap: 12px; align-items: start; }
+  .il-col h5 { margin: 0 0 6px; font-size: 14px; }
+  .il-step { font-family: var(--font-mono); font-size: 13px; padding: 6px 10px; border-radius: 6px; margin: 4px 0; background: var(--bg-sunk); border: 1px solid var(--line); }
+  .il-step.done { background: var(--ok-soft); border-color: var(--ok); }
+  .il-step.next { border-color: var(--accent); border-width: 2px; }
+  .il-mem { text-align: center; padding: 10px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent); }
+  .il-mem b { font-family: var(--font-mono); font-size: 26px; display: block; }
+  @media (max-width: 700px) { .il-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · ФУНДАМЕНТ</div>
+  <h1>Java Memory Model</h1>
+  <p class="lead">Главная тема курса. JMM отвечает на один вопрос: <b>какое значение может увидеть чтение поля</b>, если в него пишут другие потоки. Всё остальное — synchronized, volatile, атомики, пулы — лишь способы получить нужные гарантии.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">JLS §17.4</span><span class="tag">happens-before</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="three"><span class="h-num">2.1</span>Три проблемы многопоточности</h2>
+<div class="grid-3">
+  <div class="card"><h4>Атомарность</h4><p>Операция, которая выглядит одной, состоит из нескольких шагов, и другой поток вклинивается между ними. <code>count++</code> = прочитать, прибавить, записать.</p></div>
+  <div class="card"><h4>Видимость</h4><p>Запись одного потока может <b>никогда</b> не стать видна другому: значение осталось в регистре, кэше ядра или JIT вынес чтение из цикла.</p></div>
+  <div class="card"><h4>Порядок</h4><p>Компилятор, JIT и процессор переставляют независимые операции. Другой поток может увидеть их в «невозможном» порядке.</p></div>
+</div>
+<p>Каждый инструмент решает свой набор: <code>volatile</code> — видимость и порядок, но не атомарность составных операций; <code>synchronized</code>/<code>Lock</code> — все три; <code>AtomicXxx</code> — атомарность отдельных операций + видимость.</p>
+
+<h2 id="atomicity"><span class="h-num">2.2</span>Атомарность: потерянное обновление</h2>
+<p>Пощёлкайте шаги двух потоков в разном порядке. Оба выполняют <code>count++</code>, начальное значение 0. Найдите порядок, при котором итог — 1, а не 2.</p>
+
+<div class="widget" id="lostUpdate">
+  <div class="widget-title">Интерактив: чередование шагов count++</div>
+  <div class="il-grid">
+    <div class="il-col"><h5>Поток A</h5><div class="il-step" data-t="A" data-i="0">tmpA = count  (read)</div><div class="il-step" data-t="A" data-i="1">tmpA = tmpA + 1</div><div class="il-step" data-t="A" data-i="2">count = tmpA  (write)</div></div>
+    <div class="il-mem"><span style="font-size:13px">count в памяти</span><b id="luMem">0</b><span class="mono" style="font-size:12px" id="luRegs">tmpA=– tmpB=–</span></div>
+    <div class="il-col"><h5>Поток B</h5><div class="il-step" data-t="B" data-i="0">tmpB = count  (read)</div><div class="il-step" data-t="B" data-i="1">tmpB = tmpB + 1</div><div class="il-step" data-t="B" data-i="2">count = tmpB  (write)</div></div>
+  </div>
+  <div class="controls">
+    <button class="btn primary" id="luA">Шаг потока A</button>
+    <button class="btn primary" id="luB">Шаг потока B</button>
+    <button class="btn" id="luReset">Сначала</button>
+  </div>
+  <div class="log" id="luLog">Нажимайте кнопки, чтобы выбрать, какой поток делает следующий шаг.</div>
+</div>
+<script>
+(function(){
+  var st, log;
+  function reset(){ st={A:0,B:0,mem:0,tmpA:null,tmpB:null}; log=[]; render("Нажимайте кнопки, чтобы выбрать, какой поток делает следующий шаг."); }
+  function render(msg){
+    document.getElementById("luMem").textContent=st.mem;
+    document.getElementById("luRegs").textContent="tmpA="+(st.tmpA===null?"–":st.tmpA)+"  tmpB="+(st.tmpB===null?"–":st.tmpB);
+    document.querySelectorAll("#lostUpdate .il-step").forEach(function(el){
+      var t=el.dataset.t,i=+el.dataset.i; el.classList.toggle("done",i<st[t]); el.classList.toggle("next",i===st[t]);
+    });
+    document.getElementById("luA").disabled=st.A>2; document.getElementById("luB").disabled=st.B>2;
+    if(msg) log.push(msg);
+    if(st.A>2&&st.B>2) log.push(st.mem===2?"✔ Итог 2 — повезло: шаги не пересеклись.":"✘ Итог "+st.mem+" — потерянное обновление! Один инкремент перезаписал другой.");
+    document.getElementById("luLog").textContent=log.join("\n");
+  }
+  function step(t){
+    var k="tmp"+t, i=st[t];
+    if(i===0){ st[k]=st.mem; render(t+": прочитал count = "+st[k]); }
+    else if(i===1){ st[k]=st[k]+1; render(t+": вычислил "+st[k]+" в своём регистре"); }
+    else if(i===2){ st.mem=st[k]; render(t+": записал count = "+st.mem); }
+    st[t]++; render();
+  }
+  document.addEventListener("DOMContentLoaded",function(){
+    document.getElementById("luA").onclick=function(){step("A")};
+    document.getElementById("luB").onclick=function(){step("B")};
+    document.getElementById("luReset").onclick=reset; reset();
+  });
+})();
+</script>
+
+<pre data-title="LostUpdate.java — проверьте сами"><code class="java">public class LostUpdate {
+    static int count = 0;                       // попробуйте volatile — не поможет!
+
+    public static void main(String[] args) throws InterruptedException {
+        Runnable inc = () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) count++; };
+        Thread a = new Thread(inc), b = new Thread(inc);
+        a.start(); b.start(); a.join(); b.join();
+        System.out.println(count);              // обычно &lt; 2_000_000
+    }
+}</code></pre>
+<p>Атомарны по JLS только чтения и записи ссылок и примитивов, кроме <code>long</code>/<code>double</code> без <code>volatile</code> (их запись может «порваться» на две 32-битные половины — на практике на 64-битных JVM этого не бывает, но спецификация разрешает). Любое «прочитать-изменить-записать» неатомарно.</p>
+
+<h2 id="hardware"><span class="h-num">2.3</span>Откуда берутся проблемы видимости и порядка</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="Иерархия памяти CPU">
+  <defs><marker id="b1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <g>
+    <rect x="40" y="16" width="300" height="46" rx="8" class="box-info"/><text x="190" y="45" text-anchor="middle" font-weight="700">Ядро 0 · поток A · регистры</text>
+    <rect x="40" y="74" width="140" height="38" rx="6" class="box-warn"/><text x="110" y="98" text-anchor="middle" font-size="13">Store buffer</text>
+    <rect x="200" y="74" width="140" height="38" rx="6" class="box"/><text x="270" y="98" text-anchor="middle" font-size="13">L1 ~1 нс</text>
+    <rect x="40" y="124" width="300" height="38" rx="6" class="box"/><text x="190" y="148" text-anchor="middle" font-size="13">L2 ~4 нс</text>
+  </g>
+  <g>
+    <rect x="460" y="16" width="300" height="46" rx="8" class="box-info"/><text x="610" y="45" text-anchor="middle" font-weight="700">Ядро 1 · поток B · регистры</text>
+    <rect x="460" y="74" width="140" height="38" rx="6" class="box-warn"/><text x="530" y="98" text-anchor="middle" font-size="13">Store buffer</text>
+    <rect x="620" y="74" width="140" height="38" rx="6" class="box"/><text x="690" y="98" text-anchor="middle" font-size="13">L1</text>
+    <rect x="460" y="124" width="300" height="38" rx="6" class="box"/><text x="610" y="148" text-anchor="middle" font-size="13">L2</text>
+  </g>
+  <rect x="40" y="186" width="720" height="40" rx="7" class="box-acc"/><text x="400" y="211" text-anchor="middle" font-size="13.5">L3 (общий) ~12 нс · протокол когерентности MESI между кэшами</text>
+  <rect x="40" y="244" width="720" height="40" rx="7" class="box"/><text x="400" y="269" text-anchor="middle" font-size="13.5">Оперативная память ~80–100 нс</text>
+  <path d="M340 93 C 400 93, 400 93, 456 93" class="ln-dash" marker-end="url(#b1)"/>
+  <text x="400" y="85" text-anchor="middle" font-size="11" class="muted">не видно!</text>
+</svg>
+<figcaption>Запись ядра 0 сначала попадает в store buffer и не видна ядру 1, пока не «стечёт» в кэш. Когерентность кэшей (MESI) не спасает: проблема в буферах, регистрах и в оптимизациях компилятора. Барьеры памяти (их ставит JVM для volatile/synchronized) заставляют дождаться слива буфера и запрещают перестановки.</figcaption>
+</figure>
+
+<p>Второй источник — <b>компилятор и JIT</b>. Если JIT доказал, что в цикле поле не меняется <i>этим потоком</i>, он имеет право прочитать его один раз:</p>
+<div class="grid-2">
+<pre data-title="Что написали" class="bad-code"><code class="java">boolean running = true;  // без volatile
+
+void worker() {
+    while (running) {
+        doWork();
+    }
+}</code></pre>
+<pre data-title="Что может сделать JIT (hoisting)" class="bad-code"><code class="java">void worker() {
+    if (running) {
+        while (true) {      // вечный цикл:
+            doWork();       // running = false
+        }                   // из другого потока
+    }                       // не увидим никогда
+}</code></pre>
+</div>
+<p>Это не теоретический баг: на HotSpot он стабильно воспроизводится, если <code>doWork()</code> тривиален и заинлайнен. Исправление — <code>volatile boolean running</code>.</p>
+
+<h2 id="hb"><span class="h-num">2.4</span>Happens-before — единственное, что нужно запомнить</h2>
+<p>JMM не описывает кэши и барьеры. Он определяет отношение <b>happens-before (HB)</b> между действиями. Правило: <b>если запись W happens-before чтения R, то R гарантированно видит W</b> (или более позднюю запись). Если между W и R нет HB-цепочки и хотя бы одно из действий — запись, это <b>гонка данных (data race)</b>, и чтение может вернуть что угодно из допустимого.</p>
+
+<div class="table-wrap"><table>
+<tr><th>#</th><th>Правило HB</th><th>Пример</th></tr>
+<tr><td>1</td><td><b>Program order</b>: в пределах одного потока каждое действие HB следующего</td><td>внутри одного потока всё «как написано» (as-if-serial)</td></tr>
+<tr><td>2</td><td><b>Monitor lock</b>: unlock монитора HB каждого последующего lock того же монитора</td><td>выход из <code>synchronized(m)</code> → вход в <code>synchronized(m)</code></td></tr>
+<tr><td>3</td><td><b>Volatile</b>: запись volatile-поля HB каждого последующего чтения этого поля</td><td><code>ready = true</code> → <code>if (ready)</code></td></tr>
+<tr><td>4</td><td><b>Thread start</b>: <code>t.start()</code> HB любого действия в <code>t</code></td><td>поля, заполненные до start(), видны в новом потоке</td></tr>
+<tr><td>5</td><td><b>Thread termination</b>: любое действие в <code>t</code> HB возврата из <code>t.join()</code> / <code>isAlive()==false</code></td><td>результаты видны после join</td></tr>
+<tr><td>6</td><td><b>Interrupt</b>: вызов <code>t.interrupt()</code> HB обнаружения прерывания в <code>t</code></td><td></td></tr>
+<tr><td>7</td><td><b>Finalizer</b>: конец конструктора HB начала finalize()</td><td>(устарело)</td></tr>
+<tr><td>8</td><td><b>Транзитивность</b>: A HB B и B HB C ⇒ A HB C</td><td>основа «piggybacking»</td></tr>
+</table></div>
+<p>Плюс гарантии <code>java.util.concurrent</code> (javadoc «Memory Consistency Properties»): помещение в конкурентную коллекцию/очередь HB извлечения; действия до <code>executor.submit()</code> HB начала задачи; действия задачи HB возврата из <code>future.get()</code>; <code>countDown()</code> HB возврата из <code>await()</code>; освобождение <code>Lock</code> HB его захвата.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 270" role="img" aria-label="Транзитивность happens-before через volatile">
+  <defs>
+    <marker id="b2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
+    <marker id="b3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker>
+  </defs>
+  <text x="170" y="24" text-anchor="middle" font-weight="700">Поток A (писатель)</text>
+  <text x="630" y="24" text-anchor="middle" font-weight="700">Поток B (читатель)</text>
+  <rect x="60" y="40" width="220" height="40" rx="7" class="box"/><text x="170" y="65" text-anchor="middle" class="mono" font-size="13">data = 42</text>
+  <rect x="60" y="110" width="220" height="40" rx="7" class="box"/><text x="170" y="135" text-anchor="middle" class="mono" font-size="13">config = load()</text>
+  <rect x="60" y="180" width="220" height="40" rx="7" class="box-acc"/><text x="170" y="205" text-anchor="middle" class="mono" font-size="13">ready = true  (volatile)</text>
+  <rect x="520" y="110" width="220" height="40" rx="7" class="box-acc"/><text x="630" y="135" text-anchor="middle" class="mono" font-size="13">if (ready)  (volatile)</text>
+  <rect x="520" y="180" width="220" height="40" rx="7" class="box-ok"/><text x="630" y="205" text-anchor="middle" class="mono" font-size="13">use(data, config) ✔</text>
+  <path d="M170 80 V106" class="ln" marker-end="url(#b2)"/><path d="M170 150 V176" class="ln" marker-end="url(#b2)"/>
+  <path d="M630 150 V176" class="ln" marker-end="url(#b2)"/>
+  <path d="M282 196 C 400 196, 410 132, 516 132" class="ln-acc" marker-end="url(#b3)"/>
+  <text x="400" y="160" text-anchor="middle" font-size="12.5" fill="var(--accent)">synchronizes-with</text>
+  <text x="40" y="255" font-size="12.5" class="muted">program order (серые) + synchronizes-with (оранжевая) ⇒ data=42 HB use(data). Обычные поля «едут» на volatile-записи.</text>
+</svg>
+</figure>
+
+<div class="callout warn"><span class="c-title">HB — это не «раньше по времени»</span>
+Если запись физически произошла раньше чтения, но HB нет — гарантий нет. И наоборот: HB не означает, что действия реально выполнятся в этом порядке; означает лишь, что результат будет неотличим от такого порядка.
+</div>
+
+<h2 id="volatile"><span class="h-num">2.5</span>volatile: что даёт и чего не даёт</h2>
+<div class="grid-2">
+  <div class="card"><h4>✔ Даёт</h4><ul><li>Видимость: чтение видит последнюю запись volatile-поля.</li><li>Порядок: всё, что было до volatile-записи, видно после volatile-чтения того же поля (release/acquire).</li><li>Атомарность чтения/записи <code>long</code>/<code>double</code>.</li></ul></div>
+  <div class="card"><h4>✘ Не даёт</h4><ul><li>Атомарность составных операций: <code>v++</code>, <code>if (v == null) v = x</code>, check-then-act.</li><li>Взаимное исключение.</li><li>Видимость для полей <i>внутри</i> объекта, изменённых <b>после</b> публикации ссылки.</li></ul></div>
+</div>
+<p><b>Когда volatile достаточно</b>: (1) записи не зависят от текущего значения (флаги, «последнее значение»), или пишет только один поток; (2) переменная не участвует в инвариантах вместе с другими полями; (3) блокировка при доступе не нужна по другим причинам.</p>
+<pre data-title="Типичные корректные применения volatile" class="good-code"><code class="java">// 1. Флаг остановки
+private volatile boolean shutdown;
+public void stop() { shutdown = true; }
+
+// 2. Публикация неизменяемого снимка (один писатель, много читателей)
+private volatile Config current = Config.defaults();
+public void reload() { current = Config.loadFromDb(); }     // новая неизменяемая ссылка
+public Config config() { return current; }
+
+// 3. Cheap read-write lock: пишем под локом, читаем без него
+private volatile long value;
+public long get() { return value; }
+public synchronized void increment() { value++; }</code></pre>
+
+<h2 id="final"><span class="h-num">2.6</span>final-поля и безопасная публикация</h2>
+<p><b>Публикация</b> — сделать ссылку на объект доступной другому потоку. Если опубликовать небезопасно (обычное поле без синхронизации), другой поток может увидеть ссылку на объект, конструктор которого «ещё не закончился» — поля со значениями по умолчанию.</p>
+<pre data-title="Небезопасная публикация" class="bad-code"><code class="java">class Holder {
+    private int n;
+    Holder(int n) { this.n = n; }
+    void check() { if (n != n) throw new AssertionError(); } // может упасть (JCiP §3.5)!
+}
+public Holder holder;                           // обычное поле
+public void init() { holder = new Holder(42); } // запись ссылки может «обогнать» запись n</code></pre>
+
+<div class="callout ok"><span class="c-title">4 способа безопасной публикации (JCiP)</span>
+<ol style="margin:6px 0 0">
+<li>Инициализация из <b>статического инициализатора</b> (<code>static final X x = new X()</code>) — гарантируется блокировкой инициализации класса.</li>
+<li>Сохранение ссылки в <b>volatile</b>-поле или <code>AtomicReference</code>.</li>
+<li>Сохранение в <b>final</b>-поле корректно сконструированного объекта.</li>
+<li>Сохранение в поле, защищённое <b>локом</b>, или в <b>потокобезопасную коллекцию</b>/очередь.</li>
+</ol></div>
+
+<p><b>Семантика final</b>: если объект корректно сконструирован (ссылка <code>this</code> не утекла из конструктора), любой поток, получивший ссылку на объект даже через гонку, увидит правильно инициализированные final-поля и всё, что достижимо через них на момент конца конструктора («freeze»). Поэтому <b>неизменяемые объекты</b> (все поля final, состояние не меняется) потокобезопасны без синхронизации — это главный инструмент проектирования.</p>
+<pre data-title="Утечка this — ломает гарантии final" class="bad-code"><code class="java">public class Listener {
+    private final int threshold;
+    public Listener(EventBus bus) {
+        bus.register(this);   // this утёк: другой поток может вызвать onEvent()
+        threshold = 10;       // до этой строки, и увидит threshold == 0
+    }
+    public void onEvent(int v) { if (v &gt; threshold) alert(); }
+}
+// Решение: приватный конструктор + статическая фабрика, регистрирующая уже готовый объект.</code></pre>
+
+<h2 id="dcl"><span class="h-num">2.7</span>Double-checked locking — экзамен на JMM</h2>
+<pre data-title="Сломанный DCL (до исправления)" class="bad-code"><code class="java">private static Singleton instance;
+public static Singleton get() {
+    if (instance == null) {                    // 1. чтение без синхронизации — гонка
+        synchronized (Singleton.class) {
+            if (instance == null) instance = new Singleton(); // 2. allocate → publish ref → init?
+        }
+    }
+    return instance;  // может вернуть ссылку на недоинициализированный объект
+}</code></pre>
+<p><code>new Singleton()</code> — это «выделить память, вызвать конструктор, записать ссылку». Без HB запись ссылки может стать видимой другому потоку раньше, чем записи полей в конструкторе. Поток на строке 1 увидит не-null и вернёт полуготовый объект.</p>
+<div class="grid-2">
+<pre data-title="Исправление: volatile" class="good-code"><code class="java">private static volatile Singleton instance;
+public static Singleton get() {
+    Singleton local = instance;        // одно volatile-чтение
+    if (local == null) {
+        synchronized (Singleton.class) {
+            local = instance;
+            if (local == null) {
+                instance = local = new Singleton();
+            }
+        }
+    }
+    return local;
+}</code></pre>
+<pre data-title="Лучше: holder idiom" class="good-code"><code class="java">public final class Singleton {
+    private Singleton() {}
+    private static final class Holder {
+        static final Singleton INSTANCE = new Singleton();
+    }
+    public static Singleton get() {
+        return Holder.INSTANCE;  // ленивость и
+    }                            // потокобезопасность
+}                                // даёт JVM при
+                                 // инициализации класса</code></pre>
+</div>
+
+<h2 id="falsesharing"><span class="h-num">2.8</span>False sharing — проблема производительности</h2>
+<p>Кэш оперирует <b>линиями по 64 байта</b>. Если два независимых горячих поля, которые пишут разные потоки, лежат в одной линии, каждое изменение инвалидирует линию у другого ядра — и «независимые» потоки начинают сериализоваться через протокол когерентности. Корректность не страдает, страдает пропускная способность (в разы).</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 160" role="img" aria-label="False sharing">
+  <text x="20" y="22" font-weight="700" font-size="14">Плохо: одна кэш-линия</text>
+  <rect x="20" y="32" width="360" height="40" rx="6" class="box-bad"/>
+  <rect x="24" y="36" width="80" height="32" rx="4" class="box-warn"/><text x="64" y="57" text-anchor="middle" class="mono" font-size="12">countA</text>
+  <rect x="108" y="36" width="80" height="32" rx="4" class="box-info"/><text x="148" y="57" text-anchor="middle" class="mono" font-size="12">countB</text>
+  <text x="290" y="57" text-anchor="middle" class="mono muted" font-size="12">…48 байт</text>
+  <text x="20" y="96" font-size="13">ядро 0 пишет countA → линия у ядра 1</text><text x="20" y="114" font-size="13">становится invalid → промах → ping-pong</text>
+  <text x="420" y="22" font-weight="700" font-size="14">Хорошо: разные линии</text>
+  <rect x="420" y="32" width="170" height="40" rx="6" class="box-ok"/><rect x="424" y="36" width="80" height="32" rx="4" class="box-warn"/><text x="464" y="57" text-anchor="middle" class="mono" font-size="12">countA</text><text x="548" y="57" text-anchor="middle" class="mono muted" font-size="11">padding</text>
+  <rect x="600" y="32" width="170" height="40" rx="6" class="box-ok"/><rect x="604" y="36" width="80" height="32" rx="4" class="box-info"/><text x="644" y="57" text-anchor="middle" class="mono" font-size="12">countB</text><text x="728" y="57" text-anchor="middle" class="mono muted" font-size="11">padding</text>
+  <text x="420" y="96" font-size="13">@jdk.internal.vm.annotation.Contended</text>
+  <text x="420" y="116" font-size="13">(для своего кода: -XX:-RestrictContended)</text>
+  <text x="20" y="146" font-size="13" class="muted">Пример в JDK: ячейки Striped64.Cell внутри LongAdder помечены @Contended (тема 05).</text>
+</svg>
+</figure>
+<p>Ручной padding (7 полей <code>long</code> до и после) хрупок: JVM может переупорядочить поля. <code>@Contended</code> решает это на уровне раскладки объекта и не требует читать/писать «пустые» поля. Для пользовательского кода аннотация работает только с флагом <code>-XX:-RestrictContended</code>.</p>
+
+<h2 id="drf"><span class="h-num">2.9</span>Итог: как рассуждать о любом коде</h2>
+<div class="callout info"><span class="c-title">Гарантия DRF-SC</span>
+Если программа <b>корректно синхронизирована</b> (в ней нет гонок данных — все конфликтующие доступы упорядочены HB), то все её исполнения выглядят <b>последовательно согласованными</b>: как будто действия всех потоков перемешаны в один порядок, согласованный с порядком в каждом потоке. Отсюда практическое правило: убедитесь, что для каждого общего изменяемого поля любая пара «запись + чтение/запись из разных потоков» связана HB — и можно рассуждать о коде «обычно».
+</div>
+<ol class="steps">
+  <li>Выпишите все поля, доступные более чем одному потоку.</li>
+  <li>Для каждого — неизменяемое ли оно (final + неизменяемый объект)? Тогда достаточно безопасной публикации.</li>
+  <li>Если изменяемое — каким механизмом даётся HB для каждой пары доступов: тот же лок? volatile? конкурентная коллекция? join?</li>
+  <li>Есть ли составные операции (check-then-act, read-modify-write)? Они должны быть под одним локом или выражены одной атомарной операцией (CAS, <code>compute</code>).</li>
+  <li>Участвуют ли несколько полей в одном инварианте? Тогда их надо менять под одним локом или собрать в один неизменяемый объект и менять ссылку атомарно.</li>
+</ol>
+
+<h2 id="sim"><span class="h-num">2.10</span>Интерактив: есть ли happens-before</h2>
+<p>Весь анализ конкурентного кода сводится к одному вопросу: связаны ли запись и чтение отношением happens-before. Если да — читатель гарантированно видит запись. Если нет — это гонка данных, и JVM вправе показать что угодно.</p>
+<div class="widget" id="hbW">
+  <div class="widget-title">Проверка пары «действие A в потоке 1 → действие B в потоке 2»</div>
+  <div class="controls"><label>пара действий<select id="hbCase" style="max-width:100%">
+    <option value="plain">A: x = 1 (обычное поле) → B: чтение x</option>
+    <option value="vol">A: запись volatile v → B: чтение v</option>
+    <option value="piggy">A: x = 1; затем запись volatile v → B: чтение v; затем чтение x</option>
+    <option value="piggyBad">A: запись volatile v; затем x = 1 → B: чтение v; затем чтение x</option>
+    <option value="lock">A: x = 1 внутри synchronized(m) → B: чтение x внутри synchronized(m)</option>
+    <option value="lock2">A: x = 1 внутри synchronized(m1) → B: чтение x внутри synchronized(m2)</option>
+    <option value="halfLock">A: x = 1 внутри synchronized(m) → B: чтение x без синхронизации</option>
+    <option value="start">A: x = 1; затем t.start() → B: чтение x в потоке t</option>
+    <option value="join">A: x = 1 в потоке t → B: t.join(); затем чтение x</option>
+    <option value="final">A: конструктор пишет final-поле → B: чтение поля через ссылку, полученную гонкой</option>
+    <option value="nonfinal">A: конструктор пишет обычное поле → B: чтение поля через ссылку, полученную гонкой</option>
+    <option value="chm">A: map.put(k, obj) в ConcurrentHashMap → B: map.get(k) и чтение полей obj</option>
+    <option value="submit">A: x = 1; затем executor.submit(task) → B: чтение x в task</option>
+    <option value="atomic">A: counter.incrementAndGet() (AtomicInteger) → B: counter.get()</option>
+  </select></label></div>
+  <div class="verdict" id="hbOut"></div>
+</div>
+<script>
+(function () {
+  var A = {
+    plain: [0, "Нет. Поток 2 может никогда не увидеть 1: значение осталось в регистре или кэше ядра, а JIT вправе вынести чтение из цикла. Классический бесконечный while (!stop) {}."],
+    vol: [1, "Да. Правило volatile: запись happens-before каждое последующее чтение той же переменной."],
+    piggy: [1, "Да — транзитивность. x = 1 hb запись v (порядок программы в потоке 1), запись v hb чтение v (volatile), чтение v hb чтение x (порядок программы в потоке 2). Одна volatile-запись «публикует» всё, что было записано до неё."],
+    piggyBad: [0, "Нет. x = 1 выполняется ПОСЛЕ записи volatile, и цепочка не замыкается. Порядок строк критичен: сначала данные, потом volatile-флаг готовности."],
+    lock: [1, "Да. Освобождение монитора happens-before каждый последующий захват ТОГО ЖЕ монитора."],
+    lock2: [0, "Нет. Разные мониторы не связаны. Это самая частая ошибка: «оба метода synchronized», но один static (монитор класса), а другой нет (монитор this)."],
+    halfLock: [0, "Нет. Синхронизация нужна и на записи, и на чтении. Незащищённое чтение — гонка, даже если запись «под локом»."],
+    start: [1, "Да. Вызов start() happens-before любое действие в запущенном потоке. Всё, что записано до start, поток увидит."],
+    join: [1, "Да. Последнее действие потока happens-before успешный возврат из join()."],
+    final: [1, "Да — гарантия final-полей: после завершения конструктора любой поток видит инициализированные final-поля и объекты, достижимые через них, даже при публикации через гонку. Условие: ссылка this не утекла из конструктора."],
+    nonfinal: [0, "Нет. Поток 2 может увидеть объект с полем в значении по умолчанию (0/null): запись ссылки и запись поля могут быть переупорядочены. Нужна безопасная публикация: final, volatile, synchronized или потокобезопасная коллекция."],
+    chm: [1, "Да. Помещение объекта в потокобезопасную коллекцию happens-before его извлечение — это безопасная публикация. Но дальнейшие изменения полей obj после put снова требуют синхронизации."],
+    submit: [1, "Да. Передача задачи в Executor happens-before начало её выполнения (гарантия java.util.concurrent)."],
+    atomic: [1, "Да. У Atomic* семантика volatile: и чтение, и запись, и CAS."]
+  };
+  var s = document.getElementById("hbCase"), o = document.getElementById("hbOut");
+  function run() { var a = A[s.value]; o.className = "verdict " + (a[0] ? "ok" : "bad"); o.innerHTML = "<b>" + (a[0] ? "Happens-before есть. " : "Гонка данных. ") + "</b>" + SG.esc(a[1].replace(/^(Да|Нет)[.—\s-]*\s?/, "")); }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">2.11</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Поле <code>volatile int count</code>, два потока выполняют <code>count++</code> по 10 000 раз. Результат?</p><ul><li>Всегда 20 000</li><li>Обычно меньше 20 000: volatile даёт видимость, но не атомарность чтения-изменения-записи</li><li>Всегда 10 000</li><li>Ошибка компиляции</li></ul><div class="why">count++ — три действия. Нужен AtomicInteger, LongAdder или блокировка.</div></div>
+<div class="mcq" data-ok="2"><p>Что гарантирует final-поле в многопоточной программе?</p><ul><li>Что объект нельзя изменить</li><li>Ничего особенного</li><li>Что после завершения конструктора любой поток увидит его инициализированным без синхронизации (если this не утёк)</li><li>Что поле хранится в регистре</li></ul><div class="why">Поэтому неизменяемые объекты с final-полями потокобезопасны и могут публиковаться как угодно.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое false sharing?</p><ul><li>Независимые переменные разных потоков лежат в одной кэш-линии, и запись одним ядром инвалидирует кэш другого</li><li>Два потока читают одну переменную</li><li>Утечка ссылки this</li><li>Вид deadlock</li></ul><div class="why">Корректность не страдает, страдает скорость — в разы. Лечение: @Contended, LongAdder, разнесение полей.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему volatile int counter; counter++ из нескольких потоков теряет обновления?</summary><div class="a"><p>volatile гарантирует видимость каждого отдельного чтения и записи, но <code>++</code> — это чтение, сложение и запись. Два потока могут прочитать одно и то же значение, оба прибавят 1 и оба запишут одинаковый результат. Нужна атомарность: <code>AtomicInteger.incrementAndGet()</code>, <code>LongAdder</code> или лок.</p></div></details>
+<details class="q"><summary>Дайте определение data race в терминах JMM.</summary><div class="a"><p>Два доступа к одной переменной из разных потоков, хотя бы один — запись, и они не упорядочены отношением happens-before. Программа без гонок данных — корректно синхронизированная, для неё действует DRF-SC.</p></div></details>
+<details class="q"><summary>Поток A: x = 1; flag = true; (flag — volatile). Поток B: if (flag) print(x). Может ли B напечатать 0? А если flag не volatile?</summary><div class="a"><p>С volatile — нет: запись x HB записи flag (program order), запись flag HB чтения flag, которое вернуло true (volatile rule), чтение flag HB чтения x. По транзитивности B видит x = 1. Без volatile — да, может: нет HB, записи могут быть переставлены компилятором или CPU, и B увидит flag = true, а x = 0.</p></div></details>
+<details class="q"><summary>Почему неизменяемый объект можно передавать между потоками без синхронизации?</summary><div class="a"><p>Все поля final → семантика freeze в конце конструктора гарантирует, что любой поток, получивший ссылку, увидит инициализированные значения final-полей и всё достижимое через них. Состояние больше не меняется → нет конфликтующих записей → нет гонок. Условие: <code>this</code> не утёк из конструктора, а изменяемые объекты внутри (массивы, коллекции) не модифицируются после конструирования.</p></div></details>
+<details class="q"><summary>Зачем в исправленном DCL локальная переменная local?</summary><div class="a"><p>Оптимизация: на «горячем» пути, когда экземпляр уже создан, происходит одно volatile-чтение вместо двух (проверка + return). volatile-чтение дешевле лока, но не бесплатно — оно запрещает часть оптимизаций. Корректность от этого не зависит.</p></div></details>
+<details class="q"><summary>Что такое false sharing и как его найти?</summary><div class="a"><p>Два независимых поля, интенсивно изменяемые разными потоками, оказываются в одной 64-байтной кэш-линии, и протокол когерентности гоняет линию между ядрами. Признак: плохая масштабируемость при росте числа потоков без видимой конкуренции за локи. Инструменты: <code>perf c2c</code> на Linux, JOL для просмотра раскладки объекта, JMH-бенчмарк с и без <code>@Contended</code>.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

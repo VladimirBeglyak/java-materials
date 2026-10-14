@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Redis: надёжность и масштаб</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · КЭШ И REDIS</div>
+  <h1>Redis: надёжность и масштабирование</h1>
+  <p class="lead">Один процесс Redis хранит всё в памяти одного сервера. Четыре механизма снимают это ограничение по очереди: персистентность спасает данные при перезапуске, репликация создаёт копии, Sentinel автоматически переключает на копию, Cluster распределяет данные по нескольким серверам.</p>
+  <div class="meta"><span class="tag">4 конспекта</span><span class="tag">~3 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Какую проблему решает</th><th>Какую не решает</th></tr>
+<tr><td><a href="#persistence">Персистентность</a></td><td>Данные переживают перезапуск процесса</td><td>Отказ сервера, доступность</td></tr>
+<tr><td><a href="#replication">Репликация</a></td><td>Копии данных, масштаб чтения</td><td>Автоматическое переключение</td></tr>
+<tr><td><a href="#sentinel">Sentinel</a></td><td>Автоматический failover</td><td>Объём данных больше памяти одного сервера, масштаб записи</td></tr>
+<tr><td><a href="#cluster">Cluster</a></td><td>Шардирование + failover</td><td>Многоключевые операции между шардами</td></tr>
+</table></div>
+
+<h2 id="persistence"><span class="h-num">10.1</span>Персистентность: RDB и AOF<span class="sk-num">#43</span></h2>
+<p>По умолчанию Redis живёт в памяти, и перезапуск означает пустую базу. Персистентность сохраняет данные на диск двумя способами: периодическим снимком всего набора (<b>RDB</b>) или журналом каждой команды записи (<b>AOF</b>).</p>
+<figure class="sketch"><a href="img/43-redis-persistence.jpg"><img src="img/43-redis-persistence.jpg" width="1024" height="1536" loading="lazy" alt="Redis Persistence: RDB, AOF, сравнение, совместное использование, настройки"></a><figcaption><b>Конспект #43.</b> Redis Persistence <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th></th><th>RDB (снимок)</th><th>AOF (журнал)</th></tr>
+<tr><td>Что на диске</td><td>Компактный бинарный файл состояния на момент времени</td><td>Последовательность команд записи</td></tr>
+<tr><td>Потеря данных при сбое</td><td>Всё с последнего снимка (минуты)</td><td>До 1 секунды при <code>everysec</code></td></tr>
+<tr><td>Влияние на запись</td><td>Нет (кроме момента снимка)</td><td>Небольшое</td></tr>
+<tr><td>Размер файла</td><td>Меньше</td><td>Больше; периодически переписывается (rewrite)</td></tr>
+<tr><td>Восстановление</td><td>Быстрое — загрузить файл</td><td>Медленнее — проиграть команды</td></tr>
+<tr><td>Для чего</td><td>Кэш, бэкапы</td><td>Данные, которые жалко потерять</td></tr>
+</table></div>
+<p><b>Политики <code>appendfsync</code></b>: <code>always</code> — сброс на диск после каждой записи (надёжно, медленно); <code>everysec</code> — раз в секунду (значение по умолчанию, разумный компромисс); <code>no</code> — на усмотрение ОС.</p>
+<div class="callout info"><span class="c-title">Как устроен снимок и чем он опасен</span>
+Для RDB Redis вызывает <code>fork()</code>: дочерний процесс получает «замороженную» копию памяти и пишет её на диск, родитель продолжает обслуживать запросы. Память не копируется сразу — работает copy-on-write: страница дублируется, только когда родитель её изменяет. При интенсивной записи во время снимка потребление памяти может вырасти почти вдвое, а сам <code>fork</code> большого процесса даёт заметную паузу. Вывод: серверу Redis нужен запас свободной памяти, а не «maxmemory = вся RAM».
+</div>
+<div class="callout ok"><span class="c-title">Рекомендация конспекта: включать оба</span>
+RDB — для быстрого восстановления и бэкапов, AOF — для минимальной потери. При запуске Redis загружает AOF как более полный. В современных версиях файл AOF после перезаписи начинается с RDB-снимка, за которым идут только свежие команды, — получается и компактно, и быстро. Для чистого кэша персистентность можно отключить совсем: пустой кэш после перезапуска — допустимое состояние (если вы пережили вопрос из <a href="09-caching.html#failures">темы 09</a>).
+</div>
+
+<h2 id="replication"><span class="h-num">10.2</span>Репликация<span class="sk-num">#42</span></h2>
+<p>Мастер принимает записи и пересылает поток команд репликам; реплики доступны только для чтения. Репликация <b>асинхронная</b>: мастер отвечает клиенту, не дожидаясь реплик.</p>
+<figure class="sketch"><a href="img/42-redis-replication.jpg"><img src="img/42-redis-replication.jpg" width="1024" height="1536" loading="lazy" alt="Redis Replication: архитектура, full и incremental sync, настройки, метрики"></a><figcaption><b>Конспект #42.</b> Redis Replication <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="vs">
+  <div class="card"><h4>Полная синхронизация</h4><ul><li>При первом подключении реплики или после долгого разрыва.</li><li>Мастер делает RDB-снимок и передаёт его целиком.</li><li>Дорого: <code>fork</code>, диск, сеть.</li></ul></div>
+  <div class="card"><h4>Частичная синхронизация</h4><ul><li>После короткого разрыва.</li><li>Мастер хранит недавние команды в кольцевом буфере (<b>replication backlog</b>) и досылает недостающее по смещению реплики.</li><li>Если разрыв длиннее, чем вмещает буфер, — снова полная.</li></ul></div>
+</div>
+<p>Практическое следствие: размер <code>repl-backlog-size</code> (по умолчанию 1 МБ) нужно увеличивать на нагруженных системах, иначе каждое кратковременное пропадание сети заканчивается полной синхронизацией, которая сама нагружает мастер.</p>
+<div class="callout bad"><span class="c-title">Асинхронная репликация = подтверждённая запись может пропасть</span>
+Клиент получил <code>OK</code>, мастер упал до отправки команды реплике, реплику повысили до мастера — записи нет. Это фундаментальное свойство Redis, и оно определяет, что в нём можно хранить.
+<ul>
+  <li>Смягчение: <code>min-replicas-to-write 1</code> и <code>min-replicas-max-lag 10</code> — мастер отказывается принимать записи, если нет ни одной реплики с отставанием меньше 10 секунд. Ограничивает окно потери и защищает от split-brain.</li>
+  <li>Команда <code>WAIT</code> блокирует клиента, пока запись не дойдёт до N реплик, — но и она не превращает Redis в строго согласованную систему.</li>
+  <li>Для данных, потеря которых недопустима (деньги), Redis — кэш и ускоритель, а не источник истины.</li>
+</ul>
+</div>
+
+<h2 id="sentinel"><span class="h-num">10.3</span>Sentinel<span class="sk-num">#41</span></h2>
+<p>Репликация сама не переключает клиентов на реплику при отказе мастера. Sentinel — отдельные процессы-наблюдатели, которые следят за мастером и репликами, договариваются между собой об отказе, повышают реплику и сообщают клиентам адрес нового мастера.</p>
+<figure class="sketch"><a href="img/41-redis-sentinel.jpg"><img src="img/41-redis-sentinel.jpg" width="1024" height="1536" loading="lazy" alt="Redis Sentinel: архитектура, обнаружение отказа, failover, подключение клиентов"></a><figcaption><b>Конспект #41.</b> Redis Sentinel <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<ol class="steps">
+  <li>Каждый Sentinel периодически отправляет <code>PING</code> мастеру. Нет ответа дольше <code>down-after-milliseconds</code> — <b>SDOWN</b> (subjectively down): «я считаю, что мастер недоступен».</li>
+  <li>Sentinel опрашивает коллег. Если с ним согласны <code>quorum</code> наблюдателей — <b>ODOWN</b> (objectively down).</li>
+  <li>Наблюдатели выбирают лидера, который проведёт переключение. Для этого нужно согласие <b>большинства всех</b> Sentinel.</li>
+  <li>Лидер выбирает лучшую реплику (приоритет, наименьшее отставание), повышает её и перенастраивает остальные.</li>
+  <li>Клиенты узнают новый адрес у Sentinel.</li>
+</ol>
+<div class="callout info"><span class="c-title">Почему наблюдателей минимум три и нечётное число</span>
+Один Sentinel не отличит падение мастера от собственной сетевой проблемы, а сам становится точкой отказа. Два — не образуют большинства, если один недоступен. Три Sentinel на трёх разных машинах (лучше — в разных зонах) переживают отказ одного. Заметьте разницу: <code>quorum</code> — сколько нужно для признания отказа, а для самого переключения всегда требуется большинство — это и защищает от split-brain.
+</div>
+<p><b>Клиент должен знать о Sentinel</b>: он подключается не к адресу мастера, а к списку наблюдателей и спрашивает «кто сейчас мастер для <code>mymaster</code>?». В Spring Data Redis — <code>RedisSentinelConfiguration</code> или свойства <code>spring.data.redis.sentinel.master</code> и <code>.nodes</code>.</p>
+<p><b>Ограничение</b>: Sentinel не шардирует. Все данные по-прежнему должны помещаться в память одного сервера, и запись идёт в один мастер.</p>
+
+<h2 id="cluster"><span class="h-num">10.4</span>Cluster<span class="sk-num">#40</span></h2>
+<p>Redis Cluster распределяет данные между несколькими мастерами и сам переключает на реплику при отказе. Пространство ключей разделено на <b>16 384 хэш-слота</b>; каждый мастер отвечает за свой диапазон слотов.</p>
+<figure class="sketch"><a href="img/40-redis-cluster.jpg"><img src="img/40-redis-cluster.jpg" width="1024" height="1536" loading="lazy" alt="Redis Cluster: архитектура, хэш-слоты, поток запроса, failover"></a><figcaption><b>Конспект #40.</b> Redis Cluster <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<pre data-title="как ключ попадает на узел"><code class="txt">slot = CRC16(key) mod 16384
+
+CRC16("user:1001") mod 16384 = 5478   -- слоты 5461–10922 обслуживает узел 2
+</code></pre>
+<p><b>Путь запроса.</b> Клиент отправляет команду любому узлу. Если слот принадлежит этому узлу — команда выполняется. Если нет — узел отвечает перенаправлением, и клиент повторяет запрос по указанному адресу. «Умные» клиенты (Lettuce, Jedis) кэшируют карту слотов и сразу идут на нужный узел.</p>
+<div class="table-wrap"><table>
+<tr><th>Ответ</th><th>Когда</th><th>Что делает клиент</th></tr>
+<tr><td><code>MOVED</code></td><td>Слот постоянно принадлежит другому узлу</td><td>Обновляет карту слотов и повторяет запрос</td></tr>
+<tr><td><code>ASK</code></td><td>Слот прямо сейчас переезжает, ключ уже на новом узле</td><td>Повторяет <i>один</i> запрос на новом узле, карту не меняет</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Главное ограничение, которого нет на схеме: многоключевые операции</span>
+Команды над несколькими ключами (<code>MGET</code>, <code>MULTI</code>-транзакции, Lua-скрипты, пересечение множеств) работают, только если <b>все ключи в одном слоте</b>. Чтобы поместить связанные ключи вместе, используют <b>хэш-теги</b>: слот вычисляется только по части ключа в фигурных скобках. Ключи <code>{user:1001}:profile</code> и <code>{user:1001}:cart</code> гарантированно окажутся в одном слоте. Обратная сторона: неудачный тег собирает слишком много данных на одном узле.
+</div>
+<ul>
+  <li><b>Минимальная конфигурация</b> — три мастера и по реплике у каждого (шесть узлов). Узлы обмениваются состоянием по gossip-протоколу; отказ мастера подтверждается большинством мастеров, после чего его реплика повышается.</li>
+  <li><b>Гарантии те же, что у репликации</b>: асинхронная, подтверждённая запись может быть потеряна при переключении.</li>
+  <li><b>Если отказали мастер и все его реплики</b>, часть слотов недоступна — по умолчанию кластер перестаёт принимать запросы целиком (<code>cluster-require-full-coverage</code>).</li>
+  <li><b>Изменение размера</b> — перенос слотов между узлами (resharding) без остановки, но с нагрузкой на сеть и ответами <code>ASK</code>.</li>
+</ul>
+<div class="callout interview"><span class="c-title">Sentinel или Cluster?</span>
+Данные помещаются в память одного сервера и запись не упирается в одно ядро — <b>Sentinel</b>: проще, нет ограничений на многоключевые команды. Данных или записи больше, чем выдерживает один узел, — <b>Cluster</b>. В управляемых облачных сервисах оба режима доступны как готовая настройка, и эксплуатация кластера перестаёт быть вашей заботой.
+</div>
+
+<h2 id="sim"><span class="h-num">10.5</span>Интерактив: отказ мастера и работа Sentinel</h2>
+<div class="widget stepper" id="rsnSim">
+  <div class="widget-title">Симулятор: failover Redis под управлением трёх Sentinel</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="rsM"><h5>redis-1</h5><div class="items"><span class="chip ok" data-to="2">MASTER, offset 1000</span><span class="chip bad" data-from="2" data-to="8">недоступен</span><span class="chip warn" data-from="8">вернулся → стал REPLICA, данные 991–1000 стёрты</span></div></div>
+    <div class="lane node" id="rsR1"><h5>redis-2</h5><div class="items"><span class="chip" data-to="6">REPLICA, offset 990</span><span class="chip ok" data-from="6">MASTER, offset 990 → …</span></div></div>
+    <div class="lane node" id="rsR2"><h5>redis-3</h5><div class="items"><span class="chip" data-to="7">REPLICA, offset 985</span><span class="chip" data-from="7">REPLICA нового мастера</span></div></div>
+    <div class="lane node" id="rsS"><h5>Sentinel × 3 (кворум 2)</h5><div class="items"><span class="chip" data-to="3">наблюдают: PING раз в секунду</span><span class="chip warn" data-from="3" data-to="4">S1: +sdown</span><span class="chip bad" data-from="4" data-to="5">+odown (2 из 3)</span><span class="chip info" data-from="5" data-to="8">лидер failover: S2</span><span class="chip ok" data-from="8">наблюдают за redis-2</span></div></div>
+  </div>
+  <section class="st-step" data-t="Норма" data-hl="rsM"><h4>Асинхронная репликация</h4><p>Мастер отвечает клиенту «OK» <b>до</b> того, как запись дошла до реплик. Реплики отстают: redis-2 на 10 записей, redis-3 на 15. Это цена скорости.</p></section>
+  <section class="st-step" data-t="Мастер падает" data-hl="rsM"><h4>redis-1 недоступен</h4><p>Записи 991–1000 клиентам подтверждены, но ни на одной реплике их нет.</p></section>
+  <section class="st-step" data-t="Субъективно недоступен" data-hl="rsS"><h4>+sdown: один Sentinel не получил ответ</h4><p>Sentinel S1 не получает PONG дольше <code>down-after-milliseconds</code> (например, 5 с) и считает мастер недоступным <i>субъективно</i>. Возможно, проблема в сети между S1 и мастером — одного мнения мало.</p></section>
+  <section class="st-step" data-t="Объективно недоступен" data-hl="rsS"><h4>+odown: кворум согласен</h4><p>S1 опрашивает остальных. Если с ним согласны не меньше <code>quorum</code> сентинелей — мастер недоступен <i>объективно</i>. Нечётное число Sentinel в разных зонах защищает от ложных срабатываний при разделе сети.</p></section>
+  <section class="st-step" data-t="Выборы лидера" data-hl="rsS"><h4>Sentinel выбирают, кто проведёт failover</h4><p>Голосование по алгоритму, похожему на Raft: нужен голос <b>большинства всех</b> Sentinel (не кворума из настройки). Если большинство недоступно, failover не начнётся — это защита от split brain.</p></section>
+  <section class="st-step" data-t="Повышение реплики" data-hl="rsR1"><h4>Выбор лучшей реплики → REPLICAOF NO ONE</h4><p>Критерии: приоритет <code>replica-priority</code>, затем наибольший offset репликации (меньше потерь), затем run id. Выбран redis-2 (offset 990).</p></section>
+  <section class="st-step" data-t="Перенастройка" data-hl="rsR2 rsS"><h4>Остальные реплики и клиенты</h4><p>redis-3 получает <code>REPLICAOF redis-2</code>. Клиенты узнают новый адрес у Sentinel (подписка на <code>+switch-master</code>): клиент должен подключаться через Sentinel, а не по жёсткому адресу. Весь процесс — от 10 до 30 секунд, в это время запись недоступна.</p></section>
+  <section class="st-step" data-t="Старый мастер вернулся" data-hl="rsM"><h4>redis-1 становится репликой — и теряет данные</h4><p>Sentinel переводит его в реплики нового мастера. Он отбрасывает свои данные и синхронизируется заново: записи 991–1000, подтверждённые клиентам, <b>потеряны безвозвратно</b>.</p>
+    <p>Уменьшить окно потерь: <code>min-replicas-to-write 1</code> + <code>min-replicas-max-lag 10</code> — мастер перестаёт принимать запись без живых реплик; <code>WAIT numreplicas timeout</code> для критичных команд. Полностью исключить потери Redis с асинхронной репликацией не может — поэтому он не источник истины для денег.</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">10.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Чем RDB отличается от AOF?</p><ul><li>Ничем</li><li>RDB — журнал команд, AOF — снимок</li><li>RDB — периодический снимок всей памяти (компактно, быстрая загрузка, потеря данных с последнего снимка); AOF — журнал каждой записи (меньше потерь, больше файл)</li><li>AOF работает только в кластере</li></ul><div class="why">Обычно включают оба: AOF с fsync раз в секунду ограничивает потери секундой, RDB — для резервных копий.</div></div>
+<div class="mcq" data-ok="1"><p>Как Redis Cluster определяет, на каком узле лежит ключ?</p><ul><li>По первой букве ключа</li><li>CRC16(key) mod 16384 → хэш-слот; слоты распределены между мастерами</li><li>Спрашивает у Sentinel</li><li>Случайно</li></ul><div class="why">Клиент кэширует карту слотов; при перемещении слота получает MOVED/ASK. Многоключевые операции требуют одного слота — хэш-теги <code>{user:1}</code>.</div></div>
+<div class="mcq" data-ok="0"><p>Почему Sentinel-ов должно быть минимум три?</p><ul><li>Для выбора лидера failover нужно большинство; при двух отказ одного блокирует переключение, а раздел сети грозит split brain</li><li>Так быстрее репликация</li><li>Каждый следит за своим узлом</li><li>Требование лицензии</li></ul><div class="why">И размещать их нужно в разных зонах отказа, отдельно от самих узлов Redis.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>RDB или AOF для хранилища сессий, где потеря 5 минут данных неприемлема?</summary><div class="a"><p>AOF с <code>appendfsync everysec</code> (потеря не более секунды), желательно вместе с RDB для быстрого восстановления и бэкапов. Только RDB с редкими снимками потеряет всё с момента последнего снимка. И персистентность не заменяет репликацию: при отказе сервера файл на его диске недоступен.</p></div></details>
+<details class="q"><summary>Почему во время снимка RDB потребление памяти может вырасти почти вдвое?</summary><div class="a"><p>Снимок делает дочерний процесс после <code>fork()</code>, разделяющий страницы памяти с родителем по принципу copy-on-write. Каждая страница, изменённая родителем за время снимка, копируется. При интенсивной записи изменится большая часть страниц — и память будет занята дважды.</p></div></details>
+<details class="q"><summary>Клиент получил OK на SET, а после failover ключа нет. Как это возможно?</summary><div class="a"><p>Репликация асинхронная: мастер подтвердил запись до её передачи реплике и вышел из строя. Повышенная реплика этой записи не имеет. Окно потери сужают <code>min-replicas-to-write</code> и <code>WAIT</code>, но строгой гарантии Redis не даёт.</p></div></details>
+<details class="q"><summary>Зачем Sentinel различает SDOWN и ODOWN?</summary><div class="a"><p>Один наблюдатель мог потерять связь с мастером из-за собственной сетевой проблемы. SDOWN — его личное мнение; переключение по нему приводило бы к ложным срабатываниям и split-brain. ODOWN наступает, когда недоступность подтверждает кворум наблюдателей, а само переключение требует большинства.</p></div></details>
+<details class="q"><summary>В Redis Cluster транзакция <code>MULTI</code> над ключами <code>cart:42</code> и <code>stock:7</code> возвращает ошибку CROSSSLOT. Почему и что делать?</summary><div class="a"><p>Ключи попали в разные слоты (возможно, на разные узлы), а многоключевые операции в кластере допустимы только в пределах одного слота. Варианты: хэш-теги, если ключи логически связаны (<code>{order:99}:cart</code>, <code>{order:99}:stock</code>); изменение модели данных (один хэш вместо двух ключей); перенос координации в приложение.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

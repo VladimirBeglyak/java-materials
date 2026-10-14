@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · StampedLock и оптимистичное чтение</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · LOCKS</div>
+  <h1>StampedLock и оптимистичное чтение</h1>
+  <p class="lead"><code>StampedLock</code> (Java 8) добавляет к чтению и записи третий режим — <b>оптимистичное чтение</b>: читатель вообще ничего не пишет в общую память, просто запоминает версию («штамп»), читает поля и проверяет, не было ли записи. Если не было — данные согласованы, а читатели не мешают друг другу даже на уровне кэша. Платить за это приходится сложностью: копировать поля, терпеть несогласованные значения до проверки, отсутствие реентерабельности.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">штамп</span><span class="tag">tryOptimisticRead</span><span class="tag">validate</span><span class="tag">конверсии</span><span class="tag">не реентерабелен</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pattern"><span class="h-num">12.1</span>Идиома оптимистичного чтения</h2>
+<pre data-title="пример из Javadoc StampedLock"><code class="java">class Point {
+    private double x, y;
+    private final StampedLock sl = new StampedLock();
+
+    void move(double dx, double dy) {
+        long stamp = sl.writeLock();                        // эксклюзивная запись: версия +1
+        try { x += dx; y += dy; } finally { sl.unlockWrite(stamp); }
+    }
+    double distanceFromOrigin() {
+        long stamp = sl.tryOptimisticRead();                // 0, если сейчас идёт запись
+        double curX = x, curY = y;                          // 1) копируем поля в локальные переменные
+        if (!sl.validate(stamp)) {                          // 2) была ли запись после получения штампа?
+            stamp = sl.readLock();                          // 3) да — читаем заново под обычной блокировкой чтения
+            try { curX = x; curY = y; } finally { sl.unlockRead(stamp); }
+        }
+        return Math.hypot(curX, curY);                      // 4) используем только проверенные копии
+    }
+}</code></pre>
+
+<h2 id="sim"><span class="h-num">12.2</span>Симулятор: читатель и писатель</h2>
+<div class="widget" id="stW">
+  <div class="widget-title">Point(x = 3, y = 4); читатель читает оптимистично</div>
+  <div class="controls">
+    <label>когда вмешивается писатель move(1, 1)<select id="stS"><option value="none">не вмешивается</option><option value="between">между чтением x и y</option><option value="after">после чтения обоих, до validate</option><option value="before">до tryOptimisticRead (запись ещё идёт)</option></select></label>
+    <button class="btn primary" type="button" id="stGo">Выполнить</button>
+  </div>
+  <div class="log" id="stLog"></div>
+  <div class="verdict" id="stV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("stS").value, ver = 256, x = 3, y = 4, log = [], cx, cy, stamp, res, path;
+    function write(stage) { ver += 128; x += 1; y += 1; ver += 128; log.push("  ✎ писатель: writeLock (state: бит записи), x=" + x + ", y=" + y + ", unlockWrite → версия " + ver + " " + stage); }
+    if (s === "before") { log.push("писатель держит writeLock в момент чтения"); stamp = 0; log.push("читатель: tryOptimisticRead() → 0 (запись в процессе)"); }
+    else { stamp = ver; log.push("читатель: tryOptimisticRead() → штамп " + stamp + " (без записи в общую память)"); }
+    cx = x; log.push("читатель: curX = x → " + cx);
+    if (s === "between") write("(между чтениями)");
+    cy = y; log.push("читатель: curY = y → " + cy + (s === "between" ? "  ← пара (" + cx + ", " + cy + ") НЕСОГЛАСОВАНА: такой точки никогда не было" : ""));
+    if (s === "after") write("(после чтений)");
+    if (s === "before") { ver += 256; x += 1; y += 1; }
+    var ok = stamp !== 0 && stamp === ver;
+    log.push("читатель: validate(" + stamp + ") → " + ok + (ok ? "" : " (версия изменилась или штамп 0)"));
+    if (!ok) { var r = ver; cx = x; cy = y; log.push("читатель: fallback — readLock(), читаем заново: (" + cx + ", " + cy + "), unlockRead"); path = "bad"; }
+    res = Math.hypot(cx, cy).toFixed(3);
+    log.push("результат: distance = " + res);
+    $("stLog").textContent = log.join("\n");
+    $("stV").className = "verdict " + (ok ? "ok" : "warn");
+    $("stV").textContent = ok ? "Записи не было: результат вычислен без единой записи в общую память — читатели не мешают друг другу и писателю." : s === "after" ? "Пара прочитана согласованной, но writer успел изменить данные до validate — проверка это обнаружила, повторное чтение под блокировкой. Без validate результат был бы устаревшим (а в общем случае — несогласованным)." : s === "between" ? "Самое важное: между чтением полей данные могут быть «разорваны». До validate нельзя ничего делать с прочитанными значениями — ни ветвлений с побочными эффектами, ни бесконечных циклов, ни разыменования ссылок, которые могли стать null." : "Штамп 0 — запись идёт прямо сейчас; validate(0) всегда false. Сразу читаем под блокировкой.";
+  }
+  $("stGo").addEventListener("click", run); $("stS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="api"><span class="h-num">12.3</span>Режимы и конверсии</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th></tr>
+<tr><td><code>writeLock()</code> / <code>tryWriteLock()</code></td><td>эксклюзивная блокировка, возвращает штамп для <code>unlockWrite(stamp)</code></td></tr>
+<tr><td><code>readLock()</code> / <code>tryReadLock()</code></td><td>разделяемая блокировка, <code>unlockRead(stamp)</code></td></tr>
+<tr><td><code>tryOptimisticRead()</code> + <code>validate(stamp)</code></td><td>оптимистичное чтение (без блокировки)</td></tr>
+<tr><td><code>tryConvertToWriteLock(stamp)</code></td><td>повысить чтение/оптимистичное чтение до записи, если возможно (иначе 0 — отпустить и взять запись заново)</td></tr>
+<tr><td><code>tryConvertToReadLock</code>, <code>tryConvertToOptimisticRead</code></td><td>понизить</td></tr>
+<tr><td><code>asReadLock()</code>, <code>asWriteLock()</code>, <code>asReadWriteLock()</code></td><td>представления как Lock — без Condition</td></tr>
+</table></div>
+<pre data-title="условное обновление с повышением блокировки"><code class="java">void moveIfAtOrigin(double newX, double newY) {
+    long stamp = sl.readLock();
+    try {
+        while (x == 0.0 &amp;&amp; y == 0.0) {
+            long ws = sl.tryConvertToWriteLock(stamp);      // атомарно, если мы единственный читатель
+            if (ws != 0L) { stamp = ws; x = newX; y = newY; break; }
+            sl.unlockRead(stamp); stamp = sl.writeLock();   // не вышло — отпустить и взять запись (и перепроверить в цикле)
+        }
+    } finally { sl.unlock(stamp); }
+}</code></pre>
+<div class="callout warn"><span class="c-title">Ограничения</span>
+<b>Не реентерабелен</b>: повторный writeLock в том же потоке — взаимоблокировка с самим собой. <b>Нет Condition</b>. Нет понятия владельца: штамп можно отпустить из другого потока, но ошибки не обнаруживаются. <code>readLock()</code>/<code>writeLock()</code> не прерываемы (есть <code>readLockInterruptibly()</code>). Используйте внутри хорошо изолированных классов, а не как общую блокировку по коду.
+</div>
+
+<h2 id="quiz"><span class="h-num">12.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему оптимистичное чтение масштабируется лучше блокировки чтения?</p><ul><li>Оно использует несколько блокировок</li><li>Читатель ничего не пишет в общую память — нет конкуренции за кэш-линию состояния</li><li>Оно не проверяет данные</li><li>Оно выполняется в отдельном потоке</li></ul><div class="why">Блокировка чтения — CAS по общему state.</div></div>
+<div class="mcq" data-ok="3"><p>Что можно делать с данными, прочитанными оптимистично, до validate?</p><ul><li>Что угодно</li><li>Вызывать методы объектов по прочитанным ссылкам</li><li>Возвращать их вызывающему</li><li>Только копировать в локальные переменные — они могут быть несогласованными</li></ul><div class="why">Действия — только после успешного validate.</div></div>
+<div class="mcq" data-ok="0"><p>Что произойдёт, если поток с writeLock StampedLock снова вызовет writeLock()?</p><ul><li>Он заблокируется навсегда — StampedLock не реентерабелен</li><li>Увеличится счётчик захватов</li><li>IllegalMonitorStateException</li><li>Вернётся тот же штамп</li></ul><div class="why">Главное отличие от ReentrantReadWriteLock.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда StampedLock — правильный выбор?</summary><div class="a"><p>Небольшое изолированное состояние (несколько примитивных полей), читаемое очень часто многими потоками и изменяемое редко, где важна масштабируемость чтения: координаты, статистика, кэш небольших значений. Код блокировок сосредоточен в одном классе, нет вызовов чужого кода под блокировкой, не нужны реентерабельность и условия. Иначе — ReentrantReadWriteLock или неизменяемые снимки.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

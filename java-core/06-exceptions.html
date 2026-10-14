@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Исключения</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ОСНОВА ЯЗЫКА</div>
+  <h1>Исключения</h1>
+  <p class="lead">Исключение — способ сообщить об ошибке так, чтобы её нельзя было случайно проигнорировать. Механизм прост, но именно в обработке ошибок рождается большинство инцидентов: проглоченное исключение, потерянная причина, незакрытый ресурс.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">checked / unchecked</span><span class="tag">try-with-resources</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="hierarchy"><span class="h-num">6.1</span>Иерархия</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="Иерархия Throwable: Error, проверяемые исключения, RuntimeException">
+  <rect x="330" y="14" width="140" height="40" rx="8" class="box"/><text x="400" y="39" text-anchor="middle" font-weight="700" class="mono" font-size="13">Throwable</text>
+  <path d="M400 54 V75 H170 V96" class="ln"/><path d="M400 75 H580 V96" class="ln"/>
+  <rect x="90" y="96" width="160" height="40" rx="8" class="box-bad"/><text x="170" y="121" text-anchor="middle" font-weight="700" class="mono" font-size="13">Error</text>
+  <rect x="500" y="96" width="160" height="40" rx="8" class="box-warn"/><text x="580" y="121" text-anchor="middle" font-weight="700" class="mono" font-size="13">Exception</text>
+  <path d="M170 136 V178" class="ln"/>
+  <rect x="40" y="178" width="260" height="104" rx="8" class="box-bad"/>
+  <g class="mono" font-size="12.5"><text x="56" y="202">OutOfMemoryError</text><text x="56" y="222">StackOverflowError</text><text x="56" y="242">NoClassDefFoundError</text></g>
+  <text x="56" y="268" font-size="12" class="muted">сбой JVM или среды — не перехватывают</text>
+  <path d="M580 136 V152 H440 V178" class="ln"/><path d="M580 152 H675 V166" class="ln"/>
+  <rect x="330" y="178" width="220" height="104" rx="8" class="box-warn"/>
+  <g class="mono" font-size="12.5"><text x="346" y="202">IOException</text><text x="346" y="222">SQLException</text><text x="346" y="242">InterruptedException</text></g>
+  <text x="346" y="268" font-size="12" class="muted">проверяемые (checked)</text>
+  <rect x="570" y="166" width="210" height="34" rx="8" class="box-info"/><text x="675" y="188" text-anchor="middle" font-weight="700" class="mono" font-size="12.5">RuntimeException</text>
+  <rect x="570" y="206" width="210" height="84" rx="8" class="box-info"/>
+  <g class="mono" font-size="12"><text x="582" y="226">NullPointerException</text><text x="582" y="244">IllegalArgumentException</text><text x="582" y="262">IllegalStateException</text><text x="582" y="280">IndexOutOfBoundsException</text></g>
+</svg>
+<figcaption>Компилятор проверяет обработку всего, что наследует <code>Exception</code>, кроме ветви <code>RuntimeException</code>. <code>Error</code> и <code>RuntimeException</code> — непроверяемые.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<tr><th></th><th>Checked</th><th>Unchecked (RuntimeException)</th><th>Error</th></tr>
+<tr><td>Смысл</td><td>Ожидаемый сбой внешнего мира: файла нет, сеть недоступна</td><td>Ошибка в программе или нарушение контракта: <code>null</code>, неверный аргумент</td><td>Среда не может продолжать: нет памяти, нет класса</td></tr>
+<tr><td>Требование компилятора</td><td>Перехватить или объявить в <code>throws</code></td><td>Нет</td><td>Нет</td></tr>
+<tr><td>Что делать</td><td>Обработать или преобразовать</td><td>Исправить код; перехватывать на границе системы</td><td>Не перехватывать; дать процессу завершиться</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Современная практика: непроверяемые по умолчанию</span>
+Проверяемые исключения задумывались как способ заставить обработать ошибку, но на практике приводят к пустым <code>catch</code> и «протекающим» сигнатурам: низкоуровневый <code>SQLException</code> всплывает через пять слоёв. Spring, Hibernate и большинство современных библиотек используют непроверяемые исключения; проверяемые оставляют для случаев, когда вызывающий действительно может и должен отреагировать. Кроме того, они плохо сочетаются с лямбдами (<a href="10-lambdas.html#functional">тема 10</a>).
+</div>
+<p><b><code>ClassNotFoundException</code> и <code>NoClassDefFoundError</code>.</b> Первое — проверяемое исключение: класс запросили по имени во время выполнения (<code>Class.forName</code>), и его нет в classpath. Второе — ошибка: класс был при компиляции, а при выполнении отсутствует или его статическая инициализация ранее завершилась исключением (тогда первым в логе будет <code>ExceptionInInitializerError</code>, и искать нужно его).</p>
+
+<h2 id="try"><span class="h-num">6.2</span>try, catch, finally</h2>
+<pre><code class="java">try {
+    process(file);
+} catch (FileNotFoundException e) {          // сначала более конкретный тип,
+    log.warn("Файл не найден: {}", file);
+} catch (IOException | TimeoutException e) { // затем общий; multi-catch — для одинаковой обработки
+    throw new ImportException("Не удалось обработать " + file, e);
+} finally {
+    cleanup();                               // выполняется при любом исходе
+}</code></pre>
+<ul>
+  <li><b>Порядок <code>catch</code></b>: от частного к общему. Обратный порядок — ошибка компиляции (недостижимый код).</li>
+  <li><b><code>finally</code></b> выполняется после нормального завершения, после <code>return</code>, после исключения. Не выполнится только при <code>System.exit</code>, аварийной остановке JVM или бесконечном цикле в <code>try</code>.</li>
+</ul>
+<pre data-title="три задачи с finally"><code class="java">static int a() {
+    try { return 1; } finally { return 2; }        // 2 — и любое исключение из try будет молча потеряно
+}
+static int b() {
+    int x = 1;
+    try { return x; } finally { x = 2; }           // 1 — возвращаемое значение уже вычислено и сохранено
+}
+static StringBuilder c() {
+    var sb = new StringBuilder("a");
+    try { return sb; } finally { sb.append("b"); } // "ab" — сохранена ссылка, объект изменён
+}</code></pre>
+<div class="callout bad"><span class="c-title">Никогда не пишите return и throw в finally</span>
+Они отменяют всё, что произошло в <code>try</code>: и возвращаемое значение, и летящее исключение. Ошибка исчезает бесследно.
+</div>
+
+<h2 id="twr"><span class="h-num">6.3</span>try-with-resources</h2>
+<p>Всё, что нужно закрывать, — файлы, соединения, потоки ввода-вывода — реализует <code>AutoCloseable</code>. Конструкция <code>try (...)</code> гарантирует вызов <code>close()</code> и правильно обрабатывает ошибки самого закрытия.</p>
+<pre data-title="до Java 7: длинно и теряет исходное исключение" class="bad-code"><code class="java">Connection conn = null;
+try {
+    conn = dataSource.getConnection();
+    work(conn);                        // бросило SQLException A
+} finally {
+    if (conn != null) conn.close();    // бросило SQLException B — A потеряно навсегда
+}</code></pre>
+<pre class="good-code"><code class="java">try (Connection conn = dataSource.getConnection();
+     PreparedStatement ps = conn.prepareStatement(sql)) {
+    work(ps);
+}   // закрытие в обратном порядке: сначала ps, затем conn</code></pre>
+<ul>
+  <li><b>Порядок закрытия обратен порядку открытия.</b></li>
+  <li><b>Подавленные исключения.</b> Если тело бросило исключение, а <code>close()</code> — ещё одно, наружу летит исключение из тела, а второе прикрепляется к нему и доступно через <code>getSuppressed()</code>. В стектрейсе оно помечено <code>Suppressed:</code>.</li>
+  <li><b><code>Files.lines()</code>, <code>Files.walk()</code></b> и другие стримы поверх ресурсов тоже нужно закрывать через try-with-resources (<a href="13-io.html#files">тема 13</a>).</li>
+</ul>
+
+<h2 id="custom"><span class="h-num">6.4</span>Свои исключения и перевод между слоями</h2>
+<pre><code class="java">public class OrderNotFoundException extends RuntimeException {
+    private final long orderId;
+    public OrderNotFoundException(long orderId) {
+        super("Заказ не найден: id=" + orderId);     // сообщение с контекстом
+        this.orderId = orderId;
+    }
+    public long orderId() { return orderId; }
+}
+
+try {
+    return jdbc.queryForObject(sql, mapper, id);
+} catch (EmptyResultDataAccessException e) {
+    throw new OrderNotFoundException(id);           // перевод на язык предметной области
+} catch (DataAccessException e) {
+    throw new StorageException("Ошибка чтения заказа " + id, e);   // причина сохранена
+}</code></pre>
+<ul>
+  <li><b>Каждый слой говорит на своём языке.</b> Сервис не должен знать о <code>SQLException</code>; контроллер — о деталях хранилища.</li>
+  <li><b>Причину передают всегда</b> — вторым аргументом конструктора. Без неё в логе останется «Ошибка чтения заказа» без единого намёка, что именно сломалось.</li>
+  <li><b>Стандартные исключения</b> для нарушений контракта: <code>IllegalArgumentException</code> — плохой аргумент, <code>IllegalStateException</code> — объект не в том состоянии, <code>UnsupportedOperationException</code> — операция не поддерживается, <code>NullPointerException</code> — через <code>Objects.requireNonNull(x, "x")</code>.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Исключения дороги — не для обычного хода программы</span>
+При создании исключения JVM обходит стек вызовов и сохраняет его (<code>fillInStackTrace</code>) — это на порядки дороже обычного возврата из метода, и чем глубже стек, тем дороже. Проверять «есть ли пользователь» через <code>try/catch</code> в цикле на миллион итераций нельзя. Для ожидаемых ситуаций — <code>Optional</code>, пустая коллекция или результат-объект. Там, где исключение всё же служит сигналом на горячем пути, стектрейс отключают четвёртым параметром конструктора (<code>writableStackTrace = false</code>).
+</div>
+
+<h2 id="antipatterns"><span class="h-num">6.5</span>Антипаттерны</h2>
+<div class="table-wrap"><table>
+<tr><th>Что пишут</th><th>Чем плохо</th><th>Как правильно</th></tr>
+<tr><td><code>catch (Exception e) { }</code></td><td>Ошибка проглочена, программа продолжает с неверным состоянием</td><td>Обработать, преобразовать или не перехватывать</td></tr>
+<tr><td><code>e.printStackTrace()</code></td><td>Пишет в <code>stderr</code> мимо системы логирования</td><td><code>log.error("…", e)</code> — исключение последним аргументом</td></tr>
+<tr><td><code>log.error(e.getMessage())</code></td><td>Нет ни типа, ни стека, ни причины</td><td><code>log.error("Контекст", e)</code></td></tr>
+<tr><td><code>log.error(…, e); throw e;</code></td><td>Одно исключение в логе пять раз — на каждом слое</td><td>Либо логировать, либо пробрасывать; логирует тот, кто обрабатывает</td></tr>
+<tr><td><code>throw new MyException(e.getMessage())</code></td><td>Потеряны причина и исходный стек</td><td><code>new MyException("…", e)</code></td></tr>
+<tr><td><code>catch (Throwable t)</code></td><td>Перехватывает <code>OutOfMemoryError</code> — процесс продолжает жить в непригодном состоянии</td><td><code>catch (Exception e)</code>, и только на границе: обработчик запроса, поток-воркер</td></tr>
+<tr><td><code>catch (NullPointerException e)</code></td><td>Маскирует ошибку в коде</td><td>Проверить на <code>null</code> заранее</td></tr>
+<tr><td><code>catch (InterruptedException e) { }</code></td><td>Поток «забывает» запрос на остановку</td><td>Восстановить флаг: <code>Thread.currentThread().interrupt()</code> (<a href="../java-concurrency/01-threads.html">Java Concurrency, тема 01</a>)</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Где перехватывать</span>
+Исключение ловят там, где с ним можно что-то сделать: повторить, подставить запасное значение, преобразовать в ответ пользователю. В типичном сервисе таких мест немного — граница системы (<code>@RestControllerAdvice</code>, обработчик сообщения из очереди, планировщик) и точки интеграции с внешними системами. Весь код между ними исключения не перехватывает.
+</div>
+
+<h2 id="errors"><span class="h-num">6.6</span>Ошибки, которые нужно узнавать</h2>
+<div class="table-wrap"><table>
+<tr><th>Ошибка</th><th>Причина</th><th>Куда смотреть</th></tr>
+<tr><td><code>StackOverflowError</code></td><td>Бесконечная или слишком глубокая рекурсия</td><td>Условие выхода; циклические ссылки в <code>toString</code>/<code>equals</code>; сериализация графа в JSON</td></tr>
+<tr><td><code>OutOfMemoryError: Java heap space</code></td><td>Куча заполнена живыми объектами</td><td>Дамп кучи: утечка или слишком большой запрос (<a href="14-memory-gc.html#leaks">тема 14</a>)</td></tr>
+<tr><td><code>ExceptionInInitializerError</code></td><td>Исключение в статическом инициализаторе</td><td>Поле <code>Caused by</code>; все следующие обращения к классу дадут <code>NoClassDefFoundError</code></td></tr>
+<tr><td><code>ClassCastException</code></td><td>Приведение к несовместимому типу</td><td>Сырые типы generics; один класс, загруженный двумя загрузчиками (<a href="15-classloading-reflection.html#loaders">тема 15</a>)</td></tr>
+<tr><td><code>ConcurrentModificationException</code></td><td>Коллекция изменена во время обхода</td><td>Чаще всего — удаление в цикле <code>for-each</code> в одном потоке (<a href="08-collections.html#iterators">тема 08</a>)</td></tr>
+</table></div>
+<p><b>Как читать стектрейс</b>: первая строка — тип и сообщение; далее кадры сверху вниз от места возникновения к точке входа. При цепочке причин самое важное — <b>последний</b> блок <code>Caused by</code>: это исходная ошибка. Ищите в нём первую строку с пакетом вашего приложения.</p>
+
+<h2 id="lab"><span class="h-num">6.7</span>Интерактив: поток управления try / catch / finally</h2>
+<pre data-title="Метод, который исследуем"><code class="java">static int run() {
+    try (Res r = new Res()) {          // Res.close() печатает "close" и может бросить исключение
+        print("try");
+        /* A: здесь может быть исключение или return 1 */
+    } catch (IllegalStateException e) {
+        print("catch");
+        /* B: здесь может быть новое исключение или return 2 */
+    } finally {
+        print("finally");
+        /* C: здесь может быть return 3 или исключение */
+    }
+    print("after");
+    return 0;
+}</code></pre>
+<div class="widget" id="tcW">
+  <div class="widget-title">Симулятор: что напечатает и что вернёт run()</div>
+  <div class="controls">
+    <label>A: в try<select id="tcA"><option value="ok">ничего особенного</option><option value="ret">return 1</option><option value="ise">throw new IllegalStateException("try")</option><option value="io">throw new UncheckedIOException (не ловится catch)</option></select></label>
+    <label>close()<select id="tcClose"><option value="ok">закрывается нормально</option><option value="ex">бросает IllegalStateException("close")</option></select></label>
+    <label>B: в catch<select id="tcB"><option value="ok">ничего особенного</option><option value="ret">return 2</option><option value="ex">throw new RuntimeException("catch")</option></select></label>
+    <label>C: в finally<select id="tcC"><option value="ok">ничего особенного</option><option value="ret">return 3</option><option value="ex">throw new RuntimeException("finally")</option></select></label>
+  </div>
+  <div class="log" id="tcLog"></div>
+  <div class="verdict" id="tcOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var A = $("tcA").value, CL = $("tcClose").value, B = $("tcB").value, C = $("tcC").value, L = [], notes = [];
+    var pending = null, ret = null; // pending: {type, msg, suppressed}
+    L.push("try");
+    if (A === "ret") ret = 1;
+    else if (A === "ise") pending = { type: "IllegalStateException", msg: "try", sup: [] };
+    else if (A === "io") pending = { type: "UncheckedIOException", msg: "try", sup: [] };
+    L.push("close      ← ресурс закрывается сразу при выходе из try, ДО catch и finally");
+    if (CL === "ex") {
+      if (pending) { pending.sup.push("IllegalStateException(close)"); notes.push("Исключение из close() не потеряно: оно добавлено к основному как подавленное — e.getSuppressed()."); }
+      else { pending = { type: "IllegalStateException", msg: "close", sup: [] }; if (ret !== null) { notes.push("return 1 отменён исключением из close()."); ret = null; } }
+    }
+    if (pending && pending.type === "IllegalStateException") {
+      L.push("catch      ← поймано IllegalStateException(" + pending.msg + ")" + (pending.sup.length ? " с подавленным " + pending.sup[0] : ""));
+      pending = null;
+      if (B === "ret") ret = 2;
+      else if (B === "ex") pending = { type: "RuntimeException", msg: "catch", sup: [] };
+    } else if (pending) { notes.push("catch (IllegalStateException) не подходит по типу — исключение летит дальше, но finally выполнится."); }
+    L.push("finally    ← выполняется всегда" + (ret !== null ? " (значение return " + ret + " уже вычислено и ждёт)" : ""));
+    if (C === "ret") {
+      if (pending) notes.push("return в finally ПРОГЛОТИЛ исключение " + pending.type + "(" + pending.msg + ") — оно бесследно исчезло.");
+      else if (ret !== null) notes.push("return 3 в finally заменил return " + ret + ".");
+      pending = null; ret = 3;
+    } else if (C === "ex") {
+      if (pending) notes.push("Исключение из finally ЗАМЕНИЛО " + pending.type + "(" + pending.msg + ") — исходное потеряно (без suppressed).");
+      else if (ret !== null) notes.push("Исключение из finally отменило return " + ret + ".");
+      pending = { type: "RuntimeException", msg: "finally", sup: [] }; ret = null;
+    }
+    var o = $("tcOut");
+    if (pending) { o.className = "verdict bad"; o.innerHTML = "<b>Метод завершился исключением " + pending.type + '("' + pending.msg + '")</b>' + (pending.sup.length ? ", suppressed: " + pending.sup.join(", ") : "") + ". " + notes.join(" "); }
+    else {
+      if (ret === null) { L.push("after"); ret = 0; }
+      o.className = "verdict " + (notes.some(function (n) { return /ПРОГЛОТИЛ|ЗАМЕНИЛ/.test(n); }) ? "warn" : "ok");
+      o.innerHTML = "<b>Метод вернул " + ret + ".</b> " + notes.join(" ");
+    }
+    $("tcLog").textContent = L.join("\n");
+  }
+  ["tcA", "tcClose", "tcB", "tcC"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) A = исключение, C = <code>return 3</code> — исключение исчезает без следа; поэтому <code>return</code> и <code>throw</code> в finally считаются ошибкой. (2) A = исключение и close() бросает — второе не теряется, а прикрепляется как suppressed. (3) A = <code>return 1</code> — finally всё равно выполняется.</p>
+
+<h2 id="quiz"><span class="h-num">6.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Чем checked-исключения отличаются от unchecked?</p><ul><li>Checked быстрее</li><li>Unchecked нельзя ловить</li><li>Checked компилятор заставляет обработать или объявить в throws; unchecked (RuntimeException и Error) — нет</li><li>Checked наследуют Error</li></ul><div class="why">Checked — для ожидаемых ситуаций, из которых вызывающий может восстановиться (IOException). Unchecked — ошибки программирования и нарушения контракта.</div></div>
+<div class="mcq" data-ok="1"><p>В каком порядке закрываются ресурсы в <code>try (A a = …; B b = …)</code>?</p><ul><li>a, затем b</li><li>b, затем a — в обратном порядке объявления</li><li>Одновременно</li><li>Порядок не определён</li></ul><div class="why">Как стек: последний открытый закрывается первым — он может зависеть от предыдущих.</div></div>
+<div class="mcq" data-ok="0"><p>Что плохого в <code>catch (Exception e) { log.error("failed"); }</code>?</p><ul><li>Теряется стектрейс и причина, ошибка проглочена, выполнение продолжается в некорректном состоянии</li><li>Exception нельзя ловить</li><li>Ничего плохого</li><li>Нужен ещё finally</li></ul><div class="why">Минимум — <code>log.error("failed", e)</code> и осмысленная реакция: проброс, обёртка с причиной (<code>new MyException("…", e)</code>) или обоснованное восстановление.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем проверяемые исключения отличаются от непроверяемых и когда какие использовать?</summary><div class="a"><p>Проверяемые (наследники <code>Exception</code>, кроме <code>RuntimeException</code>) компилятор требует перехватить или объявить. Они подходят для ожидаемых сбоев, на которые вызывающий может отреагировать. Непроверяемые — для ошибок программирования и нарушений контракта. В современном коде по умолчанию выбирают непроверяемые, а внешние проверяемые оборачивают на границе слоя.</p></div></details>
+<details class="q"><summary>Что вернёт метод <code>try { return 1; } finally { return 2; }</code> и что в нём опасно?</summary><div class="a"><p>2. <code>return</code> в <code>finally</code> заменяет результат блока <code>try</code> — и точно так же уничтожает любое исключение, вылетевшее из <code>try</code>: метод вернётся нормально, будто ошибки не было.</p></div></details>
+<details class="q"><summary>Что такое подавленное исключение?</summary><div class="a"><p>Исключение, возникшее при автоматическом закрытии ресурса, когда тело <code>try</code> уже бросило другое. Основным остаётся исключение из тела, а исключение из <code>close()</code> добавляется к нему и доступно через <code>getSuppressed()</code>. В ручном <code>finally</code> произошло бы обратное: исключение закрытия вытеснило бы исходное.</p></div></details>
+<details class="q"><summary>В логе <code>NoClassDefFoundError: Could not initialize class com.shop.Config</code>, хотя класс в архиве есть. В чём причина?</summary><div class="a"><p>Статическая инициализация класса при первом обращении завершилась исключением — в логе раньше должен быть <code>ExceptionInInitializerError</code> с настоящей причиной (например, не найден файл настроек). После неудачной инициализации класс помечается непригодным, и все последующие обращения дают эту ошибку.</p></div></details>
+<details class="q"><summary>Почему нельзя перехватывать Throwable?</summary><div class="a"><p>Вместе с исключениями будут перехвачены <code>Error</code>: нехватка памяти, переполнение стека, ошибки загрузки классов. После них состояние JVM может быть неконсистентным, и продолжение работы приводит к повреждению данных или зависанию. Исключение — самый верх потока-воркера, где ошибку логируют и корректно завершают работу.</p></div></details>
+<details class="q"><summary>Почему исключения нельзя использовать для управления обычным ходом программы?</summary><div class="a"><p>Создание исключения требует обхода и сохранения стека вызовов, что намного дороже обычного возврата; оно скрывает логику («переход» не виден в сигнатуре); мешает оптимизациям JIT. Ожидаемые исходы — «не найдено», «невалидно» — выражают возвращаемым значением: <code>Optional</code>, результатом-объектом, пустой коллекцией.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

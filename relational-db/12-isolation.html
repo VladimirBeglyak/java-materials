@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Уровни изоляции на практике</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ТРАНЗАКЦИИ И КОНКУРЕНТНОСТЬ</div>
+  <h1>Уровни изоляции на практике</h1>
+  <p class="lead">Буква I в ACID — самая коварная: по умолчанию база <b>не</b> гарантирует, что параллельные транзакции ведут себя как последовательные. Разбираем аномалии на конкретных сценариях (потерянное обновление, неповторяемое чтение, фантомы, write skew), что от чего защищает в PostgreSQL и MySQL и какие приёмы применять в коде.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">аномалии</span><span class="tag">READ COMMITTED</span><span class="tag">REPEATABLE READ</span><span class="tag">SERIALIZABLE</span><span class="tag">@Version</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="anomalies"><span class="h-num">12.1</span>Аномалии</h2>
+<div class="table-wrap"><table>
+<tr><th>Аномалия</th><th>Что происходит</th><th>Пример ущерба</th></tr>
+<tr><td>Грязное чтение</td><td>видны незафиксированные изменения чужой транзакции</td><td>показали деньги, которых не будет после отката</td></tr>
+<tr><td>Неповторяемое чтение</td><td>повторное чтение строки даёт другое значение</td><td>расчёт по двум чтениям одной строки не сходится</td></tr>
+<tr><td>Фантом</td><td>повторный запрос по условию возвращает другие строки</td><td>отчёт: сумма и количество посчитаны по разным наборам</td></tr>
+<tr><td>Искажение чтения (read skew)</td><td>разные строки прочитаны в разных состояниях</td><td>сумма по счетам «теряет» или «создаёт» деньги</td></tr>
+<tr><td>Потерянное обновление</td><td>две транзакции читают, вычисляют и пишут — одна запись затирает другую</td><td>остаток на складе, счётчик, баланс неверны</td></tr>
+<tr><td>Искажение записи (write skew)</td><td>обе проверяют инвариант по общим данным и меняют <b>разные</b> строки</td><td>оба дежурных врача снялись с дежурства; товар продан дважды</td></tr>
+</table></div>
+
+<h2 id="levels"><span class="h-num">12.2</span>Что гарантирует каждый уровень</h2>
+<div class="table-wrap"><table>
+<tr><th>Аномалия</th><th>READ COMMITTED (PG, по умолчанию)</th><th>REPEATABLE READ (PG)</th><th>REPEATABLE READ (MySQL, по умолчанию)</th><th>SERIALIZABLE (PG)</th></tr>
+<tr><td>Грязное чтение</td><td>✔ нет</td><td>✔ нет</td><td>✔ нет</td><td>✔ нет</td></tr>
+<tr><td>Неповторяемое чтение</td><td>✘ есть</td><td>✔ нет</td><td>✔ нет (обычный SELECT)</td><td>✔ нет</td></tr>
+<tr><td>Фантом</td><td>✘ есть</td><td>✔ нет</td><td>✔ для обычного SELECT; для <code>FOR UPDATE</code> — gap-блокировки</td><td>✔ нет</td></tr>
+<tr><td>Read skew</td><td>✘ есть</td><td>✔ нет</td><td>✔ нет</td><td>✔ нет</td></tr>
+<tr><td>Потерянное обновление</td><td>✘ есть (при чтении в приложение)</td><td>✔ ошибка сериализации</td><td>✘ есть: UPDATE читает текущую версию</td><td>✔ ошибка сериализации</td></tr>
+<tr><td>Write skew</td><td>✘ есть</td><td>✘ есть</td><td>✘ есть</td><td>✔ ошибка сериализации (SSI)</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">REPEATABLE READ в PostgreSQL — на самом деле Snapshot Isolation</span>
+Вся транзакция видит один снимок, поэтому в ней нет ни неповторяемых чтений, ни фантомов (стандарт SQL их здесь допускает). Но snapshot isolation не равна сериализуемости: остаётся write skew. SERIALIZABLE в PostgreSQL — это SSI: отслеживаются зависимости «прочитал то, что другой изменил», и при опасном цикле одна из транзакций получает ошибку <code>40001</code>.
+</div>
+
+<h2 id="sim"><span class="h-num">12.3</span>Симулятор аномалий</h2>
+<div class="widget" id="anW">
+  <div class="widget-title">Выберите сценарий и уровень изоляции</div>
+  <div class="controls">
+    <label>сценарий<select id="anS">
+      <option value="lost">Потерянное обновление: склад</option>
+      <option value="nonrep">Неповторяемое чтение: цена</option>
+      <option value="phantom">Фантом: отчёт по новым заказам</option>
+      <option value="readskew">Read skew: сумма по счетам</option>
+      <option value="skew">Write skew: дежурные врачи</option>
+    </select></label>
+    <label>уровень<select id="anL"><option value="rc">READ COMMITTED</option><option value="rr">REPEATABLE READ</option><option value="ser">SERIALIZABLE</option></select></label>
+  </div>
+  <div class="table-wrap"><table id="anT"></table></div>
+  <div class="verdict" id="anV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var D = {
+    lost: {
+      base: [["SELECT qty FROM stock WHERE id=1 → 10", ""], ["", "SELECT qty FROM stock WHERE id=1 → 10"], ["приложение: 10 − 3 = 7", ""], ["UPDATE stock SET qty = 7 WHERE id=1", ""], ["COMMIT", ""], ["", "приложение: 10 − 2 = 8"]],
+      rc: [[["", "UPDATE stock SET qty = 8 WHERE id=1"], ["", "COMMIT"]], "bad", "Итог qty = 8, хотя продано 5 из 10 — ожидалось 5. Обновление A потеряно. Защита: атомарный UPDATE … SET qty = qty − 2 WHERE qty >= 2, SELECT … FOR UPDATE или оптимистическая блокировка (@Version)."],
+      rr: [[["", "UPDATE stock SET qty = 8 WHERE id=1"], ["", "ERROR 40001: could not serialize access due to concurrent update"], ["", "ROLLBACK → повтор: читает 7, пишет 5"]], "ok", "PostgreSQL REPEATABLE READ обнаруживает, что строку изменила транзакция, невидимая снимку B, и прерывает B. После повтора qty = 5. Внимание: в MySQL REPEATABLE READ этой защиты нет — UPDATE затрёт значение."],
+      ser: [[["", "UPDATE stock SET qty = 8 WHERE id=1"], ["", "ERROR 40001: could not serialize access"], ["", "ROLLBACK → повтор: читает 7, пишет 5"]], "ok", "Как и REPEATABLE READ: ошибка сериализации, повтор даёт верное qty = 5. Приложение обязано уметь повторять транзакцию."]
+    },
+    nonrep: {
+      base: [["BEGIN; SELECT price FROM products WHERE id=1 → 100", ""], ["", "UPDATE products SET price = 120 WHERE id=1; COMMIT"]],
+      rc: [[["SELECT price FROM products WHERE id=1 → 120", ""], ["счёт: позиция по 100, итог по 120", ""]], "bad", "В READ COMMITTED каждый запрос берёт новый снимок: второй SELECT видит 120. Документ, собранный из двух чтений, противоречив."],
+      rr: [[["SELECT price FROM products WHERE id=1 → 100", ""], ["COMMIT", ""]], "ok", "Снимок взят на всю транзакцию: оба чтения дают 100. Документ согласован (на момент начала транзакции)."],
+      ser: [[["SELECT price FROM products WHERE id=1 → 100", ""], ["COMMIT", ""]], "ok", "Как в REPEATABLE READ — один снимок."]
+    },
+    phantom: {
+      base: [["BEGIN; SELECT count(*) FROM orders WHERE status='new' → 3", ""], ["", "INSERT INTO orders(status) VALUES ('new'); COMMIT"]],
+      rc: [[["SELECT sum(total) FROM orders WHERE status='new' → сумма по 4 заказам", ""]], "bad", "Отчёт: «3 заказа на сумму …» — где сумма включает четвёртый. Каждый запрос видит свой снимок."],
+      rr: [[["SELECT sum(total) FROM orders WHERE status='new' → сумма по 3 заказам", ""]], "ok", "В PostgreSQL REPEATABLE READ фантомов нет: новый заказ создан после снимка и невидим."],
+      ser: [[["SELECT sum(total) FROM orders WHERE status='new' → сумма по 3 заказам", ""]], "ok", "Фантомов нет. Если бы A ещё и писала на основе этого чтения, SSI проследил бы зависимость."]
+    },
+    readskew: {
+      base: [["BEGIN; SELECT balance FROM acc WHERE id='X' → 50", ""], ["", "перевод 30: X = 20, Y = 80; COMMIT"]],
+      rc: [[["SELECT balance FROM acc WHERE id='Y' → 80", ""], ["итог 50 + 80 = 130", ""]], "bad", "Деньги «появились»: X прочитан до перевода, Y — после. Сверки и отчёты на READ COMMITTED с несколькими запросами — источник ложных расхождений. Один запрос SELECT sum(balance) был бы согласован."],
+      rr: [[["SELECT balance FROM acc WHERE id='Y' → 50", ""], ["итог 50 + 50 = 100", ""]], "ok", "Один снимок — согласованное состояние на момент начала. Отчёты и выгрузки запускайте в REPEATABLE READ (лучше — READ ONLY на реплике)."],
+      ser: [[["SELECT balance FROM acc WHERE id='Y' → 50", ""], ["итог 100", ""]], "ok", "Согласовано. Для read-only отчёта можно SERIALIZABLE READ ONLY DEFERRABLE — гарантированно без ошибок сериализации."]
+    },
+    skew: {
+      base: [["SELECT count(*) FROM doctors WHERE on_call → 2", ""], ["", "SELECT count(*) FROM doctors WHERE on_call → 2"], ["2 > 1, можно уйти: UPDATE doctors SET on_call=false WHERE name='Алиса'", ""], ["", "2 > 1, можно уйти: UPDATE doctors SET on_call=false WHERE name='Боб'"], ["COMMIT", ""]],
+      rc: [[["", "COMMIT"]], "bad", "Ни одного дежурного. Транзакции меняли разные строки — блокировок не было, конфликта не было. Инвариант «хотя бы один дежурный» нарушен."],
+      rr: [[["", "COMMIT"]], "bad", "Snapshot isolation не помогает: каждая видела 2 дежурных и меняла свою строку. Write skew — главное отличие REPEATABLE READ от SERIALIZABLE."],
+      ser: [[["", "COMMIT → ERROR 40001: could not serialize access due to read/write dependencies"], ["", "повтор: count → 1, уйти нельзя"]], "ok", "SSI видит цикл: A прочитала строку, которую изменила B, и наоборот. Вторая транзакция прервана, после повтора инвариант сохранён. Альтернативы без SERIALIZABLE: SELECT … FOR UPDATE всех дежурных, явная блокировка общего ресурса (строка «смена», advisory lock), ограничение в схеме."]
+    }
+  };
+  function run() {
+    var d = D[$("anS").value], l = d[$("anL").value], rows = d.base.concat(l[0]);
+    $("anT").innerHTML = "<tr><th>#</th><th>Транзакция A</th><th>Транзакция B</th></tr>" + rows.map(function (r, i) { return "<tr><td>" + (i + 1) + "</td><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>"; }).join("");
+    $("anV").className = "verdict " + l[1]; $("anV").textContent = (l[1] === "ok" ? "✔ " : "✘ ") + l[2];
+  }
+  ["anS", "anL"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="patterns"><span class="h-num">12.4</span>Приёмы защиты в коде</h2>
+<div class="table-wrap"><table>
+<tr><th>Приём</th><th>Когда</th><th>Цена</th></tr>
+<tr><td>Атомарный UPDATE с условием</td><td>счётчики, остатки, балансы: <code>SET qty = qty − :n WHERE id = :id AND qty &gt;= :n</code>, проверить число изменённых строк</td><td>почти бесплатно — лучший вариант, когда логика выражается в SQL</td></tr>
+<tr><td>Пессимистическая блокировка <code>SELECT … FOR UPDATE</code></td><td>сложная логика между чтением и записью, высокая конкуренция за строку</td><td>ожидания, риск deadlock (тема 13), держать коротко</td></tr>
+<tr><td>Оптимистическая блокировка (<code>@Version</code>)</td><td>низкая конкуренция, долгие «пользовательские» сценарии (форма редактирования)</td><td>при конфликте — исключение и повтор/сообщение пользователю</td></tr>
+<tr><td>SERIALIZABLE + повтор</td><td>сложные инварианты по многим строкам (write skew), когда сложно перечислить блокировки</td><td>ошибки 40001 под нагрузкой, обязательный повтор всей транзакции</td></tr>
+<tr><td>Ограничения в схеме</td><td>UNIQUE, CHECK, EXCLUDE, внешние ключи — инвариант проверяет база</td><td>не все инварианты выразимы</td></tr>
+</table></div>
+<pre data-title="три способа списать остаток в Spring"><code class="java">// 1. Атомарный UPDATE — предпочтительно
+@Modifying
+@Query("update Stock s set s.qty = s.qty - :n where s.id = :id and s.qty &gt;= :n")
+int reserve(long id, int n);          // 0 → недостаточно товара
+
+// 2. Пессимистическая блокировка: SELECT … FOR UPDATE
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "3000"))
+Optional&lt;Stock&gt; findLockedById(long id);
+
+// 3. Оптимистическая: UPDATE … SET version = version + 1 WHERE id = ? AND version = ?
+@Entity class Stock { @Id Long id; int qty; @Version long version; }
+// конфликт → ObjectOptimisticLockingFailureException → повтор
+
+// повтор при 40001/40P01/оптимистическом конфликте — снаружи транзакции!
+@Retryable(retryFor = { CannotAcquireLockException.class, ObjectOptimisticLockingFailureException.class },
+           maxAttempts = 3, backoff = @Backoff(delay = 50, multiplier = 2, random = true))
+@Transactional(isolation = Isolation.SERIALIZABLE)
+public void transfer(...) { ... }</code></pre>
+<div class="callout warn"><span class="c-title">Повтор должен охватывать всю транзакцию</span>
+После ошибки сериализации транзакция мертва: повторять нужно с BEGIN, перечитав данные. Если <code>@Retryable</code> стоит внутри <code>@Transactional</code>-метода, повтор произойдёт в уже прерванной транзакции. И помните о побочных эффектах: отправленное письмо повтором не отменить — выносите их после коммита (outbox).
+</div>
+
+<h2 id="choose"><span class="h-num">12.5</span>Как выбирать уровень</h2>
+<ul>
+  <li><b>READ COMMITTED</b> — по умолчанию для OLTP. Достаточно, если запись идёт атомарными UPDATE, ограничениями и явными блокировками там, где читаете-проверяете-пишете.</li>
+  <li><b>REPEATABLE READ</b> — отчёты, выгрузки, сверки: согласованный снимок для нескольких запросов. В PostgreSQL ещё и защита от потерянного обновления (с повтором).</li>
+  <li><b>SERIALIZABLE</b> — когда корректность важнее пропускной способности и инварианты сложны. Требует повторов и коротких транзакций; объявляйте read-only транзакции как <code>READ ONLY</code> — им меньше ошибок.</li>
+</ul>
+<pre data-title="уровень на транзакцию"><code class="sql">BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+-- … отчёт …
+COMMIT;
+
+SET default_transaction_isolation = 'serializable';   -- для роли или базы</code></pre>
+
+<h2 id="quiz"><span class="h-num">12.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="3"><p>Какой уровень изоляции PostgreSQL защищает от write skew?</p><ul><li>READ COMMITTED</li><li>REPEATABLE READ</li><li>Никакой</li><li>SERIALIZABLE</li></ul><div class="why">Snapshot isolation (REPEATABLE READ) не видит конфликт, когда транзакции пишут разные строки.</div></div>
+<div class="mcq" data-ok="1"><p>Самый простой и надёжный способ списать товар со склада без потерянных обновлений?</p><ul><li>SELECT, проверить в Java, UPDATE с новым значением</li><li><code>UPDATE stock SET qty = qty - :n WHERE id = :id AND qty &gt;= :n</code> и проверка числа изменённых строк</li><li>synchronized-метод в Java</li><li>Кэш в Redis</li></ul><div class="why">Проверка и изменение атомарны внутри одной команды; synchronized не работает при нескольких экземплярах приложения.</div></div>
+<div class="mcq" data-ok="0"><p>Что должно сделать приложение при ошибке 40001?</p><ul><li>Повторить транзакцию целиком с начала</li><li>Повторить только последнюю команду</li><li>Проигнорировать</li><li>Перезапустить базу</li></ul><div class="why">Транзакция прервана; повторять нужно с BEGIN и перечитыванием данных.</div></div>
+<div class="mcq" data-ok="2"><p>Чем отличается REPEATABLE READ в MySQL InnoDB от PostgreSQL в контексте потерянного обновления?</p><ul><li>Ничем</li><li>MySQL выдаёт ошибку сериализации, PostgreSQL — нет</li><li>В MySQL UPDATE работает с текущей зафиксированной версией (current read), и обновление может быть потеряно без ошибки</li><li>MySQL не поддерживает REPEATABLE READ</li></ul><div class="why">В InnoDB для защиты нужен SELECT … FOR UPDATE или атомарный UPDATE.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните разницу между оптимистической и пессимистической блокировкой и когда что выбирать.</summary><div class="a"><p>Пессимистическая: блокировать строку при чтении (FOR UPDATE), другие ждут. Подходит при высокой конкуренции и коротких операциях. Оптимистическая: не блокировать, а при записи проверять, что версия не изменилась (WHERE version = ?); при конфликте — повтор или ошибка пользователю. Подходит при редких конфликтах и длинных сценариях (форма открыта минуты — держать блокировку нельзя).</p></div></details>
+<details class="q"><summary>Как реализовать «не продать больше билетов, чем мест» при конкурентных покупках?</summary><div class="a"><p>Варианты: атомарный UPDATE счётчика свободных мест с условием <code>free &gt; 0</code>; если места именные — UNIQUE (event_id, seat_no) на таблице билетов; при сложной логике — SELECT … FOR UPDATE строки события, затем проверки и вставка; или SERIALIZABLE с повтором. Нельзя: проверить count(*) и вставить в READ COMMITTED/REPEATABLE READ без блокировки — это write skew.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

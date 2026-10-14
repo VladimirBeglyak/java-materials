@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Функциональные эндпоинты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · WEBFLUX</div>
+  <h1>Функциональные эндпоинты</h1>
+  <p class="lead">Альтернатива аннотациям: маршруты описываются кодом — <code>RouterFunction</code> сопоставляет запрос с <code>HandlerFunction</code>, которая принимает <code>ServerRequest</code> и возвращает <code>Mono&lt;ServerResponse&gt;</code>. Никакой рефлексии и сканирования: маршрутизация явная, её легко тестировать и собирать из частей. Разбираем DSL, предикаты, вложенность, фильтры и порядок сопоставления.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">RouterFunction</span><span class="tag">HandlerFunction</span><span class="tag">ServerRequest</span><span class="tag">ServerResponse</span><span class="tag">RequestPredicates</span><span class="tag">HandlerFilterFunction</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">12.1</span>Модель</h2>
+<pre data-title="Два интерфейса"><code class="java">@FunctionalInterface
+public interface HandlerFunction&lt;T extends ServerResponse&gt; {
+    Mono&lt;T&gt; handle(ServerRequest request);
+}
+@FunctionalInterface
+public interface RouterFunction&lt;T extends ServerResponse&gt; {
+    Mono&lt;HandlerFunction&lt;T&gt;&gt; route(ServerRequest request);   // пустой Mono = «не мой запрос»
+    default RouterFunction&lt;T&gt; and(RouterFunction&lt;T&gt; other) { ... }
+    default RouterFunction&lt;T&gt; filter(HandlerFilterFunction&lt;T, T&gt; f) { ... }
+}</code></pre>
+
+<h2 id="dsl"><span class="h-num">12.2</span>DSL маршрутов</h2>
+<pre data-title="OrderRoutes.java"><code class="java">@Configuration
+class OrderRoutes {
+    @Bean
+    RouterFunction&lt;ServerResponse&gt; orderRouter(OrderHandler h) {
+        return route()
+            .path("/api/orders", b -&gt; b
+                .nest(accept(APPLICATION_JSON), json -&gt; json
+                    .GET("/{id}", h::get)
+                    .GET("", queryParam("status", s -&gt; true), h::byStatus)
+                    .GET("", h::list))
+                .POST("", contentType(APPLICATION_JSON), h::create))
+            .GET("/health", req -&gt; ok().bodyValue("UP"))
+            .filter(this::auth)                       // HandlerFilterFunction на все маршруты выше
+            .onError(OrderNotFound.class, (e, req) -&gt; ServerResponse.notFound().build())
+            .build();
+    }
+}
+
+@Component
+class OrderHandler {
+    Mono&lt;ServerResponse&gt; get(ServerRequest req) {
+        long id = Long.parseLong(req.pathVariable("id"));
+        return service.find(id)
+            .flatMap(o -&gt; ok().contentType(APPLICATION_JSON).bodyValue(o))
+            .switchIfEmpty(ServerResponse.notFound().build());
+    }
+    Mono&lt;ServerResponse&gt; create(ServerRequest req) {
+        return req.bodyToMono(CreateOrder.class)
+            .doOnNext(validator::validate)            // валидация — вручную
+            .flatMap(service::create)
+            .flatMap(o -&gt; created(URI.create("/api/orders/" + o.id())).bodyValue(o));
+    }
+    Mono&lt;ServerResponse&gt; list(ServerRequest req) {
+        return ok().contentType(APPLICATION_NDJSON).body(service.all(), Order.class);   // Flux тело
+    }
+}</code></pre>
+
+<h2 id="matcher"><span class="h-num">12.3</span>Сопоставление маршрутов</h2>
+<div class="widget" id="rmW">
+  <div class="widget-title">Маршруты из примера выше проверяются по порядку</div>
+  <div class="controls">
+    <label>Метод<select id="rmM"><option>GET</option><option>POST</option><option>DELETE</option></select></label>
+    <label>Путь<input id="rmP" value="/api/orders/17"></label>
+    <label>Query<input id="rmQ" value="" placeholder="status=NEW"></label>
+    <label>Accept<select id="rmA"><option value="json">application/json</option><option value="any">*/*</option><option value="xml">application/xml</option></select></label>
+    <label>Content-Type<select id="rmC"><option value="json">application/json</option><option value="form">application/x-www-form-urlencoded</option></select></label>
+  </div>
+  <div class="log" id="rmLog"></div>
+  <div class="verdict" id="rmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var m = $("rmM").value, p = $("rmP").value || "/", q = $("rmQ").value, acc = $("rmA").value, ct = $("rmC").value, log = [], hit = null;
+    var acceptJson = acc === "json" || acc === "any";
+    var R = [
+      { n: "GET /api/orders/{id} [accept json]", f: function () { if (!/^\/api\/orders\/[^/]+$/.test(p)) return "путь не совпал"; if (!acceptJson) return "Accept не json"; if (m !== "GET") return "метод " + m; return null; }, h: "h::get", v: function () { return "pathVariable(\"id\") = \"" + p.split("/").pop() + "\""; } },
+      { n: "GET /api/orders ?status [accept json]", f: function () { if (p !== "/api/orders") return "путь не совпал"; if (!acceptJson) return "Accept не json"; if (m !== "GET") return "метод " + m; if (!/(^|&)status=/.test(q)) return "нет query-параметра status"; return null; }, h: "h::byStatus", v: function () { return "queryParam(\"status\") = " + (/(?:^|&)status=([^&]*)/.exec(q) || [])[1]; } },
+      { n: "GET /api/orders [accept json]", f: function () { if (p !== "/api/orders") return "путь не совпал"; if (!acceptJson) return "Accept не json"; if (m !== "GET") return "метод " + m; return null; }, h: "h::list", v: function () { return ""; } },
+      { n: "POST /api/orders [content-type json]", f: function () { if (p !== "/api/orders") return "путь не совпал"; if (m !== "POST") return "метод " + m; if (ct !== "json") return "Content-Type не json"; return null; }, h: "h::create", v: function () { return ""; } },
+      { n: "GET /health", f: function () { if (p !== "/health") return "путь не совпал"; if (m !== "GET") return "метод " + m; return null; }, h: "лямбда ok().bodyValue(\"UP\")", v: function () { return ""; } }
+    ];
+    for (var i = 0; i < R.length; i++) { var why = R[i].f(); if (why) log.push("✗ " + R[i].n + " — " + why); else { log.push("✓ " + R[i].n + "  → " + R[i].h + (R[i].v() ? "  (" + R[i].v() + ")" : "")); hit = R[i]; break; } }
+    if (hit) log.push("", "filter(auth) → " + hit.h + " → Mono<ServerResponse>");
+    else log.push("", "RouterFunction вернула Mono.empty() → RouterFunctionMapping ничего не нашёл → следующие HandlerMapping → 404");
+    $("rmLog").textContent = log.join("\n");
+    var v = $("rmV");
+    if (hit) { v.className = "verdict ok"; v.textContent = "Совпал маршрут: " + hit.n + ". Проверка останавливается на первом совпадении — порядок объявления важен: более специфичный маршрут (с query-параметром) стоит раньше общего."; }
+    else { v.className = "verdict warn"; v.textContent = "Ни один маршрут не подошёл. В отличие от @RequestMapping функциональные маршруты не выдают автоматически 405 или 415 — клиент получит 404" + (m !== "GET" && m !== "POST" ? " даже для существующего пути с неподдерживаемым методом." : ".") + (p.length > 1 && /\/$/.test(p) ? " Обратите внимание на завершающий слэш: с Spring 6 /health/ не совпадает с /health (trailing slash match отключён)." : ""); }
+  }
+  ["rmM", "rmP", "rmQ", "rmA", "rmC"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="request"><span class="h-num">12.4</span>ServerRequest и ServerResponse</h2>
+<div class="grid-2">
+  <div class="card"><h4>ServerRequest</h4><ul><li><code>pathVariable(name)</code> → String (нет переменной — исключение), <code>queryParam(name)</code> → Optional</li><li><code>headers()</code>, <code>cookies()</code>, <code>attribute(name)</code></li><li><code>bodyToMono(T.class)</code>, <code>bodyToFlux</code>, <code>body(BodyExtractors.toMultipartData())</code></li><li><code>principal()</code>, <code>session()</code> — Mono</li><li><code>exchange()</code> — доступ к ServerWebExchange</li></ul></div>
+  <div class="card"><h4>ServerResponse</h4><ul><li><code>ok(), created(uri), accepted(), noContent(), notFound(), badRequest(), status(code)</code></li><li><code>.bodyValue(obj)</code> — готовый объект</li><li><code>.body(publisher, T.class)</code> — Mono/Flux</li><li><code>.render("view", model)</code> — шаблоны</li><li><code>ServerResponse.from(other)</code>, <code>.headers(h -&gt; ...)</code>, <code>.cookie(...)</code></li></ul></div>
+</div>
+<pre data-title="HandlerFilterFunction: аутентификация и замер времени"><code class="java">Mono&lt;ServerResponse&gt; auth(ServerRequest req, HandlerFunction&lt;ServerResponse&gt; next) {
+    return req.headers().firstHeader("X-Api-Key") == null
+        ? ServerResponse.status(UNAUTHORIZED).build()
+        : next.handle(req);
+}
+// before/after — для простых модификаций
+route().GET("/x", h::x)
+       .before(req -&gt; ServerRequest.from(req).header("X-Start", now()).build())
+       .after((req, resp) -&gt; { log.info("{} {}", req.path(), resp.statusCode()); return resp; })
+       .build();</code></pre>
+
+<h2 id="vs"><span class="h-num">12.5</span>Аннотации или функции</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>@Controller</th><th>RouterFunction</th></tr>
+<tr><td>Маршрутизация</td><td>декларативно, сканирование</td><td>явный код, видно целиком</td></tr>
+<tr><td>Валидация, @Valid, биндинг</td><td>встроены</td><td>вручную (Validator)</td></tr>
+<tr><td>405/415/406 автоматически</td><td>да</td><td>нет (404, если не настроить)</td></tr>
+<tr><td>OpenAPI (springdoc)</td><td>из коробки</td><td>нужны @RouterOperation</td></tr>
+<tr><td>Тестирование маршрутов</td><td>WebTestClient.bindToController</td><td>WebTestClient.bindToRouterFunction — без контекста Spring</td></tr>
+<tr><td>Старт приложения</td><td>рефлексия, медленнее</td><td>быстрее, дружит с GraalVM native</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">12.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что возвращает RouterFunction, если запрос ей не подходит?</p><ul><li>404</li><li>Пустой Mono</li><li>null</li><li>Исключение</li></ul><div class="why">Пустой Mono позволяет комбинировать маршрутизаторы через and().</div></div>
+<div class="mcq" data-ok="3"><p>Маршрут GET /api/orders объявлен до GET /api/orders с queryParam("status"). Что получит запрос ?status=NEW?</p><ul><li>byStatus</li><li>Оба по очереди</li><li>404</li><li>list — первый совпавший маршрут</li></ul><div class="why">Сопоставление идёт по порядку, специфичные маршруты должны быть раньше.</div></div>
+<div class="mcq" data-ok="0"><p>Как валидировать тело в HandlerFunction?</p><ul><li>Явно вызвать Validator в цепочке и вернуть 400 при ошибках</li><li>@Valid на параметре</li><li>Автоматически</li><li>Только через WebFilter</li></ul><div class="why">Функциональный стиль не включает автоматический биндинг и валидацию.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как совместить функциональные маршруты и @RestController в одном приложении?</summary><div class="a"><p>Можно без ограничений: RouterFunctionMapping (order −1) и RequestMappingHandlerMapping (order 0) работают вместе. Функциональные маршруты проверяются первыми; если RouterFunction вернула пустой Mono, запрос уходит к аннотированным контроллерам. Конфликт одинаковых путей решается в пользу функциональных.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

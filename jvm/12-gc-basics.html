@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Сборка мусора: основы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+#gcSvg { width: 100%; max-width: 640px; display: block; margin: 8px auto; }
+#gcSvg text { font: 12px var(--font-mono); fill: var(--fg); }
+#gcSvg .ob { fill: var(--bg-sunk); stroke: var(--line); stroke-width: 1.5; }
+#gcSvg .ob.grey { fill: var(--warn-soft); stroke: var(--warn); }
+#gcSvg .ob.black { fill: var(--ok-soft); stroke: var(--ok); }
+#gcSvg .ob.dead { fill: var(--bad-soft); stroke: var(--bad); opacity: .5; }
+#gcSvg .rt { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+#gcSvg line { stroke: var(--fg-muted); stroke-width: 1.4; marker-end: url(#arr); }
+#gcSvg line.cut { stroke-dasharray: 4 4; opacity: .35; }
+.heapbar { display: flex; gap: 2px; margin: 8px 0; }
+.heapbar span { flex: 1; font: 11px var(--font-mono); text-align: center; padding: 6px 0; border-radius: 4px; background: var(--bg-sunk); }
+.heapbar span.live { background: var(--ok-soft); } .heapbar span.dead { background: var(--bad-soft); opacity: .6; }
+</style>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · СБОРКА МУСОРА</div>
+  <h1>Сборка мусора: основы</h1>
+  <p class="lead">Сборщик мусора не ищет мусор — он ищет живое: всё, до чего можно дойти по ссылкам от корней, а остальное объявляет свободным. Поверх этой идеи построены все сборщики JVM: пометка, очистка, уплотнение, копирование, поколения, барьеры записи, safepoints и конкурентная пометка. В симуляторе вы сами пометите граф объектов и увидите, почему конкурентная сборка без барьеров теряет живые объекты.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">GC roots</span><span class="tag">mark-sweep-compact</span><span class="tag">копирование</span><span class="tag">поколения</span><span class="tag">card table</span><span class="tag">трёхцветная пометка</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="roots"><span class="h-num">12.1</span>Достижимость и корни</h2>
+<p><b>Корни</b> (GC roots) — ссылки, которые живы по определению: локальные переменные и операнды в кадрах стеков всех потоков, статические поля загруженных классов, ссылки из JNI-кода, объекты-мониторы удерживаемых блокировок, сами объекты <code>Thread</code>, внутренние структуры JVM. Объект жив, если до него есть путь от корня. Циклические ссылки (A ↔ B) не мешают: если до цикла нет пути от корней, оба — мусор. Подсчёта ссылок в JVM нет.</p>
+
+<h2 id="mark"><span class="h-num">12.2</span>Симулятор: пометка, очистка, уплотнение</h2>
+<div class="widget" id="gcW">
+  <div class="widget-title">Граф объектов в куче</div>
+  <div class="controls">
+    <label>разорвать ссылку<select id="gcCut"></select></label>
+    <button class="btn" type="button" id="gcCutB">✂ Разорвать</button>
+    <button class="btn primary" type="button" id="gcStep">Шаг пометки ▶</button>
+    <button class="btn" type="button" id="gcSweep">Очистка</button>
+    <button class="btn" type="button" id="gcCompact">Уплотнение</button>
+    <button class="btn" type="button" id="gcReset">↺ Сначала</button>
+  </div>
+  <svg id="gcSvg" viewBox="0 0 640 300" role="img" aria-label="Граф объектов"><defs><marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" opacity=".6"/></marker></defs><g id="gcG"></g></svg>
+  <div class="heapbar" id="gcHeap"></div>
+  <div class="log" id="gcLog"></div>
+</div>
+<script>
+(function () {
+  var N = { R1: [40, 60, "стек main: order"], R2: [40, 220, "static CACHE"], A: [180, 40], B: [180, 130], C: [330, 40], D: [330, 130], E: [180, 240], F: [330, 240], G: [480, 90], H: [480, 200], I: [600, 150] };
+  var E0 = [["R1", "A"], ["A", "C"], ["A", "B"], ["B", "D"], ["R2", "E"], ["E", "F"], ["G", "H"], ["H", "G"], ["D", "G"], ["H", "I"]];
+  var ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+  var $ = function (i) { return document.getElementById(i); }, edges, color, queue, phase, log, heap;
+  function reset() { edges = E0.map(function (e) { return { a: e[0], b: e[1], cut: false }; }); color = {}; ORDER.forEach(function (n) { color[n] = "white"; }); queue = null; phase = "idle"; heap = ORDER.slice(); log = ["Все объекты белые (не помечены). Корни: R1 (локальная переменная), R2 (статическое поле). G ↔ H — цикл."]; opts(); draw(); }
+  function opts() { $("gcCut").innerHTML = edges.map(function (e, i) { return e.cut ? "" : '<option value="' + i + '">' + e.a + " → " + e.b + "</option>"; }).join(""); }
+  function step() {
+    if (phase === "swept" || phase === "compacted") return;
+    if (!queue) { queue = []; edges.forEach(function (e) { if (!e.cut && e.a[0] === "R" && color[e.b] === "white") { color[e.b] = "grey"; queue.push(e.b); } }); phase = "marking"; log.push("Корни сканированы: непосредственно достижимые → серые (в очереди): " + queue.join(", ")); draw(); return; }
+    if (!queue.length) { phase = "marked"; log.push("Очередь пуста — пометка завершена. Белые объекты недостижимы: " + ORDER.filter(function (n) { return color[n] === "white"; }).join(", ") + ". Нажмите «Очистка»."); draw(); return; }
+    var n = queue.shift(), got = [];
+    edges.forEach(function (e) { if (!e.cut && e.a === n && color[e.b] === "white") { color[e.b] = "grey"; queue.push(e.b); got.push(e.b); } });
+    color[n] = "black"; log.push("Сканирую " + n + ": " + (got.length ? "новые серые " + got.join(", ") : "новых ссылок нет") + " → " + n + " чёрный (просканирован)"); draw();
+  }
+  function sweep() {
+    if (phase !== "marked") { log.push("Сначала завершите пометку."); draw(); return; }
+    var dead = ORDER.filter(function (n) { return color[n] === "white"; }); dead.forEach(function (n) { color[n] = "dead"; });
+    phase = "swept"; log.push("Очистка: память " + dead.join(", ") + " возвращена в списки свободных блоков. Объекты не двигались — куча фрагментирована (смотрите полосу ниже)."); draw();
+  }
+  function compact() {
+    if (phase !== "swept") { log.push("Уплотнение — после очистки."); draw(); return; }
+    heap = ORDER.filter(function (n) { return color[n] !== "dead"; }); phase = "compacted";
+    log.push("Уплотнение: живые объекты сдвинуты в начало, ссылки на них обновлены. Свободное место — одним куском, выделение снова простым сдвигом указателя. Цена — копирование и обновление всех ссылок (обычно с остановкой потоков)."); draw();
+  }
+  function draw() {
+    var s = "";
+    edges.forEach(function (e) { var a = N[e.a], b = N[e.b], dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy), r = 22; s += '<line class="' + (e.cut ? "cut" : "") + '" x1="' + (a[0] + dx / l * r) + '" y1="' + (a[1] + dy / l * r) + '" x2="' + (b[0] - dx / l * r) + '" y2="' + (b[1] - dy / l * r) + '"/>'; });
+    Object.keys(N).forEach(function (k) { var n = N[k]; if (k[0] === "R") s += '<rect class="rt" x="' + (n[0] - 34) + '" y="' + (n[1] - 18) + '" width="68" height="36" rx="6"/><text x="' + n[0] + '" y="' + (n[1] + 4) + '" text-anchor="middle">' + k + '</text><text x="' + n[0] + '" y="' + (n[1] + 32) + '" text-anchor="middle" opacity=".7">' + n[2] + "</text>";
+      else s += '<circle class="ob ' + (color[k] === "white" ? "" : color[k]) + '" cx="' + n[0] + '" cy="' + n[1] + '" r="20"/><text x="' + n[0] + '" y="' + (n[1] + 4) + '" text-anchor="middle">' + k + "</text>"; });
+    $("gcG").innerHTML = s;
+    $("gcHeap").innerHTML = (phase === "compacted" ? heap.concat(ORDER.slice(heap.length).map(function () { return null; })) : ORDER).map(function (n) { return n === null ? "<span>свободно</span>" : '<span class="' + (color[n] === "dead" ? "dead" : phase === "swept" || phase === "compacted" ? "live" : "") + '">' + (color[n] === "dead" ? "свободно" : n) + "</span>"; }).join("");
+    $("gcLog").textContent = log.slice(-9).join("\n"); $("gcLog").scrollTop = 1e6;
+  }
+  $("gcCutB").addEventListener("click", function () { var i = +$("gcCut").value; if (isNaN(i)) return; var e = edges[i]; e.cut = true;
+    if (phase === "marking" && color[e.a] === "black") log.push("⚠ Ссылка " + e.a + " → " + e.b + " разорвана во время пометки. Без барьеров мутатор может перевесить её на уже чёрный объект — см. раздел 12.6."); else log.push("Разорвана ссылка " + e.a + " → " + e.b + "."); opts(); draw(); });
+  $("gcStep").addEventListener("click", step); $("gcSweep").addEventListener("click", sweep); $("gcCompact").addEventListener("click", compact); $("gcReset").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Что попробовать</span>
+Пройдите пометку: G и H помечаются, потому что до цикла есть путь A → B → D → G. Сбросьте, разорвите <code>B → D</code> и пометьте снова — теперь D, G, H, I (вместе с циклом) мусор. Разорвите <code>R2 → E</code> — статический кэш больше не держит E и F.
+</div>
+
+<h2 id="algorithms"><span class="h-num">12.3</span>Три способа освободить память</h2>
+<div class="table-wrap"><table>
+<tr><th>Алгоритм</th><th>Как</th><th>Плюсы</th><th>Минусы</th><th>Где</th></tr>
+<tr><td><b>Mark-sweep</b></td><td>пометить живые, мёртвые — в списки свободных блоков</td><td>не двигает объекты</td><td>фрагментация, выделение по спискам медленнее</td><td>CMS (удалён в Java 14)</td></tr>
+<tr><td><b>Mark-compact</b></td><td>пометить, затем сдвинуть живые к началу</td><td>нет фрагментации, bump-pointer выделение</td><td>несколько проходов по куче, обновление всех ссылок</td><td>старое поколение Serial/Parallel, Full GC в G1</td></tr>
+<tr><td><b>Копирование</b> (evacuation)</td><td>скопировать живые в пустую область, старую освободить целиком</td><td>стоимость ∝ живым, а не размеру области; уплотнение бесплатно</td><td>нужно резервное место</td><td>молодое поколение всех сборщиков, регионы G1/ZGC/Shenandoah</td></tr>
+</table></div>
+
+<h2 id="generations"><span class="h-num">12.4</span>Поколения</h2>
+<p><b>Слабая гипотеза поколений</b>: большинство объектов умирает молодыми (временные строки, DTO, итераторы), а пережившие несколько сборок живут долго (кэши, сессии, синглтоны). Поэтому куча делится:</p>
+<div class="widget stepper" id="genSim">
+  <div class="widget-title">Путь объекта через поколения</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Eden</h5><div class="items"><span class="chip" id="gEden">новые объекты</span></div></div>
+    <div class="lane"><h5>Survivor S0 / S1</h5><div class="items"><span class="chip off" id="gS">выжившие, age 1..15</span></div></div>
+    <div class="lane"><h5>Old</h5><div class="items"><span class="chip off" id="gOld">долгоживущие</span></div></div>
+  </div>
+  <section class="st-step" data-t="Выделение" data-hl="gEden" data-log="new → TLAB в eden (тема 11)"><p>Все объекты рождаются в eden (кроме огромных).</p></section>
+  <section class="st-step" data-t="Молодая сборка" data-hl="gEden gS" data-log="minor GC: живые из eden и активного survivor → копируются в другой survivor, age+1; eden и старый survivor очищаются целиком"><p>Eden заполнен → молодая (minor) сборка: живые объекты из eden и одного survivor копируются в другой survivor, возраст +1. Eden освобождается целиком — 95% его содержимого обычно мусор, и копировать почти нечего.</p></section>
+  <section class="st-step" data-t="Продвижение" data-hl="gS gOld" data-log="age ≥ порога (адаптивный, до 15) или survivor переполнен → promotion в old"><p>Объект, переживший порог сборок, или не поместившийся в survivor, <b>продвигается</b> в старое поколение. Преждевременное продвижение (survivor мал, всплеск выделений) засоряет old объектами, которые скоро умрут.</p></section>
+  <section class="st-step" data-t="Старое поколение" data-hl="gOld" data-log="old заполняется → mixed/concurrent/full сборка: дорого, редко"><p>Старое поколение собирается редко и другими алгоритмами (конкурентная пометка в G1, полное уплотнение в Parallel). Задача тюнинга — чтобы туда попадали только действительно долгоживущие объекты.</p></section>
+</div>
+<h3>Ссылки из старого в молодое: card table и барьер записи</h3>
+<p>Молодая сборка не сканирует всё старое поколение, но старый объект может ссылаться на молодой (кэш, в который положили новый объект) — такая ссылка тоже корень. Поэтому каждая запись ссылки в поле (<code>putfield</code>, <code>aastore</code>) сопровождается <b>барьером записи</b>: несколько инструкций, помечающих «грязной» карту (512 байт кучи) в card table. Молодая сборка сканирует только грязные карты. G1 расширяет это до remembered sets на регион.</p>
+
+<h2 id="safepoint"><span class="h-num">12.5</span>Остановка мира и safepoints</h2>
+<p>Чтобы двигать объекты и обновлять ссылки, потоки приложения («мутаторы») должны остановиться в известных точках — <b>safepoints</b>, где JVM знает, в каких регистрах и слотах лежат ссылки (по картам oop maps от JIT). Пауза = время дойти всем потокам до safepoint (time-to-safepoint) + работа GC. Подробности — тема 18.</p>
+
+<h2 id="concurrent"><span class="h-num">12.6</span>Конкурентная пометка и трёхцветная абстракция</h2>
+<p>Современные сборщики помечают кучу <b>параллельно с работой приложения</b>. Опасность: пока GC сканирует, мутатор меняет ссылки. Классическая потеря объекта требует двух условий одновременно:</p>
+<ol>
+  <li>мутатор записывает ссылку на белый объект W в уже <b>чёрный</b> (просканированный) объект;</li>
+  <li>и удаляет последний путь к W от серых объектов.</li>
+</ol>
+<p>Тогда W останется белым и будет освобождён, хотя он жив. Барьеры ломают одно из условий:</p>
+<div class="grid-2">
+  <div class="card"><h4>SATB (snapshot-at-the-beginning)</h4><p>Барьер <b>перед</b> записью запоминает старое значение поля (удаляемую ссылку) и помечает его серым. Всё, что было живо в начале пометки, будет помечено. Плавающий мусор — объекты, умершие во время пометки, — доживёт до следующего цикла. Используют <b>G1, Shenandoah</b>.</p></div>
+  <div class="card"><h4>Incremental update</h4><p>Барьер <b>после</b> записи помечает новую ссылку (или делает чёрный объект снова серым), и GC пересканирует такие объекты в финальной паузе. Использовал CMS. ZGC использует цветные указатели и барьеры чтения (тема 13).</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">12.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Два объекта ссылаются друг на друга, других ссылок на них нет. Соберёт ли их GC?</p><ul><li>Нет, у них ненулевой счётчик ссылок</li><li>Да: они недостижимы от корней</li><li>Только Full GC</li><li>Только если вызвать System.gc()</li></ul><div class="why">JVM использует трассировку достижимости, а не подсчёт ссылок.</div></div>
+<div class="mcq" data-ok="3"><p>Почему молодая сборка обычно быстрая даже при большом eden?</p><ul><li>Она не останавливает потоки</li><li>Eden маленький</li><li>Она не трогает объекты</li><li>Копируются только живые объекты, а их в eden обычно единицы процентов</li></ul><div class="why">Стоимость копирующего сборщика пропорциональна живым данным.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем барьер записи при присваивании ссылки в поле?</p><ul><li>Чтобы GC знал о ссылках из старого поколения в молодое (card table) и о ссылках, изменённых во время конкурентной пометки</li><li>Для синхронизации потоков</li><li>Для проверки null</li><li>Для подсчёта ссылок</li></ul><div class="why">Цена — несколько инструкций на каждую запись ссылки.</div></div>
+<div class="mcq" data-ok="2"><p>Что из перечисленного — GC root?</p><ul><li>Любой объект в старом поколении</li><li>Объект с переопределённым finalize()</li><li>Локальная переменная в кадре стека работающего потока</li><li>Объект, на который ссылается другой объект</li></ul><div class="why">А также статические поля, JNI-ссылки, мониторы, потоки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните, как работает поколенческий сборщик.</summary><div class="a"><p>Куча делится на молодое (eden + два survivor) и старое поколения. Объекты рождаются в eden. Молодая сборка (с остановкой) копирует живые из eden и survivor в другой survivor, увеличивая возраст; старые по возрасту или при переполнении продвигаются в old. Ссылки old → young отслеживаются барьером записи через card table и служат дополнительными корнями. Старое поколение собирается реже: пометка (часто конкурентная) и уплотнение или эвакуация.</p></div></details>
+<details class="q"><summary>Почему конкурентный GC нуждается в барьерах, а stop-the-world — нет?</summary><div class="a"><p>При STW граф объектов не меняется во время пометки. При конкурентной пометке приложение меняет ссылки, и без перехвата этих изменений GC может не увидеть живой объект (чёрный → белый при удалении серого пути) и освободить его. Барьеры (SATB, incremental update, барьеры чтения) сообщают GC об изменениях. Плата — инструкции на каждую запись/чтение ссылки и плавающий мусор.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

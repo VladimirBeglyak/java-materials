@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 · Тестирование: JUnit 5, AssertJ, Mockito</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="23">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 23 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Тестирование: JUnit 5, AssertJ, Mockito</h1>
+  <p class="lead">Тест — это исполняемое утверждение о том, как должен вести себя код. Хорошие тесты позволяют менять код без страха; плохие — ломаются при каждом рефакторинге и ничего не ловят. Разберём инструменты (жизненный цикл JUnit, утверждения, моки) и, главное, признаки теста, который стоит своих денег.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">JUnit 5</span><span class="tag">AssertJ</span><span class="tag">Mockito</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="anatomy"><span class="h-num">23.1</span>Анатомия теста</h2>
+<pre><code class="java">class PricingPolicyTest {
+
+    private final PricingPolicy pricing = new PricingPolicy();        // тестируемый объект — без Spring и моков
+
+    @Test
+    @DisplayName("VIP-клиент получает скидку 10% на сумму заказа")
+    void vipCustomerGetsTenPercentDiscount() {
+        // arrange — исходные данные
+        var order = new OrderRequest(1, CustomerType.VIP, List.of(new OrderLine("A1", Money.rub(1000), 2)));
+
+        // act — одно действие
+        Money price = pricing.price(order);
+
+        // assert — проверка результата
+        assertThat(price).isEqualTo(Money.rub(1800));
+    }
+}</code></pre>
+<div class="grid-3">
+  <div class="card"><h4>Одно поведение</h4><p>Тест проверяет одно правило. Упал — по имени понятно, что сломано, без чтения кода.</p></div>
+  <div class="card"><h4>Независимость</h4><p>Тесты не зависят от порядка и друг от друга: никакого общего изменяемого состояния, статических полей, данных предыдущего теста.</p></div>
+  <div class="card"><h4>Детерминизм</h4><p>Нет зависимости от времени (<code>Clock</code>), случайности, сети, порядка в <code>HashMap</code>. Тест, падающий раз в неделю, приучает игнорировать красную сборку.</p></div>
+</div>
+
+<h2 id="lifecycle"><span class="h-num">23.2</span>Жизненный цикл JUnit 5</h2>
+<pre data-title="Класс теста"><code class="java">class CartTest {
+    static Database db;                       // дорогой общий ресурс
+    Cart cart;                                // состояние одного теста
+
+    CartTest()                 { log("constructor"); }
+    @BeforeAll  static void startDb()  { log("@BeforeAll");  db = Database.start(); }
+    @BeforeEach void createCart()      { log("@BeforeEach"); cart = new Cart(); }
+    @Test       void addsItem()        { log("test addsItem");    cart.add("A1"); }
+    @Test       void removesItem()     { log("test removesItem"); cart.remove("A1"); }
+    @AfterEach  void cleanTables()     { log("@AfterEach");  db.truncate(); }
+    @AfterAll   static void stopDb()   { log("@AfterAll");   db.stop(); }
+}</code></pre>
+<div class="widget stepper" id="juSim">
+  <div class="widget-title">Симулятор: что и в каком порядке вызывает JUnit</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="juI1"><h5>Экземпляр CartTest #1</h5><div class="items"><span class="chip ok" data-from="2" data-to="6">cart: новая корзина</span><span class="chip" data-from="6">уничтожен</span></div></div>
+    <div class="lane node" id="juI2"><h5>Экземпляр CartTest #2</h5><div class="items"><span class="chip" data-to="6">ещё не создан</span><span class="chip ok" data-from="6" data-to="10">cart: новая корзина</span><span class="chip" data-from="10">уничтожен</span></div></div>
+    <div class="lane node" id="juS"><h5>static</h5><div class="items"><span class="chip info" data-from="1" data-to="10">db запущена</span><span class="chip" data-from="10">db остановлена</span></div></div>
+  </div>
+  <section class="st-step" data-t="@BeforeAll" data-hl="juS" data-log="@BeforeAll"><h4>Один раз на класс</h4><p>Статический метод выполняется до создания экземпляров. Здесь — то, что дорого создавать: контейнер с БД, сервер-заглушка. Всё, что создано здесь, разделяется всеми тестами класса, значит должно либо не меняться, либо очищаться.</p></section>
+  <section class="st-step" data-t="new CartTest()" data-hl="juI1" data-log="constructor"><h4>Новый экземпляр для первого теста</h4><p>JUnit по умолчанию создаёт <b>отдельный экземпляр класса на каждый тестовый метод</b> (<code>Lifecycle.PER_METHOD</code>). Поэтому поля экземпляра не протекают между тестами — изоляция бесплатно.</p></section>
+  <section class="st-step" data-t="@BeforeEach" data-hl="juI1" data-log="@BeforeEach"><h4>Подготовка перед каждым тестом</h4><p>Общая для всех тестов часть arrange. Не прячьте сюда данные, важные для понимания конкретного теста, — читающий не должен прыгать по файлу.</p></section>
+  <section class="st-step" data-t="test addsItem" data-hl="juI1" data-log="test addsItem"><h4>Тестовый метод</h4><p>Порядок методов <b>не гарантирован</b> и намеренно не совпадает с порядком в файле: тесты не должны на него опираться.</p></section>
+  <section class="st-step" data-t="@AfterEach" data-hl="juI1 juS" data-log="@AfterEach"><h4>Очистка после теста</h4><p>Выполняется, даже если тест упал. Возвращает общие ресурсы в исходное состояние.</p></section>
+  <section class="st-step" data-t="new CartTest() №2" data-hl="juI2" data-log="constructor"><h4>Второй экземпляр</h4><p>Первый экземпляр больше не используется. Для второго теста создаётся новый объект с новыми полями.</p></section>
+  <section class="st-step" data-t="@BeforeEach" data-hl="juI2" data-log="@BeforeEach"><h4>Снова подготовка</h4><p>Корзина пустая: изменения из <code>addsItem</code> не видны.</p></section>
+  <section class="st-step" data-t="test removesItem" data-hl="juI2" data-log="test removesItem"><h4>Второй тест</h4><p>Если бы тест рассчитывал, что товар «A1» остался от предыдущего теста, он упал бы — и правильно.</p></section>
+  <section class="st-step" data-t="@AfterEach" data-hl="juI2 juS" data-log="@AfterEach"><h4>Очистка</h4></section>
+  <section class="st-step" data-t="@AfterAll" data-hl="juS" data-log="@AfterAll"><h4>Один раз после всех тестов класса</h4><p>Освобождение общих ресурсов. <code>@TestInstance(PER_CLASS)</code> меняет модель: один экземпляр на класс, <code>@BeforeAll</code> может быть нестатическим — но поля становятся общими для тестов.</p></section>
+</div>
+
+<h2 id="assert"><span class="h-num">23.3</span>Утверждения: AssertJ</h2>
+<pre><code class="java">assertThat(order.total()).isEqualByComparingTo("1800.00");                     // BigDecimal без учёта масштаба
+assertThat(orders).hasSize(2).extracting(Order::status).containsExactly(PAID, NEW);
+assertThat(user).usingRecursiveComparison().ignoringFields("id", "createdAt").isEqualTo(expected);
+assertThat(result).isPresent().get().satisfies(o -&gt; assertThat(o.items()).isNotEmpty());
+
+assertThatThrownBy(() -&gt; service.pay(order))                                    // исключение — тоже результат
+        .isInstanceOf(InsufficientFundsException.class)
+        .hasMessageContaining("баланс");
+
+assertThat(response).as("ответ на POST /orders").returns(201, Response::status);   // описание появится в сообщении об ошибке
+
+assertAll(                                                                      // JUnit: показать ВСЕ несовпадения, а не первое
+        () -&gt; assertEquals("Ivan", user.name()),
+        () -&gt; assertEquals(30, user.age()));</code></pre>
+<p>AssertJ читается как предложение и даёт подробное сообщение: что ожидалось, что получено, какой элемент коллекции лишний. Голый <code>assertTrue(list.contains(x))</code> при падении скажет только «expected true».</p>
+
+<h2 id="params"><span class="h-num">23.4</span>Параметризованные тесты</h2>
+<pre><code class="java">@ParameterizedTest(name = "{0} товаров по {1} ₽ → {2} ₽")
+@CsvSource({
+        "1, 1000, 1000",
+        "5, 1000, 5000",
+        "6, 1000, 5700",        // от 5000 — бонус 300
+        "0, 1000, 0" })
+void calculatesTotal(int qty, long price, long expected) {
+    assertThat(pricing.total(qty, Money.rub(price))).isEqualTo(Money.rub(expected));
+}
+
+@ParameterizedTest
+@NullAndEmptySource
+@ValueSource(strings = { " ", "\t", "no-at-sign" })
+void rejectsInvalidEmail(String email) {
+    assertThatThrownBy(() -&gt; new Email(email)).isInstanceOf(IllegalArgumentException.class);
+}
+
+@ParameterizedTest
+@EnumSource(value = OrderStatus.class, names = { "SHIPPED", "CANCELLED" })
+void cannotPay(OrderStatus status) { /* ... */ }</code></pre>
+<p>Таблица входов и ожидаемых результатов — лучшая форма для правил с границами. Обязательно проверяйте сами границы: 4999, 5000, 5001; пустое, null, максимальное значение.</p>
+
+<h2 id="doubles"><span class="h-num">23.5</span>Тестовые двойники и Mockito</h2>
+<div class="table-wrap"><table>
+<tr><th>Вид</th><th>Что делает</th><th>Пример</th></tr>
+<tr><td>Dummy</td><td>заполняет параметр, не используется</td><td><code>null</code> или пустой объект</td></tr>
+<tr><td>Stub</td><td>возвращает заранее заданные ответы</td><td><code>when(rates.get("USD")).thenReturn(90)</code></td></tr>
+<tr><td>Fake</td><td>рабочая упрощённая реализация</td><td>репозиторий на <code>HashMap</code>, <code>Clock.fixed</code></td></tr>
+<tr><td>Mock</td><td>проверяет, что его вызвали как ожидалось</td><td><code>verify(mailer).send(...)</code></td></tr>
+<tr><td>Spy</td><td>настоящий объект с записью вызовов и частичной подменой</td><td><code>spy(new ArrayList&lt;&gt;())</code></td></tr>
+</table></div>
+<pre><code class="java">@ExtendWith(MockitoExtension.class)                       // создаёт моки и проверяет «лишние» заглушки
+class CheckoutServiceTest {
+    @Mock PaymentGateway payments;
+    @Mock Mailer mailer;
+    @InjectMocks CheckoutService checkout;                // соберёт объект через конструктор с моками
+
+    @Test
+    void sendsReceiptAfterSuccessfulPayment() {
+        when(payments.charge(any(Money.class))).thenReturn(PaymentResult.ok("tx-1"));       // stub
+
+        checkout.pay(order());
+
+        ArgumentCaptor&lt;Receipt&gt; receipt = ArgumentCaptor.forClass(Receipt.class);
+        verify(mailer).send(eq("ivan@shop.ru"), receipt.capture());                          // взаимодействие
+        assertThat(receipt.getValue().transactionId()).isEqualTo("tx-1");
+    }
+
+    @Test
+    void doesNotSendReceiptWhenPaymentFails() {
+        when(payments.charge(any())).thenThrow(new PaymentDeclinedException());
+
+        assertThatThrownBy(() -&gt; checkout.pay(order())).isInstanceOf(PaymentDeclinedException.class);
+        verifyNoInteractions(mailer);
+    }
+}</code></pre>
+<div class="widget" id="mkW">
+  <div class="widget-title">Симулятор: как поведёт себя мок</div>
+  <div class="controls"><label>ситуация<select id="mkCase" style="max-width:100%">
+    <option value="unstubbed">вызван метод мока без заглушки, возвращающий объект</option>
+    <option value="unstubbedPrim">метод без заглушки возвращает int / boolean / List</option>
+    <option value="mismatch">заглушка when(repo.find(1L)), а код вызывает repo.find(2L)</option>
+    <option value="mixed">when(svc.calc(anyInt(), 5)).thenReturn(1) — матчер и значение вперемешку</option>
+    <option value="unused">в тесте есть when(...), который код ни разу не вызвал</option>
+    <option value="final">мок final-класса или static-метода</option>
+    <option value="void">нужно, чтобы void-метод мока бросил исключение</option>
+    <option value="spy">when(spy.get(0)).thenReturn("x") для spy пустого списка</option>
+  </select></label></div>
+  <div class="verdict" id="mkOut"></div>
+</div>
+<script>
+(function () {
+  var A = {
+    unstubbed: ["warn", "Вернётся null (для Optional — Optional.empty(), для стрима — пустой стрим). Отсюда NullPointerException в тестируемом коде, который выглядит как ошибка кода, а на деле — неполная настройка теста."],
+    unstubbedPrim: ["ok", "Значения по умолчанию: 0, false, пустая коллекция (RETURNS_DEFAULTS). Тест не упадёт, но может проверять не то, что вы думаете: «баланс 0» — это не настроенная заглушка, а настоящий ответ?"],
+    mismatch: ["warn", "Аргументы не совпали — заглушка не сработает, вернётся значение по умолчанию. В strict-режиме (MockitoExtension) тест упадёт с PotentialStubbingProblem: «Strict stubbing argument mismatch» и покажет оба вызова."],
+    mixed: ["bad", "InvalidUseOfMatchersException: если хотя бы один аргумент задан матчером, матчерами должны быть все. Правильно: when(svc.calc(anyInt(), eq(5)))."],
+    unused: ["bad", "UnnecessaryStubbingException: MockitoExtension считает лишние заглушки ошибкой. Это полезно: неиспользуемая настройка вводит читателя в заблуждение и часто означает, что тест проверяет не тот путь."],
+    final: ["ok", "С Mockito 5 инлайн-мокмейкер включён по умолчанию: final-классы мокаются, static — через try (MockedStatic<Util> m = mockStatic(Util.class)). Но потребность мокать статику — запах: зависимость стоит выделить в интерфейс."],
+    void: ["ok", "Синтаксис when(...) не подходит — у void нет значения. Используйте doThrow(new IOException()).when(mock).write(any()); аналогично doNothing(), doAnswer()."],
+    spy: ["bad", "IndexOutOfBoundsException: when(spy.get(0)) сначала вызывает НАСТОЯЩИЙ метод. Для spy используйте doReturn(\"x\").when(spy).get(0) — без вызова реального кода."]
+  };
+  var s = document.getElementById("mkCase"), o = document.getElementById("mkOut");
+  function run() { var a = A[s.value]; o.className = "verdict " + a[0]; o.textContent = a[1]; }
+  s.addEventListener("change", run); run();
+})();
+</script>
+<div class="callout bad"><span class="c-title">Когда моки вредят</span>
+Тест, который повторяет реализацию через <code>verify</code> («вызвал A, потом B с такими аргументами»), ломается при любом рефакторинге и не ловит ошибок: он проверяет, <i>как</i> код работает, а не <i>что</i> делает. Мокайте границы системы (сеть, платёжный шлюз, почта, время), а не собственные классы. Value-объекты и чистые функции не мокают вовсе. Для БД лучше настоящая база в контейнере, чем мок репозитория.
+</div>
+
+<h2 id="what"><span class="h-num">23.6</span>Что и как тестировать</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Что проверяет</th><th>Сколько</th></tr>
+<tr><td>Модульные</td><td>бизнес-правила, расчёты, граничные случаи — без I/O, миллисекунды</td><td>большинство</td></tr>
+<tr><td>Интеграционные</td><td>стыки: SQL-запросы на реальной БД, сериализацию, HTTP-контракты</td><td>меньше — на каждый стык</td></tr>
+<tr><td>Сквозные</td><td>основные пользовательские сценарии целиком</td><td>несколько</td></tr>
+</table></div>
+<div class="grid-2">
+  <div class="card"><h4>Покрытие — не цель</h4><p>90% покрытия строк не говорит, что проверены нужные случаи: можно вызвать код и ничего не утверждать. Покрытие показывает, что <b>точно не</b> тестируется. Качество тестов измеряет мутационное тестирование (PIT): выживает ли намеренно внесённая ошибка.</p></div>
+  <div class="card"><h4>Тестируемый дизайн</h4><p>Трудно написать тест — проблема в коде: скрытые зависимости (<code>new</code> внутри, статика, <code>Instant.now()</code>), смешаны вычисления и ввод-вывод. Внедрение через конструктор и чистые функции делают тесты тривиальными.</p></div>
+  <div class="card"><h4>Тест на баг</h4><p>Сначала тест, воспроизводящий ошибку (красный), потом исправление (зелёный). Баг не вернётся незамеченным.</p></div>
+  <div class="card"><h4>Плавающие тесты</h4><p>Причины: время, порядок, общие данные, гонки, <code>Thread.sleep</code> вместо ожидания условия (Awaitility). Плавающий тест чинят или удаляют сразу — иначе команда перестаёт верить сборке.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">23.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В тестовом классе поле <code>List&lt;String&gt; items = new ArrayList&lt;&gt;()</code>. Первый тест добавляет в него элемент. Что увидит второй тест?</p><ul><li>Список с одним элементом</li><li>Пустой список: JUnit создаёт новый экземпляр класса на каждый тест</li><li>null</li><li>Зависит от порядка</li></ul><div class="why">Lifecycle.PER_METHOD по умолчанию. Общим было бы static-поле — и это источник зависимых тестов.</div></div>
+<div class="mcq" data-ok="2"><p>Что вернёт метод мока, для которого не задана заглушка и тип результата — <code>Optional&lt;User&gt;</code>?</p><ul><li>null</li><li>Исключение</li><li>Optional.empty()</li><li>Optional с моком User</li></ul><div class="why">Mockito возвращает «пустые» значения: 0, false, пустые коллекции, Optional.empty(); для прочих объектов — null.</div></div>
+<div class="mcq" data-ok="0"><p>Что из перечисленного лучше НЕ мокать?</p><ul><li>Собственные value-объекты и чистые функции расчёта</li><li>Клиент платёжного шлюза</li><li>Отправку почты</li><li>Источник текущего времени</li></ul><div class="why">Мокают границы системы. Замена собственной логики моками проверяет заглушки, а не код.</div></div>
+<div class="mcq" data-ok="3"><p>Покрытие строк 95%. Что это гарантирует?</p><ul><li>Отсутствие ошибок в покрытом коде</li><li>Что проверены все граничные случаи</li><li>Что тесты имеют утверждения</li><li>Только то, что эти строки выполнялись во время тестов</li></ul><div class="why">Выполнение не равно проверке. Тест без assert даёт покрытие и не ловит ничего.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем mock отличается от stub и от spy?</summary><div class="a"><p>Stub подставляет ответы, чтобы код мог выполниться. Mock — объект, на котором проверяют взаимодействие (verify). Spy оборачивает настоящий объект: по умолчанию вызывает реальные методы, позволяет подменить часть и проверить вызовы. В Mockito один объект может играть первые две роли.</p></div></details>
+<details class="q"><summary>Какими свойствами обладает хороший модульный тест?</summary><div class="a"><p>Быстрый, изолированный, повторяемый, сам проверяет результат, проверяет одно поведение через публичный API, читается как спецификация, не ломается при рефакторинге без изменения поведения, при падении указывает на причину.</p></div></details>
+<details class="q"><summary>Как тестировать код, зависящий от времени и случайности?</summary><div class="a"><p>Вынести источник наружу и внедрять: Clock вместо Instant.now(), Supplier/RandomGenerator вместо new Random(). В тесте подставить фиксированные значения. Ожидание асинхронного результата — Awaitility с таймаутом, а не sleep.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

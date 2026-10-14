@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · LinkedHashMap и LRU-кэш</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.lru { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 10px 0; font: 13px var(--font-mono); }
+.lru span { padding: 8px 12px; border-radius: 6px; border: 1.5px solid var(--line); background: var(--bg-sunk); }
+.lru span.hit { border-color: var(--ok); background: var(--ok-soft); } .lru span.new { border-color: var(--accent); background: var(--accent-soft); }
+</style>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ХЕШ-СТРУКТУРЫ</div>
+  <h1>LinkedHashMap и LRU-кэш</h1>
+  <p class="lead"><code>LinkedHashMap</code> — это HashMap, у которого узлы дополнительно связаны в двусвязный список. Отсюда предсказуемый порядок итерации, а с режимом «порядок доступа» и одним переопределённым методом — готовый LRU-кэш на 10 строк. Разбираем устройство, оба режима порядка, хук <code>removeEldestEntry</code> и сравниваем LRU с FIFO на разных паттернах обращений.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">before/after</span><span class="tag">insertion order</span><span class="tag">access order</span><span class="tag">removeEldestEntry</span><span class="tag">LRU vs FIFO</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="struct"><span class="h-num">10.1</span>Устройство</h2>
+<pre data-title="LinkedHashMap расширяет узлы HashMap"><code class="java">static class Entry&lt;K, V&gt; extends HashMap.Node&lt;K, V&gt; {
+    Entry&lt;K, V&gt; before, after;                 // + 8 байт к узлу: двусвязный список порядка
+}
+transient LinkedHashMap.Entry&lt;K, V&gt; head;     // старейший
+transient LinkedHashMap.Entry&lt;K, V&gt; tail;     // новейший
+final boolean accessOrder;                     // false — порядок вставки, true — порядок доступа
+
+// хуки, которые HashMap вызывает в нужные моменты:
+void afterNodeAccess(Node&lt;K, V&gt; e)      { if (accessOrder) переместить e в хвост; }
+void afterNodeInsertion(boolean evict)  { if (removeEldestEntry(head)) удалить head; }
+void afterNodeRemoval(Node&lt;K, V&gt; e)     { исключить e из списка; }
+protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) { return false; }</code></pre>
+<p>Поиск по ключу — как в HashMap, O(1). Итерация идёт по списку, а не по корзинам: O(size), а не O(capacity), и в предсказуемом порядке. Повторный <code>put</code> существующего ключа в режиме вставки порядок <b>не меняет</b>.</p>
+
+<h2 id="lru"><span class="h-num">10.2</span>LRU-кэш</h2>
+<pre data-title="LRU на LinkedHashMap"><code class="java">final class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int maxSize;
+    LruCache(int maxSize) {
+        super(16, 0.75f, true);             // accessOrder = true: get и put двигают запись в хвост
+        this.maxSize = maxSize;
+    }
+    @Override protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; maxSize;            // после вставки: вытеснить самую давно использованную (голову)
+    }
+}
+// не потокобезопасен: в режиме доступа даже get — структурное изменение (меняет порядок, modCount++)
+// для многопоточности — Collections.synchronizedMap(...) или, лучше, Caffeine</code></pre>
+<div class="widget" id="lruW">
+  <div class="widget-title">Симулятор кэша на 3 записи</div>
+  <div class="controls">
+    <label>политика<select id="lruP"><option value="lru">LRU (accessOrder = true)</option><option value="fifo">FIFO (порядок вставки)</option></select></label>
+    <label>ключ<input type="text" id="lruK" value="A"></label>
+    <button class="btn primary" type="button" id="lruGet">get / put</button>
+    <label>паттерн<select id="lruS"><option value="hot">A B A C A D A E (горячий ключ A)</option><option value="loop">A B C D A B C D (цикл длиннее кэша)</option><option value="mix">A B C A B D A B E</option></select></label>
+    <button class="btn" type="button" id="lruRun">Прогнать паттерн</button>
+    <button class="btn" type="button" id="lruR">↺</button>
+  </div>
+  <div class="lru" id="lruView"></div>
+  <div class="out" id="lruOut"></div>
+  <div class="log" id="lruLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, order, hits, miss, log, mark;
+  var PAT = { hot: "ABACADAE", loop: "ABCDABCD", mix: "ABCABDABE" };
+  function reset() { order = []; hits = 0; miss = 0; log = ["пустой кэш, maxSize = 3; голова слева — кандидат на вытеснение"]; mark = {}; draw(); }
+  function access(k) {
+    var p = $("lruP").value, i = order.indexOf(k); mark = {};
+    if (i >= 0) { hits++; mark[k] = "hit"; if (p === "lru") { order.splice(i, 1); order.push(k); log.push("get(" + k + "): попадание → afterNodeAccess переносит в хвост"); } else log.push("get(" + k + "): попадание, порядок не меняется (FIFO)"); }
+    else { miss++; order.push(k); mark[k] = "new"; var ev = ""; if (order.length > 3) { ev = order.shift(); } log.push("get(" + k + "): промах → загрузить и put в хвост" + (ev ? "; removeEldestEntry → вытеснен " + ev + " (голова)" : "")); }
+    draw();
+  }
+  function draw() {
+    $("lruView").innerHTML = "голова → " + (order.length ? order.map(function (k) { return '<span class="' + (mark[k] || "") + '">' + k + "</span>"; }).join("⇄") : "<i>пусто</i>") + " ← хвост";
+    var t = hits + miss; $("lruOut").textContent = "попаданий " + hits + ", промахов " + miss + (t ? ", hit rate " + Math.round(hits / t * 100) + "%" : "");
+    $("lruLog").textContent = log.slice(-7).join("\n"); $("lruLog").scrollTop = 1e6;
+  }
+  $("lruGet").addEventListener("click", function () { var k = ($("lruK").value || "A").trim().toUpperCase().slice(0, 3); access(k); });
+  $("lruRun").addEventListener("click", function () { reset(); PAT[$("lruS").value].split("").forEach(access); log.push("— паттерн завершён —"); draw(); });
+  $("lruR").addEventListener("click", reset); $("lruP").addEventListener("change", reset);
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Что сравнить</span>
+Паттерн с горячим ключом: LRU держит A в кэше, FIFO периодически его вытесняет. Цикл длиннее кэша (A B C D…): у LRU <b>0%</b> попаданий — каждый раз вытесняется ровно тот ключ, который понадобится следующим. Поэтому продакшен-кэши (Caffeine) используют W-TinyLFU: учитывают и частоту, и недавность, устойчивы к сканированию.
+</div>
+
+<h2 id="order"><span class="h-num">10.3</span>Порядок вставки на практике</h2>
+<ul>
+  <li>Детерминированный JSON (Jackson сериализует Map в порядке итерации), стабильные отчёты и тесты.</li>
+  <li><code>LinkedHashSet</code> — удаление дубликатов с сохранением порядка: <code>new ArrayList&lt;&gt;(new LinkedHashSet&lt;&gt;(list))</code> или <code>list.stream().distinct().toList()</code>.</li>
+  <li>Java 21: <code>SequencedMap</code> — <code>firstEntry()</code>, <code>pollLastEntry()</code>, <code>putFirst(k, v)</code>, <code>putLast</code>, <code>reversed()</code> (тема 15). <code>putFirst</code> перемещает существующий ключ в начало.</li>
+  <li>Цена: +8 байт на узел и чуть медленнее вставка; итерация обычно быстрее, чем у HashMap с большой разреженной таблицей.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">10.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что нужно, чтобы LinkedHashMap работал как LRU-кэш?</p><ul><li>Переопределить get</li><li>Конструктор с accessOrder = true и переопределённый removeEldestEntry</li><li>Вызывать sort после каждого get</li><li>Использовать TreeMap</li></ul><div class="why">Два штриха к готовой структуре.</div></div>
+<div class="mcq" data-ok="3"><p>Меняет ли повторный put существующего ключа его позицию в LinkedHashMap с порядком вставки?</p><ul><li>Да, переносит в конец</li><li>Да, в начало</li><li>Удаляет и вставляет заново</li><li>Нет, порядок вставки определяется первым добавлением</li></ul><div class="why">В режиме доступа — переносит в хвост.</div></div>
+<div class="mcq" data-ok="0"><p>Почему LinkedHashMap в режиме доступа нельзя читать из нескольких потоков без синхронизации?</p><ul><li>get меняет порядок списка — это структурное изменение, гонки портят связи узлов</li><li>Он вообще не поддерживает get</li><li>Он использует ThreadLocal</li><li>Можно, get только читает</li></ul><div class="why">Синхронизация или специализированный кэш.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Реализуйте LRU-кэш без LinkedHashMap (классическая задача).</summary><div class="a"><p>HashMap&lt;K, Node&gt; + собственный двусвязный список с фиктивными головой и хвостом. get: найти узел в карте, переставить в хвост, вернуть значение. put: если есть — обновить и переставить; иначе создать узел в хвосте, положить в карту; если size &gt; capacity — удалить узел после головы из списка и из карты. Все операции O(1).</p></div></details>
+<details class="q"><summary>Чем LRU хуже LFU и W-TinyLFU?</summary><div class="a"><p>LRU учитывает только недавность: однократное сканирование большого набора (отчёт, обход) вытесняет весь полезный горячий набор; циклический доступ длиннее кэша даёт 0% попаданий. LFU учитывает частоту, но медленно забывает старое. W-TinyLFU (Caffeine) — небольшое LRU-окно для новых записей + основной сегмент, куда кандидат попадает, только если по приблизительной частоте (Count-Min Sketch) он «ценнее» вытесняемой записи.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

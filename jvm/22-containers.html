@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · JVM в контейнерах</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="22">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>JVM в контейнерах</h1>
+  <p class="lead">Большинство Java-сервисов работает в Docker и Kubernetes, и почти все «странные» проблемы там — несоответствие того, что видит JVM, и ограничений контейнера: OOM killer без ошибки в логе, троттлинг CPU с паузами GC в сотни миллисекунд, Serial GC в поде с 1 CPU, SIGTERM, который не доходит до Java. Разбираем, как JVM читает cgroups, как подобрать флаги под лимиты (с генератором), образ и корректное завершение.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">cgroups v2</span><span class="tag">лимиты памяти</span><span class="tag">квоты CPU</span><span class="tag">троттлинг</span><span class="tag">Dockerfile</span><span class="tag">graceful shutdown</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cgroups"><span class="h-num">22.1</span>Что JVM видит в контейнере</h2>
+<p>С JDK 10 (и 8u191) включён <code>-XX:+UseContainerSupport</code>: JVM читает ограничения cgroups (v1 и v2) вместо параметров всей машины.</p>
+<div class="table-wrap"><table>
+<tr><th>Ограничение Kubernetes</th><th>cgroup v2</th><th>Что делает JVM</th></tr>
+<tr><td><code>limits.memory</code></td><td><code>memory.max</code></td><td>считает это «физической памятью»: MaxRAMPercentage и др. берутся от него</td></tr>
+<tr><td><code>limits.cpu</code></td><td><code>cpu.max</code> (квота/период)</td><td>ActiveProcessorCount = ⌈квота / период⌉ → потоки GC, JIT, ForkJoinPool, эргономика</td></tr>
+<tr><td><code>requests.cpu</code></td><td><code>cpu.weight</code></td><td>с JDK 19 не учитывается (раньше — делилось на 1024 и давало 1 CPU)</td></tr>
+<tr><td><code>requests.memory</code></td><td>—</td><td>не влияет на JVM, только на планирование подов</td></tr>
+</table></div>
+<pre data-title="проверить, что видит JVM"><code class="txt">java -XshowSettings:system -version
+# Operating System Metrics:  Provider: cgroupv2   Effective CPU Count: 2   Memory Limit: 2.00G
+java -Xlog:os+container=trace -version | head
+jcmd &lt;pid&gt; VM.info | grep -A5 container</code></pre>
+
+<h2 id="gen"><span class="h-num">22.2</span>Генератор флагов под лимиты пода</h2>
+<div class="widget" id="kgW">
+  <div class="widget-title">Pod → флаги JVM</div>
+  <div class="controls">
+    <label>limits.memory, МБ<input type="number" id="kgM" value="2048" min="256" step="256"></label>
+    <label>limits.cpu<select id="kgC"><option value="0.5">0.5</option><option value="1">1</option><option value="2" selected>2</option><option value="4">4</option><option value="0">без лимита (узел 16 CPU)</option></select></label>
+    <label>тип нагрузки<select id="kgT"><option value="web">веб-сервис, задержки важны</option><option value="batch">пакетная обработка</option></select></label>
+    <label>direct/Netty-буферы<select id="kgD"><option value="0">мало</option><option value="1">много (Netty, gRPC, WebFlux)</option></select></label>
+  </div>
+  <pre style="margin:0"><code class="txt" id="kgOut"></code></pre>
+  <div class="verdict" id="kgV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var m = Math.max(256, +$("kgM").value), c = +$("kgC").value, t = $("kgT").value, d = $("kgD").value === "1";
+    var cpus = c === 0 ? 16 : Math.max(1, Math.ceil(c)), pct = m <= 512 ? 50 : m <= 1024 ? 60 : d ? 65 : 75;
+    var gc = t === "batch" ? "-XX:+UseParallelGC" : m >= 8192 && t === "web" ? "-XX:+UseZGC" : "-XX:+UseG1GC";
+    var flags = ["-XX:MaxRAMPercentage=" + pct, "-XX:InitialRAMPercentage=" + pct, gc];
+    if (c > 0 && c < 2) flags.push("-XX:ActiveProcessorCount=2   # иначе эргономика выберет Serial GC и 1 поток JIT");
+    if (d) flags.push("-XX:MaxDirectMemorySize=" + Math.round(m * 0.12) + "m");
+    flags.push("-XX:MaxMetaspaceSize=" + (m <= 1024 ? 192 : 384) + "m", "-XX:+ExitOnOutOfMemoryError", "-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps", "-Xlog:gc*:file=/logs/gc.log:time,uptime:filecount=5,filesize=20m", "-XX:+UseStringDeduplication   # для G1, если много одинаковых строк");
+    if (gc.indexOf("ZGC") >= 0) flags.splice(flags.length - 1, 1);
+    $("kgOut").textContent = "JAVA_TOOL_OPTIONS=\"" + flags.join(" \\\n  ") + "\"\n\n# куча ≈ " + Math.round(m * pct / 100) + " МБ из " + m + " МБ; остальное — metaspace, code cache, потоки, GC, direct";
+    var w = [];
+    if (c > 0 && c < 1) w.push("Лимит " + c + " CPU: JIT и GC-потоки будут троттлиться — прогрев и паузы растянутся; на старте особенно больно. Рассмотрите limit ≥ 1 и requests меньше лимита.");
+    if (c === 0) w.push("Без лимита CPU JVM увидит все 16 ядер узла: 13 потоков GC и большой ForkJoinPool в поде, которому планировщик даёт мало CPU (requests) — конкуренция за CPU с соседями.");
+    if (m < 512) w.push("Меньше 512 МБ для Spring Boot тесно: metaspace и прочее нативное съедят половину.");
+    $("kgV").className = "verdict " + (w.length ? "warn" : "ok"); $("kgV").textContent = w.length ? w.join(" ") : "Конфигурация разумна. Проверьте RSS под нагрузкой (NMT) и подстройте процент.";
+  }
+  ["kgM", "kgC", "kgT", "kgD"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="throttle"><span class="h-num">22.3</span>Троттлинг CPU: невидимые паузы</h2>
+<p>Квота CFS работает периодами по 100 мс: при <code>limits.cpu: 2</code> контейнер может потратить 200 мс процессорного времени за период — на всех потоках вместе. Пауза G1 параллельно на 8 потоках сжигает квоту за 25 мс, и <b>весь контейнер</b> замораживается до конца периода — до 75 мс сверх паузы. Признаки: метрика <code>container_cpu_cfs_throttled_periods_total</code> растёт, задержки скачут при низкой средней загрузке CPU.</p>
+<div class="callout ok"><span class="c-title">Что делать</span>
+Число потоков GC/JIT согласовать с лимитом (эргономика это делает, если лимит задан); не ставить лимит CPU ниже реальных всплесков; многие команды задают только <code>requests.cpu</code> без <code>limits.cpu</code> для latency-чувствительных сервисов, но явно указывают <code>-XX:ActiveProcessorCount</code>, чтобы JVM не видела весь узел.
+</div>
+
+<h2 id="image"><span class="h-num">22.4</span>Образ</h2>
+<pre data-title="Dockerfile: слои, jlink, без root, exec-форма"><code class="txt">FROM eclipse-temurin:21-jdk AS build
+WORKDIR /src
+COPY . .
+RUN ./mvnw -q package -DskipTests \
+ &amp;&amp; java -Djarmode=tools -jar target/app.jar extract --layers --launcher --destination /app
+
+# runtime: можно заменить на собственный jlink-runtime (тема 08) или distroless
+FROM eclipse-temurin:21-jre
+RUN useradd -r -u 10001 app
+WORKDIR /app
+# зависимости меняются редко — отдельные слои кэшируются
+COPY --from=build /app/dependencies/ ./
+COPY --from=build /app/spring-boot-loader/ ./
+COPY --from=build /app/snapshot-dependencies/ ./
+# код приложения меняется на каждый коммит — маленький верхний слой
+COPY --from=build /app/application/ ./
+USER 10001
+# exec-форма: java станет PID 1 и получит SIGTERM
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]</code></pre>
+
+<h2 id="shutdown"><span class="h-num">22.5</span>Корректное завершение пода</h2>
+<div class="widget stepper" id="sdSim">
+  <div class="widget-title">kubectl rollout: что происходит с JVM</div>
+  <div class="flow st-stage">
+    <div class="node" id="sd1"><b>endpoint удалён</b></div><span class="to">→</span>
+    <div class="node" id="sd2"><b>preStop</b></div><span class="to">→</span>
+    <div class="node" id="sd3"><b>SIGTERM</b></div><span class="to">→</span>
+    <div class="node" id="sd4"><b>shutdown hooks</b></div><span class="to">→</span>
+    <div class="node" id="sd5"><b>SIGKILL</b></div>
+  </div>
+  <section class="st-step" data-t="Снятие с балансировки" data-hl="sd1" data-log="под помечен Terminating → удаляется из Endpoints; kube-proxy/ingress узнают об этом с задержкой (секунды)"><p>Под помечается Terminating и удаляется из списка адресов сервиса. Но балансировщики узнают об этом не мгновенно — ещё несколько секунд на под могут приходить новые запросы.</p></section>
+  <section class="st-step" data-t="preStop" data-hl="sd2" data-log="lifecycle.preStop: sleep 5 — дать балансировщикам перестать слать трафик"><p>Поэтому добавляют <code>preStop</code> с короткой паузой (<code>sleep 5</code>), чтобы новые запросы перестали приходить до начала остановки.</p></section>
+  <section class="st-step" data-t="SIGTERM" data-hl="sd3" data-log="kubelet → SIGTERM процессу PID 1. Shell-форма ENTRYPOINT: PID 1 — sh, сигнал до java не дойдёт!"><p>SIGTERM получает PID 1 контейнера. Если ENTRYPOINT в shell-форме (<code>sh -c "java …"</code>), PID 1 — оболочка, и она не передаст сигнал Java: процесс будет убит через grace period без корректного завершения. Используйте exec-форму или <code>exec java …</code> в скрипте, либо tini.</p></section>
+  <section class="st-step" data-t="Корректная остановка" data-hl="sd4" data-log="JVM: shutdown hooks → Spring: server.shutdown=graceful — новые запросы отклоняются, текущие завершаются (до 30 с) → закрытие пулов, Kafka-консьюмеров"><p>JVM запускает shutdown hooks; Spring Boot с <code>server.shutdown=graceful</code> перестаёт принимать запросы, дожидается текущих (<code>spring.lifecycle.timeout-per-shutdown-phase</code>), закрывает пулы соединений, коммитит offset Kafka.</p></section>
+  <section class="st-step" data-t="Принудительно" data-hl="sd5" data-log="terminationGracePeriodSeconds (30 с) истёк → SIGKILL: без hooks, без завершения запросов"><p>Если за <code>terminationGracePeriodSeconds</code> (по умолчанию 30 с) процесс не завершился — SIGKILL. Сумма preStop + время graceful shutdown должна быть меньше grace period.</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">22.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Под с limits.cpu: 500m. Какой GC выберет JVM по умолчанию?</p><ul><li>G1</li><li>ZGC</li><li>Serial: ActiveProcessorCount = 1 → машина «клиентского класса»</li><li>Parallel</li></ul><div class="why">Задайте сборщик явно или ActiveProcessorCount=2.</div></div>
+<div class="mcq" data-ok="0"><p>Почему при низкой средней загрузке CPU у сервиса в контейнере бывают всплески задержек по 50–100 мс?</p><ul><li>Троттлинг CFS: параллельная работа (GC) исчерпывает квоту периода, и контейнер замораживается до конца периода</li><li>Медленная сеть</li><li>JIT отключён</li><li>Kubernetes перезапускает под</li></ul><div class="why">Смотрите метрики throttled periods.</div></div>
+<div class="mcq" data-ok="1"><p>Shutdown hooks не выполняются при остановке пода. Вероятная причина?</p><ul><li>Hooks не работают в Docker</li><li>ENTRYPOINT в shell-форме: SIGTERM получает оболочка, а не java</li><li>Мало памяти</li><li>Spring не поддерживает hooks</li></ul><div class="why">Exec-форма или exec в скрипте.</div></div>
+<div class="mcq" data-ok="3"><p>Какой параметр Kubernetes определяет объём памяти, от которого JVM считает MaxRAMPercentage?</p><ul><li>requests.memory</li><li>Объём памяти узла</li><li>Размер образа</li><li>limits.memory (memory.max в cgroup)</li></ul><div class="why">Без лимита JVM видит память узла — опасно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как настроить JVM-сервис для Kubernetes «по умолчанию правильно»?</summary><div class="a"><p>Лимит памяти и MaxRAMPercentage 65–75 (или явный Xmx) с запасом под не-кучу; явный сборщик (G1 для большинства, ZGC для больших куч и жёстких задержек); ActiveProcessorCount при дробных лимитах CPU; ExitOnOutOfMemoryError + дамп в том; логи GC; exec-форма ENTRYPOINT, graceful shutdown с preStop; startupProbe с запасом на старт и прогрев, readiness — после прогрева; не-root пользователь, слои образа, по возможности jlink/AOT cache.</p></div></details>
+<details class="q"><summary>Под перезапускается с кодом 137. Как понять причину?</summary><div class="a"><p>137 = 128 + 9 (SIGKILL). Варианты: OOMKilled (kubectl describe pod → Last State: OOMKilled; RSS превысил limits.memory — не-кучевая память, слишком большая куча) или провал liveness-пробы/истёк grace period при остановке. Для OOMKilled — NMT и пересчёт памяти (тема 09), для проб — таймауты проб, длинные GC-паузы, троттлинг.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

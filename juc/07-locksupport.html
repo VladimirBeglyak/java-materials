@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · LockSupport: park и unpark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · LOCKS</div>
+  <h1>LockSupport: park и unpark</h1>
+  <p class="lead">Два метода, на которых держится вся блокирующая часть пакета: <code>park()</code> усыпляет текущий поток, <code>unpark(thread)</code> будит конкретный поток. В отличие от <code>wait/notify</code>, им не нужен монитор, а будить можно до того, как поток уснул. Разбираем семантику «разрешения» (permit) в симуляторе, ложные пробуждения, прерывания, blocker-объекты в дампах потоков — и пишем свою блокировку на park/unpark.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">permit</span><span class="tag">park/unpark</span><span class="tag">ложные пробуждения</span><span class="tag">прерывание</span><span class="tag">blocker</span><span class="tag">свой мьютекс</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="permit"><span class="h-num">7.1</span>Модель «разрешения»</h2>
+<p>У каждого потока есть одно двоичное разрешение (permit), изначально отсутствующее. <code>unpark(t)</code> выдаёт разрешение (если его не было). <code>park()</code> потребляет разрешение и сразу возвращается, если оно было, иначе — блокируется до <code>unpark</code>, прерывания, таймаута или <b>без причины</b> (ложное пробуждение).</p>
+<div class="widget" id="pkW">
+  <div class="widget-title">Поток W вызывает park(), поток M — unpark(W)</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="park">W: park()</button>
+    <button class="btn primary" type="button" data-a="unpark">M: unpark(W)</button>
+    <button class="btn" type="button" data-a="unpark2">M: unpark(W) ×3</button>
+    <button class="btn" type="button" data-a="interrupt">M: W.interrupt()</button>
+    <button class="btn" type="button" data-a="spurious">ОС: ложное пробуждение</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="out" id="pkState"></div>
+  <div class="log" id="pkLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, permit, parked, intr, log;
+  function reset() { permit = false; parked = false; intr = false; log = ["W работает, разрешения нет"]; draw(); }
+  function act(a) {
+    if (a === "park") {
+      if (parked) log.push("W уже припаркован");
+      else if (intr) log.push("W: park() вернулся СРАЗУ — у потока стоит флаг прерывания (park его не сбрасывает и не бросает исключение)");
+      else if (permit) { permit = false; log.push("W: park() — разрешение было (unpark пришёл раньше) → потреблено, возврат без блокировки"); }
+      else { parked = true; log.push("W: park() — разрешения нет → поток заблокирован (WAITING (parking))"); }
+    } else if (a === "unpark" || a === "unpark2") {
+      var k = a === "unpark" ? 1 : 3;
+      if (parked) { parked = false; log.push("M: unpark(W) → W проснулся и вернулся из park()" + (k > 1 ? "; остальные " + (k - 1) + " unpark выдали одно разрешение (не копится)" : "")); if (k > 1) permit = true; }
+      else { permit = true; log.push("M: unpark(W) ×" + k + " → разрешение = 1 (двоичное: несколько unpark не накапливаются)"); }
+    } else if (a === "interrupt") { intr = true; if (parked) { parked = false; log.push("M: interrupt → W вернулся из park(); флаг прерывания остаётся установленным — код должен проверить Thread.interrupted()"); } else log.push("M: interrupt → флаг прерывания W установлен"); }
+    else if (a === "spurious") { if (parked) { parked = false; log.push("ОС: W вернулся из park() без unpark и прерывания — поэтому park ВСЕГДА вызывают в цикле с проверкой условия"); } else log.push("W не припаркован"); }
+    draw();
+  }
+  function draw() {
+    $("pkState").textContent = "W: " + (parked ? "ПРИПАРКОВАН (ждёт)" : "работает") + "   ·   permit = " + (permit ? 1 : 0) + "   ·   флаг прерывания = " + intr;
+    $("pkLog").textContent = log.slice(-7).join("\n"); $("pkLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll("#pkW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var a = b.getAttribute("data-a"); if (a === "reset") reset(); else act(a); }); });
+  reset();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th></th><th>wait / notify</th><th>park / unpark</th></tr>
+<tr><td>Нужен монитор</td><td>да (иначе IllegalMonitorStateException)</td><td>нет</td></tr>
+<tr><td>Кого будит</td><td>notify — случайного ожидающего на мониторе</td><td>unpark — конкретный поток</td></tr>
+<tr><td>Будить до ожидания</td><td>notify до wait теряется</td><td>unpark до park «запоминается» в разрешении</td></tr>
+<tr><td>Прерывание</td><td>InterruptedException, флаг сброшен</td><td>просто возврат, флаг остаётся</td></tr>
+<tr><td>Ложные пробуждения</td><td>возможны</td><td>возможны</td></tr>
+<tr><td>Виртуальные потоки</td><td>с Java 24 размонтируют носитель</td><td>размонтируют носитель (основа VT)</td></tr>
+</table></div>
+
+<h2 id="blocker"><span class="h-num">7.2</span>Blocker и наблюдаемость</h2>
+<pre data-title="в дампе потоков видно, чего ждёт поток"><code class="txt">LockSupport.park(this);    // blocker = объект, на котором ждём
+
+"worker-3" #31 WAITING (parking)
+   java.lang.Thread.State: WAITING (parking)
+        at jdk.internal.misc.Unsafe.park(Native Method)
+        - parking to wait for  &lt;0x0000000712a3c4d8&gt; (a java.util.concurrent.locks.ReentrantLock$NonfairSync)
+        at java.util.concurrent.locks.LockSupport.park(LockSupport.java:221)</code></pre>
+<p>Всегда используйте перегрузки с blocker (<code>park(Object)</code>, <code>parkNanos(Object, long)</code>) — без них дамп покажет «parking» без объекта. <code>LockSupport.getBlocker(thread)</code> возвращает его программно.</p>
+
+<h2 id="mutex"><span class="h-num">7.3</span>Свой FIFO-мьютекс</h2>
+<pre data-title="по мотивам примера из Javadoc LockSupport"><code class="java">final class FifoMutex {
+    private final AtomicBoolean locked = new AtomicBoolean();
+    private final Queue&lt;Thread&gt; waiters = new ConcurrentLinkedQueue&lt;&gt;();
+
+    public void lock() {
+        Thread current = Thread.currentThread();
+        waiters.add(current);
+        // ждём, пока мы не окажемся первыми в очереди И не захватим флаг
+        while (waiters.peek() != current || !locked.compareAndSet(false, true)) {
+            LockSupport.park(this);                     // в цикле: ложные пробуждения и чужие unpark
+            // прерывания игнорируем, но запомним, чтобы восстановить флаг
+        }
+        waiters.remove();
+    }
+    public void unlock() {
+        locked.set(false);
+        LockSupport.unpark(waiters.peek());             // разбудить следующего (unpark(null) — no-op)
+    }
+}
+// AQS (тема 08) — промышленная версия той же идеи: CAS по состоянию + очередь + park/unpark</code></pre>
+
+<h2 id="quiz"><span class="h-num">7.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Поток M вызвал unpark(W) трижды, затем W вызвал park() дважды. Что произойдёт?</p><ul><li>Оба park вернутся сразу</li><li>Оба park заблокируются</li><li>Первый park вернётся сразу (одно разрешение), второй заблокируется</li><li>Исключение</li></ul><div class="why">Разрешение двоичное, не счётчик.</div></div>
+<div class="mcq" data-ok="0"><p>Почему park вызывают в цикле с проверкой условия?</p><ul><li>park может вернуться без unpark (ложное пробуждение), из-за прерывания или чужого unpark</li><li>park работает только в цикле</li><li>Иначе не скомпилируется</li><li>Для экономии CPU</li></ul><div class="why">То же правило, что для wait и Condition.await.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает park(), если у потока установлен флаг прерывания?</p><ul><li>Бросает InterruptedException</li><li>Блокируется навсегда</li><li>Сбрасывает флаг и блокируется</li><li>Сразу возвращается; флаг остаётся установленным</li></ul><div class="why">Вызывающий код сам решает, как реагировать.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему unpark до park не теряется и почему это важно?</summary><div class="a"><p>Разрешение запоминается: если поток-освобождающий успел вызвать unpark раньше, чем ждущий дошёл до park, park вернётся сразу. Это устраняет гонку «потерянного пробуждения», которая есть у notify без монитора, и позволяет строить очереди ожидания на CAS без глобальной блокировки (AQS сначала ставит узел в очередь, затем паркуется — даже если освобождение произошло между этими действиями).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

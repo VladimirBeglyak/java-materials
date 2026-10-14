@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Графовые базы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Графовые базы</h1>
+  <p class="lead">Когда главное в данных — связи: «друзья друзей, которые работают в той же компании», «через какие счета прошли деньги», «какие сервисы пострадают, если упадёт этот», — запросы превращаются в обходы на переменную глубину. Графовые базы хранят связи как прямые указатели и обходят их без JOIN. Разбираем модель property graph, Cypher, когда граф действительно выигрывает, а когда хватит рекурсивного CTE (песочница), и подводные камни: суперузлы и шардинг.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">property graph</span><span class="tag">Cypher</span><span class="tag">обходы</span><span class="tag">рекурсивный CTE</span><span class="tag">Neo4j</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">10.1</span>Модель property graph</h2>
+<ul>
+  <li><b>Узлы</b> с метками и свойствами: <code>(:Person {name: "Анна"})</code>, <code>(:Company {name: "Acme"})</code>.</li>
+  <li><b>Связи</b> — направленные, типизированные, тоже со свойствами: <code>-[:WORKS_AT {since: 2021}]-&gt;</code>.</li>
+  <li>Хранение со «смежностью без индекса» (index-free adjacency, Neo4j): узел хранит ссылки на свои связи, переход к соседу — разыменование указателя, а не поиск по индексу.</li>
+</ul>
+<pre data-title="Cypher: рекомендации «знакомые знакомых из моей компании»"><code class="js">MATCH (me:Person {id: 42})-[:KNOWS]-&gt;(:Person)-[:KNOWS]-&gt;(fof:Person)-[:WORKS_AT]-&gt;(c:Company)
+WHERE (me)-[:WORKS_AT]-&gt;(c) AND NOT (me)-[:KNOWS]-&gt;(fof) AND fof &lt;&gt; me
+RETURN fof.name, count(*) AS mutual
+ORDER BY mutual DESC LIMIT 10;
+
+// кратчайший путь до 6 шагов
+MATCH p = shortestPath((a:Person {id: 42})-[:KNOWS*..6]-(b:Person {id: 777})) RETURN p;</code></pre>
+
+<h2 id="cost"><span class="h-num">10.2</span>Почему обходы дороги в реляционной базе</h2>
+<div class="widget" id="hpW">
+  <div class="widget-title">Рост числа затрагиваемых узлов с глубиной</div>
+  <div class="controls">
+    <label>средняя степень узла (связей)<input type="number" id="hpD" value="150" min="1"></label>
+    <label>глубина обхода<select id="hpK"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+  </div>
+  <div class="out" id="hpOut"></div>
+  <div class="verdict" id="hpV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var d = Math.max(1, +$("hpD").value), k = +$("hpK").value, lines = [], tot = 0;
+    for (var i = 1; i <= k; i++) { var n = Math.pow(d, i); tot += n; lines.push("шаг " + i + ": до " + n.toLocaleString("ru") + " узлов"); }
+    $("hpOut").textContent = lines.join("\n") + "\nвсего (без учёта повторов): " + tot.toLocaleString("ru") + "\nреляционно: " + k + " самосоединения таблицы связей, каждое — поиск по индексу на каждую строку предыдущего шага (" + Math.round(tot).toLocaleString("ru") + " × ~3 страницы B-tree)\nграф: " + Math.round(tot).toLocaleString("ru") + " переходов по указателям";
+    $("hpV").className = "verdict " + (tot > 1e6 ? "bad" : tot > 1e4 ? "warn" : "ok");
+    $("hpV").textContent = tot > 1e6 ? "Взрывной рост: никакая база не обойдёт столько в реальном времени. Нужны ограничения (фильтры на каждом шаге, лимиты, предвычисления) — графовая база ускорит каждый шаг, но не отменит экспоненту." : tot > 1e4 ? "Зона, где графовая база заметно выигрывает: глубокие обходы с фильтрами по пути." : "Неглубокий обход: рекурсивный CTE или пара JOIN в PostgreSQL справятся.";
+  }
+  ["hpD", "hpK"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="sandbox"><span class="h-num">10.3</span>Песочница: граф в SQL</h2>
+<p>Для многих задач достаточно таблицы рёбер и рекурсивного CTE (в PostgreSQL — то же самое, плюс расширение Apache AGE для Cypher прямо в PostgreSQL).</p>
+<div class="sqlbox" data-schema="gSchema">
+  <div class="widget-title">Социальный граф: people + knows(a, b)</div>
+  <div class="sql-presets">
+    <button type="button" data-sql="SELECT p.name AS кто, q.name AS знает FROM knows k JOIN people p ON p.id = k.a JOIN people q ON q.id = k.b ORDER BY 1;">все связи</button>
+    <button type="button" data-sql="-- знакомые знакомых Анны (id 1), которых она не знает&#10;SELECT DISTINCT p.name FROM knows k1&#10;JOIN knows k2 ON k2.a = k1.b&#10;JOIN people p ON p.id = k2.b&#10;WHERE k1.a = 1 AND k2.b &lt;&gt; 1&#10;  AND k2.b NOT IN (SELECT b FROM knows WHERE a = 1);">друзья друзей</button>
+    <button type="button" data-sql="-- все достижимые от Анны с расстоянием (BFS через рекурсивный CTE)&#10;WITH RECURSIVE r(id, depth, path) AS (&#10;  SELECT 1, 0, '/1/'&#10;  UNION ALL&#10;  SELECT k.b, r.depth + 1, r.path || k.b || '/'&#10;  FROM r JOIN knows k ON k.a = r.id&#10;  WHERE r.depth &lt; 4 AND instr(r.path, '/' || k.b || '/') = 0   -- защита от циклов&#10;)&#10;SELECT p.name, min(depth) AS distance FROM r JOIN people p ON p.id = r.id GROUP BY p.name ORDER BY distance, p.name;">расстояния</button>
+    <button type="button" data-sql="-- кратчайший путь Анна → Жанна&#10;WITH RECURSIVE r(id, depth, path) AS (&#10;  SELECT 1, 0, 'Анна'&#10;  UNION ALL&#10;  SELECT k.b, r.depth + 1, r.path || ' → ' || p.name&#10;  FROM r JOIN knows k ON k.a = r.id JOIN people p ON p.id = k.b&#10;  WHERE r.depth &lt; 5 AND instr(r.path, p.name) = 0&#10;)&#10;SELECT path, depth FROM r WHERE id = 8 ORDER BY depth LIMIT 1;">кратчайший путь</button>
+    <button type="button" data-sql="-- «влиятельность»: число входящих связей&#10;SELECT p.name, count(*) AS followers FROM knows k JOIN people p ON p.id = k.b GROUP BY p.name ORDER BY followers DESC;">входящие связи</button>
+  </div>
+  <textarea>SELECT DISTINCT p.name FROM knows k1
+JOIN knows k2 ON k2.a = k1.b
+JOIN people p ON p.id = k2.b
+WHERE k1.a = 1 AND k2.b &lt;&gt; 1
+  AND k2.b NOT IN (SELECT b FROM knows WHERE a = 1);</textarea>
+</div>
+<script type="text/plain" id="gSchema">
+CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, company TEXT);
+CREATE TABLE knows (a INTEGER REFERENCES people(id), b INTEGER REFERENCES people(id), PRIMARY KEY (a, b));
+CREATE INDEX knows_b ON knows(b);
+INSERT INTO people VALUES (1,'Анна','Acme'),(2,'Борис','Acme'),(3,'Вера','Globex'),(4,'Глеб','Acme'),(5,'Дина','Initech'),(6,'Егор','Globex'),(7,'Ирина','Initech'),(8,'Жанна','Umbrella');
+INSERT INTO knows VALUES (1,2),(2,1),(1,3),(3,1),(2,4),(4,2),(3,5),(5,3),(3,6),(6,3),(4,6),(6,4),(5,7),(7,5),(7,8),(8,7),(2,5),(5,2);
+</script>
+
+<h2 id="when"><span class="h-num">10.4</span>Когда граф — правильный выбор</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Почему граф</th></tr>
+<tr><td>Антифрод: кольца связанных аккаунтов, общие устройства и карты</td><td>паттерны на 3–6 шагов с фильтрами по пути</td></tr>
+<tr><td>Рекомендации «люди/товары рядом»</td><td>обходы с подсчётом общих соседей</td></tr>
+<tr><td>Граф знаний, онтологии, GraphRAG</td><td>гибкие связи разных типов, запросы по путям</td></tr>
+<tr><td>Зависимости: сеть, сервисы, цепочки поставок</td><td>анализ влияния, кратчайшие пути</td></tr>
+<tr><td>Права доступа с вложенными группами (ReBAC, Zanzibar)</td><td>проверка «есть ли путь пользователь → ресурс»</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Подводные камни</span>
+<b>Суперузлы</b> (знаменитость с миллионом подписчиков) делают обход через них неподъёмным — нужны фильтры по типам связей и ограничения. <b>Шардинг графа</b> — сложная задача: любой разрез режет связи, и обход начинает ходить по сети; большинство графовых баз масштабируют чтение репликами, а не разбиением. <b>Аналитика по всему графу</b> (PageRank, сообщества) — это пакетные алгоритмы (Neo4j GDS, Spark GraphFrames), а не OLTP-запросы.
+</div>
+
+<h2 id="options"><span class="h-num">10.5</span>Варианты</h2>
+<ul>
+  <li><b>Neo4j</b> — самая зрелая, Cypher (основа стандарта GQL, ISO 2024), библиотека графовых алгоритмов.</li>
+  <li><b>Memgraph</b> — в памяти, совместим с Cypher, для потоковых сценариев.</li>
+  <li><b>Amazon Neptune</b> — управляемый, property graph (Gremlin/openCypher) и RDF (SPARQL).</li>
+  <li><b>Apache AGE</b> — Cypher внутри PostgreSQL; <b>рекурсивные CTE</b> — для неглубоких обходов без новой системы.</li>
+  <li><b>RDF-хранилища</b> (GraphDB, Virtuoso) — для семантических данных и онтологий.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">10.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой запрос — сильный довод в пользу графовой базы?</p><ul><li>Список заказов клиента</li><li>Сумма продаж по месяцам</li><li>Найти цепочки переводов длиной до 6 между подозрительными счетами с фильтрами на каждом шаге</li><li>Поиск товара по названию</li></ul><div class="why">Обходы переменной глубины — специализация графов.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое index-free adjacency?</p><ul><li>Узел хранит прямые ссылки на свои связи, переход к соседу не требует поиска по индексу</li><li>Отсутствие любых индексов в базе</li><li>Хэш-индекс по рёбрам</li><li>Хранение графа в одной таблице</li></ul><div class="why">Стоимость шага не зависит от размера всего графа.</div></div>
+<div class="mcq" data-ok="1"><p>Почему графовые базы плохо шардируются?</p><ul><li>Они не поддерживают репликацию</li><li>Любое разбиение режет связи, и обходы начинают ходить по сети между узлами</li><li>Узлы слишком большие</li><li>Cypher не поддерживает кластеры</li></ul><div class="why">Поэтому масштабируют в основном чтение и вертикально.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Иерархия категорий товаров (до 6 уровней) — нужна ли графовая база?</summary><div class="a"><p>Нет. Дерево небольшой глубины хорошо ложится на реляционную модель: список смежности + рекурсивный CTE, материализованный путь (ltree в PostgreSQL), closure table или nested sets — в зависимости от соотношения чтения и изменений. Графовая база оправдана при произвольных связях разных типов и глубоких обходах с фильтрами.</p></div></details>
+<details class="q"><summary>Как совместить графовую базу с основной?</summary><div class="a"><p>Основные сущности остаются в OLTP-базе (источник истины), в граф попадают только узлы и связи, нужные для обходов, с минимальными свойствами — через CDC или события. Граф должен уметь пересобираться из основной базы. Результаты обходов (рекомендации, оценка риска) возвращаются приложению или записываются обратно как производные данные.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

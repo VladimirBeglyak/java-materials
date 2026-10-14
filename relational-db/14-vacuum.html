@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · VACUUM, bloat, wraparound</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · ТРАНЗАКЦИИ И КОНКУРЕНТНОСТЬ</div>
+  <h1>VACUUM, bloat, wraparound</h1>
+  <p class="lead">Обратная сторона MVCC в PostgreSQL: мёртвые версии строк надо убирать, статистику — обновлять, а старые номера транзакций — «замораживать», иначе база остановится. Что делает VACUUM, как настроить autovacuum для больших и горячих таблиц, как измерить и устранить раздувание и не допустить аварии wraparound.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">VACUUM</span><span class="tag">autovacuum</span><span class="tag">bloat</span><span class="tag">freeze</span><span class="tag">pg_repack</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="what"><span class="h-num">14.1</span>Что делает VACUUM</h2>
+<div class="flow col">
+  <div class="node"><b>1. Просмотр таблицы</b><small>только страниц, не отмеченных в visibility map как all-visible; собирает адреса мёртвых версий (невидимых никому — старше горизонта)</small></div><span class="to">↓</span>
+  <div class="node"><b>2. Очистка индексов</b><small>удаляет из каждого индекса записи, указывающие на мёртвые версии — самая дорогая часть при многих индексах</small></div><span class="to">↓</span>
+  <div class="node"><b>3. Очистка таблицы</b><small>освобождает место на страницах, обновляет карту свободного места — новые строки займут его</small></div><span class="to">↓</span>
+  <div class="node ok"><b>4. Visibility map и заморозка</b><small>отмечает all-visible страницы (для Index Only Scan) и замораживает старые версии (защита от wraparound)</small></div>
+</div>
+<div class="grid-2">
+  <div class="card"><h4>VACUUM</h4><p>Работает параллельно с чтением и записью (SHARE UPDATE EXCLUSIVE). Место <b>не возвращает ОС</b> — только делает его доступным для новых строк (кроме пустого хвоста таблицы).</p></div>
+  <div class="card"><h4>VACUUM FULL</h4><p>Переписывает таблицу заново, компактно, и возвращает место. Но держит ACCESS EXCLUSIVE всё время работы — таблица недоступна. Для продакшена — <code>pg_repack</code> или <code>pg_squeeze</code>.</p></div>
+</div>
+
+<h2 id="autovacuum"><span class="h-num">14.2</span>Autovacuum: когда он приходит</h2>
+<p>Autovacuum запускает VACUUM для таблицы, когда число мёртвых строк превышает <code>autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × строк</code> (по умолчанию 50 + 20%). ANALYZE — при <code>50 + 10%</code> изменённых строк. С PostgreSQL 13 — и по числу вставок (для visibility map и заморозки в таблицах «только вставка»).</p>
+<div class="widget" id="avW">
+  <div class="widget-title">Симулятор: раздувание таблицы за сутки</div>
+  <div class="controls">
+    <label>строк, млн<input type="number" id="avN" value="50" min="0.01" step="1"></label>
+    <label>UPDATE в секунду<input type="number" id="avU" value="500" min="0"></label>
+    <label>scale_factor<select id="avSF"><option value="0.2" selected>0.2 (по умолчанию)</option><option value="0.05">0.05</option><option value="0.01">0.01</option></select></label>
+    <label>долгая транзакция<select id="avLT"><option value="0">нет</option><option value="2">2 часа днём</option><option value="10">idle in transaction 10 ч</option></select></label>
+  </div>
+  <div id="avBars"></div>
+  <div class="out" id="avOut"></div>
+  <div class="verdict" id="avV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(0.01, +$("avN").value) * 1e6, u = Math.max(0, +$("avU").value), sf = +$("avSF").value, lt = +$("avLT").value;
+    var trig = 50 + sf * n, perH = u * 3600, dead = 0, maxDead = 0, runs = 0, series = [];
+    for (var h = 0; h < 24; h++) {
+      var blocked = lt && h >= 10 && h < 10 + lt;
+      dead += perH;
+      if (!blocked && dead >= trig) { runs += Math.max(1, Math.floor(dead / trig)); dead = blocked ? dead : dead % trig * 0.1; }
+      maxDead = Math.max(maxDead, dead); series.push(dead);
+    }
+    var bloatPct = maxDead / (n + maxDead) * 100, interval = u ? trig / u / 60 : Infinity;
+    $("avBars").innerHTML = '<div style="display:flex;align-items:flex-end;gap:2px;height:90px;margin:8px 0">' + series.map(function (d, h) { var p = d / Math.max(maxDead, 1) * 100; return '<i title="' + h + ':00 — мёртвых ' + Math.round(d).toLocaleString("ru") + '" style="flex:1;height:' + Math.max(2, p) + '%;background:' + (lt && h >= 10 && h < 10 + lt ? "var(--bad)" : "var(--accent)") + ';border-radius:2px 2px 0 0"></i>'; }).join("") + '</div><div class="hint">мёртвые версии по часам суток (красное — время долгой транзакции)</div>';
+    $("avOut").textContent = "порог запуска autovacuum: " + Math.round(trig).toLocaleString("ru") + " мёртвых строк" +
+      "\nинтервал между запусками ≈ " + (isFinite(interval) ? (interval < 120 ? interval.toFixed(1) + " мин" : (interval / 60).toFixed(1) + " ч") : "никогда") +
+      "\nмаксимум мёртвых версий: " + Math.round(maxDead).toLocaleString("ru") + " (~" + bloatPct.toFixed(0) + "% таблицы)";
+    var v = $("avV");
+    if (lt >= 10) { v.className = "verdict bad"; v.textContent = "Долгая транзакция держит горизонт: autovacuum приходит, но ничего не может удалить. Таблица и индексы растут, и после окончания транзакции место освободится, но файлы останутся большими — нужен pg_repack. Ставьте idle_in_transaction_session_timeout."; }
+    else if (bloatPct > 15) { v.className = "verdict warn"; v.textContent = "Для большой таблицы порог 20% слишком велик: между запусками копятся миллионы мёртвых строк, а сам VACUUM становится долгим. Уменьшите scale_factor для этой таблицы (0.01–0.05) или задайте фиксированный порог."; }
+    else { v.className = "verdict ok"; v.textContent = "Autovacuum успевает: мёртвых версий немного, место переиспользуется."; }
+  }
+  ["avN", "avU", "avSF", "avLT"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<pre data-title="настройка для большой горячей таблицы и для всего сервера"><code class="sql">ALTER TABLE orders SET (
+  autovacuum_vacuum_scale_factor = 0.01,     -- 1% вместо 20%
+  autovacuum_vacuum_threshold = 10000,
+  autovacuum_analyze_scale_factor = 0.02,
+  autovacuum_vacuum_cost_limit = 2000        -- разрешить работать быстрее
+);
+
+-- postgresql.conf (современное железо):
+-- autovacuum_max_workers = 5
+-- autovacuum_vacuum_cost_limit = 1000..2000   (по умолчанию 200 — очень осторожно)
+-- autovacuum_naptime = 15s
+-- maintenance_work_mem / autovacuum_work_mem = 1GB   (больше мёртвых адресов за один проход по индексам)</code></pre>
+
+<h2 id="bloat"><span class="h-num">14.3</span>Измерить раздувание</h2>
+<pre data-title="мёртвые строки и последний VACUUM"><code class="sql">SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       last_autovacuum, last_autoanalyze, autovacuum_count
+FROM pg_stat_user_tables ORDER BY n_dead_tup DESC LIMIT 10;
+
+-- точная оценка свободного места (читает таблицу!): расширение pgstattuple
+SELECT * FROM pgstattuple('orders');           -- dead_tuple_percent, free_percent
+SELECT * FROM pgstatindex('orders_pkey');      -- avg_leaf_density, leaf_fragmentation
+
+-- что сейчас делает vacuum
+SELECT * FROM pg_stat_progress_vacuum;</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Ситуация</th><th>Что делать</th></tr>
+<tr><td>Таблица раздута в разы, нужна компактность без простоя</td><td><code>pg_repack -t orders</code> (короткие блокировки в начале и конце)</td></tr>
+<tr><td>Раздут индекс</td><td><code>REINDEX INDEX CONCURRENTLY …</code></td></tr>
+<tr><td>Раздутие возвращается</td><td>искать причину: горизонт (долгие транзакции, слоты), мало воркеров, низкий cost_limit, scale_factor</td></tr>
+<tr><td>Таблица-очередь с постоянными INSERT/DELETE</td><td>агрессивный autovacuum на таблицу; или партиции с TRUNCATE/DROP</td></tr>
+</table></div>
+
+<h2 id="wraparound"><span class="h-num">14.4</span>Wraparound: авария, которую можно не допустить</h2>
+<p>Номер транзакции — 32 бита, около 4 млрд значений, и сравнение идёт «по кругу»: для любой транзакции 2 млрд номеров — прошлое, 2 млрд — будущее. Если строке 2 млрд транзакций, её xmin «перескочит» в будущее, и строка исчезнет. Защита — <b>заморозка</b>: VACUUM помечает достаточно старые версии как frozen («видны всем, всегда»).</p>
+<div class="widget" id="wrW">
+  <div class="widget-title">Возраст самой старой незамороженной транзакции</div>
+  <div class="controls"><label>age(datfrozenxid), млн<input type="number" id="wrA" value="250" min="0" max="2147"></label><label>транзакций в секунду<input type="number" id="wrT" value="2000" min="1"></label></div>
+  <div class="bar" id="wrBar"><i></i></div>
+  <div class="verdict" id="wrV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var a = Math.min(2147, Math.max(0, +$("wrA").value)), t = Math.max(1, +$("wrT").value), left = (2000 - a) * 1e6 / t / 86400, pct = a / 2147 * 100;
+    var bar = $("wrBar"); bar.className = "bar " + (a < 200 ? "ok" : a < 1000 ? "" : "bad"); bar.firstChild.style.width = pct + "%";
+    var v = $("wrV");
+    if (a < 200) { v.className = "verdict ok"; v.textContent = "Норма: ниже autovacuum_freeze_max_age (200 млн). Обычный autovacuum замораживает строки попутно."; }
+    else if (a < 1000) { v.className = "verdict warn"; v.textContent = "Выше 200 млн: запущен «агрессивный» autovacuum против wraparound (его нельзя отменить, он читает всю таблицу). Если возраст продолжает расти — что-то мешает (горизонт, отменяемые vacuum, огромная таблица). До остановки при нынешней нагрузке ≈ " + left.toFixed(0) + " дн."; }
+    else { v.className = "verdict bad"; v.textContent = "Опасная зона! Ближе к 2 млрд (за 3 млн до предела) PostgreSQL перестанет выдавать новые номера транзакций — база перейдёт в режим только чтения, пока не выполнен VACUUM. Осталось ≈ " + Math.max(0, left).toFixed(1) + " дн. Немедленно: найти и устранить то, что держит горизонт, запустить VACUUM (FREEZE) самых старых таблиц."; }
+  }
+  ["wrA", "wrT"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<pre data-title="мониторинг возраста — обязательная метрика"><code class="sql">SELECT datname, age(datfrozenxid) FROM pg_database ORDER BY 2 DESC;
+SELECT relname, age(relfrozenxid), pg_size_pretty(pg_total_relation_size(oid))
+FROM pg_class WHERE relkind IN ('r', 'm', 't') ORDER BY 2 DESC LIMIT 10;
+-- алерт: age &gt; 500 млн</code></pre>
+<div class="callout bad"><span class="c-title">Реальные инциденты</span>
+Известные публичные истории простоя (Sentry в 2015, Mailchimp/Mandrill в 2019) — wraparound на нагруженных базах, где autovacuum не успевал или был заблокирован. Многочасовое восстановление в однопользовательском режиме. Метрика возраста xid и алерт на неё дешевле.
+</div>
+
+<h2 id="quiz"><span class="h-num">14.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Возвращает ли обычный VACUUM место операционной системе?</p><ul><li>Да, всегда</li><li>Нет, освобождённое место переиспользуется для новых строк этой таблицы (кроме пустых страниц в конце файла)</li><li>Только для индексов</li><li>Только с параметром ANALYZE</li></ul><div class="why">Сжать файл можно VACUUM FULL (с блокировкой) или pg_repack.</div></div>
+<div class="mcq" data-ok="2"><p>Autovacuum регулярно запускается по таблице, но n_dead_tup не уменьшается. Вероятная причина?</p><ul><li>Слишком мало индексов</li><li>Отключена статистика</li><li>Что-то держит горизонт: долгая транзакция, idle in transaction, забытый слот репликации</li><li>Слишком большой shared_buffers</li></ul><div class="why">Мёртвые версии, которые ещё может увидеть чей-то снимок, удалять нельзя.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем VACUUM замораживает старые версии строк?</p><ul><li>Чтобы при переполнении 32-битного счётчика транзакций старые строки не стали «невидимыми из будущего»</li><li>Чтобы сжать таблицу</li><li>Чтобы ускорить запись</li><li>Чтобы запретить их изменение</li></ul><div class="why">Замороженная версия видна всем независимо от номеров.</div></div>
+<div class="mcq" data-ok="3"><p>Почему для таблицы на 500 млн строк настройки autovacuum по умолчанию плохи?</p><ul><li>Autovacuum не работает с большими таблицами</li><li>Нужно отключить autovacuum и запускать VACUUM вручную</li><li>Он будет запускаться слишком часто</li><li>Порог 20% = 100 млн мёртвых строк между запусками: раздувание и очень долгие проходы</li></ul><div class="why">Для больших таблиц уменьшают scale_factor и поднимают cost_limit.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Таблица выросла с 10 до 80 ГБ при том же числе строк. Ваши действия?</summary><div class="a"><p>1) Убедиться, что это раздувание: pgstattuple или оценочные запросы, n_dead_tup. 2) Найти причину: долгие транзакции и idle in transaction, слоты репликации, hot_standby_feedback, отменяемый autovacuum (блокировки), недостаточные настройки для этой таблицы. 3) Устранить причину, настроить autovacuum таблицы. 4) Вернуть место: pg_repack таблицы, REINDEX CONCURRENTLY индексов. 5) Добавить мониторинг dead_pct и возраста транзакций.</p></div></details>
+<details class="q"><summary>Можно ли отключить autovacuum на таблице, чтобы он не мешал нагрузке?</summary><div class="a"><p>Нет: без него растёт раздувание, устаревает статистика (плохие планы), не обновляется visibility map (нет Index Only Scan), и приближается wraparound — тогда агрессивный vacuum всё равно запустится в худший момент. Правильно — сделать его быстрее и чаще (меньшие порции работы), а не реже.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

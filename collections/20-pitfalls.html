@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Ловушки и типичные ошибки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ПРАКТИКА</div>
+  <h1>Ловушки и типичные ошибки</h1>
+  <p class="lead">Шестнадцать ошибок с коллекциями, которые регулярно встречаются на код-ревью и в продакшен-инцидентах. Для каждой — фрагмент кода: найдите проблему сами, затем откройте разбор с причиной и исправлением. Многие из них уже встречались в курсе — здесь они собраны вместе как чек-лист.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">16 ошибок</span><span class="tag">найди баг</span><span class="tag">чек-лист ревью</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="hunt"><span class="h-num">20.1</span>Найдите ошибку</h2>
+<div class="widget" id="bgW">
+  <div class="widget-title">Фрагмент <span id="bgN"></span> из 16</div>
+  <div class="controls"><button class="btn" type="button" id="bgPrev">← назад</button><button class="btn" type="button" id="bgNext">дальше →</button><button class="btn primary" type="button" id="bgShow">Показать разбор</button><span class="st-count" id="bgScore"></span></div>
+  <pre style="margin:0"><code class="java" id="bgCode"></code></pre>
+  <div class="controls"><button class="btn" type="button" id="bgGot">✔ Нашёл сам</button><button class="btn" type="button" id="bgMiss">✘ Не нашёл</button></div>
+  <div class="verdict" id="bgV"></div>
+</div>
+<script>
+(function () {
+  var B = [
+    ["List<Integer> ids = new ArrayList<>(List.of(10, 20, 30));\nint toDelete = 30;\nids.remove(toDelete);      // хотели удалить значение 30","remove(int) удаляет по индексу, remove(Object) — по значению. С аргументом int выбирается remove(int index) → IndexOutOfBoundsException: Index 30 out of bounds for length 3 (а для маленьких чисел — тихо удалится не тот элемент). Пишите ids.remove(Integer.valueOf(toDelete)) или ids.removeIf(x -> x == toDelete)."],
+    ["for (String s : names) {\n    if (s.isBlank()) names.remove(s);\n}", "Удаление в обход итератора внутри for-each → ConcurrentModificationException (или тихий пропуск элемента, если удаляли предпоследний). names.removeIf(String::isBlank)."],
+    ["List<String> list = Arrays.asList(\"a\", \"b\");\nlist.add(\"c\");", "Arrays.asList — фиксированного размера: UnsupportedOperationException. new ArrayList<>(Arrays.asList(...)) или List.of для неизменяемого."],
+    ["class Key { String a; int b; /* equals переопределён, hashCode — нет */ }\nmap.put(new Key(\"x\", 1), v);\nmap.get(new Key(\"x\", 1));   // null", "Нарушен контракт: равные объекты должны иметь равные hashCode. Переопределяйте оба (или record)."],
+    ["Set<Point> set = new HashSet<>();\nPoint p = new Point(1, 2);   // изменяемый, equals/hashCode по x, y\nset.add(p);\np.x = 5;\nset.contains(p);              // false\nset.remove(p);                // false — утечка", "Изменение полей, участвующих в hashCode, после добавления «теряет» элемент. Ключи и элементы хеш-структур — неизменяемые."],
+    ["Map<String, Integer> counts = new HashMap<>();\nint c = counts.get(word);      // для нового слова\ncounts.put(word, c + 1);", "get вернёт null, автораспаковка в int → NullPointerException. counts.merge(word, 1, Integer::sum)."],
+    ["Map<String, List<Order>> byCustomer = new HashMap<>();\n// много потоков:\nbyCustomer.computeIfAbsent(id, k -> new ArrayList<>()).add(order);", "HashMap не потокобезопасна: потерянные записи, повреждённая структура. ConcurrentHashMap решит гонку на карте, но ArrayList внутри тоже не потокобезопасен — нужна потокобезопасная коллекция значений или синхронизация на ней."],
+    ["List<Item> page = allItems.subList(0, 20);\ncache.put(key, page);         // держим в кэше часами", "subList — представление: держит весь огромный allItems в памяти; к тому же после изменения allItems — CME. Кэшируйте копию: List.copyOf(allItems.subList(0, 20))."],
+    ["PriorityQueue<Task> pq = new PriorityQueue<>(byPriority);\n// ...\nfor (Task t : pq) process(t);      // ожидают порядок по приоритету", "Итерация PriorityQueue идёт в порядке массива кучи, не по приоритету. while (!pq.isEmpty()) process(pq.poll())."],
+    ["Comparator<User> byAge = (a, b) -> a.age() - b.age();", "Вычитание переполняется при больших разностях и ломает контракт компаратора. Comparator.comparingInt(User::age)."],
+    ["Set<String> tags = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);\ntags.add(\"Java\"); tags.add(\"java\");\ntags.size();                   // ожидали 2", "TreeSet определяет равенство компаратором: «Java» и «java» — один элемент. Это может быть и задумкой, но размер будет 1."],
+    ["Map<Long, User> users = new HashMap<>(expectedCount);   // expectedCount = 1_000_000", "Аргумент — ёмкость таблицы, а не число элементов: при 1 млн элементов будет resize (порог 0.75 · 2^20 = 786 432). HashMap.newHashMap(expectedCount)."],
+    ["List<Integer> nums = List.of(1, 2, 3);\nif (nums.contains(null)) { ... }", "List.of враждебен к null: contains(null) бросает NullPointerException. Проверяйте null отдельно или используйте коллекции, допускающие null."],
+    ["Map<String, Integer> m = Collections.synchronizedMap(new HashMap<>());\nfor (String k : m.keySet()) { ... }   // в многопоточном коде", "Итерацию синхронизированной обёртки нужно выполнять внутри synchronized (m) { ... }, иначе CME или гонки. Либо ConcurrentHashMap со слабо согласованными итераторами."],
+    ["List<String> result = stream.collect(Collectors.toList());\n// позже в другом модуле:\nresult.add(\"extra\");\n// после рефакторинга stream.toList():\nresult.add(\"extra\");          // UnsupportedOperationException", "stream.toList() возвращает неизменяемый список, Collectors.toList() — фактически ArrayList без гарантий. При замене проверяйте, не меняется ли результат дальше."],
+    ["LinkedList<Integer> list = ...;   // 100 000 элементов\nfor (int i = 0; i < list.size(); i++) sum += list.get(i);", "get(i) у LinkedList — O(n): весь цикл O(n²), минуты вместо миллисекунд. for-each (итератор) или ArrayList."]
+  ];
+  var $ = function (i) { return document.getElementById(i); }, cur = 0, res = {};
+  function draw() { $("bgN").textContent = (cur + 1); $("bgCode").textContent = B[cur][0]; $("bgV").className = "verdict"; $("bgV").textContent = "Подумайте, что здесь не так, прежде чем открыть разбор."; var g = 0; for (var k in res) if (res[k]) g++; $("bgScore").textContent = "найдено самостоятельно: " + g + " из " + Object.keys(res).length + " отвеченных"; }
+  $("bgShow").addEventListener("click", function () { $("bgV").className = "verdict warn"; $("bgV").textContent = B[cur][1]; });
+  $("bgNext").addEventListener("click", function () { cur = (cur + 1) % B.length; draw(); });
+  $("bgPrev").addEventListener("click", function () { cur = (cur - 1 + B.length) % B.length; draw(); });
+  $("bgGot").addEventListener("click", function () { res[cur] = true; cur = (cur + 1) % B.length; draw(); });
+  $("bgMiss").addEventListener("click", function () { res[cur] = false; var g = 0; for (var k in res) if (res[k]) g++; $("bgScore").textContent = "найдено самостоятельно: " + g + " из " + Object.keys(res).length + " отвеченных"; $("bgV").className = "verdict warn"; $("bgV").textContent = B[cur][1]; });
+  draw();
+})();
+</script>
+
+<h2 id="checklist"><span class="h-num">20.2</span>Чек-лист ревью кода с коллекциями</h2>
+<div class="widget" id="ckW">
+  <div class="widget-title">Отметьте, что проверено</div>
+  <div class="checks col" id="ckL"></div>
+  <div class="verdict" id="ckV"></div>
+</div>
+<script>
+(function () {
+  var I = ["Выбран правильный тип: ArrayList/ArrayDeque/HashMap по умолчанию, LinkedList — обоснован", "Ключи и элементы хеш-структур неизменяемые, equals и hashCode согласованы", "Нет удаления в обход итератора; используется removeIf или Iterator.remove", "Задана ёмкость при известном размере (newHashMap, new ArrayList<>(n))", "Нет NPE от get + распаковки; используются merge/getOrDefault/computeIfAbsent", "Компараторы через comparing/compare, без вычитания", "Публичные методы не отдают изменяемое внутреннее состояние (копии или неизменяемые коллекции)", "Нет долгоживущих subList/Arrays.asList-представлений над большими данными", "В многопоточном коде — конкурентные коллекции и атомарные составные операции", "Не используется порядок итерации HashMap/HashSet/Set.of как часть логики или тестов"];
+  var $ = function (i) { return document.getElementById(i); };
+  $("ckL").innerHTML = I.map(function (t, i) { return '<label><input type="checkbox" data-i="' + i + '"> ' + t + "</label>"; }).join("");
+  function run() { var n = $("ckL").querySelectorAll("input:checked").length; $("ckV").className = "verdict " + (n === I.length ? "ok" : n > 6 ? "warn" : "bad"); $("ckV").textContent = n + " из " + I.length + (n === I.length ? " — можно мержить." : " — непроверенные пункты — частые источники багов."); }
+  $("ckL").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">20.3</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p><code>List&lt;Integer&gt; l = new ArrayList&lt;&gt;(List.of(5, 6, 7)); l.remove(1);</code> — что останется?</p><ul><li>[6, 7]</li><li>[5, 7]</li><li>[5, 6, 7]</li><li>Исключение</li></ul><div class="why">int-литерал выбирает remove(int index).</div></div>
+<div class="mcq" data-ok="2"><p>Что не так с <code>new HashMap&lt;&gt;(map.size())</code> для копии большой карты?</p><ul><li>Ничего</li><li>Конструктор не принимает int</li><li>Ёмкость меньше нужной для порога 0.75 — при копировании произойдёт лишний resize</li><li>Это создаст TreeMap</li></ul><div class="why">new HashMap&lt;&gt;(map) сам вычисляет ёмкость правильно.</div></div>
+<div class="mcq" data-ok="0"><p>Какая операция безопасна внутри for-each по ArrayList?</p><ul><li>list.set(i, x) — замена значения</li><li>list.add(x)</li><li>list.remove(x)</li><li>list.clear()</li></ul><div class="why">set не меняет modCount.</div></div>
+
+</div></main>
+</div>
+</body>
+</html>

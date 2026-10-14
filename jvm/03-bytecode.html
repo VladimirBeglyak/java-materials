@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Байткод и стековая машина</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.vm { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 14px; margin: 12px 0; }
+.vm-code { font: 13px/1.55 var(--font-mono); background: var(--bg-sunk); border-radius: 8px; padding: 8px 0; }
+.vm-code div { padding: 0 12px; white-space: pre; }
+.vm-code div.pc { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.vm-box h5 { margin: 0 0 6px; font-size: 12px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: .05em; }
+.vm-stack { display: flex; flex-direction: column-reverse; gap: 4px; min-height: 120px; border: 1.5px dashed var(--line); border-radius: 8px; padding: 6px; margin-bottom: 12px; }
+.vm-stack span, .vm-loc span { font: 13px var(--font-mono); padding: 4px 8px; border-radius: 6px; border: 1.5px solid var(--line); background: var(--bg); }
+.vm-stack span.top { border-color: var(--accent); background: var(--accent-soft); }
+.vm-loc { display: grid; grid-template-columns: 60px minmax(0, 1fr); gap: 4px; }
+.vm-loc span.chg { border-color: var(--ok); background: var(--ok-soft); }
+@media (max-width: 640px) { .vm { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ПЛАТФОРМА И БАЙТКОД</div>
+  <h1>Байткод и стековая машина</h1>
+  <p class="lead">JVM — стековая машина: у инструкций нет регистров, они берут операнды с вершины стека операндов текущего кадра и кладут туда результат. Локальные переменные — пронумерованные слоты. Пройдите по шагам настоящий байткод (вывод <code>javap -c</code>) в симуляторе интерпретатора и посмотрите, во что javac превращает циклы, тернарный оператор, <code>switch</code>, <code>try/finally</code> и автоупаковку.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">кадр метода</span><span class="tag">стек операндов</span><span class="tag">локальные переменные</span><span class="tag">набор инструкций</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="frame"><span class="h-num">3.1</span>Кадр метода</h2>
+<p>При каждом вызове метода в стеке потока создаётся <b>кадр</b> (frame):</p>
+<ul>
+  <li><b>массив локальных переменных</b> размера <code>max_locals</code>: слот 0 — <code>this</code> (у экземплярных методов), затем аргументы, затем локальные переменные; <code>long</code> и <code>double</code> занимают по два слота; слоты переиспользуются для переменных из непересекающихся блоков;</li>
+  <li><b>стек операндов</b> глубиной не более <code>max_stack</code> — оба размера вычисляет javac и проверяет верификатор;</li>
+  <li>ссылка на <b>пул констант времени выполнения</b> класса и адрес возврата.</li>
+</ul>
+<p>Типы закодированы в инструкциях: <code>iadd</code> складывает int, <code>ladd</code> — long, <code>dadd</code> — double. Поэтому байткод проверяем статически: верификатор знает тип каждого значения в каждой точке.</p>
+
+<h2 id="sim"><span class="h-num">3.2</span>Симулятор интерпретатора</h2>
+<div class="widget" id="vmW">
+  <div class="widget-title">Выполните байткод по одной инструкции</div>
+  <div class="controls">
+    <label>метод<select id="vmP"><option value="sum">static int sum(int n)</option><option value="max">static int max(int a, int b)</option><option value="fact">static long fact(int n)</option></select></label>
+    <label>аргументы<input type="text" id="vmA" value="4"></label>
+    <button class="btn" type="button" id="vmReset">↺ Сначала</button>
+    <button class="btn primary" type="button" id="vmStep">Шаг ▶</button>
+    <button class="btn" type="button" id="vmRun">До конца ⏭</button>
+  </div>
+  <pre id="vmSrc" style="margin:0"><code class="java"></code></pre>
+  <div class="vm">
+    <div class="vm-code" id="vmCode"></div>
+    <div class="vm-box">
+      <h5>Стек операндов (вершина сверху)</h5><div class="vm-stack" id="vmStack"></div>
+      <h5>Локальные переменные</h5><div class="vm-loc" id="vmLoc"></div>
+    </div>
+  </div>
+  <div class="out" id="vmOut"></div>
+</div>
+<script>
+(function () {
+  var P = {
+    sum: { src: "static int sum(int n) {\n    int s = 0;\n    for (int i = 1; i <= n; i++) s += i;\n    return s;\n}", names: ["n", "s", "i"], args: "4",
+      code: [[0, "iconst_0"], [1, "istore_1"], [2, "iconst_1"], [3, "istore_2"], [4, "iload_2"], [5, "iload_0"], [6, "if_icmpgt", 19], [9, "iload_1"], [10, "iload_2"], [11, "iadd"], [12, "istore_1"], [13, "iinc", 2, 1], [16, "goto", 4], [19, "iload_1"], [20, "ireturn"]] },
+    max: { src: "static int max(int a, int b) {\n    return a > b ? a : b;\n}", names: ["a", "b"], args: "3, 8",
+      code: [[0, "iload_0"], [1, "iload_1"], [2, "if_icmple", 9], [5, "iload_0"], [6, "goto", 10], [9, "iload_1"], [10, "ireturn"]] },
+    fact: { src: "static long fact(int n) {\n    long r = 1;\n    while (n > 1) r *= n--;\n    return r;\n}", names: ["n", "r", "(r, 2-й слот)"], args: "5",
+      code: [[0, "lconst_1"], [1, "lstore_1"], [2, "iload_0"], [3, "iconst_1"], [4, "if_icmple", 18], [7, "lload_1"], [8, "iload_0"], [9, "iinc", 0, -1], [12, "i2l"], [13, "lmul"], [14, "lstore_1"], [15, "goto", 2], [18, "lload_1"], [19, "lreturn"]] }
+  };
+  var D = {
+    iconst_0: "положить int 0", iconst_1: "положить int 1", lconst_1: "положить long 1 (на стеке это одно значение размером в 2 слота)",
+    istore_1: "снять int с вершины → слот 1", istore_2: "снять int → слот 2", lstore_1: "снять long → слоты 1–2",
+    iload_0: "положить значение слота 0", iload_1: "положить слот 1", iload_2: "положить слот 2", lload_1: "положить long из слотов 1–2",
+    iadd: "снять два int, положить сумму", imul: "снять два int, положить произведение", lmul: "снять два long, положить произведение", i2l: "int на вершине → long",
+    if_icmpgt: "снять b, a; если a > b — переход", if_icmple: "снять b, a; если a ≤ b — переход", "goto": "безусловный переход",
+    iinc: "прибавить константу к слоту прямо в массиве локальных переменных (стек не трогается)", ireturn: "вернуть int с вершины вызывающему", lreturn: "вернуть long"
+  };
+  var $ = function (i) { return document.getElementById(i); }, p, st, loc, pc, steps, done, changed, msg;
+  function reset() {
+    p = P[$("vmP").value]; var a = $("vmA").value.split(/[ ,]+/).filter(Boolean).map(Number);
+    st = []; loc = p.names.map(function () { return "—"; }); a.forEach(function (v, i) { loc[i] = isNaN(v) ? 0 : v; });
+    pc = 0; steps = 0; done = false; changed = -1; msg = "кадр создан: аргументы в слотах 0.." + (a.length - 1) + ", стек пуст";
+    $("vmSrc").firstChild.textContent = p.src; draw();
+  }
+  function idx(off) { for (var i = 0; i < p.code.length; i++) if (p.code[i][0] === off) return i; return -1; }
+  function step() {
+    if (done) return; var ins = p.code[pc], op = ins[1], n = pc + 1, x, y; changed = -1;
+    var m = /^([il])(load|store)_(\d)$/.exec(op);
+    if (m) { var s = +m[3]; if (m[2] === "load") st.push(loc[s]); else { loc[s] = st.pop(); changed = s; if (m[1] === "l") loc[s + 1] = "(вторая половина)"; } }
+    else if (op === "iconst_0") st.push(0); else if (op === "iconst_1") st.push(1); else if (op === "lconst_1") st.push(1);
+    else if (op === "iadd") { y = st.pop(); x = st.pop(); st.push(x + y | 0); }
+    else if (op === "imul") { y = st.pop(); x = st.pop(); st.push(Math.imul(x, y)); }
+    else if (op === "lmul") { y = st.pop(); x = st.pop(); st.push(x * y); }
+    else if (op === "i2l") { }
+    else if (op === "if_icmpgt" || op === "if_icmple") { y = st.pop(); x = st.pop(); var t = op === "if_icmpgt" ? x > y : x <= y; if (t) n = idx(ins[2]); msg = x + (op === "if_icmpgt" ? " > " : " ≤ ") + y + " → " + (t ? "переход на " + ins[2] : "дальше"); }
+    else if (op === "goto") n = idx(ins[2]);
+    else if (op === "iinc") { loc[ins[2]] += ins[3]; changed = ins[2]; }
+    else if (op === "ireturn" || op === "lreturn") { done = true; msg = "возврат " + st[st.length - 1] + " — кадр уничтожается, значение кладётся на стек операндов вызывающего метода"; }
+    if (!/^if_/.test(op) && !done) msg = op + ": " + D[op];
+    pc = done ? pc : n; steps++; draw();
+  }
+  function draw() {
+    $("vmCode").innerHTML = p.code.map(function (c, i) { var t = String(c[0]).padStart(3) + ": " + c[1].padEnd(10) + (c.length > 2 ? " " + c.slice(2).join(", ") : ""); return "<div" + (i === pc ? ' class="pc"' : "") + ">" + t + "</div>"; }).join("");
+    $("vmStack").innerHTML = st.length ? st.map(function (v, i) { return "<span" + (i === st.length - 1 ? ' class="top"' : "") + ">" + v + "</span>"; }).join("") : '<span style="opacity:.5">пусто</span>';
+    $("vmLoc").innerHTML = loc.map(function (v, i) { return "<span>" + i + ": " + p.names[i] + "</span><span" + (i === changed ? ' class="chg"' : "") + ">" + v + "</span>"; }).join("");
+    $("vmOut").textContent = "шаг " + steps + (done ? " (метод завершён)" : "") + "\n" + msg;
+  }
+  $("vmP").addEventListener("change", function () { $("vmA").value = P[$("vmP").value].args; reset(); });
+  $("vmA").addEventListener("change", reset);
+  $("vmReset").addEventListener("click", reset); $("vmStep").addEventListener("click", step);
+  $("vmRun").addEventListener("click", function () { var g = 0; while (!done && g++ < 500) step(); });
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Заметьте</span>
+Цикл <code>for</code> скомпилирован с проверкой условия в начале и <code>goto</code> назад; <code>i++</code> внутри цикла — это <code>iinc</code>, работающая прямо со слотом. В <code>fact</code> long занимает слоты 1 и 2, а <code>n--</code> в выражении <code>r *= n--</code> превращается в «загрузить n, затем iinc» — постфиксная форма сначала читает значение.
+</div>
+
+<h2 id="isa"><span class="h-num">3.3</span>Набор инструкций</h2>
+<div class="table-wrap"><table>
+<tr><th>Группа</th><th>Примеры</th></tr>
+<tr><td>Константы</td><td><code>iconst_m1..5</code>, <code>bipush</code>, <code>sipush</code>, <code>ldc</code>, <code>aconst_null</code></td></tr>
+<tr><td>Локальные переменные</td><td><code>iload/istore</code>, <code>aload/astore</code> (ссылки), <code>iinc</code></td></tr>
+<tr><td>Стек</td><td><code>dup</code>, <code>dup_x1</code>, <code>pop</code>, <code>swap</code></td></tr>
+<tr><td>Арифметика и приведения</td><td><code>iadd lsub fmul ddiv irem ineg ishl iand</code>, <code>i2l l2i i2d d2i</code></td></tr>
+<tr><td>Объекты и массивы</td><td><code>new</code>, <code>newarray</code>, <code>getfield/putfield</code>, <code>getstatic/putstatic</code>, <code>iaload/iastore</code>, <code>arraylength</code>, <code>checkcast</code>, <code>instanceof</code></td></tr>
+<tr><td>Переходы</td><td><code>ifeq ifnull if_icmplt if_acmpne goto</code>, <code>tableswitch</code>, <code>lookupswitch</code></td></tr>
+<tr><td>Вызовы</td><td><code>invokestatic invokevirtual invokeinterface invokespecial invokedynamic</code> (тема 04), <code>ireturn areturn return</code></td></tr>
+<tr><td>Исключения и мониторы</td><td><code>athrow</code>, <code>monitorenter/monitorexit</code></td></tr>
+</table></div>
+<p>Опкод — один байт, поэтому инструкций около 200. Многие операции над <code>byte</code>, <code>short</code>, <code>char</code>, <code>boolean</code> выполняются как над <code>int</code> — отдельных инструкций для них нет.</p>
+
+<h2 id="javac"><span class="h-num">3.4</span>Во что компилируются конструкции Java</h2>
+<div class="widget" id="jcW">
+  <div class="widget-title">Java → байткод</div>
+  <div class="controls"><label>конструкция<select id="jcS" class="wide">
+    <option value="new">new + конструктор: почему dup</option>
+    <option value="box">автоупаковка Integer i = x</option>
+    <option value="switch">switch по плотным и редким значениям</option>
+    <option value="sswitch">switch по строкам</option>
+    <option value="finally">try / finally</option>
+    <option value="sync">synchronized-блок</option>
+    <option value="concat">конкатенация строк (Java 9+)</option>
+    <option value="incr">x = x++</option>
+  </select></label></div>
+  <div class="grid-2"><pre style="margin:0"><code class="java" id="jcJ"></code></pre><pre style="margin:0"><code class="txt" id="jcB"></code></pre></div>
+  <div class="verdict" id="jcV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    "new": ["Point p = new Point(1, 2);", "new           #7   // class Point\ndup\niconst_1\niconst_2\ninvokespecial #9   // Point.\"<init>\":(II)V\nastore_1", "new выделяет неинициализированный объект и кладёт ссылку на стек. dup делает копию: одну потребит invokespecial (конструктор), другая останется для astore. Верификатор запрещает использовать объект до вызова <init>."],
+    box: ["Integer i = x;\nint y = i;", "iload_0\ninvokestatic  #15  // Integer.valueOf:(I)Ljava/lang/Integer;\nastore_1\naload_1\ninvokevirtual #21  // Integer.intValue:()I\nistore_2", "Автоупаковка — просто вызов Integer.valueOf (кэш −128..127), распаковка — intValue(). NullPointerException при распаковке null возникает в invokevirtual."],
+    "switch": ["switch (d) { case 1: …; case 2: …; case 3: … }\nswitch (code) { case 10: …; case 500: …; case 9000: … }", "tableswitch   { 1: L1  2: L2  3: L3  default: L0 }\n\nlookupswitch  { 10: L1  500: L2  9000: L3  default: L0 }", "Плотные значения → tableswitch: переход по индексу за O(1). Редкие → lookupswitch: отсортированные пары, двоичный поиск. Выбирает javac по оценке размера и стоимости."],
+    sswitch: ["switch (s) { case \"GET\": …; case \"PUT\": … }", "aload_1\ninvokevirtual String.hashCode:()I\nlookupswitch { 70454: L_GET  79599: L_PUT  default: … }\nL_GET: aload_1; ldc \"GET\"; invokevirtual String.equals → …\n…  второй switch по номеру ветки", "Switch по строкам: сначала hashCode (lookupswitch), затем equals для защиты от коллизий, затем switch по номеру ветки. Поэтому null в switch по строке даёт NPE (до Java 21 pattern matching с case null)."],
+    "finally": ["try { work(); }\nfinally { cleanup(); }", "invokestatic work\ninvokestatic cleanup     // копия finally для нормального выхода\nreturn\nastore_1                 // обработчик any\ninvokestatic cleanup     // копия finally для исключения\naload_1\nathrow\nException table: from 0 to 3 target 7 type any", "Подпрограмм (jsr/ret) больше нет: блок finally копируется на каждый путь выхода. Большие finally раздувают метод; return внутри finally «съедает» исключение."],
+    sync: ["synchronized (lock) { count++; }", "aload_1\ndup\nastore_2\nmonitorenter\n… тело …\naload_2\nmonitorexit\ngoto END\nastore_3          // обработчик any\naload_2\nmonitorexit       // освобождение при исключении\naload_3\nathrow", "javac гарантирует monitorexit на любом пути выхода. synchronized-метод — только флаг ACC_SYNCHRONIZED, монитор берёт сама JVM (тема 18)."],
+    concat: ["return a + b;   // String a, int b", "aload_0\niload_1\ninvokedynamic #11, 0  // makeConcatWithConstants:(Ljava/lang/String;I)Ljava/lang/String;\nareturn", "С Java 9 (JEP 280) конкатенация — invokedynamic: стратегию сборки строки выбирает рантайм (StringConcatFactory) при первом вызове, без StringBuilder в байткоде (тема 04)."],
+    incr: ["int x = 5;\nx = x++;   // x == 5", "iconst_5\nistore_1\niload_1      // старое значение 5 → на стек\niinc 1, 1    // слот: 6\nistore_1     // записать 5 обратно → x = 5", "Классический вопрос: постфиксный инкремент сначала кладёт старое значение на стек, затем увеличивает слот, а присваивание записывает со стека старое значение."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("jcS").value]; $("jcJ").textContent = d[0]; $("jcB").textContent = d[1]; $("jcV").textContent = d[2]; }
+  $("jcS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="interp"><span class="h-num">3.5</span>Как интерпретирует HotSpot</h2>
+<p>HotSpot не разбирает байткод в цикле <code>switch</code> на C: при старте он генерирует <b>шаблонный интерпретатор</b> — для каждого опкода готовый кусок машинного кода, а переход между инструкциями — косвенный переход по таблице (dispatch). Значения вершины стека держатся в регистре процессора. Это в разы быстрее «наивного» интерпретатора, но всё равно в 10–50 раз медленнее JIT-кода, поэтому горячие методы компилируются (тема 16).</p>
+<pre data-title="посмотреть сгенерированный интерпретатор (нужна hsdis для дизассемблирования)"><code class="txt">java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInterpreter -version | head -50
+java -Xint -jar app.jar        # только интерпретатор: почувствуйте разницу в скорости</code></pre>
+
+<h2 id="quiz"><span class="h-num">3.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что лежит в слоте 0 локальных переменных экземплярного метода?</p><ul><li>Первый аргумент</li><li>Возвращаемое значение</li><li><code>this</code></li><li>Адрес возврата</li></ul><div class="why">У статических методов слот 0 — первый аргумент.</div></div>
+<div class="mcq" data-ok="0"><p>Почему после <code>new</code> почти всегда идёт <code>dup</code>?</p><ul><li>Одна ссылка уходит в вызов конструктора, вторая остаётся для дальнейшего использования</li><li>Чтобы удвоить память</li><li>Для синхронизации</li><li>Это ошибка javac</li></ul><div class="why">invokespecial &lt;init&gt; потребляет ссылку со стека.</div></div>
+<div class="mcq" data-ok="3"><p>Чему равен x после <code>int x = 5; x = x++;</code>?</p><ul><li>6</li><li>Ошибка компиляции</li><li>Не определено</li><li>5</li></ul><div class="why">iload (5) → iinc (слот 6) → istore (5).</div></div>
+<div class="mcq" data-ok="1"><p>Сколько слотов займут аргументы <code>static void m(long a, int b, double c)</code>?</p><ul><li>3</li><li>5</li><li>4</li><li>6</li></ul><div class="why">long 2 + int 1 + double 2.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему JVM выбрала стековую архитектуру, а не регистровую?</summary><div class="a"><p>Компактный байткод (у инструкций нет операндов-регистров), независимость от числа регистров процессора, простая генерация кода компилятором и простая верификация. Производительность не страдает, потому что JIT всё равно переводит стековый байткод в регистровый машинный код с распределением регистров. Android Dalvik/ART выбрал регистровый формат ради интерпретации на слабых устройствах.</p></div></details>
+<details class="q"><summary>Как найти в байткоде скрытое создание объектов?</summary><div class="a"><p><code>javap -c -p</code> и поиск инструкций <code>new</code>, <code>newarray</code>, вызовов <code>valueOf</code> (автоупаковка), <code>invokedynamic</code> (лямбды и конкатенация создают объекты), varargs (создание массива). Но помните: JIT может убрать выделение памяти через escape analysis (тема 11) — измеряйте профилировщиком аллокаций, а не только читая байткод.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Неизменяемые коллекции и представления</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · НЕИЗМЕНЯЕМОСТЬ И ПОРЯДОК</div>
+  <h1>Неизменяемые коллекции и представления</h1>
+  <p class="lead">В Java как минимум пять способов получить «нельзя изменить»: <code>List.of</code>, <code>List.copyOf</code>, <code>Collections.unmodifiableList</code>, <code>Arrays.asList</code>, <code>Stream.toList()</code> — и все ведут себя по-разному: где-то можно <code>set</code>, где-то запрещён <code>null</code>, где-то изменения исходника просачиваются наружу. Матрица поведения покажет разницу, а разбор устройства <code>ImmutableCollections</code> объяснит, почему порядок <code>Set.of</code> меняется от запуска к запуску.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">List.of</span><span class="tag">copyOf</span><span class="tag">unmodifiable views</span><span class="tag">Arrays.asList</span><span class="tag">toList()</span><span class="tag">защитные копии</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="kinds"><span class="h-num">14.1</span>Неизменяемая, немодифицируемая, представление</h2>
+<div class="grid-3">
+  <div class="card"><h4>Неизменяемая (immutable)</h4><p>Содержимое не может измениться никак и никогда: <code>List.of</code>, <code>List.copyOf</code>, <code>Stream.toList()</code>, Guava <code>ImmutableList</code>. Можно безопасно делиться и кэшировать.</p></div>
+  <div class="card"><h4>Немодифицируемое представление (unmodifiable view)</h4><p><code>Collections.unmodifiableList(list)</code> — обёртка, запрещающая изменения <b>через неё</b>. Владелец исходного списка меняет его — и обёртка это показывает.</p></div>
+  <div class="card"><h4>Представление фиксированного размера</h4><p><code>Arrays.asList(array)</code> — окно в массив: <code>set</code> пишет в массив, <code>add/remove</code> запрещены.</p></div>
+</div>
+<p>Неизменяемость коллекции не делает неизменяемыми <b>элементы</b>: <code>List.of(new StringBuilder())</code> — элемент можно поменять. Глубокая неизменяемость — это неизменяемая коллекция неизменяемых объектов (records, String).</p>
+
+<h2 id="matrix"><span class="h-num">14.2</span>Матрица поведения</h2>
+<div class="widget" id="mxW">
+  <div class="widget-title">Что можно сделать с результатом</div>
+  <div class="controls"><label>способ<select id="mxS" class="wide">
+    <option value="of">List.of("a", "b")</option>
+    <option value="copyOf">List.copyOf(src)</option>
+    <option value="unmod">Collections.unmodifiableList(src)</option>
+    <option value="aslist">Arrays.asList(array)</option>
+    <option value="tolist">stream.toList()   (Java 16)</option>
+    <option value="collect">stream.collect(Collectors.toList())</option>
+    <option value="collectUnmod">stream.collect(Collectors.toUnmodifiableList())</option>
+    <option value="empty">Collections.emptyList()</option>
+  </select></label></div>
+  <div class="table-wrap"><table id="mxT"></table></div>
+  <div class="verdict" id="mxV"></div>
+</div>
+<script>
+(function () {
+  var OPS = ["add(x)", "set(0, x)", "remove(0)", "содержит null", "contains(null)", "src изменили после — видно?", "сортировка list.sort"];
+  var D = {
+    of: [["✘ UOE", "✘ UOE", "✘ UOE", "✘ NPE при создании", "✘ NPE!", "— (нет источника)", "✘ UOE"], "Самая компактная неизменяемая реализация (List12 для 1–2 элементов, ListN для остальных). Враждебна к null: даже contains(null) бросает NPE."],
+    copyOf: [["✘ UOE", "✘ UOE", "✘ UOE", "✘ NPE при копировании", "✘ NPE", "нет — копия", "✘ UOE"], "Копия; если src уже неизменяемая из List.of/copyOf — возвращается тот же объект без копирования."],
+    unmod: [["✘ UOE", "✘ UOE", "✘ UOE", "✔", "✔ false/true", "✔ ДА — это обёртка", "✘ UOE"], "Представление: защищает от изменений через себя, но не от владельца src. Для API — возвращайте копию или держите src приватным."],
+    aslist: [["✘ UOE", "✔ пишет в массив", "✘ UOE", "✔", "✔", "✔ изменения массива видны", "✔ сортирует массив"], "Фиксированный размер поверх массива. Arrays.asList(intArray) с int[] даёт List<int[]> из одного элемента — классическая ошибка."],
+    tolist: [["✘ UOE", "✘ UOE", "✘ UOE", "✔ разрешены", "✔", "нет", "✘ UOE"], "Неизменяемый список, но в отличие от List.of допускает null-элементы."],
+    collect: [["✔", "✔", "✔", "✔", "✔", "нет", "✔"], "Сейчас возвращает ArrayList, но спецификация не гарантирует ни тип, ни изменяемость. Если нужен изменяемый — toCollection(ArrayList::new)."],
+    collectUnmod: [["✘ UOE", "✘ UOE", "✘ UOE", "✘ NPE", "✘ NPE", "нет", "✘ UOE"], "Как List.copyOf над результатом: null запрещены."],
+    empty: [["✘ UOE", "✘ UOE", "✘ UOE", "—", "✔ false", "—", "✔ (пустая — ничего не делает)"], "Общий синглтон, без выделения памяти. С Java 9 обычно используют List.of()."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("mxS").value]; $("mxT").innerHTML = "<tr><th>Операция</th><th>Результат</th></tr>" + OPS.map(function (o, i) { var r = d[0][i]; return "<tr><td>" + o + '</td><td style="color:' + (r[0] === "✘" ? "var(--bad)" : r[0] === "✔" ? "var(--ok)" : "inherit") + '">' + r + "</td></tr>"; }).join(""); $("mxV").textContent = d[1] + " (UOE — UnsupportedOperationException)"; }
+  $("mxS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="internals"><span class="h-num">14.3</span>Как устроены List.of, Set.of, Map.of</h2>
+<ul>
+  <li><b>Специализированные классы</b> (<code>java.util.ImmutableCollections</code>): <code>List12</code> и <code>Set12</code> хранят 1–2 элемента в полях без массива; <code>ListN</code> — массив ровно нужной длины; <code>MapN</code> и <code>SetN</code> — открытая адресация с линейным пробированием в одном массиве (ключи и значения чередуются), заполнение около 50%.</li>
+  <li><b>Случайный порядок итерации</b> <code>Set.of</code> и <code>Map.of</code>: смещение пробирования зависит от <code>SALT</code>, вычисляемого при старте JVM. Порядок меняется между запусками — специально, чтобы никто не полагался на него (тесты, которые сравнивают toString() таких множеств, «мигают»).</li>
+  <li><b>Дубликаты запрещены при создании</b>: <code>Set.of("a", "a")</code> и <code>Map.of("k", 1, "k", 2)</code> бросают <code>IllegalArgumentException</code>.</li>
+  <li><b>Map.of</b> — до 10 пар; больше — <code>Map.ofEntries(entry(k, v), …)</code>.</li>
+  <li>Отсутствие проверок изменяемости и компактность дают выигрыш по памяти и иногда по скорости; JIT может считать содержимое <code>static final List.of(…)</code> константой.</li>
+</ul>
+
+<h2 id="defensive"><span class="h-num">14.4</span>Защитные копии</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="утечка изменяемого состояния"><code class="java">public final class Order {
+    private final List&lt;Item&gt; items;
+    public Order(List&lt;Item&gt; items) { this.items = items; }      // вызывающий может изменить список позже
+    public List&lt;Item&gt; items() { return items; }                 // клиент может изменить наш список
+}
+record Team(List&lt;String&gt; members) {}                            // record не копирует сам!</code></pre>
+<pre class="good-code" data-title="копия на входе, неизменяемость на выходе"><code class="java">public final class Order {
+    private final List&lt;Item&gt; items;
+    public Order(List&lt;Item&gt; items) { this.items = List.copyOf(items); }  // + проверка на null-элементы
+    public List&lt;Item&gt; items() { return items; }                          // уже неизменяемый — копировать не нужно
+}
+record Team(List&lt;String&gt; members) {
+    Team { members = List.copyOf(members); }                    // компактный конструктор
+}</code></pre>
+</div>
+<div class="callout info"><span class="c-title">Hibernate и неизменяемые коллекции</span>
+Сущности JPA ожидают изменяемые коллекции (Hibernate подменяет их своими PersistentBag/PersistentSet). Не присваивайте полям сущностей <code>List.of</code> — при попытке Hibernate изменить коллекцию будет <code>UnsupportedOperationException</code>. Защитные копии — для DTO и доменных объектов.
+</div>
+
+<h2 id="quiz"><span class="h-num">14.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p><code>var u = Collections.unmodifiableList(src); src.add("x");</code> — что увидит u?</p><ul><li>Ничего, u — копия</li><li>Новый элемент: u — представление поверх src</li><li>UnsupportedOperationException</li><li>ConcurrentModificationException</li></ul><div class="why">Немодифицируемое ≠ неизменяемое.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт при <code>List.of("a", "b").contains(null)</code>?</p><ul><li>false</li><li>true</li><li>UnsupportedOperationException</li><li>NullPointerException</li></ul><div class="why">Коллекции из List.of враждебны к null даже при поиске.</div></div>
+<div class="mcq" data-ok="0"><p>Почему тест, сравнивающий <code>Set.of("a", "b", "c").toString()</code> со строкой, иногда падает?</p><ul><li>Порядок итерации Set.of рандомизирован при старте JVM (SALT)</li><li>Set.of удаляет элементы</li><li>toString не определён</li><li>Из-за GC</li></ul><div class="why">Специально, чтобы не полагались на порядок.</div></div>
+<div class="mcq" data-ok="2"><p>Чем <code>stream.toList()</code> отличается от <code>collect(Collectors.toList())</code>?</p><ul><li>Ничем</li><li>toList() возвращает ArrayList</li><li>toList() гарантированно неизменяемый (но допускает null), а Collectors.toList() на практике ArrayList без гарантий</li><li>toList() запрещает null</li></ul><div class="why">Замена в существующем коде может сломать места, которые меняют результат.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как вернуть из метода коллекцию, которую вызывающий не сможет испортить?</summary><div class="a"><p>Если поле — изменяемый список, который класс продолжает менять: вернуть <code>Collections.unmodifiableList(list)</code> (дёшево, но вызывающий увидит будущие изменения) или <code>List.copyOf(list)</code> (снимок). Если поле с самого начала неизменяемое (List.copyOf в конструкторе) — возвращать его напрямую. Для очень больших коллекций и частых вызовов — представление; для передачи между потоками и кэшей — неизменяемую копию.</p></div></details>
+<details class="q"><summary>Почему Arrays.asList(new int[]{1, 2, 3}).size() == 1?</summary><div class="a"><p>Arrays.asList(T... a) — дженерик-метод; int[] не может быть T[] (примитивы не параметризуют), поэтому весь массив становится одним элементом T = int[]. Для примитивов — IntStream.of(arr).boxed().toList() или Arrays.stream(arr).boxed().toList().</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Планировщик и EXPLAIN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ВНУТРЕННЕЕ УСТРОЙСТВО</div>
+  <h1>Планировщик и EXPLAIN</h1>
+  <p class="lead">SQL говорит «что», планировщик решает «как». Он оценивает число строк по статистике, считает стоимость вариантов и выбирает дешёвый. Почти все медленные запросы — это ошибка оценки или отсутствие пути, который был бы дешевле. Учимся читать <code>EXPLAIN ANALYZE</code> так, чтобы находить причину за минуту.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">стоимость</span><span class="tag">статистика</span><span class="tag">виды Scan</span><span class="tag">виды Join</span><span class="tag">EXPLAIN ANALYZE</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cost"><span class="h-num">8.1</span>Модель стоимости</h2>
+<p>Стоимость — условные единицы, где 1 = последовательное чтение одной страницы. Основные параметры:</p>
+<div class="table-wrap"><table>
+<tr><th>Параметр</th><th>По умолчанию</th><th>Смысл</th></tr>
+<tr><td><code>seq_page_cost</code></td><td>1.0</td><td>чтение страницы подряд</td></tr>
+<tr><td><code>random_page_cost</code></td><td>4.0</td><td>случайное чтение; для SSD обычно ставят 1.1–1.5</td></tr>
+<tr><td><code>cpu_tuple_cost</code></td><td>0.01</td><td>обработка строки</td></tr>
+<tr><td><code>cpu_index_tuple_cost</code></td><td>0.005</td><td>обработка записи индекса</td></tr>
+<tr><td><code>cpu_operator_cost</code></td><td>0.0025</td><td>вычисление оператора или функции</td></tr>
+<tr><td><code>effective_cache_size</code></td><td>4GB</td><td>сколько данных, по мнению планировщика, в кэше — влияет на привлекательность индексов</td></tr>
+</table></div>
+<p>Главный вход формулы — <b>оценка числа строк</b> (cardinality) на каждом шаге. Ошибка оценки в 100 раз почти гарантирует плохой план: Nested Loop там, где нужен Hash Join, или индекс там, где дешевле прочитать всё.</p>
+
+<h2 id="scans"><span class="h-num">8.2</span>Способы чтения таблицы</h2>
+<div class="widget" id="scW">
+  <div class="widget-title">Seq Scan против Index Scan: где точка перелома</div>
+  <p class="hint">Таблица 1 млн строк, 10 000 страниц (100 строк на странице). Двигайте долю строк, которую возвращает условие.</p>
+  <div class="controls">
+    <label>доля строк, %<input type="number" id="scSel" value="1" min="0.001" max="100" step="0.1"></label>
+    <label>random_page_cost<select id="scRpc"><option value="4">4.0 (HDD, по умолчанию)</option><option value="1.1" selected>1.1 (SSD)</option></select></label>
+    <label>корреляция<select id="scCor"><option value="0">0 — строки разбросаны</option><option value="1">1 — таблица упорядочена по столбцу</option></select></label>
+  </div>
+  <div id="scBars"></div>
+  <div class="verdict" id="scV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = Math.min(100, Math.max(0.001, +$("scSel").value)) / 100, rpc = +$("scRpc").value, cor = +$("scCor").value;
+    var N = 1e6, P = 1e4, rows = N * s;
+    var seq = P * 1 + N * 0.01 + N * 0.0025;
+    var heapPages = cor ? Math.max(1, P * s) : Math.min(P, rows) + (rows > P ? (rows - P) * 0.1 : 0);
+    var idx = 3 * rpc + rows * 0.005 + rows * 0.0025 + (cor ? heapPages * 1 : heapPages * rpc) + rows * 0.01;
+    var bmp = 3 * rpc + rows * 0.005 + Math.min(P, cor ? P * s : P * (1 - Math.pow(1 - 1 / P, rows))) * (cor ? 1 : (rpc + 1) / 2) + rows * 0.01 + rows * 0.0025;
+    var all = [["Seq Scan", seq], ["Index Scan", idx], ["Bitmap Heap Scan", bmp]], mx = Math.max(seq, idx, bmp), best = all.slice().sort(function (a, b) { return a[1] - b[1]; })[0][0];
+    $("scBars").innerHTML = all.map(function (a) {
+      return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px"><b>' + a[0] + '</b><span style="font-family:var(--font-mono)">cost ≈ ' + Math.round(a[1]).toLocaleString("ru") + '</span></div><div class="bar ' + (a[0] === best ? "ok" : "") + '"><i style="width:' + Math.max(1, a[1] / mx * 100) + '%"></i></div>';
+    }).join("");
+    $("scV").className = "verdict ok";
+    $("scV").textContent = "Строк: " + Math.round(rows).toLocaleString("ru") + ". Планировщик выберет " + best + ". " +
+      (best === "Seq Scan" ? "Условие возвращает слишком много строк: читать таблицу подряд дешевле, чем прыгать по индексу." : best === "Index Scan" ? "Мало строк (или таблица упорядочена по столбцу) — индекс выгоден." : "Средняя доля: сначала собрать по индексу битовую карту страниц, затем прочитать их по порядку — без повторных чтений одной страницы.");
+  }
+  ["scSel", "scRpc", "scCor"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Узел</th><th>Как работает</th><th>Когда</th></tr>
+<tr><td>Seq Scan</td><td>все страницы подряд, фильтр к каждой строке</td><td>маленькие таблицы, большая доля строк</td></tr>
+<tr><td>Index Scan</td><td>по индексу, для каждой записи — страница таблицы</td><td>мало строк, нужен порядок индекса</td></tr>
+<tr><td>Index Only Scan</td><td>данные берутся из индекса, таблица — только для непомеченных all-visible страниц (<code>Heap Fetches</code>)</td><td>покрывающий индекс + свежий VACUUM</td></tr>
+<tr><td>Bitmap Index Scan → Bitmap Heap Scan</td><td>собирает битовую карту страниц (можно из нескольких индексов: BitmapAnd/Or), затем читает страницы по порядку, перепроверяя условие (<code>Recheck Cond</code>)</td><td>средняя доля строк, условия по разным индексам</td></tr>
+</table></div>
+
+<h2 id="joins"><span class="h-num">8.3</span>Три алгоритма соединения</h2>
+<div class="grid-3">
+  <div class="card"><h4>Nested Loop</h4><p>Для каждой строки внешней стороны — поиск во внутренней (обычно по индексу). Отлично, когда внешних строк мало. Катастрофа, если оценили 10, а пришло 100 000.</p></div>
+  <div class="card"><h4>Hash Join</h4><p>Меньшую сторону загружает в хэш-таблицу (в <code>work_mem</code>), большую проходит один раз. Лучший для больших соединений по равенству. Не влезла хэш-таблица — пишет пачки на диск (<code>Batches: 8</code>).</p></div>
+  <div class="card"><h4>Merge Join</h4><p>Обе стороны отсортированы по ключу — проход «молнией». Хорош, если порядок уже есть (индексы) или нужен на выходе.</p></div>
+</div>
+<p>Порядок соединения таблиц планировщик тоже выбирает сам: до <code>join_collapse_limit</code> (8) таблиц перебирает варианты, больше — генетический алгоритм (GEQO). Поэтому запрос на 15 таблиц может иметь нестабильный план.</p>
+
+<h2 id="stats"><span class="h-num">8.4</span>Статистика: откуда берутся оценки</h2>
+<p><code>ANALYZE</code> (вручную или autovacuum) читает выборку из 300 × <code>default_statistics_target</code> строк и сохраняет для каждого столбца в <code>pg_stats</code>:</p>
+<ul>
+  <li><code>null_frac</code>, <code>n_distinct</code> — доля NULL и число различных значений;</li>
+  <li><code>most_common_vals</code> + <code>most_common_freqs</code> — частые значения и их доли;</li>
+  <li><code>histogram_bounds</code> — границы корзин равной заполненности для остальных значений;</li>
+  <li><code>correlation</code> — насколько физический порядок совпадает с порядком значений.</li>
+</ul>
+<pre data-title="как планировщик оценил условие и почему ошибся"><code class="sql">SELECT most_common_vals, most_common_freqs, n_distinct
+FROM pg_stats WHERE tablename = 'orders' AND attname = 'status';
+
+-- столбцы зависимы (city и country): по умолчанию планировщик перемножает доли → недооценка
+CREATE STATISTICS orders_geo (dependencies, ndistinct, mcv) ON city, country FROM customers;
+ANALYZE customers;
+
+-- для столбца с «длинным хвостом» значений — подробнее статистика
+ALTER TABLE events ALTER COLUMN tenant_id SET STATISTICS 1000;</code></pre>
+<div class="callout warn"><span class="c-title">Типичные причины плохих оценок</span>
+Статистика устарела (массовая загрузка без ANALYZE), коррелированные столбцы, условия на выражения (<code>lower(email)</code> без индекса по выражению — нет статистики), функции с неизвестной селективностью, параметризованные запросы с «общим» планом при сильно неравномерных данных, CTE и подзапросы, результат которых сложно оценить.
+</div>
+
+<h2 id="explain"><span class="h-num">8.5</span>Чтение EXPLAIN ANALYZE</h2>
+<pre data-title="EXPLAIN (ANALYZE, BUFFERS) — всегда вместе"><code class="txt">Limit  (cost=0.43..85.61 rows=20 width=48) (actual time=0.041..0.212 rows=20 loops=1)
+  Buffers: shared hit=24
+  -&gt;  Nested Loop  (cost=0.43..4260.70 rows=1000 width=48) (actual time=0.040..0.208 rows=20 loops=1)
+        -&gt;  Index Scan Backward using orders_created on orders o  (cost=0.29..120.3 rows=1000 width=24)
+                                                                (actual time=0.020..0.051 rows=20 loops=1)
+              Filter: (status = 'paid'::text)
+              Rows Removed by Filter: 3
+        -&gt;  Index Scan using customers_pkey on customers c  (cost=0.14..4.1 rows=1 width=32)
+                                                          (actual time=0.006..0.006 rows=1 loops=20)
+              Index Cond: (id = o.customer_id)
+Planning Time: 0.3 ms
+Execution Time: 0.25 ms</code></pre>
+<div class="widget stepper" id="exSim">
+  <div class="widget-title">Как читать план: пять вопросов</div>
+  <section class="st-step" data-t="Снизу вверх, изнутри наружу" data-log="порядок: Index Scan orders → Index Scan customers (×20) → Nested Loop → Limit"><p>План — дерево. Листья (самые глубокие отступы) выполняются первыми и отдают строки родителям. Верхний узел возвращает результат клиенту. Узлы работают конвейером: Limit, получив 20 строк, останавливает всё дерево — поэтому Nested Loop с оценкой 1000 строк реально выдал только 20.</p></section>
+  <section class="st-step" data-t="estimated rows против actual rows" data-log="Index Scan orders: rows=1000 (оценка) — actual rows=20 (из-за Limit — нормально)"><p>Главная проверка: <code>rows=</code> в оценке и <code>actual … rows=</code> на каждом узле. Расхождение в 10+ раз (без объяснения через Limit) — источник плохого плана. Ищите <b>самый нижний</b> узел с расхождением: выше ошибка только размножается.</p></section>
+  <section class="st-step" data-t="loops умножает" data-log="customers: actual time=0.006 × loops=20 = 0.12 мс; rows=1 на каждый цикл"><p>Время и строки показаны <b>за один цикл</b>. Внутренняя сторона Nested Loop с <code>loops=50000</code> и временем 0.02 мс — это 1 секунда. Классическая находка: Nested Loop с огромным loops из-за недооценки внешней стороны.</p></section>
+  <section class="st-step" data-t="Buffers: где ввод-вывод" data-log="Buffers: shared hit=24 → всё из кэша; read=N → чтения с диска (или кэша ОС)"><p><code>shared hit</code> — страницы из shared buffers, <code>read</code> — пришлось читать, <code>dirtied/written</code> — запрос сам пачкал и писал страницы, <code>temp read/written</code> — сортировка или хэш ушли на диск. Число страниц точнее времени показывает объём работы и не зависит от «прогретости» кэша.</p></section>
+  <section class="st-step" data-t="Красные флаги" data-log="Rows Removed by Filter: 3 — мало; 1 000 000 — нужен индекс или другое условие"><p>Ищите: <code>Rows Removed by Filter</code> огромное → индекс не по тому условию; <code>Sort Method: external merge Disk</code> → мало work_mem или нужен индекс для порядка; <code>Heap Fetches</code> большие в Index Only Scan → таблице нужен VACUUM; <code>Hash Batches &gt; 1</code> → хэш не влез в память; Seq Scan по большой таблице во внутренней стороне Nested Loop.</p></section>
+</div>
+<div class="callout info"><span class="c-title">Инструменты</span>
+<code>EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT TEXT)</code>; визуализаторы explain.dalibo.com и explain.depesz.com; расширение <code>auto_explain</code> пишет в журнал планы запросов дольше порога — незаменимо для редких медленных запросов в продакшене. Помните: <code>EXPLAIN ANALYZE</code> <b>выполняет</b> запрос — для UPDATE/DELETE оборачивайте в <code>BEGIN … ROLLBACK</code>.
+</div>
+
+<h2 id="generic"><span class="h-num">8.6</span>Подготовленные запросы и «общий» план</h2>
+<p>JDBC-драйвер PostgreSQL после 5 выполнений одного <code>PreparedStatement</code> переходит на серверные подготовленные выражения; сервер после 5 выполнений может выбрать <b>generic plan</b> — план без учёта конкретных значений параметров. Если данные неравномерны (у одного клиента 10 заказов, у другого 10 млн), общий план может быть плох для части значений.</p>
+<pre data-title="диагностика и обход"><code class="sql">-- увидеть план для параметров
+PREPARE q(bigint) AS SELECT * FROM orders WHERE customer_id = $1;
+EXPLAIN EXECUTE q(42);
+
+-- для проблемного запроса/сессии: всегда планировать заново под значения
+SET plan_cache_mode = force_custom_plan;</code></pre>
+
+<h2 id="sandbox"><span class="h-num">8.7</span>Песочница: планы SQLite</h2>
+<p>В браузере работает SQLite: его <code>EXPLAIN QUERY PLAN</code> проще, но показывает те же решения — полный просмотр (<code>SCAN</code>) или поиск по индексу (<code>SEARCH … USING INDEX</code>), временные B-деревья для сортировки и группировки. Создайте индекс и посмотрите, как меняется план.</p>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">EXPLAIN QUERY PLAN</div>
+  <div class="sql-presets">
+    <button type="button" data-sql="EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 3;">без индекса</button>
+    <button type="button" data-sql="CREATE INDEX IF NOT EXISTS orders_cust ON orders(customer_id);&#10;EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 3;">с индексом</button>
+    <button type="button" data-sql="EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 3 ORDER BY created_at DESC;">ORDER BY → temp b-tree</button>
+    <button type="button" data-sql="CREATE INDEX IF NOT EXISTS orders_cust_created ON orders(customer_id, created_at);&#10;EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 3 ORDER BY created_at DESC;">составной индекс убирает сортировку</button>
+    <button type="button" data-sql="CREATE INDEX IF NOT EXISTS orders_cust_created ON orders(customer_id, created_at);&#10;EXPLAIN QUERY PLAN SELECT customer_id, created_at FROM orders WHERE customer_id = 3;">покрывающий индекс</button>
+    <button type="button" data-sql="EXPLAIN QUERY PLAN SELECT c.name, count(*) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name;">JOIN + GROUP BY</button>
+    <button type="button" data-sql="EXPLAIN QUERY PLAN SELECT * FROM customers WHERE lower(name) = 'анна';">функция над столбцом</button>
+  </div>
+  <textarea>EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 3;</textarea>
+</div>
+
+<h2 id="quiz"><span class="h-num">8.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В плане: <code>Nested Loop (rows=12) (actual rows=480000)</code>, внутренняя сторона — Index Scan с <code>loops=480000</code>. В чём корень проблемы?</p><ul><li>Мало shared_buffers</li><li>Недооценка числа строк внешней стороны: план выбран под 12 строк</li><li>Индекс повреждён</li><li>Nested Loop всегда плох</li></ul><div class="why">Ищите нижний узел с расхождением оценки и факта и чините статистику или запрос.</div></div>
+<div class="mcq" data-ok="3"><p>Почему условие, отбирающее 40% строк, обычно выполняется Seq Scan даже при наличии индекса?</p><ul><li>Индексы не работают с большими таблицами</li><li>Планировщик игнорирует индексы для текста</li><li>Это ошибка, нужно отключить enable_seqscan</li><li>Случайные чтения страниц по индексу дороже последовательного чтения всей таблицы</li></ul><div class="why">При большой доле строк индекс трогает почти каждую страницу, да ещё в случайном порядке.</div></div>
+<div class="mcq" data-ok="0"><p>Что значит <code>Sort Method: external merge Disk: 120MB</code>?</p><ul><li>Сортировка не поместилась в work_mem и шла через временные файлы</li><li>Сортировка по индексу</li><li>Таблица хранится на диске</li><li>Сортировка распараллелена</li></ul><div class="why">Варианты: индекс, дающий нужный порядок; меньше строк до сортировки; увеличение work_mem для этого запроса.</div></div>
+<div class="mcq" data-ok="2"><p>Чем опасно запускать <code>EXPLAIN ANALYZE DELETE …</code> на проде?</p><ul><li>Ничем, это только план</li><li>Блокирует всю базу</li><li>Запрос реально выполнится и удалит строки</li><li>Сбрасывает статистику</li></ul><div class="why">ANALYZE выполняет запрос. Оборачивайте в BEGIN … ROLLBACK.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Ваш порядок действий с медленным запросом?</summary><div class="a"><p>1) Получить реальный план: EXPLAIN (ANALYZE, BUFFERS) или auto_explain, на продовых данных. 2) Найти узлы, где больше всего времени и буферов. 3) Сравнить оценки и факт, найти нижнее расхождение. 4) Проверить актуальность статистики (ANALYZE), коррелированные столбцы. 5) Проверить, есть ли подходящий индекс и «индексируемо» ли условие. 6) Переписать запрос, если план ограничен формой запроса. 7) Перепроверить на реальных параметрах, включая «тяжёлых» клиентов.</p></div></details>
+<details class="q"><summary>Почему один и тот же запрос быстр в psql и медленный из приложения?</summary><div class="a"><p>Частые причины: приложение использует подготовленные выражения и получает generic plan; разные значения параметров (в psql проверяли «лёгкого» клиента); типы параметров не совпадают со столбцом (строка вместо числа → приведение и нет индекса); другие настройки сессии; холодный кэш; ожидание блокировок или пула соединений, а не выполнение.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900), (7,'Монитор','электроника',32000);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'), (104,3,'cancelled','2026-07-02'),
+  (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'), (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500), (104,6,3,900),
+  (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800), (107,5,2,600), (108,1,1,93000);
+</script>
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · HashMap изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.hm { display: grid; gap: 3px; margin: 10px 0; }
+.hm .b { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 6px; align-items: center; font: 12px var(--font-mono); }
+.hm .b > span:first-child { text-align: right; color: var(--fg-muted); }
+.hm .chain { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-height: 26px; border-bottom: 1px dashed var(--line); padding: 2px 0; }
+.hm .nd { padding: 3px 7px; border-radius: 5px; border: 1.5px solid var(--line); background: var(--bg-sunk); }
+.hm .nd.hit { border-color: var(--ok); background: var(--ok-soft); } .hm .nd.new { border-color: var(--accent); background: var(--accent-soft); }
+.hm .nd.lo { border-color: var(--info); } .hm .nd.hi { border-color: var(--warn); background: var(--warn-soft); }
+.hm .tree { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ХЕШ-СТРУКТУРЫ</div>
+  <h1>HashMap изнутри</h1>
+  <p class="lead">Массив корзин, в каждой — цепочка узлов, превращающаяся в красно-чёрное дерево при большом числе коллизий. Разберём на живой хеш-таблице, как из <code>hashCode()</code> получается номер корзины, что делает «перемешивание» старших битов, как идёт <code>put</code> и <code>get</code>, и как при росте таблицы каждая цепочка ровно делится на две — без пересчёта хэшей.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">table и Node</span><span class="tag">hash ^ (h &gt;&gt;&gt; 16)</span><span class="tag">(n−1) &amp; hash</span><span class="tag">load factor</span><span class="tag">resize split</span><span class="tag">treeify</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="struct"><span class="h-num">8.1</span>Устройство</h2>
+<pre data-title="HashMap (JDK 8+, упрощённо)"><code class="java">public class HashMap&lt;K, V&gt; extends AbstractMap&lt;K, V&gt; implements Map&lt;K, V&gt;, Cloneable, Serializable {
+    static final int DEFAULT_INITIAL_CAPACITY = 16;     // всегда степень двойки
+    static final float DEFAULT_LOAD_FACTOR = 0.75f;
+    static final int TREEIFY_THRESHOLD = 8, UNTREEIFY_THRESHOLD = 6, MIN_TREEIFY_CAPACITY = 64;
+
+    transient Node&lt;K, V&gt;[] table;                        // создаётся лениво при первом put
+    transient int size;
+    int threshold;                                       // capacity * loadFactor: при size &gt; threshold — resize()
+
+    static class Node&lt;K, V&gt; { final int hash; final K key; V value; Node&lt;K, V&gt; next; }   // хэш сохранён в узле!
+
+    static final int hash(Object key) {
+        int h;
+        return (key == null) ? 0 : (h = key.hashCode()) ^ (h &gt;&gt;&gt; 16);   // старшие биты подмешиваются в младшие
+    }
+    // индекс корзины: (n - 1) &amp; hash   — то же, что hash mod n для n = 2^k, но без деления
+}</code></pre>
+
+<h2 id="sim"><span class="h-num">8.2</span>Живая хеш-таблица</h2>
+<div class="widget" id="hmW">
+  <div class="widget-title">HashMap&lt;String, Integer&gt; — настоящие String.hashCode()</div>
+  <div class="controls">
+    <label>ключ<input type="text" id="hmK" value="Aa"></label>
+    <button class="btn primary" type="button" id="hmPut">put</button>
+    <button class="btn" type="button" id="hmGet">get</button>
+    <button class="btn" type="button" id="hmRem">remove</button>
+    <button class="btn" type="button" id="hmFill">+8 слов</button>
+    <button class="btn" type="button" id="hmColl">+коллизии (Aa, BB, AaAa…)</button>
+    <button class="btn" type="button" id="hmReset">↺</button>
+  </div>
+  <div class="out" id="hmCalc"></div>
+  <div class="hm" id="hmTable"></div>
+  <div class="out" id="hmStat"></div>
+  <div class="log" id="hmLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, tab, size, log, mark, words = ["apple", "banana", "cherry", "date", "fig", "grape", "kiwi", "lemon", "mango", "melon", "olive", "peach", "pear", "plum", "lime", "berry"], wi = 0, coll = ["Aa", "BB", "AaAa", "AaBB", "BBAa", "BBBB", "AaAaAa", "AaAaBB", "BBBBAa", "AaBBAa"], ci = 0;
+  function sh(s) { var h = 0; for (var i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
+  function spread(h) { return (h ^ (h >>> 16)) | 0; }
+  function bin(x, n) { return (x >>> 0).toString(2).padStart(32, "0").slice(-n); }
+  function reset() { tab = new Array(16).fill(null).map(function () { return []; }); size = 0; log = ["new HashMap<>(): table == null; при первом put создаётся массив на 16 корзин, threshold = 12"]; mark = {}; draw(); }
+  function idx(hash) { return (tab.length - 1) & hash; }
+  function calc(k) {
+    var h = sh(k), s = spread(h), n = tab.length, b = Math.log2(n);
+    $("hmCalc").textContent = "\"" + k + "\".hashCode()  = " + h + "\n  h            = " + bin(h, 32) + "\n  h >>> 16     = " + bin(h >>> 16, 32) + "\n  hash = h ^ (h>>>16) = " + bin(s, 32) + "\n  index = hash & (" + n + "−1) = младшие " + b + " бит: " + bin(s, b) + " = " + idx(s);
+    return s;
+  }
+  function resize() {
+    var old = tab, n = old.length * 2, nt = new Array(n).fill(null).map(function () { return []; }), moved = 0; mark = {};
+    old.forEach(function (chain, i) { chain.forEach(function (nd) { var hiBit = (nd.h & old.length) !== 0; nt[hiBit ? i + old.length : i].push(nd); mark[nd.k] = hiBit ? "hi" : "lo"; if (hiBit) moved++; }); });
+    tab = nt; log.push("  size > threshold → resize: " + old.length + " → " + n + " корзин. Каждая цепочка делится по одному биту хэша (hash & " + old.length + "): «lo» остаются в корзине i, «hi» переезжают в i + " + old.length + ". Переехало " + moved + " из " + size + ", хэши не пересчитывались.");
+  }
+  function put(k) {
+    var s = calc(k), i = idx(s), chain = tab[i], cmp = 0; mark = {};
+    for (var j = 0; j < chain.length; j++) { cmp++; if (chain[j].h === s && chain[j].k === k) { chain[j].v++; mark[k] = "hit"; log.push("put(\"" + k + "\"): корзина " + i + ", найден существующий ключ (сравнений: " + cmp + ") → значение заменено, size не меняется"); draw(); return; } }
+    chain.push({ k: k, h: s, v: 1 }); size++; mark[k] = "new";
+    log.push("put(\"" + k + "\"): корзина " + i + (chain.length > 1 ? ", коллизия — узел добавлен в конец цепочки (длина " + chain.length + ")" : ", пустая — новый узел"));
+    if (chain.length > 8) log.push(tab.length < 64 ? "  цепочка > 8, но таблица < 64 корзин → вместо дерева resize (treeifyBin предпочитает рост)" : "  цепочка > 8 и таблица ≥ 64 → корзина превращена в красно-чёрное дерево (TreeNode), поиск O(log n)");
+    if (chain.length > 8 && tab.length < 64) resize();
+    else if (size > tab.length * 0.75) resize();
+    draw();
+  }
+  function get(k) {
+    var s = calc(k), i = idx(s), chain = tab[i], cmp = 0; mark = {};
+    for (var j = 0; j < chain.length; j++) { cmp++; var hEq = chain[j].h === s; if (hEq && chain[j].k === k) { mark[k] = "hit"; log.push("get(\"" + k + "\"): корзина " + i + " → найден за " + cmp + " сравнений (сначала hash, затем == и equals) → " + chain[j].v); draw(); return; } }
+    log.push("get(\"" + k + "\"): корзина " + i + ", просмотрено " + cmp + " узлов → null"); draw();
+  }
+  function rem(k) { var s = calc(k), i = idx(s), chain = tab[i]; for (var j = 0; j < chain.length; j++) if (chain[j].k === k) { chain.splice(j, 1); size--; log.push("remove(\"" + k + "\"): узел исключён из цепочки корзины " + i + " (таблица не сжимается никогда)"); draw(); return; } log.push("remove(\"" + k + "\"): нет такого ключа"); draw(); }
+  function draw() {
+    $("hmTable").innerHTML = tab.map(function (chain, i) { return '<div class="b"><span>[' + i + ']</span><div class="chain">' + (chain.length > 8 && tab.length >= 64 ? '<span class="tree">🌳 TreeNode</span>' : "") + chain.map(function (nd) { return '<span class="nd ' + (mark[nd.k] || "") + '" title="hash ' + nd.h + '">' + nd.k + "=" + nd.v + "</span>"; }).join("→") + "</div></div>"; }).join("");
+    var used = tab.filter(function (c) { return c.length; }).length, maxc = Math.max.apply(null, tab.map(function (c) { return c.length; }));
+    $("hmStat").textContent = "size = " + size + ", корзин = " + tab.length + ", threshold = " + Math.floor(tab.length * 0.75) + ", занято корзин = " + used + ", самая длинная цепочка = " + maxc + ", load = " + (size / tab.length).toFixed(2);
+    $("hmLog").textContent = log.slice(-6).join("\n"); $("hmLog").scrollTop = 1e6;
+  }
+  $("hmPut").addEventListener("click", function () { put($("hmK").value); });
+  $("hmGet").addEventListener("click", function () { get($("hmK").value); });
+  $("hmRem").addEventListener("click", function () { rem($("hmK").value); });
+  $("hmFill").addEventListener("click", function () { for (var i = 0; i < 8; i++) put(words[wi++ % words.length] + (wi > words.length ? wi : "")); });
+  $("hmColl").addEventListener("click", function () { for (var i = 0; i < 3; i++) put(coll[ci++ % coll.length]); });
+  $("hmK").addEventListener("input", function () { calc($("hmK").value); });
+  $("hmReset").addEventListener("click", reset);
+  reset(); calc("Aa");
+})();
+</script>
+<div class="callout info"><span class="c-title">Что попробовать</span>
+«+коллизии»: у строк <code>"Aa"</code> и <code>"BB"</code> одинаковый <code>hashCode()</code> (2112) — их комбинации тоже совпадают, все попадают в одну корзину. Добавляйте слова до 13 штук — увидите resize с разделением цепочек на «lo» (синие) и «hi» (жёлтые).
+</div>
+
+<h2 id="why"><span class="h-num">8.3</span>Почему именно так</h2>
+<div class="table-wrap"><table>
+<tr><th>Решение</th><th>Зачем</th></tr>
+<tr><td>Ёмкость — степень двойки</td><td>индекс через побитовое И вместо медленного деления; при росте ×2 каждый узел либо остаётся, либо сдвигается ровно на старую ёмкость</td></tr>
+<tr><td><code>h ^ (h &gt;&gt;&gt; 16)</code></td><td>при маленькой таблице индекс берёт только младшие биты; плохие hashCode (различаются только старшими битами, например Float, адресоподобные числа) иначе давали бы сплошные коллизии</td></tr>
+<tr><td>Хэш хранится в Node</td><td>не вызывать hashCode повторно при сравнении и resize; быстрое отсечение неравных ключей до equals</td></tr>
+<tr><td>Load factor 0.75</td><td>баланс памяти и длины цепочек: при случайных хэшах средняя цепочка &lt; 1, вероятность цепочки длиной 8 ≈ 6·10⁻⁸ (распределение Пуассона, из комментария в исходниках HashMap)</td></tr>
+<tr><td>Деревья в корзинах (Java 8)</td><td>защита от худшего случая: при множестве коллизий (плохой hashCode или атака) поиск O(log n), а не O(n); для Comparable-ключей сравнение через compareTo, иначе — по классу и identityHashCode</td></tr>
+<tr><td>Вставка в хвост цепочки (Java 8)</td><td>в Java 7 вставка шла в голову, и параллельный resize без синхронизации мог создать цикл в списке — бесконечный цикл get() на 100% CPU</td></tr>
+</table></div>
+
+<h2 id="null"><span class="h-num">8.4</span>null, порядок итерации, итераторы</h2>
+<ul>
+  <li>HashMap допускает один ключ <code>null</code> (хэш 0, корзина 0) и любые null-значения. Поэтому <code>get(k) == null</code> не отличает «нет ключа» от «значение null» — используйте <code>containsKey</code> или <code>getOrDefault</code>. ConcurrentHashMap и <code>Map.of</code> null запрещают.</li>
+  <li>Итерация идёт по корзинам по порядку — порядок «случайный» и меняется после resize. Нужен порядок — LinkedHashMap.</li>
+  <li>Итераторы keySet/values/entrySet — fail-fast (тема 03). Изменение значения через <code>entry.setValue</code> — разрешено.</li>
+  <li>Обход <code>entrySet()</code> вместо <code>keySet()</code> + <code>get(k)</code> экономит повторный поиск каждого ключа.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">8.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как вычисляется номер корзины в HashMap?</p><ul><li>key.hashCode() % capacity</li><li>Math.abs(key.hashCode()) % capacity</li><li>(capacity − 1) &amp; (h ^ (h &gt;&gt;&gt; 16)), где h = key.hashCode()</li><li>Случайно</li></ul><div class="why">Степень двойки позволяет заменить деление битовой маской.</div></div>
+<div class="mcq" data-ok="0"><p>Что происходит с узлами при resize с 16 до 32 корзин?</p><ul><li>Каждый либо остаётся в корзине i, либо переходит в i + 16 — по биту hash &amp; 16, без пересчёта хэшей</li><li>Все хэши пересчитываются</li><li>Все узлы переходят в новые корзины случайно</li><li>Узлы не перемещаются</li></ul><div class="why">Цепочка делится на «lo» и «hi» с сохранением порядка.</div></div>
+<div class="mcq" data-ok="3"><p>Когда корзина превращается в дерево?</p><ul><li>При любой коллизии</li><li>Когда size &gt; threshold</li><li>При 64 элементах в карте</li><li>Когда цепочка длиннее 8 и в таблице не меньше 64 корзин (иначе таблица растёт)</li></ul><div class="why">Обратно в список — при уменьшении до 6.</div></div>
+<div class="mcq" data-ok="1"><p>Сколько корзин у <code>new HashMap&lt;&gt;()</code> сразу после создания?</p><ul><li>16</li><li>0 — таблица создаётся лениво при первом put</li><li>10</li><li>12</li></ul><div class="why">Как и у ArrayList — экономия на пустых картах.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите, что происходит при map.put(key, value).</summary><div class="a"><p>Вычисляется hash = h ^ (h &gt;&gt;&gt; 16); если таблицы нет — resize до 16; индекс (n−1) &amp; hash; пустая корзина — новый узел; иначе обход цепочки (или дерева): совпал hash и (== или equals) — заменить значение и вернуть старое; не нашли — добавить в хвост; если длина цепочки превысила 8 — treeifyBin (дерево или resize при n &lt; 64); modCount++, size++; если size &gt; threshold — resize с удвоением и разделением цепочек.</p></div></details>
+<details class="q"><summary>Почему в Java 7 HashMap мог зациклиться в многопоточном коде, и почему это не значит, что Java 8 HashMap потокобезопасен?</summary><div class="a"><p>В Java 7 resize переносил узлы, вставляя их в голову новой цепочки — порядок разворачивался; два потока, одновременно делающие resize, могли создать циклическую ссылку, и get() крутился бесконечно. Java 8 сохраняет порядок при разделении, и цикла нет, но без синхронизации по-прежнему возможны потерянные записи, неверный size, частично видимые узлы. Для многопоточности — ConcurrentHashMap.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

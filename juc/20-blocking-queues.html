@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Блокирующие очереди изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ОЧЕРЕДИ И СТРУКТУРЫ</div>
+  <h1>Блокирующие очереди изнутри</h1>
+  <p class="lead"><code>BlockingQueue</code> — основной способ передать данные между потоками: производитель кладёт, потребитель забирает, а очередь сама усыпляет того, кому нечего делать. Семь реализаций устроены очень по-разному: одна блокировка и массив, две блокировки и связный список, куча, очередь с задержками, передача «из рук в руки». Разберём каждую, матрицу методов (бросить, вернуть, ждать, ждать с таймаутом) и почему <code>LinkedBlockingQueue</code> даёт производителям и потребителям работать параллельно.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">4 формы API</span><span class="tag">ArrayBlockingQueue</span><span class="tag">две блокировки LBQ</span><span class="tag">DelayQueue</span><span class="tag">SynchronousQueue</span><span class="tag">TransferQueue</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="api"><span class="h-num">20.1</span>Четыре формы API</h2>
+<div class="widget" id="apW">
+  <div class="widget-title">Что сделает метод?</div>
+  <div class="controls">
+    <label>очередь сейчас<select id="apQ"><option value="full">полная (для вставки)</option><option value="empty">пустая (для извлечения)</option></select></label>
+    <label>метод<select id="apM"><option value="add">add / remove / element</option><option value="offer">offer / poll / peek</option><option value="put">put / take</option><option value="timed">offer(e, t, unit) / poll(t, unit)</option></select></label>
+  </div>
+  <div class="verdict" id="apV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var R = {
+    add: ["IllegalStateException: Queue full", "NoSuchElementException"],
+    offer: ["возвращает false сразу", "возвращает null сразу (peek — тоже null)"],
+    put: ["блокирует, пока не появится место (прерываемо)", "блокирует, пока не появится элемент (прерываемо)"],
+    timed: ["ждёт до таймаута, затем false", "ждёт до таймаута, затем null"]
+  };
+  function run() { var q = $("apQ").value, m = $("apM").value, r = R[m][q === "full" ? 0 : 1]; $("apV").className = "verdict " + (m === "add" ? "bad" : m === "put" ? "warn" : "ok"); $("apV").textContent = (q === "full" ? "вставка: " : "извлечение: ") + r + (m === "put" ? " — основная форма для производитель–потребитель" : m === "timed" ? " — лучший выбор, когда нужен контроль времени и реакция на перегрузку" : ""); }
+  ["apQ", "apM"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>null-элементы запрещены во всех реализациях: <code>poll()</code> возвращает null как признак «пусто». <code>drainTo(collection, max)</code> забирает пачку элементов за один захват блокировки — эффективно для батч-обработки.</p>
+
+<h2 id="impls"><span class="h-num">20.2</span>Реализации</h2>
+<div class="table-wrap"><table>
+<tr><th>Очередь</th><th>Устройство</th><th>Особенности</th></tr>
+<tr><td><code>ArrayBlockingQueue(n)</code></td><td>кольцевой массив, <b>одна</b> ReentrantLock, Condition notEmpty/notFull</td><td>фиксированная ёмкость, память выделена сразу, без мусора на элемент; производители и потребители сериализуются на одной блокировке; есть честный режим</td></tr>
+<tr><td><code>LinkedBlockingQueue(n)</code></td><td>связный список, <b>две</b> блокировки — putLock (хвост) и takeLock (голова), счётчик AtomicInteger</td><td>производители и потребители работают параллельно; узел на элемент (мусор); по умолчанию ёмкость Integer.MAX_VALUE — фактически неограниченная</td></tr>
+<tr><td><code>LinkedBlockingDeque</code></td><td>двусвязный список, одна блокировка</td><td>операции с обоих концов, ограниченная ёмкость; работа-кража вручную</td></tr>
+<tr><td><code>PriorityBlockingQueue</code></td><td>двоичная куча + одна блокировка (рост массива — под отдельным спин-флагом)</td><td>неограниченная; take — минимальный элемент; итерация не упорядочена</td></tr>
+<tr><td><code>DelayQueue&lt;E extends Delayed&gt;</code></td><td>PriorityQueue по оставшейся задержке + leader-поток (как в STPE)</td><td>take отдаёт элемент, только когда его задержка истекла: кэши с истечением, повторные попытки с паузой</td></tr>
+<tr><td><code>SynchronousQueue</code></td><td>ёмкость 0: put ждёт take и наоборот (в JDK 21 переписана на основе алгоритма LinkedTransferQueue)</td><td>прямая передача; используется в newCachedThreadPool; честный режим — FIFO, нечестный — LIFO</td></tr>
+<tr><td><code>LinkedTransferQueue</code></td><td>«двойная» неблокирующая очередь (узлы-данные и узлы-запросы), CAS</td><td>неограниченная; <code>transfer(e)</code> ждёт, пока потребитель заберёт элемент; <code>tryTransfer</code>; высокая производительность</td></tr>
+</table></div>
+
+<h2 id="twolocks"><span class="h-num">20.3</span>Одна блокировка против двух</h2>
+<div class="widget" id="tlW">
+  <div class="widget-title">Производитель и потребитель одновременно обращаются к очереди с 3 элементами</div>
+  <div class="controls"><label>очередь<select id="tlQ"><option value="abq">ArrayBlockingQueue (одна блокировка)</option><option value="lbq">LinkedBlockingQueue (две блокировки)</option></select></label></div>
+  <div class="out" id="tlOut"></div>
+  <div class="verdict" id="tlV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var q = $("tlQ").value, lines;
+    if (q === "abq") lines = ["t0  P: put → lock.lock() ✔                C: take → lock.lock() … ЖДЁТ", "t1  P: items[putIndex] = x; count++; notEmpty.signal()", "t2  P: unlock()                         C: lock() ✔", "t3                                        C: x = items[takeIndex]; count--; notFull.signal(); unlock()", "итог: операции выполнены последовательно (≈ 2 × время критической секции)"];
+    else lines = ["t0  P: put → putLock.lock() ✔           C: take → takeLock.lock() ✔   (разные блокировки!)", "t1  P: last.next = node; last = node     C: head = head.next; x = item", "t2  P: count.getAndIncrement() (атомарно) C: count.getAndDecrement()", "t3  P: putLock.unlock()                  C: takeLock.unlock()", "сигналы «перекрёстные»: P будит потребителя через takeLock, только если очередь была пуста (c == 0); C будит производителя, только если была полна", "итог: операции выполнены параллельно"];
+    $("tlOut").textContent = lines.join("\n");
+    $("tlV").className = "verdict " + (q === "lbq" ? "ok" : "warn");
+    $("tlV").textContent = q === "lbq" ? "Голова и хвост списка независимы (при непустой очереди), поэтому каждой стороне — своя блокировка. Выше пропускная способность при многих производителях и потребителях, но узел на каждый элемент — нагрузка на GC." : "Массив с общими индексами и count защищён одной блокировкой: проще и без мусора, но производители и потребители мешают друг другу. Для умеренной нагрузки — отличный выбор с жёсткой ёмкостью.";
+  }
+  $("tlQ").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="patterns"><span class="h-num">20.4</span>Паттерны</h2>
+<pre data-title="потребитель с корректной остановкой (poison pill) и пачками"><code class="java">static final Event POISON = new Event("STOP");
+// потребитель
+List&lt;Event&gt; batch = new ArrayList&lt;&gt;(500);
+while (true) {
+    Event first = queue.take();                     // ждём хотя бы один
+    if (first == POISON) break;
+    batch.add(first);
+    queue.drainTo(batch, 499);                      // плюс всё, что уже накопилось — одним захватом
+    if (batch.remove(POISON)) { flush(batch); break; }
+    flush(batch); batch.clear();
+}
+// остановка: queue.put(POISON) — по одной «таблетке» на каждого потребителя; либо interrupt()</code></pre>
+<div class="callout warn"><span class="c-title">Ограничивайте ёмкость</span>
+Неограниченная очередь между быстрым производителем и медленным потребителем — это отложенный OutOfMemoryError. Ограниченная очередь с <code>put</code> даёт противодавление, с <code>offer(timeout)</code> — контролируемый отказ.
+</div>
+
+<h2 id="quiz"><span class="h-num">20.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему LinkedBlockingQueue может обслуживать put и take параллельно?</p><ul><li>Она lock-free</li><li>У головы и хвоста свои блокировки (takeLock и putLock), счётчик — атомарный</li><li>Она копирует элементы</li><li>Она не блокирует</li></ul><div class="why">У ArrayBlockingQueue одна блокировка.</div></div>
+<div class="mcq" data-ok="3"><p>Какая ёмкость у new LinkedBlockingQueue&lt;&gt;()?</p><ul><li>16</li><li>0</li><li>1024</li><li>Integer.MAX_VALUE — фактически без ограничения</li></ul><div class="why">Задавайте ёмкость явно.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает SynchronousQueue.put(x)?</p><ul><li>Ждёт, пока другой поток не заберёт x вызовом take</li><li>Кладёт в буфер на один элемент</li><li>Сразу возвращает false</li><li>Отправляет x всем потребителям</li></ul><div class="why">Ёмкость ноль — прямая передача.</div></div>
+<div class="mcq" data-ok="2"><p>Для чего DelayQueue?</p><ul><li>Для очереди с приоритетом по важности</li><li>Для медленных потребителей</li><li>Элементы становятся доступны take только после истечения их задержки — повторы с паузой, истечение кэша, тайм-ауты</li><li>Для логирования</li></ul><div class="why">Элементы реализуют Delayed.getDelay.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>ArrayBlockingQueue или LinkedBlockingQueue?</summary><div class="a"><p>ABQ — когда нужна жёсткая ограниченная ёмкость, предсказуемая память и отсутствие мусора на элемент, нагрузка умеренная (одна блокировка не узкое место). LBQ — когда много производителей и потребителей одновременно, важна пропускная способность (две блокировки), допустим мусор от узлов; всегда с явной ёмкостью. Для максимальной пропускной способности без ожидания — неблокирующие очереди (ConcurrentLinkedQueue, LinkedTransferQueue) или специализированные (JCTools, Disruptor).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

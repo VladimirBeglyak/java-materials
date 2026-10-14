@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · WebClient и Reactor Netty</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · WEBFLUX</div>
+  <h1>WebClient и Reactor Netty</h1>
+  <p class="lead">WebClient — неблокирующий HTTP-клиент поверх Reactor Netty HttpClient: цепочка вызова ленива, отменяема и встраивается в реактивный конвейер. В продакшене решают детали: пул соединений и его очередь ожидания, четыре разных таймаута, обработка статусов, освобождение тела ответа и «протухшие» соединения за балансировщиком. Разбираем всё это и декларативные клиенты <code>@HttpExchange</code>.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">retrieve / exchangeToMono</span><span class="tag">onStatus</span><span class="tag">ConnectionProvider</span><span class="tag">таймауты</span><span class="tag">ExchangeFilterFunction</span><span class="tag">@HttpExchange</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="basics"><span class="h-num">15.1</span>Запрос и ответ</h2>
+<pre data-title="retrieve — основной способ"><code class="java">Mono&lt;Price&gt; price = webClient.get()
+    .uri("/prices/{sku}?currency={c}", sku, "EUR")
+    .header("X-Request-Id", rid)
+    .retrieve()
+    .onStatus(HttpStatusCode::is4xxClientError, resp -&gt;
+        resp.bodyToMono(ProblemDetail.class)
+            .map(pd -&gt; new PriceRejected(sku, pd.getDetail())))   // своё исключение вместо WebClientResponseException
+    .bodyToMono(Price.class);
+
+Mono&lt;ResponseEntity&lt;Price&gt;&gt; withHeaders = webClient.get().uri("/prices/{sku}", sku)
+    .retrieve().toEntity(Price.class);                             // статус + заголовки + тело
+
+Mono&lt;Price&gt; manual = webClient.get().uri("/prices/{sku}", sku)
+    .exchangeToMono(resp -&gt; resp.statusCode().is2xxSuccessful()
+        ? resp.bodyToMono(Price.class)
+        : resp.releaseBody().then(Mono.empty()));                  // явное освобождение; иначе тело освободится
+                                                                   // автоматически после завершения функции</code></pre>
+<div class="callout warn"><span class="c-title">Тело ответа держит соединение</span>
+Пока тело не прочитано или не освобождено, соединение не вернётся в пул. <code>retrieve</code> и <code>exchangeToMono</code> делают это за вас; устаревший <code>exchange()</code> удалён именно из-за утечек соединений.
+</div>
+
+<h2 id="pool"><span class="h-num">15.2</span>Пул соединений</h2>
+<div class="widget" id="plW">
+  <div class="widget-title">Что будет через минуту такой нагрузки на один хост?</div>
+  <div class="controls">
+    <label>запросов/с<input type="number" id="plR" value="2000" min="1"></label>
+    <label>задержка сервиса, мс<input type="number" id="plL" value="300" min="1"></label>
+    <label>maxConnections<input type="number" id="plM" value="500" min="1"></label>
+    <label>pendingAcquireMaxCount<input type="number" id="plQ" value="1000" min="-1"></label>
+    <label>pendingAcquireTimeout, с<input type="number" id="plT" value="45" min="1"></label>
+  </div>
+  <div class="rows" id="plRows"></div>
+  <div class="verdict" id="plV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var r = Math.max(1, +$("plR").value), l = Math.max(1, +$("plL").value) / 1000, m = Math.max(1, +$("plM").value), q = +$("plQ").value, to = Math.max(1, +$("plT").value);
+    var need = r * l, thr = m / l, util = Math.min(1, need / m), excess = r - thr;
+    function row(n, val, frac, cls) { return '<div class="row"><b>' + n + '</b><span class="bar ' + (cls || "") + '"><i style="width:' + (Math.min(1, frac) * 100).toFixed(1) + '%"></i></span><span>' + val + "</span></div>"; }
+    var html = row("нужно соединений (Литтл)", need.toFixed(1), need / Math.max(need, m), need > m ? "bad" : "ok") + row("занятость пула", Math.round(util * 100) + "%", util, util > 0.85 ? "bad" : "ok") + row("пропускная способность пула", Math.round(thr) + " зап/с", Math.min(1, thr / r), thr < r ? "bad" : "ok");
+    var v = $("plV");
+    if (excess <= 0) { v.className = "verdict " + (util > 0.85 ? "warn" : "ok"); v.textContent = util > 0.85 ? "Пул почти исчерпан: малейший рост задержки сервиса — и запросы встанут в очередь. Запас нужен." : "Пул справляется: соединений хватает, очередь пуста."; }
+    else {
+      var qLimit = q < 0 ? Infinity : q, tFill = qLimit / excess, tWait = to * thr / excess, msg;
+      html += row("очередь растёт на", Math.round(excess) + " зап/с", 1, "bad");
+      if (tFill < 60 && tFill < tWait) msg = "Через " + tFill.toFixed(1) + " с очередь ожидания (" + q + ") заполнится, и новые запросы получат PoolAcquirePendingLimitException сразу, не дожидаясь.";
+      else if (q < 0 || tWait < 60) msg = "Очередь растёт, время ожидания соединения превысит " + to + " с примерно через " + Math.min(60, (to * thr / excess)).toFixed(0) + " с → PoolAcquireTimeoutException. До этого запросы просто «висят»" + (q < 0 ? ", а неограниченная очередь копит память." : ".");
+      else msg = "Очередь растёт, но за минуту лимиты не достигнуты — задержка ответов при этом растёт с каждой секундой.";
+      v.className = "verdict bad"; v.textContent = msg + " Решения: увеличить maxConnections, ограничить concurrency во flatMap, таймаут ожидания сделать коротким (fail fast), circuit breaker.";
+    }
+    $("plRows").innerHTML = html;
+  }
+  ["plR", "plL", "plM", "plQ", "plT"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<p>По умолчанию WebClient использует глобальный пул Reactor Netty «http»: <code>max(2 × max(ядра, 8), 500)</code>, то есть на практике 500 соединений <b>на каждый удалённый адрес</b>, очередь ожидания — 1000, таймаут получения 45 с. (Значение <code>2 × max(ядра, 8)</code> и очередь 500 получает собственный <code>ConnectionProvider.create(name)</code>.) Для важных зависимостей создавайте отдельный ConnectionProvider.</p>
+
+<h2 id="config"><span class="h-num">15.3</span>Настройка: пул и таймауты</h2>
+<pre data-title="Продакшен-конфигурация клиента" class="good-code"><code class="java">@Bean
+WebClient pricingClient(WebClient.Builder builder) {          // Boot-овский билдер: кодеки, observation
+    ConnectionProvider pool = ConnectionProvider.builder("pricing")
+        .maxConnections(100)
+        .pendingAcquireMaxCount(200)
+        .pendingAcquireTimeout(Duration.ofSeconds(2))          // fail fast вместо 45 с
+        .maxIdleTime(Duration.ofSeconds(20))                   // меньше idle-таймаута балансировщика!
+        .maxLifeTime(Duration.ofMinutes(5))
+        .evictInBackground(Duration.ofSeconds(30))
+        .metrics(true)                                         // reactor.netty.connection.provider.* в Micrometer
+        .build();
+    HttpClient http = HttpClient.create(pool)
+        .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 1_000)   // установка TCP-соединения
+        .responseTimeout(Duration.ofSeconds(3))                // от отправки запроса до заголовков ответа (и между чтениями)
+        .compress(true);
+    return builder.baseUrl("https://pricing.internal")
+        .clientConnector(new ReactorClientHttpConnector(http))
+        .build();
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Таймаут</th><th>Что ограничивает</th><th>Ошибка</th></tr>
+<tr><td><code>CONNECT_TIMEOUT_MILLIS</code></td><td>TCP-handshake (по умолчанию 30 с)</td><td>ConnectTimeoutException</td></tr>
+<tr><td><code>pendingAcquireTimeout</code></td><td>ожидание свободного соединения в пуле</td><td>PoolAcquireTimeoutException</td></tr>
+<tr><td><code>responseTimeout</code></td><td>максимальный интервал между чтениями из сети от отправки запроса до полного получения ответа (включая тело)</td><td>ReadTimeoutException</td></tr>
+<tr><td><code>Mono.timeout(d)</code></td><td>всё целиком, включая чтение тела и повторы (если стоит после retry)</td><td>TimeoutException</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Connection reset by peer / PrematureCloseException</span>
+Балансировщик (AWS ALB — 60 с по умолчанию, NLB/NAT Gateway — 350 с, nginx keepalive_timeout — 75 с) молча закрывает простаивающие соединения, а клиент берёт «мёртвое» соединение из пула. Лечится <code>maxIdleTime</code> меньше idle-таймаута на той стороне и повтором только для идемпотентных запросов.
+</div>
+
+<h2 id="filters"><span class="h-num">15.4</span>Фильтры и декларативные клиенты</h2>
+<pre data-title="ExchangeFilterFunction и @HttpExchange"><code class="java">ExchangeFilterFunction bearer = (req, next) -&gt; tokenProvider.token()      // Mono&lt;String&gt;, кэшируется
+    .flatMap(t -&gt; next.exchange(ClientRequest.from(req).headers(h -&gt; h.setBearerAuth(t)).build()));
+
+WebClient client = builder.filter(bearer).filter(logRequests()).build();
+
+// Декларативный интерфейс (Spring 6)
+@HttpExchange("/prices")
+interface PricingApi {
+    @GetExchange("/{sku}") Mono&lt;Price&gt; get(@PathVariable String sku);
+    @PostExchange          Mono&lt;Void&gt;  update(@RequestBody Price p);
+}
+@Bean PricingApi pricingApi(WebClient pricingClient) {
+    return HttpServiceProxyFactory.builderFor(WebClientAdapter.create(pricingClient))
+        .build().createClient(PricingApi.class);
+}</code></pre>
+<p>Для OAuth2 есть готовый <code>ServerOAuth2AuthorizedClientExchangeFilterFunction</code> (client_credentials, обновление токена), для балансировки по Spring Cloud LoadBalancer — <code>@LoadBalanced WebClient.Builder</code> или <code>ReactorLoadBalancerExchangeFilterFunction</code>.</p>
+
+<h2 id="quiz"><span class="h-num">15.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что вернёт retrieve().bodyToMono(...) при ответе 503 без onStatus?</p><ul><li>Пустой Mono</li><li>null</li><li>Ошибку WebClientResponseException.ServiceUnavailable</li><li>Тело ошибки как Price</li></ul><div class="why">retrieve по умолчанию превращает 4xx/5xx в WebClientResponseException.</div></div>
+<div class="mcq" data-ok="0"><p>Почему из WebClient удалили метод exchange()?</p><ul><li>Он перекладывал чтение/освобождение тела на приложение — забытое тело удерживало соединение и буферы</li><li>Он был медленным</li><li>Он не поддерживал заголовки</li><li>Его заменил RestTemplate</li></ul><div class="why">retrieve и exchangeToMono/Flux освобождают непрочитанное тело автоматически.</div></div>
+<div class="mcq" data-ok="3"><p>Сервис отвечает за 500 мс, нагрузка 300 зап/с, пул 100 соединений. Что произойдёт?</p><ul><li>Всё хорошо</li><li>Пропускная способность 1000 зап/с</li><li>Ошибка компиляции</li><li>Нужно 150 соединений — запросы копятся в очереди ожидания пула</li></ul><div class="why">По Литтлу 300 × 0,5 = 150 &gt; 100.</div></div>
+<div class="mcq" data-ok="1"><p>Что ограничивает responseTimeout?</p><ul><li>TCP-handshake</li><li>Паузу между чтениями из сети от отправки запроса до полного получения ответа</li><li>Ожидание соединения в пуле</li><li>Время жизни соединения</li></ul><div class="why">Для пула — pendingAcquireTimeout, для соединения — CONNECT_TIMEOUT_MILLIS.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Можно ли использовать WebClient в Spring MVC-приложении?</summary><div class="a"><p>Да, это распространённый сценарий: подключается spring-webflux ради клиента, приложение остаётся Servlet. Для синхронного кода вызывают <code>.block()</code> — это допустимо в потоках Tomcat (не event loop). Однако с Spring 6.1 для синхронного кода естественнее <code>RestClient</code> — у него тот же fluent-API, а с виртуальными потоками блокировка дёшева. WebClient остаётся выбором, когда нужны параллельные вызовы, стриминг или композиция через Reactor.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

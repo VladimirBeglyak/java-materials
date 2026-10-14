@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · HTTP/2, HTTP/3, WebSocket, gRPC</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ПРИКЛАДНОЙ УРОВЕНЬ</div>
+  <h1>HTTP/2, HTTP/3, WebSocket, gRPC</h1>
+  <p class="lead">Эволюция HTTP — это история борьбы с двумя врагами: числом RTT и блокировкой начала очереди. Разбираем, что изменила каждая версия, почему HTTP/3 ушёл на UDP, и как выбирать между SSE, WebSocket и gRPC.</p>
+  <div class="meta"><span class="tag">~3,5 часа</span><span class="tag">RFC 9112–9114, 9000, 6455</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="h1"><span class="h-num">11.1</span>HTTP/1.1 и его пределы</h2>
+<ul>
+  <li><b>HTTP/1.0</b>: новое TCP-соединение на каждый запрос — рукопожатие и медленный старт каждый раз.</li>
+  <li><b>HTTP/1.1</b>: постоянные соединения (keep-alive) по умолчанию. Но в одном соединении — <b>один запрос за раз</b>: следующий ждёт, пока придёт ответ на предыдущий.</li>
+  <li><b>Pipelining</b> (отправка нескольких запросов без ожидания) провалился: ответы должны идти строго по порядку, медленный первый ответ блокирует остальные (HOL на уровне HTTP), прокси его ломали. Браузеры его не включают.</li>
+  <li>Обходной путь браузеров — до <b>6 соединений на хост</b>, а сайтов — шардирование доменов, склейка файлов, спрайты. Всё это — костыли.</li>
+</ul>
+
+<h2 id="h2"><span class="h-num">11.2</span>HTTP/2: мультиплексирование</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 220" role="img" aria-label="Мультиплексирование HTTP/2">
+  <text x="20" y="22" font-weight="700">HTTP/1.1 — запросы по очереди</text>
+  <rect x="20" y="34" width="200" height="26" rx="4" class="box-info"/><text x="120" y="52" text-anchor="middle" class="mono" font-size="11">GET /a ………… ответ a</text>
+  <rect x="224" y="34" width="120" height="26" rx="4" class="box-ok"/><text x="284" y="52" text-anchor="middle" class="mono" font-size="11">GET /b → b</text>
+  <rect x="348" y="34" width="150" height="26" rx="4" class="box-warn"/><text x="423" y="52" text-anchor="middle" class="mono" font-size="11">GET /c → c</text>
+  <text x="20" y="100" font-weight="700">HTTP/2 — кадры потоков чередуются в одном TCP-соединении</text>
+  <g class="mono" font-size="10.5">
+    <rect x="20" y="112" width="44" height="26" rx="3" class="box-info"/><text x="42" y="129" text-anchor="middle">H1</text>
+    <rect x="66" y="112" width="44" height="26" rx="3" class="box-ok"/><text x="88" y="129" text-anchor="middle">H3</text>
+    <rect x="112" y="112" width="44" height="26" rx="3" class="box-warn"/><text x="134" y="129" text-anchor="middle">H5</text>
+    <rect x="158" y="112" width="44" height="26" rx="3" class="box-ok"/><text x="180" y="129" text-anchor="middle">D3</text>
+    <rect x="204" y="112" width="44" height="26" rx="3" class="box-info"/><text x="226" y="129" text-anchor="middle">D1</text>
+    <rect x="250" y="112" width="44" height="26" rx="3" class="box-warn"/><text x="272" y="129" text-anchor="middle">D5</text>
+    <rect x="296" y="112" width="44" height="26" rx="3" class="box-info"/><text x="318" y="129" text-anchor="middle">D1</text>
+    <rect x="342" y="112" width="44" height="26" rx="3" class="box-warn"/><text x="364" y="129" text-anchor="middle">D5</text>
+  </g>
+  <text x="400" y="130" font-size="12">H — HEADERS, D — DATA, цифра — id потока</text>
+  <text x="20" y="170" font-size="12.5">Один медленный ответ больше не блокирует остальные <tspan font-weight="700">на уровне HTTP</tspan>.</text>
+  <text x="20" y="190" font-size="12.5">Но потеря одного TCP-сегмента останавливает <tspan font-weight="700">все</tspan> потоки, пока он не будет повторён (HOL в TCP).</text>
+  <text x="20" y="210" font-size="12.5" class="muted">На сетях с потерями HTTP/2 может проиграть шести соединениям HTTP/1.1.</text>
+</svg>
+</figure>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Что даёт</th></tr>
+<tr><td>Бинарные кадры и потоки</td><td>сотни параллельных запросов в одном соединении; разбор быстрее и однозначнее текста</td></tr>
+<tr><td>HPACK</td><td>сжатие заголовков таблицей уже переданных значений — повторяющиеся cookies и токены почти бесплатны</td></tr>
+<tr><td>Управление потоком по каждому потоку</td><td>медленный потребитель одного стрима не забивает соединение</td></tr>
+<tr><td>Server push</td><td>сервер «угадывает» нужные ресурсы. На практике не прижился и удалён из браузеров; замена — <code>103 Early Hints</code></td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Балансировка долгих HTTP/2 соединений</span>
+Клиент (часто gRPC) открывает одно HTTP/2-соединение и шлёт через него все запросы. L4-балансировщик распределяет <b>соединения</b>, а не запросы: после масштабирования новые поды не получают нагрузку, а старые перегружены. Решения: L7-балансировщик (Envoy, Nginx с <code>grpc_pass</code>), балансировка на клиенте, ограничение времени жизни соединения (<code>max_connection_age</code>).
+</div>
+
+<h2 id="h3"><span class="h-num">11.3</span>HTTP/3 и QUIC</h2>
+<p>QUIC — транспорт поверх UDP, в который встроены TLS 1.3, надёжность, управление перегрузкой и независимые потоки. HTTP/3 — отображение семантики HTTP на QUIC.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 230" role="img" aria-label="Сравнение рукопожатий">
+  <text x="20" y="22" font-weight="700">До первого байта ответа (новое соединение)</text>
+  <text x="20" y="58" font-size="13">TCP + TLS 1.2</text>
+  <rect x="200" y="42" width="140" height="26" rx="4" class="box"/><text x="270" y="60" text-anchor="middle" font-size="11">TCP 1 RTT</text>
+  <rect x="340" y="42" width="280" height="26" rx="4" class="box-warn"/><text x="480" y="60" text-anchor="middle" font-size="11">TLS 1.2 — 2 RTT</text>
+  <rect x="620" y="42" width="140" height="26" rx="4" class="box-acc"/><text x="690" y="60" text-anchor="middle" font-size="11">HTTP 1 RTT</text>
+  <text x="20" y="102" font-size="13">TCP + TLS 1.3</text>
+  <rect x="200" y="86" width="140" height="26" rx="4" class="box"/><text x="270" y="104" text-anchor="middle" font-size="11">TCP 1 RTT</text>
+  <rect x="340" y="86" width="140" height="26" rx="4" class="box-warn"/><text x="410" y="104" text-anchor="middle" font-size="11">TLS 1 RTT</text>
+  <rect x="480" y="86" width="140" height="26" rx="4" class="box-acc"/><text x="550" y="104" text-anchor="middle" font-size="11">HTTP 1 RTT</text>
+  <text x="20" y="146" font-size="13">QUIC (HTTP/3)</text>
+  <rect x="200" y="130" width="140" height="26" rx="4" class="box-ok"/><text x="270" y="148" text-anchor="middle" font-size="11">QUIC+TLS 1 RTT</text>
+  <rect x="340" y="130" width="140" height="26" rx="4" class="box-acc"/><text x="410" y="148" text-anchor="middle" font-size="11">HTTP 1 RTT</text>
+  <text x="20" y="190" font-size="13">QUIC 0-RTT (повторно)</text>
+  <rect x="200" y="174" width="140" height="26" rx="4" class="box-acc"/><text x="270" y="192" text-anchor="middle" font-size="11">запрос сразу</text>
+  <text x="20" y="224" font-size="12" class="muted">При RTT 100 мс: 400 мс → 300 мс → 200 мс → 100 мс.</text>
+</svg>
+</figure>
+<ul>
+  <li><b>Нет HOL между потоками</b>: потеря пакета задерживает только тот поток, чьи данные в нём были.</li>
+  <li><b>Миграция соединения</b>: соединение идентифицируется Connection ID, а не пятёркой — переход телефона с Wi-Fi на LTE не рвёт загрузку.</li>
+  <li><b>В пространстве пользователя</b>: обновления алгоритмов без обновления ядра ОС; заголовки транспорта зашифрованы — middlebox'ы не могут «окостенить» протокол.</li>
+  <li><b>Обнаружение</b>: клиент узнаёт о поддержке HTTP/3 из заголовка <code>Alt-Svc: h3=":443"</code> или DNS-записи HTTPS; если UDP 443 заблокирован в корпоративной сети — откат на HTTP/2.</li>
+  <li><b>Цена</b>: больше CPU (шифрование и обработка в userspace), меньше аппаратных оптимизаций, сложнее отладка. Внутри дата-центра выигрыш мал — HTTP/3 нужен прежде всего на «последней миле».</li>
+</ul>
+
+<h2 id="realtime"><span class="h-num">11.4</span>Сервер → клиент: polling, SSE, WebSocket</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Short polling</th><th>Long polling</th><th>SSE</th><th>WebSocket</th></tr>
+<tr><td>Направление</td><td>клиент спрашивает каждые N с</td><td>сервер держит запрос до события</td><td>сервер → клиент</td><td>двунаправленный</td></tr>
+<tr><td>Транспорт</td><td>HTTP</td><td>HTTP</td><td>HTTP, <code>text/event-stream</code></td><td>Upgrade с HTTP/1.1 на свой протокол кадров</td></tr>
+<tr><td>Задержка события</td><td>до N с</td><td>~RTT</td><td>~RTT</td><td>~RTT</td></tr>
+<tr><td>Переподключение</td><td>—</td><td>вручную</td><td>встроено, <code>Last-Event-ID</code></td><td>вручную</td></tr>
+<tr><td>Прокси и CDN</td><td>прозрачно</td><td>таймауты</td><td>нужно отключить буферизацию</td><td>нужна поддержка Upgrade, idle timeout</td></tr>
+<tr><td>Когда</td><td>редкие обновления</td><td>наследие</td><td>уведомления, ленты, статусы, токены LLM</td><td>чаты, совместное редактирование, игры, котировки</td></tr>
+</table></div>
+<pre data-title="Рукопожатие WebSocket"><code class="http">GET /ws HTTP/1.1
+Host: app.bank.by
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=</code></pre>
+<p>Масштабирование WebSocket: соединение привязано к конкретному поду — для рассылки событий между подами нужна шина (Redis Pub/Sub, Kafka), для плавного деплоя — переподключение клиентов с jitter, для NAT и балансировщиков — ping/pong чаще их idle timeout. Проверяйте <code>Origin</code> при рукопожатии: cookie отправляются автоматически, иначе возможен Cross-Site WebSocket Hijacking.</p>
+
+<h2 id="grpc"><span class="h-num">11.5</span>gRPC</h2>
+<p>RPC-фреймворк поверх HTTP/2 с Protocol Buffers: контракт в <code>.proto</code>, генерация клиентов, компактная бинарная сериализация. Четыре типа вызовов: unary, server streaming, client streaming, bidirectional streaming.</p>
+<ul>
+  <li><b>Deadlines</b> передаются в метаданных (<code>grpc-timeout</code>) и распространяются по цепочке вызовов — каждый следующий сервис знает, сколько времени осталось.</li>
+  <li><b>Статусы</b> своего формата (<code>UNAVAILABLE</code>, <code>DEADLINE_EXCEEDED</code>…) передаются в trailers HTTP/2.</li>
+  <li><b>Из браузера</b> напрямую не работает (нет доступа к HTTP/2 trailers) — нужен gRPC-Web через прокси.</li>
+  <li><b>Балансировка</b> — см. выше: долгие соединения требуют L7 или клиентской балансировки.</li>
+</ul>
+<div class="grid-2">
+  <div class="card"><h4>REST/JSON</h4><p>Публичные API, браузеры, кэширование CDN, простота отладки curl'ом, слабая связность команд.</p></div>
+  <div class="card"><h4>gRPC</h4><p>Межсервисное взаимодействие внутри компании, строгие контракты, стриминг, высокая частота вызовов, многоязычные клиенты.</p></div>
+</div>
+
+<h2 id="lab"><span class="h-num">11.6</span>Лабораторная</h2>
+<pre><code class="sh">$ curl -sI --http2 https://www.google.com | head -1          # HTTP/2 200
+$ curl -sI https://cloudflare.com | grep -i alt-svc          # объявление h3
+$ curl -sI --http3 https://cloudflare.com | head -1          # если curl собран с HTTP/3
+# Chrome DevTools → Network → правый клик по заголовкам → колонка Protocol (h2, h3)
+# chrome://net-export — запись сетевой активности браузера</code></pre>
+
+<h2 id="sim"><span class="h-num">11.7</span>Интерактив: блокировка начала очереди в трёх версиях HTTP</h2>
+<div class="widget" id="holW">
+  <div class="widget-title">Симулятор: страница из шести ресурсов</div>
+  <div class="controls">
+    <label>протокол<select id="holProto"><option value="h1">HTTP/1.1 — одно соединение</option><option value="h1x6">HTTP/1.1 — шесть соединений (как браузер)</option><option value="h2">HTTP/2 — одно TCP-соединение, шесть потоков</option><option value="h3">HTTP/3 — QUIC поверх UDP, шесть потоков</option></select></label>
+    <label>событие<select id="holEv"><option value="slow">ответ №1 медленный (сервер думает 2 с)</option><option value="loss">потерян один пакет ответа №1</option><option value="none">всё идеально</option></select></label>
+  </div>
+  <div class="lanes" id="holLanes"></div>
+  <div class="verdict" id="holOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var p = $("holProto").value, e = $("holEv").value, st = [], msg, cls = "ok";
+    for (var i = 1; i <= 6; i++) {
+      var s = "ok";
+      if (e === "slow") { if (i === 1) s = "slow"; else if (p === "h1") s = "blocked"; }
+      else if (e === "loss") { if (i === 1) s = "slow"; else if (p === "h1" || p === "h2") s = "blocked"; }
+      st.push(s);
+    }
+    var names = { ok: ["ok", "получен"], slow: ["warn", "задержан"], blocked: ["bad", "ждёт чужой проблемы"] };
+    $("holLanes").innerHTML = st.map(function (s, i) { return '<div class="lane"><h5>Ресурс ' + (i + 1) + (p === "h1x6" ? " · соединение " + (i + 1) : (p === "h1" ? " · в очереди" : " · поток " + (i * 2 + 1))) + '</h5><div class="items"><span class="chip ' + names[s][0] + '">' + names[s][1] + "</span></div></div>"; }).join("");
+    if (e === "none") msg = { h1: "Запросы идут строго по очереди: следующий — только после полного ответа на предыдущий. Шесть ресурсов = шесть последовательных обменов.", h1x6: "Параллельность достигается количеством соединений: шесть TCP- и TLS-рукопожатий, шесть медленных стартов. Лимит браузера — 6 соединений на хост.", h2: "Все шесть запросов уходят сразу по одному соединению; ответы чередуются фреймами. Одно рукопожатие, одно окно перегрузки, сжатие заголовков HPACK.", h3: "То же мультиплексирование, но потоки независимы на транспортном уровне; рукопожатие QUIC + TLS 1.3 за 1 RTT." }[p];
+    else if (e === "slow") {
+      if (p === "h1") { cls = "bad"; msg = "Блокировка начала очереди на уровне HTTP: соединение занято медленным ответом, остальные пять запросов стоят за ним."; }
+      else msg = (p === "h1x6" ? "Каждый запрос на своём соединении" : "Потоки мультиплексированы") + ": медленный ответ не мешает остальным. Именно эту проблему решил HTTP/2.";
+    } else {
+      if (p === "h1") { cls = "bad"; msg = "Потеря задерживает единственное соединение целиком."; }
+      else if (p === "h1x6") msg = "Потеря затронула одно соединение из шести; остальные пять ответов приходят без задержки. Парадокс: на плохой сети HTTP/1.1 с несколькими соединениями может оказаться отзывчивее HTTP/2.";
+      else if (p === "h2") { cls = "bad"; msg = "Блокировка начала очереди на уровне TCP. Для TCP все шесть потоков — один поток байтов: пока потерянный сегмент не доставлен повторно, ядро не отдаёт приложению и уже полученные данные ДРУГИХ потоков. Один потерянный пакет тормозит всю страницу."; }
+      else msg = "QUIC ведёт порядок доставки отдельно для каждого потока: потеря пакета задерживает только тот поток, чьи данные в нём были. Ради этого транспорт и перенесли из ядра (TCP) в пользовательское пространство поверх UDP.";
+    }
+    $("holOut").className = "verdict " + cls; $("holOut").textContent = msg;
+  }
+  $("holProto").addEventListener("change", run); $("holEv").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">11.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какую проблему HTTP/2 решил, а какую — нет?</p><ul><li>Решил потери пакетов</li><li>Решил блокировку начала очереди на уровне HTTP (мультиплексирование), но не на уровне TCP</li><li>Решил обе</li><li>Не решил ни одной</li></ul><div class="why">TCP гарантирует порядок единого потока байтов; его блокировку убирает только QUIC в HTTP/3.</div></div>
+<div class="mcq" data-ok="2"><p>Нужно отправлять клиенту обновления цен раз в секунду, клиент ничего не шлёт. Что проще всего?</p><ul><li>Polling каждые 100 мс</li><li>WebSocket</li><li>Server-Sent Events: один долгий HTTP-ответ, автоматическое переподключение</li><li>gRPC unary</li></ul><div class="why">SSE — односторонний поток поверх обычного HTTP. WebSocket нужен, когда поток двусторонний.</div></div>
+<div class="mcq" data-ok="0"><p>Почему gRPC-балансировку нельзя делать обычным L4-балансировщиком?</p><ul><li>gRPC держит одно долгое HTTP/2-соединение, и все запросы уходят на один бэкенд; нужна балансировка по запросам (L7) или на клиенте</li><li>gRPC использует UDP</li><li>gRPC не работает через балансировщики</li><li>Из-за Protobuf</li></ul><div class="why">L4 распределяет соединения, а не запросы внутри них.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какую проблему решил HTTP/2 и какую нет?</summary><div class="a"><p>Решил HOL-блокировку на уровне HTTP: запросы мультиплексируются в одном соединении, не нужно 6 соединений и склейка файлов; сжал заголовки. Не решил HOL на уровне TCP: потеря одного сегмента тормозит все потоки. Это решает QUIC.</p></div></details>
+<details class="q"><summary>Почему QUIC работает поверх UDP, а не является новым протоколом рядом с TCP?</summary><div class="a"><p>Новый протокол IP (не 6 и не 17) не пройдёт через миллионы NAT и файрволов, а изменения TCP годами внедряются в ядра ОС и ломаются middlebox'ами. UDP проходит почти везде, а вся логика реализуется в пространстве пользователя и шифруется.</p></div></details>
+<details class="q"><summary>После увеличения числа подов gRPC-сервиса нагрузка на новые поды почти нулевая. Почему?</summary><div class="a"><p>Клиенты держат долгие HTTP/2-соединения со старыми подами, а L4-балансировщик (например, Service в Kubernetes) распределяет только новые соединения. Нужна L7-балансировка по запросам, клиентская балансировка или ограничение возраста соединения.</p></div></details>
+<details class="q"><summary>Что выбрать для ленты уведомлений в веб-приложении: SSE или WebSocket?</summary><div class="a"><p>SSE: поток только от сервера, обычный HTTP (работает с HTTP/2, авторизацией, прокси), автоматическое переподключение с Last-Event-ID. WebSocket нужен, когда клиент тоже часто шлёт сообщения с низкой задержкой.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Несколько хранилищ: CDC, outbox, CQRS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · АРХИТЕКТУРА</div>
+  <h1>Несколько хранилищ: CDC, outbox, CQRS</h1>
+  <p class="lead">Как только рядом с основной базой появляется кэш, поисковый индекс или аналитическое хранилище, возникает главный вопрос: как держать их согласованными? «Записать в обе» не работает. Разбираем, почему двойная запись ломается, паттерны transactional outbox и CDC, CQRS с моделями чтения, идемпотентность и упорядочение, и как жить с задержкой согласования.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">dual write</span><span class="tag">outbox</span><span class="tag">Debezium</span><span class="tag">CQRS</span><span class="tag">идемпотентность</span><span class="tag">eventual consistency</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="dual"><span class="h-num">16.1</span>Почему двойная запись ломается</h2>
+<div class="widget" id="dwW">
+  <div class="widget-title">Три способа сломать «записать в базу и в поиск»</div>
+  <div class="controls"><label>сценарий<select id="dwS" class="wide">
+    <option value="crash">приложение падает между двумя записями</option>
+    <option value="rollback">запись в индекс прошла, транзакция базы откатилась</option>
+    <option value="race">два параллельных обновления одного товара</option>
+  </select></label></div>
+  <div class="table-wrap"><table id="dwT"></table></div>
+  <div class="verdict bad" id="dwV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    crash: [["UPDATE products SET price = 900 — COMMIT", "—"], ["💥 OOM / деплой / сеть", "—"], ["", "в индексе по-прежнему price = 1000"]],
+    rollback: [["BEGIN; UPDATE products SET price = 900", ""], ["", "index(product 7, price 900) ✔"], ["ошибка ограничения → ROLLBACK", ""], ["", "в индексе 900, в базе 1000"]],
+    race: [["A: UPDATE price = 900 — COMMIT", ""], ["B: UPDATE price = 800 — COMMIT", ""], ["", "B: index(price 800)"], ["", "A (задержался на GC): index(price 900)"]]
+  };
+  var V = { crash: "Расхождение навсегда (до следующего изменения товара). Ни повторов, ни следа, что что-то не дошло.", rollback: "Поиск показывает данные, которых никогда не было. Если писать в индекс после коммита — возвращаемся к сценарию с падением.", race: "В базе 800, в индексе 900: записи во второе хранилище пришли в другом порядке. Без упорядочения по ключу и версий это не исправить." };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var s = $("dwS").value; $("dwT").innerHTML = "<tr><th>База</th><th>Поисковый индекс</th></tr>" + D[s].map(function (r) { return "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>"; }).join(""); $("dwV").textContent = V[s]; }
+  $("dwS").addEventListener("change", run); run();
+})();
+</script>
+<p>Корень проблемы: нет общей транзакции между двумя системами (2PC/XA между базой и брокером почти никто не использует — медленно, хрупко, многие системы не поддерживают). Решение — <b>одна запись в одну систему</b>, а распространение изменения — надёжным асинхронным процессом.</p>
+
+<h2 id="outbox"><span class="h-num">16.2</span>Transactional outbox</h2>
+<div class="widget stepper" id="obSim">
+  <div class="widget-title">Outbox: событие в той же транзакции, что и данные</div>
+  <div class="flow st-stage">
+    <div class="node" id="obApp"><b>сервис заказов</b></div><span class="to">→</span>
+    <div class="node" id="obDb"><b>orders + outbox (одна база)</b></div><span class="to">→</span>
+    <div class="node" id="obRelay"><b>ретранслятор</b><small>poller или CDC</small></div><span class="to">→</span>
+    <div class="node" id="obK"><b>Kafka</b></div><span class="to">→</span>
+    <div class="node" id="obC"><b>потребители: поиск, кэш, аналитика</b></div>
+  </div>
+  <section class="st-step" data-t="Одна транзакция" data-hl="obApp obDb" data-log="BEGIN; INSERT INTO orders …; INSERT INTO outbox(aggregate_id, type, payload) …; COMMIT"><p>Сервис в одной локальной транзакции меняет данные и вставляет событие в таблицу <code>outbox</code>. Либо оба факта записаны, либо ни одного — атомарность обеспечивает база.</p></section>
+  <section class="st-step" data-t="Ретранслятор читает outbox" data-hl="obRelay obDb" data-log="relay: SELECT … FROM outbox ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 100 (или Debezium читает WAL)"><p>Отдельный процесс забирает новые события: опросом таблицы или, лучше, через CDC (Debezium с Outbox Event Router читает вставки в outbox из WAL — без нагрузки опросами).</p></section>
+  <section class="st-step" data-t="Публикация" data-hl="obK" data-log="produce(key = aggregate_id) → acks=all; затем пометить/удалить строки outbox"><p>События публикуются в Kafka с ключом агрегата (порядок по заказу сохраняется). После подтверждения строки outbox удаляются или помечаются. Падение между публикацией и пометкой — повторная публикация: <b>at-least-once</b>.</p></section>
+  <section class="st-step" data-t="Потребители" data-hl="obC" data-log="consumer: проверка event_id/версии → обновить поисковый индекс/кэш/витрину"><p>Потребители обновляют свои хранилища идемпотентно: учитывают event_id или версию агрегата и пропускают устаревшие события. Новый потребитель может прочитать топик с начала (при достаточной ретенции) или получить начальный снимок.</p></section>
+</div>
+<pre data-title="outbox в Spring"><code class="java">@Transactional
+public Order place(PlaceOrder cmd) {
+    Order order = orders.save(Order.from(cmd));
+    outbox.save(new OutboxEvent(UUID.randomUUID(), "Order", order.getId(), "OrderPlaced",
+                                json(new OrderPlaced(order.getId(), order.getTotal(), order.getVersion()))));
+    return order;                     // оба INSERT — в одной транзакции
+}
+// Spring Modulith: события модулей с Event Publication Registry и externalization в Kafka — готовая реализация идеи</code></pre>
+
+<h2 id="cdc"><span class="h-num">16.3</span>CDC: изменения прямо из журнала базы</h2>
+<p>Change Data Capture читает журнал базы (WAL PostgreSQL через логическую репликацию, binlog MySQL, oplog/change streams MongoDB) и превращает каждое изменение строки в событие. Debezium — стандартный инструмент (Kafka Connect или Debezium Server).</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>CDC таблиц напрямую</th><th>Outbox (через CDC или poller)</th></tr>
+<tr><td>Изменения в коде</td><td>не нужны</td><td>запись события в outbox</td></tr>
+<tr><td>Что в событии</td><td>строка таблицы «до/после» — внутренняя схема утекает наружу</td><td>доменное событие с явным контрактом</td></tr>
+<tr><td>Когда</td><td>репликация данных в аналитику, поиск, кэш внутри команды; legacy без изменений кода</td><td>интеграция между сервисами и командами</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Эксплуатация CDC</span>
+Логический слот репликации держит WAL, пока коннектор не прочитал его: остановленный Debezium = растущий диск primary (тема 15 первого пособия). Мониторьте отставание слота, задайте <code>max_slot_wal_keep_size</code>. Начальный снимок больших таблиц — инкрементальный (Debezium incremental snapshots). Изменения схемы таблиц должны быть совместимы с потребителями.
+</div>
+
+<h2 id="cqrs"><span class="h-num">16.4</span>CQRS: отдельные модели записи и чтения</h2>
+<div class="flow col">
+  <div class="node acc"><b>Команды → модель записи</b><small>нормализованная схема в PostgreSQL, инварианты, транзакции</small></div><span class="to">↓ события (outbox/CDC)</span>
+  <div class="node info"><b>Проекции → модели чтения</b><small>денормализованные витрины под конкретные экраны и запросы: документ в OpenSearch, ключ в Redis, таблица в ClickHouse, отдельная таблица в той же базе</small></div><span class="to">↓</span>
+  <div class="node ok"><b>Запросы читают готовые витрины</b><small>быстро, без JOIN, масштабируются независимо</small></div>
+</div>
+<ul>
+  <li>CQRS не требует event sourcing и отдельных баз: начать можно с материализованного представления или таблицы-витрины в той же базе.</li>
+  <li>Проекции должны уметь <b>пересобираться</b> с нуля (из событий или из модели записи) — это и лечение ошибок, и миграция.</li>
+  <li>Интерфейс должен учитывать задержку: после команды показывать результат из ответа команды, а не перечитывать витрину.</li>
+</ul>
+
+<h2 id="consistency"><span class="h-num">16.5</span>Жить с eventual consistency</h2>
+<div class="widget" id="lagW">
+  <div class="widget-title">Насколько отстанет витрина</div>
+  <div class="controls">
+    <label>интервал опроса outbox, мс<input type="number" id="lgP" value="500" min="0"></label>
+    <label>задержка Kafka, мс<input type="number" id="lgK" value="20" min="0"></label>
+    <label>обработка у потребителя, мс<input type="number" id="lgC" value="30" min="0"></label>
+    <label>refresh индекса, мс<input type="number" id="lgR" value="1000" min="0"></label>
+  </div>
+  <div class="out" id="lgOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var p = +$("lgP").value, k = +$("lgK").value, c = +$("lgC").value, r = +$("lgR").value;
+    var avg = p / 2 + k + c + r / 2, max = p + k + c + r;
+    $("lgOut").textContent = "в среднем: ~" + Math.round(avg) + " мс, в худшем случае (без сбоев): ~" + Math.round(max) + " мс\nпри остановке потребителя или ребалансировке — секунды–минуты: интерфейс и бизнес-процессы должны это переносить" +
+      "\nдля CDC вместо опроса интервал ≈ 0 → среднее ~" + Math.round(k + c + r / 2 + 10) + " мс";
+  }
+  ["lgP", "lgK", "lgC", "lgR"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Проблема</th><th>Решение</th></tr>
+<tr><td>Дубликаты событий</td><td>идемпотентные обработчики: таблица обработанных id, UPSERT по ключу, версии</td></tr>
+<tr><td>Порядок</td><td>ключ партиции = id агрегата; в событии — версия, устаревшие отбрасываются</td></tr>
+<tr><td>«Ядовитое» событие</td><td>повторы с отступом, затем DLT/DLQ и алерт; не блокировать партицию навсегда</td></tr>
+<tr><td>Расхождения накапливаются</td><td>периодическая сверка (reconciliation) и полная пересборка проекции</td></tr>
+<tr><td>Пользователь не видит своё изменение</td><td>чтение из модели записи сразу после команды, оптимистичный интерфейс</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">16.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какую проблему решает transactional outbox?</p><ul><li>Ускоряет запись в базу</li><li>Атомарно связывает изменение данных и факт публикации события, без распределённой транзакции</li><li>Гарантирует exactly-once доставку потребителям</li><li>Заменяет Kafka</li></ul><div class="why">Доставка остаётся at-least-once — нужна идемпотентность.</div></div>
+<div class="mcq" data-ok="3"><p>Debezium читает изменения таблицы orders. Чем это хуже outbox для интеграции между командами?</p><ul><li>Debezium медленнее</li><li>Debezium теряет события</li><li>CDC невозможен в PostgreSQL</li><li>Внутренняя схема таблицы становится публичным контрактом; переименование столбца ломает потребителей</li></ul><div class="why">Outbox публикует доменные события с явным контрактом.</div></div>
+<div class="mcq" data-ok="0"><p>Как не допустить, чтобы устаревшее событие перезаписало свежие данные в витрине?</p><ul><li>Хранить версию агрегата и применять событие, только если его версия больше сохранённой</li><li>Увеличить число партиций</li><li>Обрабатывать события параллельно</li><li>Отключить повторы</li></ul><div class="why">Плюс ключ партиции по id агрегата для порядка.</div></div>
+<div class="mcq" data-ok="2"><p>Что из перечисленного верно про CQRS?</p><ul><li>Требует event sourcing</li><li>Требует отдельной базы для чтения</li><li>Модели чтения — производные, их можно пересобрать; начать можно с витрины в той же базе</li><li>Устраняет eventual consistency</li></ul><div class="why">Разделение моделей — идея, а не обязательный набор технологий.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как добавить нового потребителя (например, поиск), если события публикуются уже год, а ретенция топика — 7 дней?</summary><div class="a"><p>Начальная загрузка: снимок текущего состояния из базы (Debezium snapshot, выгрузка или отдельный «bootstrap»-топик с компактизацией), затем чтение событий с позиции, соответствующей моменту снимка (или с перекрытием и идемпотентностью). На будущее — компактизированный топик с текущим состоянием агрегатов позволяет любому новому потребителю восстановить состояние.</p></div></details>
+<details class="q"><summary>Сервис должен списать деньги в своей базе и отправить событие в другой сервис. Как сделать надёжно?</summary><div class="a"><p>Outbox: в одной транзакции списание и запись события в outbox; ретранслятор публикует в брокер; получатель обрабатывает идемпотентно. Для процессов из нескольких сервисов с компенсацией — сага (оркестрация или хореография) поверх тех же механизмов. Никаких HTTP-вызовов другого сервиса внутри транзакции базы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

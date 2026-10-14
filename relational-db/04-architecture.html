@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Архитектура СУБД: путь запроса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ВНУТРЕННЕЕ УСТРОЙСТВО</div>
+  <h1>Архитектура СУБД: путь запроса</h1>
+  <p class="lead">Между <code>executeQuery()</code> в вашем коде и байтами на диске — процесс-обработчик, разбор, переписывание, планирование, исполнение, кэш страниц, журнал предзаписи и фоновые процессы. Эта карта нужна, чтобы дальнейшие темы (индексы, MVCC, VACUUM, репликация) легли на место. Основа — PostgreSQL; в конце — чем отличается MySQL InnoDB.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">процессы</span><span class="tag">shared buffers</span><span class="tag">планировщик</span><span class="tag">WAL</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="processes"><span class="h-num">4.1</span>Процессы и память</h2>
+<div class="flow col">
+  <div class="node info"><b>Клиент (JDBC, psql)</b><small>TCP 5432, протокол PostgreSQL</small></div><span class="to">↓ подключение</span>
+  <div class="node"><b>postmaster</b><small>главный процесс: принимает соединение и порождает (fork) отдельный процесс-обработчик</small></div><span class="to">↓</span>
+  <div class="node acc"><b>backend — по процессу на соединение</b><small>своя локальная память: work_mem для сортировок и хэшей, кэш каталога, подготовленные запросы</small></div><span class="to">⇅</span>
+  <div class="node ok"><b>Общая память</b><small>shared_buffers — кэш страниц таблиц и индексов; WAL buffers; таблица блокировок; сведения о транзакциях</small></div><span class="to">⇅</span>
+  <div class="node"><b>Кэш ОС (page cache) → диск</b><small>файлы данных по 1 ГБ, сегменты WAL по 16 МБ</small></div>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Фоновый процесс</th><th>Что делает</th></tr>
+<tr><td>checkpointer</td><td>периодически сбрасывает все изменённые («грязные») страницы на диск и отмечает контрольную точку в WAL</td></tr>
+<tr><td>background writer</td><td>понемногу сбрасывает грязные страницы заранее, чтобы обработчикам не пришлось делать это самим</td></tr>
+<tr><td>walwriter</td><td>сбрасывает буферы WAL на диск</td></tr>
+<tr><td>autovacuum launcher и workers</td><td>убирают мёртвые версии строк и обновляют статистику (тема 14)</td></tr>
+<tr><td>walsender / walreceiver</td><td>передают WAL репликам (тема 15)</td></tr>
+<tr><td>archiver</td><td>копирует сегменты WAL в архив для восстановления на момент времени (тема 19)</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Процесс на соединение — важное следствие</span>
+Каждое соединение — отдельный процесс ОС с мегабайтами памяти, а переключения между тысячами процессов съедают процессор. Поэтому у PostgreSQL практический предел — сотни активных соединений, а не тысячи, и между приложением и базой ставят пул (HikariCP в приложении, PgBouncer перед базой — тема 16).
+</div>
+
+<h2 id="path"><span class="h-num">4.2</span>Путь запроса по шагам</h2>
+<pre><code class="sql">UPDATE orders SET status = 'paid' WHERE id = 105;</code></pre>
+<div class="widget stepper" id="qpSim">
+  <div class="widget-title">Симулятор: от строки SQL до COMMIT</div>
+  <div class="flow st-stage">
+    <div class="node" id="qpParse"><b>Parser</b></div><span class="to">→</span>
+    <div class="node" id="qpRewrite"><b>Analyzer / Rewriter</b></div><span class="to">→</span>
+    <div class="node" id="qpPlan"><b>Planner</b></div><span class="to">→</span>
+    <div class="node" id="qpExec"><b>Executor</b></div><span class="to">→</span>
+    <div class="node" id="qpBuf"><b>Shared buffers</b></div><span class="to">→</span>
+    <div class="node" id="qpWal"><b>WAL</b></div><span class="to">→</span>
+    <div class="node" id="qpDisk"><b>Диск</b></div>
+  </div>
+  <section class="st-step" data-t="Разбор" data-hl="qpParse" data-log="parse: UpdateStmt(relation=orders, set=[status='paid'], where=id=105)"><h4>1. Синтаксический разбор</h4><p>Текст превращается в дерево разбора. Проверяется только грамматика: опечатка в ключевом слове — ошибка здесь; несуществующая таблица — ещё нет. Для подготовленных выражений (<code>PreparedStatement</code>) разбор выполняется один раз.</p></section>
+  <section class="st-step" data-t="Анализ и переписывание" data-hl="qpRewrite" data-log="analyze: orders → oid 16384, status: text, id: bigint; права UPDATE проверены"><h4>2. Семантический анализ и переписывание</h4><p>Имена связываются с объектами каталога (таблицы, столбцы, типы, функции), проверяются права. Переписывание раскрывает представления (view) в их определение и применяет правила, политики построчной безопасности (RLS).</p></section>
+  <section class="st-step" data-t="Планирование" data-hl="qpPlan" data-log="plan: Update on orders → Index Scan using orders_pkey (id = 105), cost=0.29..8.31 rows=1"><h4>3. Выбор плана</h4><p>Планировщик перебирает способы выполнить запрос (полный просмотр, индекс, способы соединения), оценивает стоимость каждого по статистике таблиц и выбирает самый дешёвый. Здесь — поиск по первичному ключу. Об этом — темы 08–09.</p></section>
+  <section class="st-step" data-t="Исполнение: поиск строки" data-hl="qpExec qpBuf" data-log="exec: index orders_pkey → ctid (12,4); страница 12 таблицы — в shared buffers (hit)"><h4>4. Исполнение: найти строку</h4><p>Исполнитель — дерево узлов, каждый отдаёт строки родителю по запросу. Узел Index Scan идёт по B-дереву индекса и получает адрес строки (ctid: страница 12, позиция 4). Затем нужна сама страница таблицы: менеджер буферов ищет её в shared buffers. Нет — читает из файла (возможно, из кэша ОС) в свободный буфер, вытесняя давно неиспользуемый.</p></section>
+  <section class="st-step" data-t="Новая версия строки" data-hl="qpBuf" data-log="exec: старой версии xmax = 742; новая версия (12,7) xmin = 742, status = 'paid'"><h4>5. UPDATE = новая версия строки</h4><p>Строка не перезаписывается на месте: старая версия помечается как удалённая транзакцией 742, рядом записывается новая (MVCC, тема 11). Если изменённый столбец не входит в индексы и на странице есть место — индексы не трогаются (HOT, тема 05). Страница в shared buffers становится «грязной»; на диск её запишут позже.</p></section>
+  <section class="st-step" data-t="Запись в WAL" data-hl="qpWal" data-log="wal: запись в WAL-буфер: heap update (12,4)→(12,7), LSN 0/3A2F110"><h4>6. Запись в журнал предзаписи</h4><p>Описание изменения добавляется в буфер WAL. Правило WAL: запись журнала попадает на диск <b>раньше</b>, чем изменённая страница данных. Поэтому страницы можно сбрасывать когда угодно — при сбое всё восстановится из журнала (тема 10).</p></section>
+  <section class="st-step" data-t="COMMIT" data-hl="qpWal qpDisk" data-log="commit: запись commit 742 в WAL → fsync до LSN 0/3A2F1A0 → «COMMIT» клиенту"><h4>7. COMMIT: долговечность</h4><p>При фиксации транзакции её запись в WAL сбрасывается на диск (<code>fsync</code>) и только потом клиент получает подтверждение. Сами страницы таблицы при этом ещё в памяти. Цена коммита — один последовательный сброс журнала; несколько одновременных коммитов объединяются в один сброс (group commit).</p></section>
+  <section class="st-step" data-t="Контрольная точка" data-hl="qpDisk" data-log="checkpoint: грязные страницы сброшены на диск; WAL до этой точки можно удалить или архивировать"><h4>8. Позже: контрольная точка</h4><p>Checkpointer записывает грязные страницы в файлы данных. После этого старый WAL для восстановления не нужен. Чем реже контрольные точки, тем меньше записи, но дольше восстановление после сбоя.</p></section>
+</div>
+
+<h2 id="buffers"><span class="h-num">4.3</span>Кэш страниц: почему важна «тёплая» база</h2>
+<div class="grid-2">
+  <div class="card"><h4>Двойное кэширование</h4><p>Страница может быть в shared buffers и в кэше ОС одновременно. Обычный совет — shared_buffers около 25% памяти; остальное эффективно использует кэш ОС. Узнать долю попаданий: <code>pg_stat_database.blks_hit / (blks_hit + blks_read)</code> — для OLTP ожидается 99%+.</p></div>
+  <div class="card"><h4>Рабочий набор</h4><p>Скорость определяется тем, помещаются ли в память <b>часто используемые</b> страницы — верхние уровни индексов и «горячие» данные, а не вся база. Отсюда эффект последовательных ключей (тема 02): новые записи концентрируются в немногих страницах.</p></div>
+</div>
+
+<h2 id="innodb"><span class="h-num">4.4</span>MySQL InnoDB: та же задача — другие решения</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>PostgreSQL</th><th>MySQL InnoDB</th></tr>
+<tr><td>Соединения</td><td>процесс на соединение</td><td>поток на соединение (дешевле, но пул всё равно нужен)</td></tr>
+<tr><td>Хранение таблицы</td><td>heap: строки в порядке вставки, все индексы указывают на физический адрес</td><td>кластерный индекс: строки лежат в B-дереве первичного ключа; вторичные индексы хранят значение первичного ключа</td></tr>
+<tr><td>Старые версии строк</td><td>в самой таблице (мёртвые кортежи), убирает VACUUM</td><td>в undo-журнале; строка в таблице всегда последняя, purge чистит undo</td></tr>
+<tr><td>Журнал</td><td>WAL — и для восстановления, и для репликации</td><td>redo log для восстановления + отдельный binlog для репликации</td></tr>
+<tr><td>Кэш</td><td>shared_buffers + кэш ОС</td><td>buffer pool, обычно 50–75% памяти, в обход кэша ОС</td></tr>
+<tr><td>Следствие для ключей</td><td>случайный ключ раздувает индекс первичного ключа</td><td>случайный ключ перемешивает саму таблицу, а длинный ключ копируется в каждый вторичный индекс</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">4.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Когда изменённая UPDATE-ом страница таблицы оказывается на диске?</p><ul><li>Сразу при выполнении UPDATE</li><li>Позже — при контрольной точке или вытеснении из кэша; при COMMIT на диск сбрасывается только WAL</li><li>Только при остановке сервера</li><li>Никогда, данные живут в памяти</li></ul><div class="why">Долговечность обеспечивает журнал; страницы пишутся асинхронно.</div></div>
+<div class="mcq" data-ok="2"><p>Почему для PostgreSQL рекомендуют пул соединений?</p><ul><li>Без пула нельзя выполнять транзакции</li><li>Пул шифрует соединения</li><li>Каждое соединение — отдельный процесс ОС: тысячи соединений расходуют память и процессор на переключения</li><li>Пул ускоряет диск</li></ul><div class="why">Небольшое число активных соединений обслуживает больше запросов, чем тысячи конкурирующих.</div></div>
+<div class="mcq" data-ok="0"><p>На каком этапе обнаружится ошибка «relation "ordrs" does not exist»?</p><ul><li>При анализе: имена связываются с объектами каталога</li><li>При синтаксическом разборе</li><li>При планировании</li><li>При коммите</li></ul><div class="why">Парсер проверяет только грамматику; существование объектов — анализатор.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите путь запроса внутри PostgreSQL.</summary><div class="a"><p>Соединение → backend-процесс → разбор → анализ и переписывание (представления, RLS) → планирование по статистике → исполнение дерева узлов; страницы читаются через shared buffers (кэш ОС, диск); изменения — новые версии строк в буферах и записи в WAL; COMMIT — сброс WAL на диск; страницы данных записываются позже контрольной точкой.</p></div></details>
+<details class="q"><summary>Чем heap-таблица PostgreSQL отличается от кластерного индекса InnoDB?</summary><div class="a"><p>В PostgreSQL строки лежат без порядка, все индексы (включая первичный) ссылаются на физический адрес строки. В InnoDB таблица и есть B-дерево первичного ключа; вторичные индексы хранят первичный ключ, и поиск по ним требует второго прохода по кластерному индексу. Отсюда в InnoDB особая важность короткого и последовательного первичного ключа.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Стримы поверх коллекций и Collectors</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ИТЕРАЦИЯ И СТРИМЫ</div>
+  <h1>Стримы поверх коллекций и Collectors</h1>
+  <p class="lead">Стрим — не коллекция, а ленивый конвейер поверх сплитератора источника: элементы по одному проходят все операции, а работа начинается только с терминальной операции. Трассировщик покажет порядок вызовов и короткое замыкание <code>limit</code>/<code>findFirst</code>, а конструктор коллекторов — как собирать результаты в нужные коллекции: <code>toMap</code> с дубликатами, <code>groupingBy</code> с подчинёнными коллекторами, <code>partitioningBy</code>, <code>teeing</code>.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">ленивость</span><span class="tag">слияние стадий</span><span class="tag">короткое замыкание</span><span class="tag">toMap</span><span class="tag">groupingBy</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pipeline"><span class="h-num">17.1</span>Как течёт конвейер</h2>
+<div class="widget" id="trW">
+  <div class="widget-title">Трассировка: List.of(5, 2, 8, 1, 9, 4, 7)</div>
+  <div class="controls"><label>конвейер<select id="trS" class="wide">
+    <option value="fm">.filter(x &gt; 3).map(x * 10).toList()</option>
+    <option value="limit">.filter(x &gt; 3).map(x * 10).limit(2).toList()</option>
+    <option value="first">.filter(x &gt; 6).findFirst()</option>
+    <option value="sorted">.filter(x &gt; 3).sorted().map(x * 10).limit(2).toList()</option>
+    <option value="nostart">.filter(x &gt; 3).map(x * 10)   // без терминальной операции</option>
+  </select></label></div>
+  <div class="log" id="trLog" style="max-height:320px"></div>
+  <div class="verdict" id="trV"></div>
+</div>
+<script>
+(function () {
+  var SRC = [5, 2, 8, 1, 9, 4, 7], $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("trS").value, log = [], out = [], calls = 0;
+    if (s === "nostart") { $("trLog").textContent = "(ничего)"; $("trV").className = "verdict warn"; $("trV").textContent = "Без терминальной операции не выполняется ни одной лямбды: промежуточные операции лишь строят цепочку стадий. Стрим можно использовать только один раз — повторный вызов бросит IllegalStateException."; return; }
+    if (s === "sorted") {
+      SRC.forEach(function (x) { calls++; log.push("filter(" + x + ") → " + (x > 3)); });
+      var buf = SRC.filter(function (x) { return x > 3; }); log.push("sorted: барьер — накоплены все прошедшие элементы [" + buf.join(", ") + "], сортировка"); buf.sort(function (a, b) { return a - b; }); log.push("sorted: выдаёт по одному [" + buf.join(", ") + "]");
+      for (var i = 0; i < buf.length && out.length < 2; i++) { calls++; log.push("  map(" + buf[i] + ") → " + buf[i] * 10); out.push(buf[i] * 10); log.push("  limit: " + out.length + "/2" + (out.length === 2 ? " → отмена дальнейшей выдачи" : "")); }
+      $("trLog").textContent = log.join("\n"); $("trV").className = "verdict warn"; $("trV").textContent = "Результат " + JSON.stringify(out) + ". sorted — промежуточная операция с состоянием: она обязана получить ВСЕ элементы, прежде чем выдать первый; limit после неё уже не спасает filter от полного прохода. Вызовов лямбд: " + calls + ".";
+      return;
+    }
+    for (var j = 0; j < SRC.length; j++) {
+      var x = SRC[j]; log.push("источник → " + x);
+      if (s === "first") { calls++; var p = x > 6; log.push("  filter(" + x + ") → " + p); if (p) { out.push(x); log.push("  findFirst: найден " + x + " → короткое замыкание, источник больше не читается"); break; } continue; }
+      calls++; var ok = x > 3; log.push("  filter(" + x + ") → " + ok); if (!ok) continue;
+      calls++; log.push("  map(" + x + ") → " + x * 10); out.push(x * 10);
+      if (s === "limit") { log.push("  limit: " + out.length + "/2"); if (out.length === 2) { log.push("  limit достигнут → cancellationRequested, обход остановлен"); break; } }
+    }
+    $("trLog").textContent = log.join("\n");
+    $("trV").className = "verdict ok"; $("trV").textContent = "Результат " + JSON.stringify(s === "first" ? "Optional[" + out[0] + "]" : out) + ". Элементы идут по одному через все стадии (вертикально), а не стадия за стадией по всей коллекции. Вызовов лямбд: " + calls + (s !== "fm" ? " — короткое замыкание сэкономило работу." : ".");
+  }
+  $("trS").addEventListener("change", run); run();
+})();
+</script>
+<p>Внутри: каждая промежуточная операция — стадия <code>AbstractPipeline</code>; терминальная операция «склеивает» стадии в цепочку <code>Sink</code>-ов и вызывает <code>spliterator.forEachRemaining(sink)</code>. Для операций с коротким замыканием используется <code>tryAdvance</code> с проверкой отмены. Флаги сплитератора (SIZED, DISTINCT, SORTED) позволяют пропускать лишнюю работу.</p>
+
+<h2 id="collectors"><span class="h-num">17.2</span>Collectors: в какие коллекции собирать</h2>
+<div class="widget" id="clW">
+  <div class="widget-title">Сотрудники: (Анна, IT, 3200), (Борис, Sales, 2100), (Вера, IT, 4100), (Глеб, HR, 1800), (Дина, Sales, 2600), (Анна, HR, 2300)</div>
+  <div class="controls"><label>коллектор<select id="clS" class="wide">
+    <option value="toMapDup">toMap(Employee::name, Employee::salary)</option>
+    <option value="toMapMerge">toMap(name, salary, Integer::sum)</option>
+    <option value="toMapTree">toMap(name, salary, (a, b) -&gt; a, TreeMap::new)</option>
+    <option value="group">groupingBy(Employee::dept)</option>
+    <option value="groupCount">groupingBy(dept, counting())</option>
+    <option value="groupSum">groupingBy(dept, TreeMap::new, summingInt(salary))</option>
+    <option value="groupMapping">groupingBy(dept, mapping(name, toSet()))</option>
+    <option value="partition">partitioningBy(e -&gt; e.salary() &gt;= 2500)</option>
+    <option value="joining">map(name).collect(joining(", ", "[", "]"))</option>
+    <option value="teeing">teeing(counting(), averagingInt(salary), (n, avg) -&gt; …)</option>
+    <option value="toColl">toCollection(() -&gt; new TreeSet&lt;&gt;(comparing(name)))</option>
+  </select></label></div>
+  <div class="out" id="clOut"></div>
+  <div class="verdict" id="clV"></div>
+</div>
+<script>
+(function () {
+  var E = [["Анна", "IT", 3200], ["Борис", "Sales", 2100], ["Вера", "IT", 4100], ["Глеб", "HR", 1800], ["Дина", "Sales", 2600], ["Анна", "HR", 2300]];
+  var $ = function (i) { return document.getElementById(i); };
+  function fmt(o) { return "{" + Object.keys(o).map(function (k) { var v = o[k]; return k + "=" + (Array.isArray(v) ? "[" + v.join(", ") + "]" : v); }).join(", ") + "}"; }
+  function run() {
+    var s = $("clS").value, out, note, cls = "ok";
+    if (s === "toMapDup") { out = "java.lang.IllegalStateException: Duplicate key Анна (attempted merging values 3200 and 2300)"; note = "toMap без функции слияния падает на первом дубликате ключа. Всегда задавайте merge-функцию, если ключи могут повторяться."; cls = "bad"; }
+    else if (s === "toMapMerge") { var m = {}; E.forEach(function (e) { m[e[0]] = (m[e[0]] || 0) + e[2]; }); out = fmt(m) + "   // HashMap, порядок не гарантирован"; note = "Функция слияния решает конфликты; null-значение из valueMapper бросит NPE (ограничение HashMap.merge)."; }
+    else if (s === "toMapTree") { var t = {}; E.forEach(function (e) { if (!(e[0] in t)) t[e[0]] = e[2]; }); var keys = Object.keys(t).sort(function (a, b) { return a.localeCompare(b, "ru"); }); out = "{" + keys.map(function (k) { return k + "=" + t[k]; }).join(", ") + "}   // TreeMap — отсортировано"; note = "Четвёртый аргумент — фабрика карты: TreeMap, LinkedHashMap, EnumMap."; }
+    else if (s === "group") { var g = {}; E.forEach(function (e) { (g[e[1]] = g[e[1]] || []).push(e[0]); }); out = fmt(g) + "   // Map<String, List<Employee>>, HashMap + ArrayList"; note = "По умолчанию HashMap и toList(): порядок групп не определён, порядок внутри группы — порядок встречи."; }
+    else if (s === "groupCount") { var c = {}; E.forEach(function (e) { c[e[1]] = (c[e[1]] || 0) + 1; }); out = fmt(c) + "   // Map<String, Long>"; note = "Подчинённый коллектор (downstream) обрабатывает каждую группу: counting, summingInt, averagingDouble, maxBy, mapping, filtering, flatMapping, reducing, collectingAndThen."; }
+    else if (s === "groupSum") { var su = {}; E.forEach(function (e) { su[e[1]] = (su[e[1]] || 0) + e[2]; }); var ks = Object.keys(su).sort(); out = "{" + ks.map(function (k) { return k + "=" + su[k]; }).join(", ") + "}   // TreeMap"; note = "Фабрика карты — второй аргумент groupingBy."; }
+    else if (s === "groupMapping") { var gm = {}; E.forEach(function (e) { gm[e[1]] = gm[e[1]] || []; if (gm[e[1]].indexOf(e[0]) < 0) gm[e[1]].push(e[0]); }); out = fmt(gm) + "   // Map<String, Set<String>>"; note = "mapping преобразует элементы группы перед сбором."; }
+    else if (s === "partition") { var pt = { "false": [], "true": [] }; E.forEach(function (e) { pt[e[2] >= 2500].push(e[0]); }); out = "{false=[" + pt["false"].join(", ") + "], true=[" + pt["true"].join(", ") + "]}"; note = "partitioningBy всегда возвращает карту с обоими ключами true и false, даже если группа пуста."; }
+    else if (s === "joining") { out = "\"[" + E.map(function (e) { return e[0]; }).join(", ") + "]\""; note = "joining использует один StringBuilder — эффективнее конкатенации в reduce."; }
+    else if (s === "teeing") { var avg = E.reduce(function (a, e) { return a + e[2]; }, 0) / E.length; out = "new Stats(count=" + E.length + ", avg=" + avg.toFixed(1) + ")"; note = "teeing (Java 12) прогоняет элементы через два коллектора за один проход и объединяет результаты."; }
+    else { var seen = {}, ts = []; E.forEach(function (e) { if (!seen[e[0]]) { seen[e[0]] = 1; ts.push(e[0]); } }); ts.sort(function (a, b) { return a.localeCompare(b, "ru"); }); out = "[" + ts.join(", ") + "]   // TreeSet по имени: вторая «Анна» отброшена"; note = "toCollection — любая коллекция-приёмник. Компаратор TreeSet определяет и порядок, и равенство: сотрудники с одинаковым именем считаются дубликатами (тема 04)."; cls = "warn"; }
+    $("clOut").textContent = out; $("clV").className = "verdict " + cls; $("clV").textContent = note;
+  }
+  $("clS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="tips"><span class="h-num">17.3</span>Практические правила</h2>
+<ul>
+  <li><b>Не изменяйте источник</b> из лямбд стрима (CME или неопределённое поведение) и не используйте внешнее изменяемое состояние (<code>list.add</code> в <code>forEach</code> параллельного стрима — гонка). Собирайте коллектором.</li>
+  <li><b>Цикл против стрима</b>: для простой итерации с побочными эффектами, ранним выходом с возвратом, проверяемыми исключениями — обычный for. Стримы — для преобразований и агрегаций.</li>
+  <li><b>Примитивные стримы</b> (<code>IntStream</code>, <code>mapToInt</code>, <code>sum()</code>) избегают упаковки.</li>
+  <li><b>Stream.toList()</b> (неизменяемый, допускает null) против <code>Collectors.toList()</code> — тема 14.</li>
+  <li><b>Map.entrySet().stream()</b> для работы с картами; обратно — <code>toMap(Map.Entry::getKey, Map.Entry::getValue)</code>.</li>
+  <li>Java 22+: <b>Stream Gatherers</b> (<code>gather(Gatherers.windowFixed(3))</code>, финальные в Java 24) — свои промежуточные операции: окна, сканирование, свёртки с состоянием.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">17.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько раз вызовется filter в <code>List.of(1..1_000_000).stream().filter(x -&gt; x &gt; 10).findFirst()</code>?</p><ul><li>1 000 000</li><li>0</li><li>11 — до первого подходящего элемента</li><li>10</li></ul><div class="why">Короткое замыкание и обработка по одному элементу.</div></div>
+<div class="mcq" data-ok="0"><p>Что сделает <code>toMap(k, v)</code> при дублирующемся ключе?</p><ul><li>Бросит IllegalStateException: Duplicate key</li><li>Оставит первое значение</li><li>Оставит последнее значение</li><li>Соберёт значения в список</li></ul><div class="why">Нужна merge-функция третьим аргументом.</div></div>
+<div class="mcq" data-ok="3"><p>Почему <code>.sorted().limit(1)</code> не быстрее полной сортировки?</p><ul><li>limit игнорируется</li><li>sorted — терминальная операция</li><li>limit работает до sorted</li><li>sorted — барьер: должна получить все элементы до выдачи первого</li></ul><div class="why">Для минимума — min(); для top-k — куча.</div></div>
+<div class="mcq" data-ok="1"><p>Какая карта и какие коллекции значений у <code>groupingBy(f)</code> по умолчанию?</p><ul><li>TreeMap и TreeSet</li><li>HashMap и списки (toList)</li><li>LinkedHashMap и ArrayList с гарантией</li><li>ConcurrentHashMap</li></ul><div class="why">Для порядка групп передайте фабрику карты.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему стрим нельзя использовать дважды?</summary><div class="a"><p>Стрим — одноразовый конвейер над сплитератором источника, который потребляется при обходе (и может быть одноразовым по природе: файл, сеть, генератор). После терминальной операции стадии помечаются использованными — повторный вызов бросает IllegalStateException. Нужен повторный обход — создайте стрим заново из коллекции (Supplier&lt;Stream&gt;) или соберите результат в коллекцию.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

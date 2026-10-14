@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Future, FutureTask, CompletionService</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ИСПОЛНИТЕЛИ</div>
+  <h1>Future, FutureTask, CompletionService</h1>
+  <p class="lead"><code>Future</code> — квитанция на результат, который вычисляется в другом потоке. Под ней почти всегда <code>FutureTask</code> с конечным автоматом из семи состояний — разберём его переходы в симуляторе: что делает <code>cancel(true)</code> с выполняющейся задачей, что вернёт <code>get()</code>. Затем — как собирать результаты нескольких задач: <code>invokeAll</code>, <code>invokeAny</code> и <code>CompletionService</code>, отдающий результаты в порядке готовности.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">get и cancel</span><span class="tag">состояния FutureTask</span><span class="tag">resultNow (19+)</span><span class="tag">invokeAll/Any</span><span class="tag">CompletionService</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="api"><span class="h-num">18.1</span>Future</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Поведение</th></tr>
+<tr><td><code>get()</code></td><td>блокирует до результата; ExecutionException с причиной, CancellationException, InterruptedException</td></tr>
+<tr><td><code>get(timeout, unit)</code></td><td>+ TimeoutException (задача при этом продолжает работать!)</td></tr>
+<tr><td><code>cancel(mayInterruptIfRunning)</code></td><td>не начатая — не начнётся; выполняющаяся — при true получит interrupt (если код его проверяет — остановится)</td></tr>
+<tr><td><code>isDone()</code>, <code>isCancelled()</code></td><td>isDone true при любом завершении, включая отмену и ошибку</td></tr>
+<tr><td><code>state()</code>, <code>resultNow()</code>, <code>exceptionNow()</code> (Java 19)</td><td>без блокировки и проверяемых исключений: RUNNING, SUCCESS, FAILED, CANCELLED</td></tr>
+</table></div>
+
+<h2 id="fsm"><span class="h-num">18.2</span>Конечный автомат FutureTask</h2>
+<div class="widget" id="fsW">
+  <div class="widget-title">FutureTask&lt;String&gt; — нажимайте события</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="start">поток пула начал run()</button>
+    <button class="btn" type="button" data-a="ok">call() вернул "ok"</button>
+    <button class="btn" type="button" data-a="fail">call() бросил IOException</button>
+    <button class="btn" type="button" data-a="c0">cancel(false)</button>
+    <button class="btn" type="button" data-a="c1">cancel(true)</button>
+    <button class="btn" type="button" data-a="get">get()</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="flow" id="fsFlow"></div>
+  <div class="log" id="fsLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, state, running, log, interrupted;
+  var S = ["NEW", "COMPLETING", "NORMAL", "EXCEPTIONAL", "CANCELLED", "INTERRUPTING", "INTERRUPTED"];
+  function reset() { state = "NEW"; running = false; interrupted = false; log = ["new FutureTask(callable): state = NEW (0); runner = null; waiters = null"]; draw(); }
+  function act(a) {
+    if (a === "start") { if (state !== "NEW") log.push("run(): state ≠ NEW → задача не выполняется (уже отменена или завершена)"); else if (running) log.push("уже выполняется"); else { running = true; log.push("run(): CAS(runner, null, currentThread) — только один поток выполнит задачу; вызывается call()"); } }
+    else if (a === "ok" || a === "fail") {
+      if (!running) log.push("задача не выполняется");
+      else if (state !== "NEW") { running = false; log.push("call() завершился, но state = " + state + " → результат ОТБРАСЫВАЕТСЯ (задача была отменена во время работы)"); }
+      else { state = "COMPLETING"; log.push("set/setException: CAS(state, NEW, COMPLETING) — короткое промежуточное состояние; outcome = " + (a === "ok" ? "\"ok\"" : "IOException")); state = a === "ok" ? "NORMAL" : "EXCEPTIONAL"; running = false; log.push("  state = " + state + " (release-запись); finishCompletion(): разбудить всех ожидающих get() — стек Трайбера waiters"); }
+    }
+    else if (a === "c0" || a === "c1") {
+      if (state !== "NEW") log.push("cancel(): state = " + state + " ≠ NEW → false (поздно)");
+      else if (a === "c0") { state = "CANCELLED"; log.push("cancel(false): CAS(state, NEW, CANCELLED) → true" + (running ? "; выполнение НЕ прерывается — задача доработает, но результат будет отброшен" : "; задача уже не начнётся")); }
+      else { state = "INTERRUPTING"; log.push("cancel(true): CAS(NEW → INTERRUPTING)" + (running ? "; runner.interrupt() — выполняющийся код получит флаг прерывания" : "")); state = "INTERRUPTED"; interrupted = running; log.push("  state = INTERRUPTED; ожидающие get() разбужены"); }
+    }
+    else if (a === "get") {
+      if (state === "NEW" || state === "COMPLETING") log.push("get(): результата нет → поток добавлен в стек waiters и паркуется (LockSupport.park)");
+      else if (state === "NORMAL") log.push("get() → \"ok\"");
+      else if (state === "EXCEPTIONAL") log.push("get() → ExecutionException: причина IOException (исходное исключение — getCause())");
+      else log.push("get() → CancellationException");
+    }
+    draw();
+  }
+  function draw() {
+    $("fsFlow").innerHTML = S.map(function (s) { return '<div class="node' + (s === state ? " acc" : "") + '"><b>' + s + "</b></div>"; }).join('<span class="to">·</span>') + (running ? '<div class="node info"><b>runner выполняет call()</b>' + (interrupted ? "<small>флаг прерывания установлен</small>" : "") + "</div>" : "");
+    $("fsLog").textContent = log.slice(-8).join("\n"); $("fsLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll("#fsW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var a = b.getAttribute("data-a"); if (a === "reset") reset(); else act(a); }); });
+  reset();
+})();
+</script>
+<p>Возможные переходы: NEW → COMPLETING → NORMAL; NEW → COMPLETING → EXCEPTIONAL; NEW → CANCELLED; NEW → INTERRUPTING → INTERRUPTED. Все финальные состояния необратимы.</p>
+
+<h2 id="many"><span class="h-num">18.3</span>Результаты нескольких задач</h2>
+<div class="widget" id="mnW">
+  <div class="widget-title">Три запроса к сервисам: 300, 1200 и 600 мс</div>
+  <div class="controls"><label>способ<select id="mnS" class="wide"><option value="loop">submit всех + get() по порядку отправки</option><option value="all">invokeAll(tasks)</option><option value="cs">ExecutorCompletionService: take() по готовности</option><option value="any">invokeAny(tasks)</option></select></label></div>
+  <div class="out" id="mnOut"></div>
+  <div class="verdict" id="mnV"></div>
+</div>
+<script>
+(function () {
+  var D = [["A", 300], ["B", 1200], ["C", 600]], $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("mnS").value, lines, v;
+    if (s === "loop" || s === "all") { lines = ["t=1200 мс: все результаты доступны", "обработка в порядке отправки: A (готов с 300 мс, ждал 900), B, C (готов с 600 мс, ждал 600)"]; v = s === "all" ? "invokeAll блокирует до завершения ВСЕХ задач (или таймаута — тогда незавершённые отменяются) и возвращает Future в порядке отправки." : "Каждый get() блокирует; быстрые результаты ждут медленного B, стоящего раньше в списке."; }
+    else if (s === "cs") { lines = ["t=300 мс: take() → A — обработан сразу", "t=600 мс: take() → C", "t=1200 мс: take() → B"]; v = "CompletionService кладёт завершённые Future в BlockingQueue: обрабатываем результаты по мере готовности. Удобно для показа частичных результатов и раннего выхода."; }
+    else { lines = ["t=300 мс: A успешен → вернуть его результат", "B и C отменены (cancel(true))"]; v = "invokeAny возвращает результат первой УСПЕШНО завершившейся задачи и отменяет остальные — для запросов к репликам («кто быстрее»). Если все упали — ExecutionException."; }
+    $("mnOut").textContent = lines.join("\n"); $("mnV").className = "verdict ok"; $("mnV").textContent = v;
+  }
+  $("mnS").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="CompletionService"><code class="java">CompletionService&lt;Quote&gt; cs = new ExecutorCompletionService&lt;&gt;(executor);
+providers.forEach(p -&gt; cs.submit(() -&gt; p.quote(request)));
+for (int i = 0; i &lt; providers.size(); i++) {
+    Future&lt;Quote&gt; f = cs.poll(2, TimeUnit.SECONDS);    // следующий готовый
+    if (f == null) break;                              // общий таймаут
+    try { show(f.get()); } catch (ExecutionException e) { log.warn("provider failed", e.getCause()); }
+}</code></pre>
+
+<h2 id="quiz"><span class="h-num">18.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает cancel(true) с уже выполняющейся задачей?</p><ul><li>Немедленно останавливает поток</li><li>Переводит Future в отменённое состояние и прерывает поток-исполнитель; остановится ли код, зависит от его реакции на прерывание</li><li>Ничего</li><li>Ждёт завершения</li></ul><div class="why">Результат в любом случае будет отброшен.</div></div>
+<div class="mcq" data-ok="3"><p>Как получить исходное исключение задачи из get()?</p><ul><li>Оно и бросается</li><li>Через isDone</li><li>Оно теряется</li><li>ExecutionException.getCause()</li></ul><div class="why">Не логируйте только ExecutionException без причины.</div></div>
+<div class="mcq" data-ok="0"><p>Чем полезен ExecutorCompletionService?</p><ul><li>Отдаёт завершённые задачи в порядке готовности</li><li>Отменяет медленные задачи</li><li>Выполняет задачи последовательно</li><li>Повторяет упавшие задачи</li></ul><div class="why">Внутри — BlockingQueue завершённых Future.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему get(timeout) не освобождает ресурсы, и как правильно ограничить время задачи?</summary><div class="a"><p>TimeoutException означает только, что ожидающий перестал ждать: задача продолжает работать и занимать поток. Нужно явно вызвать future.cancel(true) и писать задачу так, чтобы она реагировала на прерывание (проверяла флаг, использовала прерываемые операции), плюс таймауты на уровне I/O (сокеты, HTTP-клиент, JDBC). В CompletableFuture — orTimeout + отмена, в структурной конкурентности — закрытие области отменяет подзадачи.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

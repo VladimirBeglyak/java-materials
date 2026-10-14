@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · CyclicBarrier, Phaser, Exchanger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · СИНХРОНИЗАТОРЫ</div>
+  <h1>CyclicBarrier, Phaser, Exchanger</h1>
+  <p class="lead">Синхронизаторы для вычислений по фазам: потоки делают свою часть работы и ждут остальных перед следующим шагом. <code>CyclicBarrier</code> — фиксированная группа и многократное использование, с «поломкой» барьера при сбое одного участника. <code>Phaser</code> — динамическое число участников, номера фаз и иерархия для тысяч потоков. <code>Exchanger</code> — обмен данными между двумя потоками. Симуляторы барьера и фазера — внутри.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">поколения барьера</span><span class="tag">BrokenBarrierException</span><span class="tag">barrierAction</span><span class="tag">Phaser: регистрация</span><span class="tag">onAdvance</span><span class="tag">Exchanger</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="barrier"><span class="h-num">14.1</span>CyclicBarrier</h2>
+<p>Внутри — не AQS, а <code>ReentrantLock</code>, одна <code>Condition trip</code>, счётчик оставшихся участников и объект <b>поколения</b> (Generation) с флагом <code>broken</code>. Последний пришедший выполняет <code>barrierAction</code> (в своём потоке), будит всех и начинает новое поколение. Если кто-то из ожидающих прерван или вышел по таймауту, барьер «ломается»: все остальные получают <code>BrokenBarrierException</code>, а барьер нужно сбросить <code>reset()</code>.</p>
+<div class="widget" id="cbW">
+  <div class="widget-title">new CyclicBarrier(3, () -&gt; mergeResults())</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="A">A: await()</button><button class="btn primary" type="button" data-a="B">B: await()</button><button class="btn primary" type="button" data-a="C">C: await()</button>
+    <button class="btn" type="button" data-a="timeout">таймаут у ожидающего</button>
+    <button class="btn" type="button" data-a="reset">barrier.reset()</button>
+  </div>
+  <div class="out" id="cbOut"></div>
+  <div class="log" id="cbLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, waiting, gen, broken, log;
+  function init() { waiting = []; gen = 0; broken = false; log = ["parties = 3, count = 3, поколение 0"]; draw(); }
+  function act(a) {
+    if (a === "reset") { if (waiting.length) log.push("reset(): ожидающие " + waiting.join(", ") + " получают BrokenBarrierException"); waiting = []; broken = false; gen++; log.push("reset → новое поколение " + gen + ", count = 3"); }
+    else if (a === "timeout") { if (!waiting.length) log.push("никто не ждёт"); else { var t = waiting.pop(); log.push(t + ": await(timeout) истёк → TimeoutException; поколение " + gen + " СЛОМАНО: " + (waiting.length ? waiting.join(", ") + " получают BrokenBarrierException" : "") ); waiting = []; broken = true; } }
+    else {
+      if (broken) log.push(a + ": await() → сразу BrokenBarrierException (барьер сломан, нужен reset)");
+      else if (waiting.indexOf(a) >= 0) log.push(a + " уже ждёт");
+      else { waiting.push(a); var idx = 3 - waiting.length; log.push(a + ": await() → индекс прибытия " + idx + (idx > 0 ? ", trip.await() — ждём остальных" : ""));
+        if (waiting.length === 3) { log.push("  " + a + " пришёл последним → выполняет barrierAction mergeResults() в СВОЁМ потоке, затем trip.signalAll(); поколение " + gen + " → " + (gen + 1)); waiting = []; gen++; } }
+    }
+    draw();
+  }
+  function draw() { $("cbOut").textContent = "поколение " + gen + (broken ? " (СЛОМАНО)" : "") + "   ждут: [" + waiting.join(", ") + "]   осталось прийти: " + (3 - waiting.length); $("cbLog").textContent = log.slice(-7).join("\n"); $("cbLog").scrollTop = 1e6; }
+  document.querySelectorAll("#cbW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  init();
+})();
+</script>
+
+<h2 id="phaser"><span class="h-num">14.2</span>Phaser</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th></tr>
+<tr><td><code>register()</code>, <code>bulkRegister(n)</code></td><td>добавить участников в текущую фазу (в любой момент)</td></tr>
+<tr><td><code>arrive()</code></td><td>отметиться без ожидания (производитель, который не ждёт)</td></tr>
+<tr><td><code>arriveAndAwaitAdvance()</code></td><td>как CyclicBarrier.await</td></tr>
+<tr><td><code>arriveAndDeregister()</code></td><td>отметиться и выйти из числа участников</td></tr>
+<tr><td><code>awaitAdvance(phase)</code></td><td>ждать окончания фазы, не будучи участником</td></tr>
+<tr><td><code>onAdvance(phase, registered)</code></td><td>переопределяемый хук: true — завершить фазер</td></tr>
+</table></div>
+<div class="widget" id="phW">
+  <div class="widget-title">Phaser: участники приходят и уходят</div>
+  <div class="controls">
+    <button class="btn" type="button" data-a="reg">register()</button>
+    <button class="btn primary" type="button" data-a="arr">arriveAndAwaitAdvance()</button>
+    <button class="btn" type="button" data-a="dereg">arriveAndDeregister()</button>
+    <label>onAdvance завершает после фазы<select id="phMax"><option value="3">2</option><option value="99">никогда</option></select></label>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="out" id="phOut"></div>
+  <div class="log" id="phLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, phase, parties, arrived, term, log;
+  function reset() { phase = 0; parties = 1; arrived = 0; term = false; log = ["new Phaser(1): фаза 0, зарегистрирован 1 участник (координатор)"]; draw(); }
+  function advance() {
+    log.push("  все " + parties + " пришли → onAdvance(" + phase + ", " + parties + ")");
+    if (phase + 1 >= +$("phMax").value || parties === 0) { term = true; log.push("  onAdvance вернул true → фазер ЗАВЕРШЁН (getPhase() < 0)"); return; }
+    phase++; arrived = 0; log.push("  → фаза " + phase + ", ожидающие проснулись");
+  }
+  function act(a) {
+    if (term) { log.push("фазер завершён: await-методы возвращаются сразу с отрицательной фазой"); draw(); return; }
+    if (a === "reg") { parties++; log.push("register(): участников " + parties + " (можно в любой фазе — в отличие от CyclicBarrier)"); }
+    else if (a === "arr") { arrived++; log.push("участник пришёл (" + arrived + "/" + parties + ")" + (arrived < parties ? ", ждёт" : "")); if (arrived >= parties) advance(); }
+    else if (a === "dereg") { if (parties === 0) log.push("нет участников"); else { parties--; log.push("arriveAndDeregister(): участников " + parties + " (пришедших " + arrived + ")"); if (parties === 0) advance(); else if (arrived >= parties) advance(); } }
+    draw();
+  }
+  function draw() { $("phOut").textContent = (term ? "ЗАВЕРШЁН" : "фаза " + phase) + "   зарегистрировано: " + parties + "   пришли: " + arrived + "   ждём ещё: " + Math.max(0, parties - arrived); $("phLog").textContent = log.slice(-7).join("\n"); $("phLog").scrollTop = 1e6; }
+  document.querySelectorAll("#phW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var a = b.getAttribute("data-a"); if (a === "reset") reset(); else act(a); }); });
+  $("phMax").addEventListener("change", reset);
+  reset();
+})();
+</script>
+<p>Состояние фазера упаковано в один <code>long</code>: номер фазы, число участников и число не пришедших (поэтому до 65 535 участников на фазер). Для большего числа или снижения конкуренции фазеры объединяют в <b>дерево</b> (<code>new Phaser(parent)</code>): дочерний фазер регистрируется в родителе как один участник.</p>
+
+<h2 id="exchanger"><span class="h-num">14.3</span>Exchanger</h2>
+<pre data-title="двойная буферизация: заполнитель и потребитель меняются буферами"><code class="java">Exchanger&lt;ByteBuffer&gt; ex = new Exchanger&lt;&gt;();
+// поток-заполнитель
+ByteBuffer buf = emptyBuf;
+while (running) { fill(buf); buf = ex.exchange(buf); }      // отдаёт полный, получает пустой
+// поток-потребитель
+ByteBuffer cur = fullBuf;
+while (running) { cur = ex.exchange(cur); drain(cur); }     // отдаёт пустой, получает полный</code></pre>
+<p>Первый пришедший ждёт второго; при высокой конкуренции используется «арена» слотов, чтобы пары встречались в разных ячейках. Применяется редко: конвейеры с двойной буферизацией, генетические алгоритмы.</p>
+
+<h2 id="choose"><span class="h-num">14.4</span>Сравнение</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>CountDownLatch</th><th>CyclicBarrier</th><th>Phaser</th></tr>
+<tr><td>Многоразовый</td><td>нет</td><td>да</td><td>да</td></tr>
+<tr><td>Число участников</td><td>фиксировано при создании</td><td>фиксировано</td><td>динамическое</td></tr>
+<tr><td>Ждущие и отмечающиеся</td><td>разные потоки</td><td>одни и те же</td><td>любые комбинации</td></tr>
+<tr><td>Действие по завершении фазы</td><td>—</td><td>barrierAction</td><td>onAdvance</td></tr>
+<tr><td>Сбой участника</td><td>остальные ждут вечно (без таймаута)</td><td>BrokenBarrierException всем</td><td>нет поломки; arriveAndDeregister</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">14.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В каком потоке выполняется barrierAction у CyclicBarrier?</p><ul><li>В отдельном служебном потоке</li><li>В потоке, пришедшем к барьеру последним</li><li>В первом пришедшем</li><li>В главном потоке</li></ul><div class="why">Остальные ждут, пока действие завершится.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт с другими участниками, если один из ожидающих на CyclicBarrier прерван?</p><ul><li>Ничего, барьер подождёт замену</li><li>Барьер уменьшит parties</li><li>Они будут ждать вечно</li><li>Они получат BrokenBarrierException; барьер сломан до reset()</li></ul><div class="why">Поломка распространяется, чтобы никто не завис.</div></div>
+<div class="mcq" data-ok="0"><p>Чем Phaser отличается от CyclicBarrier?</p><ul><li>Участников можно регистрировать и снимать динамически; есть номера фаз, неучаствующее ожидание и иерархия</li><li>Phaser одноразовый</li><li>Phaser не блокирует потоки</li><li>Ничем</li></ul><div class="why">Phaser — обобщение барьера и защёлки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Задача: N рабочих потоков вычисляют итерацию симуляции, после каждой итерации нужно собрать результаты и проверить сходимость. Что использовать?</summary><div class="a"><p>CyclicBarrier(N, action) — action в последнем пришедшем потоке объединяет частичные результаты и выставляет флаг сходимости; потоки после await проверяют флаг и продолжают или выходят. Если число рабочих меняется (динамическое разбиение) или нужно ограниченное число фаз — Phaser с onAdvance, возвращающим true при сходимости. Обязательно обработать BrokenBarrierException и таймауты.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

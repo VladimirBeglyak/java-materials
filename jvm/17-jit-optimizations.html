@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Оптимизации JIT и деоптимизация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ИСПОЛНЕНИЕ</div>
+  <h1>Оптимизации JIT и деоптимизация</h1>
+  <p class="lead">C2 делает с вашим кодом то, что не сделает ни один человек: встраивает цепочки вызовов, превращает виртуальные вызовы в прямые по профилю, выбрасывает проверки границ массивов, векторизует циклы, удаляет блокировки и объекты. Всё это — спекуляции, и когда предположение нарушается, JVM откатывается в интерпретатор. Разбираем главные оптимизации, профиль типов в месте вызова (с симулятором мономорфных и мегаморфных вызовов) и деоптимизацию.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">встраивание</span><span class="tag">девиртуализация</span><span class="tag">мегаморфные вызовы</span><span class="tag">интринсики</span><span class="tag">циклы и SIMD</span><span class="tag">деоптимизация</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="inline"><span class="h-num">17.1</span>Встраивание — мать всех оптимизаций</h2>
+<p>Встраивание (inlining) копирует тело вызываемого метода в место вызова. Само по себе экономит лишь накладные расходы вызова, но главное — открывает остальные оптимизации: после встраивания JIT видит весь код целиком и может удалить проверки, свернуть константы, провести escape analysis.</p>
+<div class="widget" id="inW">
+  <div class="widget-title">Встроит ли C2 метод?</div>
+  <div class="controls">
+    <label>размер байткода, байт<input type="number" id="inB" value="40" min="1" max="8000"></label>
+    <label>частота вызова<select id="inH"><option value="hot">горячий (часто вызывается из этого места)</option><option value="cold">редкий</option></select></label>
+    <label>глубина вложенности встраивания<input type="number" id="inD" value="3" min="1" max="20"></label>
+    <label>место вызова<select id="inT"><option value="mono">мономорфное</option><option value="bi">биморфное</option><option value="mega">мегаморфное</option></select></label>
+    <label>уже скомпилирован в большой метод (&gt; 8000 байт машинного кода)<select id="inC"><option value="0">нет</option><option value="1">да</option></select></label>
+  </div>
+  <div class="verdict" id="inV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var b = +$("inB").value, h = $("inH").value, d = +$("inD").value, t = $("inT").value, c = $("inC").value === "1", v = $("inV"), ok, why;
+    if (t === "mega") { ok = false; why = "Мегаморфный вызов (3+ типа получателя): цель неизвестна — вызов через vtable/itable, без встраивания."; }
+    else if (d > 15) { ok = false; why = "Превышена MaxInlineLevel (15): слишком глубокая цепочка встраивания."; }
+    else if (c) { ok = false; why = "Метод уже скомпилирован в большой машинный код (InlineSmallCode, ~2500–8000 байт): встраивать дорого («already compiled into a big method»)."; }
+    else if (b <= 35) { ok = true; why = "≤ MaxInlineSize (35 байт байткода): встраивается всегда, даже если вызов холодный. Геттеры, сеттеры, маленькие утилиты бесплатны."; }
+    else if (h === "hot" && b <= 325) { ok = true; why = "Горячий вызов и ≤ FreqInlineSize (325 байт): встраивается."; }
+    else if (h === "hot") { ok = false; why = "Горячий, но слишком большой (> 325 байт байткода — «hot method too big»). Разбейте метод: горячий путь — маленький, редкие ветки — в отдельные методы."; }
+    else { ok = false; why = "Холодный вызов метода больше 35 байт — не встраивается («too big»)."; }
+    if (ok && t === "bi") why += " Биморфный: вставляются две проверки типа и оба тела.";
+    v.className = "verdict " + (ok ? "ok" : "warn"); v.textContent = (ok ? "✔ Встроит. " : "✘ Не встроит. ") + why;
+  }
+  ["inB", "inH", "inD", "inT", "inC"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>Посмотреть решения: <code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining</code> («inline (hot)», «too big», «callee is too large», «megamorphic»), или JITWatch по LogCompilation.</p>
+
+<h2 id="devirt"><span class="h-num">17.2</span>Профиль типов: мономорфные и мегаморфные вызовы</h2>
+<div class="widget" id="mmW">
+  <div class="widget-title">Место вызова <code>shape.area()</code> в горячем цикле</div>
+  <div class="controls">
+    <label>типы получателей, которые встречались<select id="mmT"><option value="1">только Circle</option><option value="2">Circle и Square</option><option value="3">Circle, Square, Triangle</option><option value="5">5 разных фигур</option></select></label>
+    <button class="btn" type="button" id="mmN">Через час пришёл новый тип: Hexagon</button>
+  </div>
+  <pre style="margin:0"><code class="txt" id="mmC"></code></pre>
+  <div class="verdict" id="mmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, extra = false;
+  var T = ["Circle", "Square", "Triangle", "Rect", "Oval"];
+  function run() {
+    var n = +$("mmT").value, code, v;
+    if (n === 1) { code = "if (shape.klass != Circle) uncommon_trap(class_check)\nresult = PI * shape.r * shape.r      // тело Circle.area встроено\n// дальше: r вынесен из цикла, вычисления векторизованы"; v = ["ok", "Мономорфный вызов: одна проверка класса и встроенное тело. Вызова нет вообще."]; }
+    else if (n === 2) { code = "if (shape.klass == Circle)      result = PI * r * r\nelse if (shape.klass == Square) result = side * side\nelse uncommon_trap(class_check)"; v = ["ok", "Биморфный: две проверки, оба тела встроены. Быстро."]; }
+    else { code = "result = shape.klass.vtable[area_index](shape)   // косвенный вызов\n// встраивания нет → нет оптимизаций через границу вызова"; v = ["warn", "Мегаморфный (3+ типов в одном месте): вызов через vtable/itable. Сам вызов стоит наносекунды, но теряется встраивание и всё, что оно открывает — в узких циклах разница бывает в разы. Если один тип доминирует (>90%), C2 может встроить его с проверкой («TypeProfileMajorReceiverPercent»)."]; }
+    if (extra && n <= 2) { code += "\n\n→ shape.klass == Hexagon: uncommon_trap(class_check)\n→ деоптимизация: кадр восстановлен в интерпретаторе, код «made not entrant»\n→ сбор профиля заново → перекомпиляция (" + (n === 1 ? "теперь биморфный" : "теперь мегаморфный") + ")"; v = ["warn", "Новый тип нарушил предположение: произошла деоптимизация и перекомпиляция. Однократно — нормально. Постоянные деоптимизации (deopt storm) — проблема производительности."]; }
+    $("mmC").textContent = code; $("mmV").className = "verdict " + v[0]; $("mmV").textContent = v[1];
+  }
+  $("mmT").addEventListener("change", function () { extra = false; run(); }); $("mmN").addEventListener("click", function () { extra = true; run(); }); run();
+})();
+</script>
+<p>Профиль собирается <b>на место вызова</b>, а не на метод: общий метод-утилита, который вызывают с разными типами (например, <code>Stream.map</code> с десятками лямбд в разных частях приложения), становится мегаморфным внутри — так называемое «загрязнение профиля» (profile pollution). Поэтому микробенчмарк со стримом на одной лямбде может быть быстрее, чем тот же стрим в реальном приложении.</p>
+<p><b>Class Hierarchy Analysis</b>: если у класса загружена единственная реализация метода, вызов девиртуализуется без проверки, а JVM запоминает зависимость. При загрузке подкласса, переопределяющего метод, зависимый код деоптимизируется.</p>
+
+<h2 id="catalog"><span class="h-num">17.3</span>Каталог оптимизаций C2</h2>
+<div class="table-wrap"><table>
+<tr><th>Оптимизация</th><th>Что делает</th></tr>
+<tr><td>Интринсики</td><td>вызов заменяется готовым машинным кодом: <code>System.arraycopy</code>, <code>Arrays.equals/fill</code>, <code>String.indexOf/equals</code>, <code>Math.*</code>, <code>Integer.bitCount</code>, CRC32, AES/SHA, <code>Unsafe</code>, VarHandle-операции. Список: <code>-XX:+PrintIntrinsics</code></td></tr>
+<tr><td>Свёртка констант и распространение</td><td><code>static final</code> поля как константы, вычисления на этапе компиляции, удаление мёртвых веток</td></tr>
+<tr><td>Удаление проверок</td><td>null-проверки неявные (через ловушку обращения к нулевой странице), проверки границ массивов выносятся из цикла (range check elimination), проверки типов после доказательства</td></tr>
+<tr><td>Циклы</td><td>размотка (unrolling), вынос инвариантов (loop-invariant code motion), разделение на пред-/основной/пост-цикл, <b>автовекторизация</b> SuperWord — SIMD-инструкции AVX для простых циклов по массивам</td></tr>
+<tr><td>Escape analysis</td><td>скалярная замена объектов, удаление блокировок (тема 11)</td></tr>
+<tr><td>Блокировки</td><td>укрупнение соседних synchronized (lock coarsening), удаление неэкранирующихся (lock elision)</td></tr>
+<tr><td>Глобальная нумерация значений, планирование</td><td>общие подвыражения, перестановка инструкций (GVN, GCM)</td></tr>
+</table></div>
+<pre data-title="Vector API (incubator) — явный SIMD, когда автовекторизации мало"><code class="java">static final VectorSpecies&lt;Float&gt; S = FloatVector.SPECIES_PREFERRED;
+static void mul(float[] a, float[] b, float[] c) {
+    int i = 0;
+    for (; i &lt; S.loopBound(a.length); i += S.length())
+        FloatVector.fromArray(S, a, i).mul(FloatVector.fromArray(S, b, i)).intoArray(c, i);
+    for (; i &lt; a.length; i++) c[i] = a[i] * b[i];          // хвост
+}   // --add-modules jdk.incubator.vector</code></pre>
+
+<h2 id="deopt"><span class="h-num">17.4</span>Деоптимизация</h2>
+<div class="widget stepper" id="dpSim">
+  <div class="widget-title">Uncommon trap: из C2-кода обратно в интерпретатор</div>
+  <div class="flow st-stage">
+    <div class="node" id="dp1"><b>C2-код</b><small>спекуляция</small></div><span class="to">→</span>
+    <div class="node" id="dp2"><b>uncommon trap</b></div><span class="to">→</span>
+    <div class="node" id="dp3"><b>восстановление кадров</b></div><span class="to">→</span>
+    <div class="node" id="dp4"><b>интерпретатор</b></div><span class="to">→</span>
+    <div class="node" id="dp5"><b>перекомпиляция</b></div>
+  </div>
+  <section class="st-step" data-t="Спекуляция" data-hl="dp1" data-log="профиль: ветка if (order.isVip()) ни разу не выполнялась → C2 не компилирует её, ставит uncommon trap"><p>По профилю ветка <code>if (order.isVip())</code> никогда не выполнялась. C2 не генерирует для неё код, а ставит ловушку (uncommon trap). Остальной код оптимизирован так, будто ветки нет.</p></section>
+  <section class="st-step" data-t="Срабатывание" data-hl="dp2" data-log="пришёл VIP-заказ → uncommon_trap(reason=unstable_if, action=reinterpret)"><p>Пришёл первый VIP-заказ — выполнение доходит до ловушки. Причина (<code>unstable_if</code>, <code>class_check</code>, <code>null_check</code>, <code>range_check</code>, <code>unloaded</code>) и действие записываются.</p></section>
+  <section class="st-step" data-t="Восстановление" data-hl="dp3" data-log="по debug info в safepoint-точке: скалярно заменённые объекты материализуются, встроенные методы → отдельные кадры интерпретатора"><p>По отладочной информации, сохранённой при компиляции, JVM восстанавливает состояние так, будто код всё время интерпретировался: встроенные методы снова становятся отдельными кадрами, скалярно заменённые объекты <b>материализуются</b> в куче, значения из регистров раскладываются по слотам.</p></section>
+  <section class="st-step" data-t="Продолжение" data-hl="dp4" data-log="выполнение продолжается в интерпретаторе с той же инструкции; скомпилированный метод помечен made not entrant"><p>Выполнение продолжается в интерпретаторе — корректно, но медленно. Версия кода помечается «made not entrant».</p></section>
+  <section class="st-step" data-t="Перекомпиляция" data-hl="dp5" data-log="профиль дополняется → новая компиляция C1/C2 с учётом ветки; если ловушка срабатывает снова и снова — C2 перестаёт спекулировать здесь"><p>Метод снова набирает счётчики и компилируется с учётом новой ветки. Если одна и та же спекуляция проваливается многократно, C2 запоминает это (PerBytecodeTrapLimit) и перестаёт на неё полагаться.</p></section>
+</div>
+<pre data-title="увидеть деоптимизации"><code class="txt">-Xlog:deoptimization=debug
+# JFR: событие jdk.Deoptimization — причина, метод, строка; JDK Mission Control показывает частоту
+jcmd &lt;pid&gt; Compiler.CodeHeap_Analytics</code></pre>
+
+<h2 id="quiz"><span class="h-num">17.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему встраивание называют главной оптимизацией JIT?</p><ul><li>Оно уменьшает размер кода</li><li>Оно открывает остальные оптимизации: после встраивания компилятор видит код целиком</li><li>Оно ускоряет загрузку классов</li><li>Оно убирает GC</li></ul><div class="why">Escape analysis, удаление проверок, свёртка констант работают через границы встроенных вызовов.</div></div>
+<div class="mcq" data-ok="3"><p>Что такое мегаморфный вызов?</p><ul><li>Вызов статического метода</li><li>Вызов с большим числом аргументов</li><li>Вызов, который JIT встроил дважды</li><li>Виртуальный вызов, в месте которого встречалось 3+ типов получателя: без встраивания, через vtable</li></ul><div class="why">Мономорфный и биморфный — встраиваются с проверками типа.</div></div>
+<div class="mcq" data-ok="0"><p>Что происходит при срабатывании uncommon trap?</p><ul><li>Деоптимизация: состояние восстанавливается для интерпретатора, выполнение продолжается корректно, код позже перекомпилируется</li><li>JVM падает</li><li>Выбрасывается исключение</li><li>Метод пропускается</li></ul><div class="why">Спекулятивные оптимизации безопасны благодаря деоптимизации.</div></div>
+<div class="mcq" data-ok="2"><p>Почему микробенчмарк стрима с одной лямбдой бывает быстрее того же кода в приложении?</p><ul><li>В приложении другой GC</li><li>Бенчмарк использует больше памяти</li><li>В приложении внутренние места вызова Stream получают много разных лямбд — профиль загрязнён, вызовы мегаморфные, встраивания нет</li><li>JMH отключает JIT</li></ul><div class="why">Profile pollution.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как написать код, удобный для JIT?</summary><div class="a"><p>Маленькие методы с горячим путём (меньше FreqInlineSize), редкие ветки — отдельными методами; избегать мегаморфных мест в узких циклах (группировать по типу, специализировать); простые циклы по массивам с int-счётчиком (векторизация, удаление проверок границ); не создавать лишних объектов, которые сбегают; static final для констант и MethodHandle; стабильные типы и ветки. Но всё — после профилирования: в 99% кода JIT справляется сам.</p></div></details>
+<details class="q"><summary>Что такое deoptimization storm и как его заметить?</summary><div class="a"><p>Повторяющиеся деоптимизации и перекомпиляции одних и тех же методов (например, из-за постоянной смены типов, загрузки классов, переключения редких веток) — CPU уходит на компиляцию, код часто исполняется интерпретатором. Видно в JFR (jdk.Deoptimization), -Xlog:deoptimization, PrintCompilation (много made not entrant для одного метода), по росту времени потоков компилятора.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

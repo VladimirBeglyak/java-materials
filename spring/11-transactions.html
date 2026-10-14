@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Транзакции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ДАННЫЕ</div>
+  <h1>Транзакции: @Transactional изнутри</h1>
+  <p class="lead"><code>@Transactional</code> — самая используемая и самая непонятая аннотация Spring. Под ней — прокси, перехватчик, менеджер транзакций и ThreadLocal, к которому привязано соединение с БД. Из этого устройства следуют все правила: какие исключения откатывают транзакцию, что делают propagation-режимы, откуда берётся <code>UnexpectedRollbackException</code> и почему <code>REQUIRES_NEW</code> может повесить приложение.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">TransactionInterceptor</span><span class="tag">TransactionSynchronizationManager</span><span class="tag">propagation</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="basics"><span class="h-num">11.1</span>Что такое транзакция на уровне JDBC</h2>
+<pre data-title="Без Spring: транзакция — это состояние соединения"><code class="java">try (Connection c = dataSource.getConnection()) {
+    c.setAutoCommit(false);                 // начало транзакции
+    try {
+        debit(c, from, amount);             // все операции — через ОДНО соединение
+        credit(c, to, amount);
+        c.commit();
+    } catch (SQLException e) {
+        c.rollback();
+        throw e;
+    }
+}</code></pre>
+<p>Главное ограничение: все операции транзакции должны идти через одно и то же соединение. Как сделать это, если <code>debit</code> вызывает репозиторий, а тот — <code>JdbcTemplate</code>, и никто не передаёт соединение параметром? Spring кладёт соединение в <b>ThreadLocal</b> текущего потока, и все компоненты доступа к данным берут его оттуда.</p>
+<div class="table-wrap"><table>
+<tr><th>Интерфейс</th><th>Роль</th></tr>
+<tr><td><code>PlatformTransactionManager</code></td><td><code>getTransaction(def)</code>, <code>commit(status)</code>, <code>rollback(status)</code>. Реализации: <code>JdbcTransactionManager</code> (JDBC), <code>JpaTransactionManager</code> (JPA, управляет и EntityManager, и JDBC-соединением), <code>JtaTransactionManager</code> (распределённые XA)</td></tr>
+<tr><td><code>TransactionDefinition</code></td><td>propagation, isolation, timeout, readOnly, имя</td></tr>
+<tr><td><code>TransactionStatus</code></td><td>новая ли транзакция, rollback-only, savepoint</td></tr>
+<tr><td><code>TransactionSynchronizationManager</code></td><td>ThreadLocal-хранилище: ресурсы (DataSource → ConnectionHolder, EntityManagerFactory → EntityManagerHolder), синхронизации, имя и флаги текущей транзакции</td></tr>
+</table></div>
+
+<h2 id="how"><span class="h-num">11.2</span>Как работает @Transactional</h2>
+<div class="flow col">
+  <div class="node info"><b>proxy.transfer(...)</b><small>CGLIB-прокси бина (тема 04)</small></div><span class="to">↓</span>
+  <div class="node acc"><b>TransactionInterceptor.invokeWithinTransaction</b><small>AnnotationTransactionAttributeSource читает @Transactional метода/класса (кэшируется) → выбирает TransactionManager (по qualifier или единственный)</small></div><span class="to">↓</span>
+  <div class="node"><b>createTransactionIfNecessary → tm.getTransaction(def)</b><small>есть ли транзакция в ThreadLocal? → решение по propagation</small></div><span class="to">↓</span>
+  <div class="node"><b>doBegin</b><small>connection = dataSource.getConnection(); setAutoCommit(false); isolation, readOnly, timeout; bindResource(dataSource, ConnectionHolder)</small></div><span class="to">↓</span>
+  <div class="node ok"><b>invocation.proceedWithInvocation()</b><small>ваш метод; JdbcTemplate → DataSourceUtils.getConnection(ds) находит привязанное соединение</small></div><span class="to">↓</span>
+  <div class="node"><b>commitTransactionAfterReturning / completeTransactionAfterThrowing</b><small>правила отката → commit или rollback; синхронизации beforeCommit / afterCommit / afterCompletion</small></div><span class="to">↓</span>
+  <div class="node"><b>cleanupAfterCompletion</b><small>unbindResource, восстановление autoCommit, connection.close() → возврат в пул; resume приостановленной транзакции</small></div>
+</div>
+<pre data-title="TransactionAspectSupport.invokeWithinTransaction — суть"><code class="java">TransactionAttribute attr = attributeSource.getTransactionAttribute(method, targetClass);
+PlatformTransactionManager tm = determineTransactionManager(attr);
+TransactionInfo txInfo = createTransactionIfNecessary(tm, attr, joinpointIdentification);
+Object result;
+try {
+    result = invocation.proceedWithInvocation();
+} catch (Throwable ex) {
+    completeTransactionAfterThrowing(txInfo, ex);   // attr.rollbackOn(ex) ? rollback : commit
+    throw ex;
+} finally {
+    cleanupTransactionInfo(txInfo);                 // восстановить предыдущий TransactionInfo в ThreadLocal
+}
+commitTransactionAfterReturning(txInfo);
+return result;</code></pre>
+<div class="callout warn"><span class="c-title">Следствия из ThreadLocal</span>
+Транзакция живёт в потоке. Код в <code>@Async</code>, <code>CompletableFuture.supplyAsync</code>, parallel stream, отдельном пуле — <b>вне</b> транзакции вызывающего: другой поток, другое соединение, свой коммит. Нельзя «распараллелить» работу внутри одной транзакции.
+</div>
+
+<h2 id="propagation"><span class="h-num">11.3</span>Propagation: что делать, если транзакция уже есть</h2>
+<div class="table-wrap"><table>
+<tr><th>Режим</th><th>Транзакция есть</th><th>Транзакции нет</th></tr>
+<tr><td><code>REQUIRED</code> (по умолчанию)</td><td>участвовать в ней</td><td>создать новую</td></tr>
+<tr><td><code>REQUIRES_NEW</code></td><td>приостановить, создать новую (второе соединение!)</td><td>создать новую</td></tr>
+<tr><td><code>NESTED</code></td><td>savepoint в текущей</td><td>создать новую</td></tr>
+<tr><td><code>SUPPORTS</code></td><td>участвовать</td><td>выполнить без транзакции</td></tr>
+<tr><td><code>MANDATORY</code></td><td>участвовать</td><td><code>IllegalTransactionStateException</code></td></tr>
+<tr><td><code>NOT_SUPPORTED</code></td><td>приостановить, выполнить без транзакции</td><td>без транзакции</td></tr>
+<tr><td><code>NEVER</code></td><td><code>IllegalTransactionStateException</code></td><td>без транзакции</td></tr>
+</table></div>
+<p><b>Физическая</b> транзакция — реальная транзакция в БД на одном соединении. <b>Логическая</b> — область действия каждого <code>@Transactional</code>-метода. При <code>REQUIRED</code> несколько логических разделяют одну физическую. Внутренний метод, упавший с исключением, не может откатить физическую транзакцию сам — он помечает её <b>rollback-only</b>.</p>
+
+<div class="widget" id="tp">
+  <div class="widget-title">Симулятор propagation</div>
+  <p class="hint"><code>OrderService.place()</code> вызывает <code>AuditService.log()</code> через прокси. Выберите конфигурацию — увидите физические транзакции и итог.</p>
+  <div class="controls">
+    <label>place()<select id="tpOuter"><option value="tx">@Transactional</option><option value="none">без транзакции</option></select></label>
+    <label>log() propagation<select id="tpProp"><option>REQUIRED</option><option>REQUIRES_NEW</option><option>NESTED</option><option>SUPPORTS</option><option>MANDATORY</option><option>NOT_SUPPORTED</option><option>NEVER</option></select></label>
+    <label>log() бросает RuntimeException<select id="tpThrow"><option value="no">нет</option><option value="catch">да, place() ловит его</option><option value="prop">да, исключение летит дальше</option></select></label>
+  </div>
+  <div class="log" id="tpLog"></div>
+  <div class="verdict" id="tpOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var outer = $("tpOuter").value === "tx", p = $("tpProp").value, th = $("tpThrow").value, L = [], cls = "ok", v;
+    var conn = outer ? "conn#1" : null;
+    if (outer) L.push("place():  getTransaction(REQUIRED) → нет активной → doBegin: " + conn + ", autoCommit=false  [T1]");
+    else L.push("place():  без транзакции");
+    L.push("place():  INSERT order");
+    var inner = null, innerConn = null, mode;
+    if (p === "MANDATORY" && !outer) { L.push("log():    MANDATORY и нет транзакции"); $("tpLog").textContent = L.join("\n"); var o0 = $("tpOut"); o0.className = "verdict bad"; o0.textContent = "IllegalTransactionStateException: No existing transaction found for transaction marked with propagation 'mandatory'. log() не выполнился."; return; }
+    if (p === "NEVER" && outer) { L.push("log():    NEVER, а транзакция T1 активна"); L.push("place():  " + (th === "catch" ? "ловит исключение, " : "") + "…"); $("tpLog").textContent = L.join("\n"); var o1 = $("tpOut"); o1.className = "verdict bad"; o1.textContent = "IllegalTransactionStateException: Existing transaction found for transaction marked with propagation 'never'."; return; }
+    if ((p === "REQUIRED" || p === "SUPPORTS" || p === "MANDATORY") && outer) { mode = "join"; L.push("log():    " + p + " → участвует в T1 (то же соединение " + conn + ")"); }
+    else if (p === "REQUIRES_NEW" || ((p === "REQUIRED" || p === "NESTED") && !outer)) {
+      mode = "new"; innerConn = outer ? "conn#2" : "conn#1";
+      if (outer && p === "REQUIRES_NEW") L.push("log():    REQUIRES_NEW → suspend(T1): unbind " + conn + " из ThreadLocal");
+      L.push("log():    doBegin: " + innerConn + "  [T2]" + (outer ? "  ← второе соединение из пула, пока " + conn + " занято" : ""));
+    } else if (p === "NESTED") { mode = "nested"; L.push("log():    NESTED → SAVEPOINT SAVEPOINT_1 в T1 (" + conn + ")"); }
+    else if (p === "NOT_SUPPORTED" && outer) { mode = "none"; L.push("log():    NOT_SUPPORTED → suspend(T1), выполнение без транзакции (autocommit, каждое выражение коммитится сразу)"); }
+    else { mode = "none"; L.push("log():    " + p + " → без транзакции (autocommit)"); }
+    L.push("log():    INSERT audit");
+    var failed = th !== "no";
+    if (failed) L.push("log():    ✘ RuntimeException");
+    var outerFate, auditFate, extra = "";
+    if (mode === "join") {
+      if (failed) { L.push("log():    TransactionInterceptor: участник, не владелец → setRollbackOnly() на T1"); }
+      if (!failed) { outerFate = "commit"; }
+      else if (th === "catch") { L.push("place():  ловит исключение, продолжает, при выходе commit(T1)"); L.push("place():  T1 помечена rollback-only → ROLLBACK"); outerFate = "unexpected"; }
+      else { outerFate = "rollback"; }
+      auditFate = outerFate === "commit" ? "сохранён" : "откачен вместе с заказом";
+    } else if (mode === "new") {
+      if (failed) L.push("log():    ROLLBACK T2 (" + innerConn + " → в пул)"); else L.push("log():    COMMIT T2 (" + innerConn + " → в пул)");
+      if (outer && p === "REQUIRES_NEW") L.push("log():    resume(T1): bind " + conn + " обратно");
+      auditFate = failed ? "откачен" : "сохранён независимо от заказа";
+      if (!outer) outerFate = failed && th === "prop" ? "notx-fail" : "notx";
+      else outerFate = failed && th === "prop" ? "rollback" : "commit";
+      if (outer && p === "REQUIRES_NEW") extra = " Осторожно: на время log() поток держит два соединения. При пуле в N соединений и N одновременных place() все ждут второе соединение — взаимная блокировка пула.";
+    } else if (mode === "nested") {
+      if (failed) L.push("log():    ROLLBACK TO SAVEPOINT SAVEPOINT_1"); else L.push("log():    RELEASE SAVEPOINT SAVEPOINT_1");
+      auditFate = failed ? "откачен до savepoint" : "сохранится при коммите T1";
+      outerFate = failed && th === "prop" ? "rollback" : "commit";
+      if (outerFate === "rollback" && !failed) auditFate = "откачен";
+      extra = " NESTED работает через JDBC savepoints (JdbcTransactionManager). JpaTransactionManager с Hibernate его не поддерживает: NestedTransactionNotSupportedException.";
+    } else {
+      auditFate = "записан сразу (autocommit) и не откатится";
+      if (outer && p === "NOT_SUPPORTED") L.push("log():    resume(T1)");
+      outerFate = outer ? (failed && th === "prop" ? "rollback" : "commit") : (failed && th === "prop" ? "notx-fail" : "notx");
+      if (failed) auditFate = "частично выполнен, откатывать нечего";
+    }
+    if (outerFate === "commit") L.push("place():  COMMIT T1 (" + conn + " → в пул)");
+    if (outerFate === "rollback") L.push("place():  исключение вылетело из place() → ROLLBACK T1");
+    if (outerFate === "notx-fail") L.push("place():  исключение вылетело из place()");
+    $("tpLog").textContent = L.join("\n");
+    var order = { commit: "сохранён", rollback: "откачен", unexpected: "откачен", notx: "сохранён (autocommit)", "notx-fail": "сохранён (autocommit), хотя метод упал" }[outerFate];
+    v = "Заказ: " + order + ". Аудит: " + auditFate + ".";
+    if (outerFate === "unexpected") { cls = "bad"; v = "UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only. Вызывающий думал, что всё хорошо, раз исключение поймано, но физическая транзакция уже помечена на откат. " + v; }
+    else if (outerFate === "rollback" || outerFate === "notx-fail") cls = "warn";
+    $("tpOut").className = "verdict " + cls; $("tpOut").textContent = v + extra;
+  }
+  ["tpOuter", "tpProp", "tpThrow"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) REQUIRED + «place() ловит» — UnexpectedRollbackException. (2) REQUIRES_NEW + «ловит» — аудит откатился, заказ сохранён. (3) REQUIRES_NEW без ошибки и с ошибкой «летит дальше» — аудит сохранён, заказ откачен: так пишут журнал попыток.</p>
+
+<h2 id="rollback"><span class="h-num">11.4</span>Правила отката</h2>
+<div class="vs">
+  <div class="card"><h4>Откатывают по умолчанию</h4><p><code>RuntimeException</code> и <code>Error</code> (наследие EJB). С Spring 6.2 правило можно поменять глобально: <code>@EnableTransactionManagement(rollbackOn = RollbackOn.ALL_EXCEPTIONS)</code>. Исключение должно <b>вылететь из прокси</b> — пойманное внутри метода ничего не откатывает.</p></div>
+  <div class="card"><h4>НЕ откатывают</h4><p>Checked-исключения (<code>IOException</code>, свои <code>extends Exception</code>) — транзакция <b>коммитится</b>, хотя метод завершился исключением. Нужно <code>@Transactional(rollbackFor = Exception.class)</code>.</p></div>
+</div>
+<pre data-title="Явное управление"><code class="java">@Transactional(rollbackFor = PaymentException.class, noRollbackFor = NotificationException.class)
+public void pay(Order o) throws PaymentException { /* ... */ }
+
+// Пометить откат без исключения:
+TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();</code></pre>
+
+<h2 id="attrs"><span class="h-num">11.5</span>Isolation, readOnly, timeout</h2>
+<div class="table-wrap"><table>
+<tr><th>Isolation</th><th>Грязное чтение</th><th>Неповторяемое чтение</th><th>Фантомы</th><th>Где по умолчанию</th></tr>
+<tr><td><code>READ_UNCOMMITTED</code></td><td>возможно</td><td>возможно</td><td>возможно</td><td>—</td></tr>
+<tr><td><code>READ_COMMITTED</code></td><td>нет</td><td>возможно</td><td>возможно</td><td>PostgreSQL, Oracle, SQL Server</td></tr>
+<tr><td><code>REPEATABLE_READ</code></td><td>нет</td><td>нет</td><td>возможно (в PostgreSQL и MySQL InnoDB — нет)</td><td>MySQL InnoDB</td></tr>
+<tr><td><code>SERIALIZABLE</code></td><td>нет</td><td>нет</td><td>нет</td><td>—</td></tr>
+</table></div>
+<p><code>Isolation.DEFAULT</code> — уровень БД. Нестандартный уровень применяется только при создании новой физической транзакции; участник с другим уровнем по умолчанию молча получит уровень внешней (строгая проверка — <code>validateExistingTransaction=true</code> у менеджера).</p>
+<p><b>readOnly = true</b>: <code>Connection.setReadOnly(true)</code> (драйвер может оптимизировать, PostgreSQL выполнит <code>SET TRANSACTION READ ONLY</code>), в JPA — <code>FlushMode.MANUAL</code> и отключение dirty checking в Hibernate: меньше памяти и CPU на больших выборках. Используется для маршрутизации на реплику через <code>AbstractRoutingDataSource</code> + <code>LazyConnectionDataSourceProxy</code>.</p>
+<p><b>timeout</b>: секунды; JDBC-операции получают <code>Statement.setQueryTimeout</code> по остатку времени.</p>
+
+<h2 id="pitfalls"><span class="h-num">11.6</span>Типичные ошибки</h2>
+<div class="table-wrap"><table>
+<tr><th>Ошибка</th><th>Почему</th><th>Решение</th></tr>
+<tr><td>Вызов <code>this.txMethod()</code></td><td>мимо прокси</td><td>вынести в другой бин, <code>TransactionTemplate</code></td></tr>
+<tr><td>Checked-исключение не откатило</td><td>правило по умолчанию</td><td><code>rollbackFor</code></td></tr>
+<tr><td>Исключение поймано в сервисе</td><td>прокси не видит исключения</td><td>пробросить или <code>setRollbackOnly</code></td></tr>
+<tr><td>HTTP-вызов внутри транзакции</td><td>соединение БД держится всё время вызова, пул истощается; при откате HTTP-эффект не отменить</td><td>внешние вызовы вне транзакции, события AFTER_COMMIT, outbox</td></tr>
+<tr><td><code>REQUIRES_NEW</code> под нагрузкой</td><td>два соединения на поток → deadlock пула</td><td>пул ≥ потоки × 2 или убрать REQUIRES_NEW</td></tr>
+<tr><td><code>@Transactional</code> в <code>@PostConstruct</code></td><td>прокси ещё нет</td><td><code>ApplicationReadyEvent</code></td></tr>
+<tr><td>Два менеджера транзакций</td><td><code>NoUniqueBeanDefinitionException</code> или не тот менеджер</td><td><code>@Transactional("ordersTm")</code>, <code>@Primary</code></td></tr>
+<tr><td><code>LazyInitializationException</code></td><td>доступ к ленивой коллекции после закрытия транзакции и EntityManager</td><td>fetch join / entity graph / DTO (тема 12)</td></tr>
+</table></div>
+
+<h2 id="programmatic"><span class="h-num">11.7</span>Программное управление</h2>
+<pre><code class="java">@Service
+class ImportService {
+    private final TransactionTemplate tx;
+    ImportService(PlatformTransactionManager tm) {
+        this.tx = new TransactionTemplate(tm);
+        this.tx.setTimeout(30);
+    }
+
+    void importAll(List&lt;Batch&gt; batches) {
+        for (Batch b : batches) {
+            try {
+                tx.executeWithoutResult(status -&gt; save(b));       // отдельная транзакция на пачку
+            } catch (DataAccessException e) {
+                log.warn("batch {} failed", b.id(), e);           // остальные пачки продолжат
+            }
+        }
+    }
+
+    void onCommit(Runnable r) {                                     // выполнить после коммита текущей транзакции
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() { r.run(); }
+        });
+    }
+}</code></pre>
+
+<h2 id="quiz"><span class="h-num">11.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Метод @Transactional бросает IOException. Что с транзакцией?</p><ul><li>Откат</li><li>Зависит от БД</li><li>Коммит: checked-исключения по умолчанию не откатывают транзакцию</li><li>Транзакция остаётся открытой</li></ul><div class="why">По умолчанию rollbackOn = RuntimeException || Error. Для checked — rollbackFor.</div></div>
+<div class="mcq" data-ok="1"><p>Как JdbcTemplate внутри @Transactional-метода получает соединение именно этой транзакции?</p><ul><li>Транзакционный менеджер передаёт его в параметрах</li><li>DataSourceUtils.getConnection находит ConnectionHolder, привязанный к потоку в TransactionSynchronizationManager</li><li>JdbcTemplate открывает новое соединение, а БД объединяет их</li><li>Через AOP-прокси JdbcTemplate</li></ul><div class="why">Соединение привязано к ThreadLocal по ключу DataSource в doBegin; JdbcTemplate ищет его там.</div></div>
+<div class="mcq" data-ok="3"><p>Откуда UnexpectedRollbackException?</p><ul><li>БД откатила транзакцию из-за deadlock</li><li>Истёк timeout</li><li>Ошибка сети при коммите</li><li>Участник REQUIRED упал и пометил транзакцию rollback-only, а внешний метод поймал исключение и попытался закоммитить</li></ul><div class="why">Внешний метод не знает, что общая физическая транзакция уже обречена. Spring откатывает её и сообщает об этом исключением, чтобы ошибка не осталась незамеченной.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите, как работает @Transactional от аннотации до COMMIT.</summary><div class="a"><p>Бин обёрнут в прокси (BeanFactoryTransactionAttributeSourceAdvisor нашёл аннотацию). Вызов → TransactionInterceptor → атрибуты из AnnotationTransactionAttributeSource → выбор TransactionManager → getTransaction: проверка существующей транзакции в TransactionSynchronizationManager, решение по propagation, doBegin (соединение из пула, autoCommit=false, привязка к ThreadLocal) → вызов метода (репозитории берут соединение из ThreadLocal) → по результату commit или rollback по правилам → синхронизации → отвязка, возврат соединения в пул.</p></div></details>
+<details class="q"><summary>Чем REQUIRES_NEW отличается от NESTED?</summary><div class="a"><p>REQUIRES_NEW — независимая физическая транзакция на втором соединении; её коммит не зависит от внешней, внешняя приостановлена. NESTED — savepoint внутри той же физической транзакции: откат вложенной возвращает к savepoint, но коммит происходит только вместе с внешней, и откат внешней откатывает всё. NESTED требует поддержки savepoints (JDBC), REQUIRES_NEW — второго соединения.</p></div></details>
+<details class="q"><summary>Почему нельзя делать HTTP-вызов внутри транзакции?</summary><div class="a"><p>Соединение с БД (и блокировки строк) удерживается на всё время сетевого вызова — пул истощается, растут конфликты. Откат транзакции не отменит внешний эффект (деньги списаны, письмо отправлено). Правильно: внешние вызовы до/после транзакции, после коммита — через @TransactionalEventListener или outbox.</p></div></details>
+<details class="q"><summary>Что даёт readOnly = true?</summary><div class="a"><p>Подсказку драйверу/БД (Connection.setReadOnly), в Hibernate — FlushMode.MANUAL и отказ от снимков для dirty checking (экономия памяти и CPU), возможность маршрутизации на реплику. Это не защита: запись не обязательно запрещена — зависит от драйвера и БД.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Аутентификация и авторизация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ТРАФИК И API</div>
+  <h1>Аутентификация и авторизация</h1>
+  <p class="lead">Два вопроса, которые система задаёт каждому запросу: «кто ты?» и «что тебе можно?». Глава разбирает модели прав доступа, устройство JWT и то, как OAuth 2.0 позволяет приложению действовать от имени пользователя, не зная его пароля.</p>
+  <div class="meta"><span class="tag">3 конспекта</span><span class="tag">~2,5 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="authn-authz"><span class="h-num">5.1</span>Аутентификация и авторизация<span class="sk-num">#23</span></h2>
+<p><b>Аутентификация</b> (authentication, AuthN) проверяет личность: пароль, одноразовый код, биометрия. <b>Авторизация</b> (authorization, AuthZ) решает, разрешено ли этой личности конкретное действие над конкретным ресурсом. Первая происходит при входе, вторая — при каждом обращении.</p>
+<figure class="sketch"><a href="img/23-authentication-authorization.jpg"><img src="img/23-authentication-authorization.jpg" width="1024" height="1536" loading="lazy" alt="Аутентификация и авторизация: поток, модели RBAC, ABAC, ACL, JWT, OAuth"></a><figcaption><b>Конспект #23.</b> Authentication &amp; Authorization <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<h3>Модели авторизации</h3>
+<div class="table-wrap"><table>
+<tr><th>Модель</th><th>Как принимается решение</th><th>Сильная сторона</th><th>Слабая сторона</th></tr>
+<tr><td><b>RBAC</b><br>Role-Based</td><td>Права назначены ролям, роли — пользователям</td><td>Просто понять и проверить; подходит большинству систем</td><td>«Взрыв ролей», когда нужны условия вроде «только свои заказы»</td></tr>
+<tr><td><b>ABAC</b><br>Attribute-Based</td><td>Правило над атрибутами пользователя, ресурса, действия и окружения</td><td>Тонкие условия: отдел, время, владелец, сумма</td><td>Сложнее писать, тестировать и объяснять</td></tr>
+<tr><td><b>ACL</b><br>Access Control List</td><td>У каждого ресурса — список, кому что разрешено</td><td>Точечный доступ к объекту (файл, документ)</td><td>Плохо масштабируется на миллионы объектов</td></tr>
+</table></div>
+<p>На практике комбинируют: RBAC для грубого деления (админ / оператор / клиент) плюс проверка владения ресурсом в коде или через политику. В Spring Security это <code>@PreAuthorize("hasRole('ADMIN') or #order.ownerId == authentication.name")</code>.</p>
+<div class="callout bad"><span class="c-title">Самая частая уязвимость API — не в аутентификации</span>
+Первое место в OWASP API Security Top 10 — <b>Broken Object Level Authorization</b>: сервис проверил токен, но не проверил, что <code>/orders/123</code> принадлежит именно этому пользователю. Валидный токен отвечает на вопрос «кто», но не на вопрос «можно ли к этому объекту». Проверка владения нужна в каждом эндпоинте с идентификатором в пути.
+</div>
+<ul>
+  <li><b>Пароли</b> хранят только в виде медленного хэша с солью: bcrypt, scrypt, argon2. Не SHA-256 — он слишком быстрый для перебора.</li>
+  <li><b>Эндпоинты входа</b> — первая цель перебора: на них обязателен rate limiting (<a href="04-api.html#rate-limit">тема 04</a>).</li>
+  <li><b>Сообщения об ошибках</b> не должны различать «нет такого пользователя» и «неверный пароль».</li>
+</ul>
+
+<h2 id="jwt"><span class="h-num">5.2</span>JWT<span class="sk-num">#24</span></h2>
+<p>JSON Web Token — компактный токен из трёх частей, разделённых точками: <code>header.payload.signature</code>. Сервер, получив токен, проверяет подпись и доверяет содержимому, не обращаясь к хранилищу сессий. Отсюда главное достоинство — отсутствие состояния на сервере — и главный недостаток: выданный токен трудно отозвать.</p>
+<figure class="sketch"><a href="img/24-jwt.jpg"><img src="img/24-jwt.jpg" width="1024" height="1536" loading="lazy" alt="JWT: структура, пример, поток, claims, плюсы и минусы, безопасность"></a><figcaption><b>Конспект #24.</b> JWT Token <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>Claim</th><th>Смысл</th><th>Проверять?</th></tr>
+<tr><td><code>iss</code></td><td>Кто выдал токен</td><td>Да — совпадает с ожидаемым сервером авторизации</td></tr>
+<tr><td><code>sub</code></td><td>Субъект — идентификатор пользователя</td><td>Использовать как идентификатор</td></tr>
+<tr><td><code>aud</code></td><td>Для кого предназначен</td><td>Да — токен для другого сервиса нужно отклонить</td></tr>
+<tr><td><code>exp</code> / <code>nbf</code> / <code>iat</code></td><td>Истекает / не раньше / выдан</td><td>Да, с небольшим допуском на расхождение часов</td></tr>
+<tr><td><code>jti</code></td><td>Уникальный идентификатор токена</td><td>Нужен для списка отозванных</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Что важно понимать сверх конспекта</span>
+<ul>
+  <li><b>Payload закодирован, а не зашифрован.</b> Base64url читает любой, у кого есть токен. В payload не кладут секреты и персональные данные. (Шифрованный вариант — JWE — существует, но используется редко.)</li>
+  <li><b>HS256 или RS256.</b> HS256 — один общий секрет: кто умеет проверять, тот умеет и выпускать, поэтому годится только внутри одного сервиса. RS256/ES256 — приватный ключ только у сервера авторизации, остальные проверяют публичным (берут его по адресу JWKS). В микросервисах — всегда асимметричная подпись.</li>
+  <li><b>Алгоритм фиксируют на стороне проверяющего.</b> Нельзя доверять полю <code>alg</code> из самого токена: атаки <code>alg: none</code> и подмена RS256 на HS256 (публичный ключ как HMAC-секрет) основаны именно на этом.</li>
+  <li><b>Отзыв.</b> Варианты: короткий срок жизни access-токена (5–15 минут) + refresh-токен с ротацией; чёрный список по <code>jti</code> в Redis с TTL до истечения токена; версия токена в профиле пользователя. Любой из них возвращает часть состояния на сервер — «stateless» всегда компромисс.</li>
+  <li><b>Где хранить в браузере.</b> <code>localStorage</code> доступен любому скрипту на странице (XSS крадёт токен). Cookie с флагами <code>HttpOnly; Secure; SameSite</code> недоступна JavaScript, но требует защиты от CSRF.</li>
+</ul>
+</div>
+
+<h2 id="oauth"><span class="h-num">5.3</span>OAuth 2.0<span class="sk-num">#25</span></h2>
+<p>OAuth 2.0 — фреймворк <b>делегированной авторизации</b>: пользователь разрешает приложению ограниченный доступ к своим данным на другом сервисе, не сообщая приложению пароль. Конспект подчёркивает главное: OAuth 2.0 сам по себе <i>не</i> протокол аутентификации.</p>
+<figure class="sketch"><a href="img/25-oauth2.jpg"><img src="img/25-oauth2.jpg" width="1024" height="1536" loading="lazy" alt="OAuth 2.0: роли, поток Authorization Code, типы грантов, токены, OIDC"></a><figcaption><b>Конспект #25.</b> OAuth 2.0 <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<h3>Четыре роли</h3>
+<div class="table-wrap"><table>
+<tr><th>Роль</th><th>Кто это</th><th>Пример «Войти через Google»</th></tr>
+<tr><td>Resource Owner</td><td>Владелец данных</td><td>Вы</td></tr>
+<tr><td>Client</td><td>Приложение, которому нужен доступ</td><td>Сайт, на который вы входите</td></tr>
+<tr><td>Authorization Server</td><td>Аутентифицирует владельца, спрашивает согласие, выдаёт токены</td><td>accounts.google.com</td></tr>
+<tr><td>Resource Server</td><td>Хранит данные, принимает access-токен</td><td>API профиля Google</td></tr>
+</table></div>
+<h3>Поток Authorization Code</h3>
+<ol class="steps">
+  <li>Клиент перенаправляет браузер на сервер авторизации, указывая запрашиваемые права (<code>scope</code>).</li>
+  <li>Пользователь входит и даёт согласие — <b>на стороне сервера авторизации</b>; клиент пароль не видит.</li>
+  <li>Сервер авторизации возвращает браузер к клиенту с одноразовым <b>кодом авторизации</b>.</li>
+  <li>Клиент по защищённому каналу «сервер–сервер» обменивает код на <b>access token</b> (и refresh token).</li>
+  <li>Клиент обращается к API с access-токеном; сервер ресурсов проверяет токен и отдаёт данные.</li>
+</ol>
+<p>Зачем промежуточный код, а не сразу токен? Код проходит через браузер (URL, история, логи), а токен — нет: он выдаётся только в обмен на код в прямом запросе, где клиент подтверждает свою подлинность.</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>Access token</th><th>Refresh token</th></tr>
+<tr><td>Срок жизни</td><td>Минуты</td><td>Дни, недели</td></tr>
+<tr><td>Куда отправляется</td><td>На сервер ресурсов с каждым запросом</td><td>Только на сервер авторизации</td></tr>
+<tr><td>Если украден</td><td>Ущерб ограничен коротким сроком и scope</td><td>Серьёзно — поэтому ротация: каждый refresh выдаёт новый, старый гасится</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Конспект частично устарел: OAuth 2.1</span>
+<ul>
+  <li><b>PKCE обязателен.</b> Клиент создаёт случайный <code>code_verifier</code>, отправляет его хэш в первом запросе и сам verifier — при обмене кода. Перехваченный код бесполезен без verifier. Сначала PKCE придумали для мобильных приложений и SPA, которые не могут хранить секрет клиента; сейчас он рекомендован всем.</li>
+  <li><b>Implicit grant и Password grant исключены.</b> Конспект называет Implicit «legacy» — точнее сказать «запрещён»: токен в URL-фрагменте утекает. Для SPA сейчас — Authorization Code + PKCE, часто через серверный компонент (BFF), чтобы токены вообще не попадали в браузер. Password grant требовал отдавать пароль клиенту — то, от чего OAuth и должен избавлять.</li>
+  <li><b>Параметр <code>state</code></b> в первом запросе защищает от CSRF: клиент проверяет, что вернулся тот же случайный токен.</li>
+  <li><b>Client Credentials</b> остаётся основным способом для взаимодействия «сервис–сервис», где пользователя нет.</li>
+</ul>
+</div>
+<div class="callout info"><span class="c-title">OAuth 2.0 и OpenID Connect</span>
+Access-токен говорит «предъявителю можно читать профиль», но не говорит, кто вошёл и когда. Использовать его как доказательство личности — ошибка. <b>OIDC</b> — слой поверх OAuth 2.0, добавляющий <b>ID Token</b> (JWT с данными о пользователе и факте аутентификации), эндпоинт <code>/userinfo</code> и стандартные scope (<code>openid</code>, <code>profile</code>, <code>email</code>). «Войти через Google» — это OIDC. В Spring Security: <code>oauth2Login()</code> для входа, <code>oauth2ResourceServer().jwt()</code> для проверки токенов в API.
+</div>
+
+<h2 id="sim"><span class="h-num">5.4</span>Интерактив: что внутри JWT</h2>
+<div class="widget" id="jwW">
+  <div class="widget-title">Инспектор токена</div>
+  <p class="hint">Вставьте JWT или возьмите пример. Разбор выполняется в браузере — токен никуда не отправляется. Не вставляйте боевые токены в онлайн-инструменты: они дают доступ.</p>
+  <textarea id="jwIn" spellcheck="false" style="min-height:96px"></textarea>
+  <div class="controls">
+    <button class="btn" type="button" data-s="ok">обычный токен (RS256)</button>
+    <button class="btn" type="button" data-s="exp">просроченный</button>
+    <button class="btn" type="button" data-s="none">alg: none</button>
+    <button class="btn" type="button" data-s="hs">HS256 с чувствительными данными</button>
+  </div>
+  <div class="out" id="jwOut"></div>
+  <div class="verdict" id="jwV"></div>
+</div>
+<script>
+(function () {
+  function b64u(o) { return btoa(unescape(encodeURIComponent(JSON.stringify(o)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+  function dec(s) { s = s.replace(/-/g, "+").replace(/_/g, "/"); while (s.length % 4) s += "="; return JSON.parse(decodeURIComponent(escape(atob(s)))); }
+  var now = Math.floor(Date.now() / 1000);
+  var S = {
+    ok: [{ alg: "RS256", typ: "JWT", kid: "2026-10-a" }, { iss: "https://auth.shop.ru", sub: "user-4411", aud: "orders-api", scope: "orders.read orders.write", iat: now - 60, exp: now + 840 }, "dGhpcyBpcyBub3QgYSByZWFsIHNpZ25hdHVyZQ"],
+    exp: [{ alg: "RS256", typ: "JWT", kid: "2026-10-a" }, { iss: "https://auth.shop.ru", sub: "user-4411", aud: "orders-api", iat: now - 7200, exp: now - 3600 }, "c2lnbmF0dXJl"],
+    none: [{ alg: "none", typ: "JWT" }, { sub: "admin", role: "ADMIN", exp: now + 99999 }, ""],
+    hs: [{ alg: "HS256", typ: "JWT" }, { sub: "user-4411", email: "ivan@shop.ru", passport: "MP1234567", card: "4111 1111 1111 1111", exp: now + 86400 * 365 }, "c2VjcmV0"]
+  };
+  var inp = document.getElementById("jwIn"), out = document.getElementById("jwOut"), v = document.getElementById("jwV");
+  function run() {
+    var p = inp.value.trim().split("."), h, b;
+    if (p.length !== 3) { out.textContent = "JWT состоит из трёх частей, разделённых точками: заголовок.полезная_нагрузка.подпись"; v.className = "verdict bad"; v.textContent = "Это не JWT."; return; }
+    try { h = dec(p[0]); b = dec(p[1]); } catch (e) { out.textContent = "Не удалось раскодировать Base64URL/JSON: " + e.message; v.className = "verdict bad"; v.textContent = "Токен повреждён."; return; }
+    var L = ["ЗАГОЛОВОК (Base64URL, не шифрование):", JSON.stringify(h, null, 2), "", "ПОЛЕЗНАЯ НАГРУЗКА (читается кем угодно):", JSON.stringify(b, null, 2), "", "ПОДПИСЬ: " + (p[2] ? p[2].slice(0, 24) + "… (" + p[2].length + " симв.) — проверить можно только ключом" : "ОТСУТСТВУЕТ")];
+    var issues = [], cls = "ok";
+    if (!h.alg || String(h.alg).toLowerCase() === "none") { cls = "bad"; issues.push("alg = none: токен без подписи. Любой может написать себе role: ADMIN. Сервер обязан принимать только алгоритмы из своего белого списка и никогда не доверять полю alg из токена."); }
+    if (b.exp === undefined) { cls = "bad"; issues.push("Нет exp: токен действует вечно, отозвать его нельзя."); }
+    else { var left = b.exp - Math.floor(Date.now() / 1000); if (left < 0) { cls = "bad"; issues.push("Срок истёк " + Math.round(-left / 60) + " мин назад (exp " + new Date(b.exp * 1000).toISOString() + "): сервер обязан отклонить токен. Клиент получает новый по refresh-токену."); } else { if (left > 86400) { if (cls === "ok") cls = "warn"; issues.push("Срок жизни " + Math.round(left / 86400) + " сут: украденный access-токен будет работать всё это время. Обычно 5–15 минут + refresh-токен."); } else issues.push("Действует ещё " + Math.round(left / 60) + " мин."); } }
+    if (h.alg === "HS256") { if (cls === "ok") cls = "warn"; issues.push("HS256 — симметричный ключ: каждый сервис, проверяющий токен, может и выпускать его. Для нескольких сервисов нужен асимметричный алгоритм (RS256/ES256): закрытый ключ только у сервера авторизации, открытые — в JWKS."); }
+    ["password", "passport", "card", "ssn", "secret"].forEach(function (k) { if (b[k] !== undefined) { cls = "bad"; issues.push("Поле «" + k + "» в нагрузке: содержимое JWT НЕ зашифровано — его видят браузер, прокси, логи. Только идентификаторы и права."); } });
+    if (!b.aud) issues.push("Нет aud: токен, выданный для одного сервиса, примут и другие. Проверяйте получателя.");
+    if (!b.iss) issues.push("Нет iss: неизвестно, кто выпустил токен.");
+    if (cls === "ok") issues.unshift("Структура в порядке. Сервер должен проверить: подпись ключом по kid из JWKS издателя, iss, aud, exp/nbf с допуском на расхождение часов.");
+    out.textContent = L.join("\n"); v.className = "verdict " + cls; v.innerHTML = issues.map(SG.esc).join("<br>");
+  }
+  function sample(k) { var s = S[k]; inp.value = b64u(s[0]) + "." + b64u(s[1]) + "." + s[2]; run(); }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#jwW [data-s]").forEach(function (b) { b.addEventListener("click", function () { sample(b.getAttribute("data-s")); }); });
+  sample("ok");
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">5.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Зашифровано ли содержимое обычного JWT (JWS)?</p><ul><li>Да, ключом сервера</li><li>Да, открытым ключом клиента</li><li>Нет: оно закодировано Base64URL и подписано — подпись защищает от изменения, но не от чтения</li><li>Зависит от алгоритма подписи</li></ul><div class="why">Шифрованный вариант — JWE, он встречается редко. В JWT нельзя класть секреты.</div></div>
+<div class="mcq" data-ok="1"><p>Главная сложность stateless-токенов?</p><ul><li>Они медленные</li><li>Отзыв: выданный токен действует до exp, сервер не хранит состояния, чтобы его отменить</li><li>Их нельзя передавать по HTTPS</li><li>Они не поддерживают роли</li></ul><div class="why">Решения: короткий срок жизни + refresh-токен, список отозванных jti, версия токена у пользователя.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем в OAuth 2.0 Authorization Code Flow нужен PKCE?</p><ul><li>Чтобы перехваченный код авторизации нельзя было обменять на токен без секрета, известного только начавшему процесс клиенту</li><li>Для шифрования токена</li><li>Для ускорения входа</li><li>Чтобы не использовать HTTPS</li></ul><div class="why">Клиент отправляет хэш случайной строки при старте и саму строку при обмене кода. Обязателен для публичных клиентов (SPA, мобильные), рекомендован для всех.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда вернуть 401, а когда 403?</summary><div class="a"><p>401 — личность не установлена: токена нет, он просрочен или подпись неверна; клиенту нужно аутентифицироваться заново. 403 — личность установлена, но прав на действие нет; повторная аутентификация не поможет.</p></div></details>
+<details class="q"><summary>Можно ли положить в JWT номер паспорта пользователя, раз токен подписан?</summary><div class="a"><p>Нет. Подпись защищает от изменения, а не от чтения: payload — это Base64url, его декодирует кто угодно. Токены попадают в логи, заголовки, прокси. В payload — только идентификаторы и права.</p></div></details>
+<details class="q"><summary>Пользователь нажал «Выйти со всех устройств». Как это реализовать с JWT?</summary><div class="a"><p>Сам токен отозвать нельзя — он действителен до <code>exp</code>. Варианты: удалить все refresh-токены пользователя (доступ закончится, когда истечёт короткий access-токен); вести чёрный список <code>jti</code> в Redis; хранить у пользователя «версию токенов» или время, раньше которого токены недействительны, и сверять при проверке. Для мгновенного выхода нужна проверка на стороне сервера при каждом запросе.</p></div></details>
+<details class="q"><summary>Зачем в Authorization Code нужен обмен кода на токен, если можно сразу вернуть токен?</summary><div class="a"><p>Чтобы токен никогда не проходил через браузер. Редирект с кодом виден в адресной строке, истории и логах; код одноразовый, живёт секунды и бесполезен без секрета клиента или PKCE-verifier. Токен выдаётся в прямом запросе клиента к серверу авторизации.</p></div></details>
+<details class="q"><summary>Чем OIDC отличается от OAuth 2.0?</summary><div class="a"><p>OAuth 2.0 — про доступ к ресурсам (авторизация): результат — access-токен для API. OIDC — про личность (аутентификация): добавляет ID Token в формате JWT с claims о пользователе и о самом входе (<code>sub</code>, <code>iss</code>, <code>aud</code>, <code>auth_time</code>, <code>nonce</code>), предназначенный для клиента, а не для API.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Формат class-файла</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.hx { display: flex; flex-wrap: wrap; gap: 2px; font: 12px var(--font-mono); margin: 10px 0; max-height: 260px; overflow-y: auto; padding: 8px; background: var(--bg-sunk); border-radius: 8px; }
+.hx span { padding: 1px 2px; border-radius: 3px; cursor: pointer; }
+.hx span.g0 { color: var(--accent); } .hx span.g1 { color: var(--info); } .hx span.g2 { color: var(--ok); } .hx span.g3 { color: var(--warn); } .hx span.g4 { color: var(--t-s, #8a3fb0); }
+.hx span.sel { background: var(--accent-soft); outline: 1px solid var(--accent); }
+.cf-list { max-height: 320px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.cf-list div { padding: 4px 10px; font-size: 13px; border-bottom: 1px solid var(--line); cursor: pointer; display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; }
+.cf-list div:hover { background: var(--bg-sunk); }
+.cf-list div.sel { background: var(--accent-soft); }
+.cf-list code { font-size: 12px; }
+.cf-list small { color: var(--fg-muted); font-family: var(--font-mono); }
+</style>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · ПЛАТФОРМА И БАЙТКОД</div>
+  <h1>Формат class-файла</h1>
+  <p class="lead">Class-файл — единственное, что JVM знает о вашем коде. Ни исходников, ни импортов, ни имён локальных переменных (без отладочной информации) там нет: только пул констант, описания полей и методов, байткод и атрибуты. Разберём настоящий class-файл в 401 байт побайтово: щёлкайте по структурам и байтам — увидите, как JVM читает каждый из них.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">magic и версия</span><span class="tag">constant pool</span><span class="tag">дескрипторы</span><span class="tag">атрибуты</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="structure"><span class="h-num">2.1</span>Общая структура</h2>
+<pre data-title="ClassFile (JVMS §4.1) — все числа big-endian"><code class="txt">ClassFile {
+    u4             magic;                 // 0xCAFEBABE
+    u2             minor_version;
+    u2             major_version;         // 65 = Java 21, 69 = Java 25
+    u2             constant_pool_count;   // число записей + 1
+    cp_info        constant_pool[constant_pool_count-1];
+    u2             access_flags;          // ACC_PUBLIC, ACC_FINAL, ACC_INTERFACE, ACC_ENUM, ...
+    u2             this_class;            // индекс в пуле → CONSTANT_Class
+    u2             super_class;
+    u2             interfaces_count;   u2 interfaces[];
+    u2             fields_count;       field_info  fields[];
+    u2             methods_count;      method_info methods[];
+    u2             attributes_count;   attribute_info attributes[];   // SourceFile, InnerClasses, Record, ...
+}</code></pre>
+
+<h2 id="viewer"><span class="h-num">2.2</span>Разбор настоящего файла</h2>
+<pre data-title="Hello.java → javac --release 21 -g:none"><code class="java">public class Hello {
+    static int counter = 42;
+
+    public static void main(String[] args) {
+        System.out.println("Hi");
+    }
+}</code></pre>
+<div class="widget" id="cfW">
+  <div class="widget-title">Просмотрщик Hello.class</div>
+  <div class="controls">
+    <button class="btn" type="button" id="cfOrig">Исходный файл</button>
+    <button class="btn" type="button" id="cfMagic">Испортить magic</button>
+    <button class="btn" type="button" id="cfVer">Сделать major = 70</button>
+    <button class="btn" type="button" id="cfCp">Сломать ссылку в пуле</button>
+  </div>
+  <div class="verdict" id="cfV"></div>
+  <div class="hx" id="cfHex"></div>
+  <div class="cf-list" id="cfList"></div>
+  <div class="out" id="cfDet">Щёлкните по строке структуры или по байту.</div>
+</div>
+<script>
+(function () {
+  var HEX = "cafebabe00000041001f0a000200030700040c000500060100106a6176612f6c616e672f4f626a6563740100063c696e69743e010003282956090008000907000a0c000b000c0100106a6176612f6c616e672f53797374656d0100036f75740100154c6a6176612f696f2f5072696e7453747265616d3b08000e01000248690a001000110700120c001300140100136a6176612f696f2f5072696e7453747265616d0100077072696e746c6e010015284c6a6176612f6c616e672f537472696e673b295609001600170700180c0019001a01000548656c6c6f010007636f756e74657201000149010004436f64650100046d61696e010016285b4c6a6176612f6c616e672f537472696e673b29560100083c636c696e69743e0021001600020000000100080019001a000000030001000500060001001b0000001100010001000000052ab70001b1000000000009001c001d0001001b000000150002000100000009b20007120db6000fb1000000000008001e00060001001b000000120001000000000006102ab30015b1000000000000";
+  var OPS = { 0x2a: ["aload_0", 0], 0xb7: ["invokespecial", 2], 0xb1: ["return", 0], 0xb2: ["getstatic", 2], 0x12: ["ldc", 1], 0xb6: ["invokevirtual", 2], 0x10: ["bipush", 1], 0xb3: ["putstatic", 2] };
+  var TAG = { 1: "Utf8", 3: "Integer", 4: "Float", 5: "Long", 6: "Double", 7: "Class", 8: "String", 9: "Fieldref", 10: "Methodref", 11: "InterfaceMethodref", 12: "NameAndType", 15: "MethodHandle", 16: "MethodType", 17: "Dynamic", 18: "InvokeDynamic", 19: "Module", 20: "Package" };
+  var $ = function (i) { return document.getElementById(i); }, bytes, regs, sel = -1;
+  function load(h) { bytes = []; for (var i = 0; i < h.length; i += 2) bytes.push(parseInt(h.substr(i, 2), 16)); }
+  function parse() {
+    regs = []; var p = 0, cp = [null], err = null;
+    function u1() { return bytes[p++]; } function u2() { var v = bytes[p] << 8 | bytes[p + 1]; p += 2; return v; } function u4() { var v = (bytes[p] << 24 >>> 0) + (bytes[p + 1] << 16) + (bytes[p + 2] << 8) + bytes[p + 3]; p += 4; return v; }
+    function R(start, label, det, g) { regs.push({ s: start, e: p, label: label, det: det, g: g }); }
+    function str(i) { var c = cp[i]; if (!c) return "#" + i + "?"; if (c.t === 1) return c.v; if (c.t === 7 || c.t === 8) return str(c.a); if (c.t === 12) return str(c.a) + ":" + str(c.b); if (c.t >= 9 && c.t <= 11) return str(c.a) + "." + str(c.b); return "#" + i; }
+    var s = p, m = u4(); R(s, "magic", "0x" + m.toString(16).toUpperCase() + " — признак class-файла («CAFE BABE», шутка из 1990-х). Если не совпал: java.lang.ClassFormatError: Incompatible magic value", 0);
+    if (m !== 0xCAFEBABE) err = "java.lang.ClassFormatError: Incompatible magic value " + m + " in class file Hello";
+    s = p; var mi = u2(); R(s, "minor_version", mi + (mi === 0xFFFF ? " — preview-возможности" : ""), 0);
+    s = p; var ma = u2(); R(s, "major_version", ma + " = Java " + (ma - 44) + ". JVM принимает файлы своей версии и старше; для Java 21 максимум 65", 0);
+    if (!err && ma > 65) err = "java.lang.UnsupportedClassVersionError: Hello has been compiled by a more recent version of the Java Runtime (class file version " + ma + ".0), this version of the Java Runtime only recognizes class file versions up to 65.0";
+    s = p; var n = u2(); R(s, "constant_pool_count", n + " → записей " + (n - 1) + " (индексация с 1; Long и Double занимают два слота)", 1);
+    for (var i = 1; i < n; i++) {
+      s = p; var t = u1(), c = { t: t };
+      if (t === 1) { var len = u2(), txt = ""; for (var k = 0; k < len; k++) txt += String.fromCharCode(bytes[p + k]); p += len; c.v = txt; }
+      else if (t === 7 || t === 8 || t === 16 || t === 19 || t === 20) c.a = u2();
+      else if (t >= 9 && t <= 12 || t === 17 || t === 18) { c.a = u2(); c.b = u2(); }
+      else if (t === 3 || t === 4) c.v = u4();
+      else if (t === 5 || t === 6) { u4(); u4(); }
+      else if (t === 15) { u1(); c.a = u2(); }
+      else { err = err || "java.lang.ClassFormatError: Unknown constant tag " + t; break; }
+      cp[i] = c; c.s = s; c.e = p; if (t === 5 || t === 6) i++;
+    }
+    for (var j = 1; j < cp.length; j++) { var c2 = cp[j]; if (!c2) continue;
+      var d = TAG[c2.t] + (c2.t === 1 ? " «" + c2.v + "»" : c2.t === 7 || c2.t === 8 ? " → #" + c2.a + " = " + str(j) : c2.t === 12 ? " → #" + c2.a + ":#" + c2.b + " = " + str(j) : c2.t >= 9 && c2.t <= 11 ? " → #" + c2.a + ".#" + c2.b + " = " + str(j) : "");
+      if (c2.a && (c2.a >= cp.length || !cp[c2.a])) { err = err || "java.lang.ClassFormatError: Invalid constant pool index " + c2.a + " in class file Hello"; d += "  ← НЕВЕРНЫЙ ИНДЕКС"; }
+      regs.push({ s: c2.s, e: c2.e, label: "#" + j + " " + TAG[c2.t], det: d, g: 1 }); }
+    s = p; var af = u2(); R(s, "access_flags", "0x" + af.toString(16).padStart(4, "0") + (af & 1 ? " PUBLIC" : "") + (af & 0x10 ? " FINAL" : "") + (af & 0x20 ? " SUPER (всегда ставится javac)" : "") + (af & 0x200 ? " INTERFACE" : "") + (af & 0x400 ? " ABSTRACT" : ""), 2);
+    s = p; var tc = u2(); R(s, "this_class", "#" + tc + " → " + str(tc) + " (имена во внутренней форме: java/lang/Object)", 2);
+    s = p; var sc = u2(); R(s, "super_class", "#" + sc + " → " + str(sc) + " (0 только у java/lang/Object)", 2);
+    s = p; var ic = u2(); R(s, "interfaces_count", ic, 2); for (var q = 0; q < ic; q++) { s = p; var ii = u2(); R(s, "interface", str(ii), 2); }
+    function attrs(owner) {
+      var s0 = p, ac = u2(); R(s0, owner + ": attributes_count", ac, 4);
+      for (var a = 0; a < ac; a++) {
+        var sa = p, an = u2(), al = u4(), name = str(an);
+        if (name === "Code") {
+          var ms = u2(), ml = u2(), cl = u4(); R(sa, owner + ": атрибут Code", "max_stack = " + ms + " (глубина стека операндов), max_locals = " + ml + " (слоты локальных переменных), code_length = " + cl, 4);
+          var cs = p, dis = [];
+          while (p < cs + cl) { var op = bytes[p], o = OPS[op] || ["op_0x" + op.toString(16), 0], at = p - cs; p++; var arg = 0; for (var z = 0; z < o[1]; z++) arg = arg << 8 | bytes[p++]; dis.push(at + ": " + o[0] + (o[1] ? (o[1] === 2 || o[0] === "ldc" ? " #" + arg + "  // " + str(arg) : " " + (arg << 24 >> 24)) : "")); }
+          R(cs, owner + ": байткод (" + cl + " байт)", dis.join("\n"), 3);
+          var se = p, el = u2(); p += el * 8; R(se, owner + ": exception_table_length", el + " (обработчиков try/catch нет)", 4);
+          attrs(owner + " → Code");
+        } else { p += al; R(sa, owner + ": атрибут " + name, "длина " + al, 4); }
+      }
+    }
+    function members(kind) {
+      var s1 = p, cnt = u2(); R(s1, kind + "_count", cnt, 2);
+      for (var f = 0; f < cnt; f++) {
+        var sm = p, fl = u2(), nm = u2(), ds = u2(), nme = str(nm);
+        R(sm, kind + " " + nme, "flags 0x" + fl.toString(16).padStart(4, "0") + (fl & 1 ? " PUBLIC" : "") + (fl & 2 ? " PRIVATE" : "") + (fl & 8 ? " STATIC" : "") + (fl & 0x10 ? " FINAL" : "") + "\nимя #" + nm + " = " + nme + "\nдескриптор #" + ds + " = " + str(ds) + (nme === "<init>" ? "\n<init> — конструктор, сгенерированный javac" : nme === "<clinit>" ? "\n<clinit> — статический инициализатор: counter = 42" : ""), 2);
+        attrs(nme);
+      }
+    }
+    if (!err || /Invalid constant/.test(err)) { members("field"); members("method"); attrs("class"); }
+    return err;
+  }
+  function render() {
+    var err = parse(), owner = new Array(bytes.length);
+    regs.forEach(function (r, i) { for (var b = r.s; b < r.e; b++) owner[b] = i; });
+    $("cfHex").innerHTML = bytes.map(function (b, i) { var r = regs[owner[i]]; return '<span data-r="' + owner[i] + '" class="g' + (r ? r.g : 0) + (owner[i] === sel ? " sel" : "") + '">' + b.toString(16).padStart(2, "0") + "</span>"; }).join("");
+    $("cfList").innerHTML = regs.map(function (r, i) { return '<div data-r="' + i + '"' + (i === sel ? ' class="sel"' : "") + "><small>" + r.s + "–" + (r.e - 1) + "</small><span><code>" + r.label.replace(/</g, "&lt;") + "</code></span></div>"; }).join("");
+    $("cfV").className = "verdict " + (err ? "bad" : "ok");
+    $("cfV").textContent = err ? err : "Файл корректен: " + bytes.length + " байт, " + regs.length + " структур. Зелёное — класс и члены, синее — пул констант, жёлтое — байткод.";
+  }
+  function pick(i) { sel = i; var r = regs[i]; if (!r) return; $("cfDet").textContent = r.label + "  [байты " + r.s + "–" + (r.e - 1) + "]\n" + r.det; render(); var el = $("cfList").querySelector('[data-r="' + i + '"]'); if (el) el.scrollIntoView({ block: "nearest" }); }
+  $("cfHex").addEventListener("click", function (e) { var t = e.target.closest("[data-r]"); if (t) pick(+t.getAttribute("data-r")); });
+  $("cfList").addEventListener("click", function (e) { var t = e.target.closest("[data-r]"); if (t) pick(+t.getAttribute("data-r")); });
+  $("cfOrig").addEventListener("click", function () { load(HEX); sel = -1; render(); });
+  $("cfMagic").addEventListener("click", function () { load(HEX); bytes[3] = 0xBF; sel = 0; render(); pick(0); });
+  $("cfVer").addEventListener("click", function () { load(HEX); bytes[7] = 70; sel = 2; render(); pick(2); });
+  $("cfCp").addEventListener("click", function () { load(HEX); bytes[11] = 0; bytes[12] = 99; render(); });
+  load(HEX); render();
+})();
+</script>
+
+<h2 id="pool"><span class="h-num">2.3</span>Пул констант</h2>
+<p>Пул констант — таблица символов класса. Байткод не содержит строк и имён: <code>getstatic #7</code> ссылается на запись <code>Fieldref</code>, та — на <code>Class</code> и <code>NameAndType</code>, а те — на строки <code>Utf8</code>. Это <b>символические ссылки</b>: пока класс не слинкован, JVM знает только имена. Превращение их в прямые указатели (на объект Class, смещение поля, точку входа метода) — это <b>разрешение</b> (resolution, тема 06).</p>
+<div class="table-wrap"><table>
+<tr><th>Тег</th><th>Что хранит</th></tr>
+<tr><td>Utf8</td><td>строка в модифицированной UTF-8 (нулевой символ кодируется двумя байтами)</td></tr>
+<tr><td>Integer, Float, Long, Double</td><td>числовые константы (int от −32768 до 32767 чаще кодируются прямо в инструкции bipush/sipush)</td></tr>
+<tr><td>Class, String</td><td>ссылка на Utf8 с именем класса / содержимым строкового литерала</td></tr>
+<tr><td>Fieldref, Methodref, InterfaceMethodref</td><td>класс + NameAndType</td></tr>
+<tr><td>NameAndType</td><td>имя + дескриптор</td></tr>
+<tr><td>MethodHandle, MethodType, InvokeDynamic, Dynamic</td><td>для invokedynamic и динамических констант (тема 04)</td></tr>
+<tr><td>Module, Package</td><td>в module-info.class</td></tr>
+</table></div>
+
+<h2 id="descriptors"><span class="h-num">2.4</span>Дескрипторы</h2>
+<div class="grid-2">
+<div class="table-wrap"><table>
+<tr><th>Символ</th><th>Тип</th></tr>
+<tr><td><code>B C D F I J S Z</code></td><td>byte char double float int <b>long</b> short boolean</td></tr>
+<tr><td><code>V</code></td><td>void</td></tr>
+<tr><td><code>Ljava/lang/String;</code></td><td>ссылочный тип</td></tr>
+<tr><td><code>[I</code>, <code>[[Ljava/lang/Object;</code></td><td>массивы</td></tr>
+</table></div>
+<div class="widget" id="dsW" style="margin:0">
+  <div class="widget-title">Декодер дескрипторов</div>
+  <div class="controls"><label>дескриптор<input type="text" id="dsIn" value="(ILjava/util/List;[[J)Ljava/lang/String;"></label></div>
+  <div class="out" id="dsOut"></div>
+</div>
+</div>
+<script>
+(function () {
+  var P = { B: "byte", C: "char", D: "double", F: "float", I: "int", J: "long", S: "short", Z: "boolean", V: "void" };
+  var $ = function (i) { return document.getElementById(i); };
+  function one(s, i) { var dim = 0; while (s[i] === "[") { dim++; i++; } var t; if (s[i] === "L") { var e = s.indexOf(";", i); if (e < 0) throw "нет ';'"; t = s.slice(i + 1, e).replace(/\//g, "."); i = e + 1; } else if (P[s[i]]) { t = P[s[i]]; i++; } else throw "неизвестный символ «" + (s[i] || "конец") + "» в позиции " + i; return [t + "[]".repeat(dim), i]; }
+  function run() {
+    var s = $("dsIn").value.trim(), out;
+    try {
+      if (s[0] === "(") { var i = 1, args = []; while (s[i] !== ")") { if (i >= s.length) throw "нет ')'"; var r = one(s, i); args.push(r[0]); i = r[1]; } var ret = one(s, i + 1); out = "метод: " + ret[0] + " m(" + args.join(", ") + ")\nслотов под аргументы: " + args.reduce(function (n, a) { return n + (a === "long" || a === "double" ? 2 : 1); }, 0) + " (+1 для this у экземплярного метода; long/double занимают 2)"; }
+      else out = "поле: " + one(s, 0)[0];
+    } catch (e) { out = "ошибка: " + e; }
+    $("dsOut").textContent = out;
+  }
+  $("dsIn").addEventListener("input", run); run();
+})();
+</script>
+<p>Дескриптор метода не содержит возвращаемого типа в «сигнатуре перегрузки» Java, но в class-файле он есть — поэтому на уровне JVM могут существовать два метода с одинаковыми аргументами и разными возвращаемыми типами (так компилятор делает bridge-методы для дженериков и ковариантных возвратов). Дженерики живут только в атрибуте <code>Signature</code> — для рефлексии; байткод работает со стёртыми типами.</p>
+
+<h2 id="attributes"><span class="h-num">2.5</span>Атрибуты</h2>
+<div class="table-wrap"><table>
+<tr><th>Атрибут</th><th>Где</th><th>Зачем</th></tr>
+<tr><td><code>Code</code></td><td>метод</td><td>байткод, max_stack, max_locals, таблица исключений</td></tr>
+<tr><td><code>StackMapTable</code></td><td>Code</td><td>типы на стеке и в локальных переменных в точках ветвления — ускоряет верификацию (тема 06)</td></tr>
+<tr><td><code>LineNumberTable</code>, <code>LocalVariableTable</code></td><td>Code</td><td>номера строк для стектрейсов и имена переменных для отладчика (<code>-g</code>)</td></tr>
+<tr><td><code>Exceptions</code></td><td>метод</td><td><code>throws</code> — только для javac и рефлексии, JVM не проверяет</td></tr>
+<tr><td><code>Signature</code></td><td>класс, поле, метод</td><td>дженерики</td></tr>
+<tr><td><code>RuntimeVisibleAnnotations</code></td><td>везде</td><td>аннотации с <code>@Retention(RUNTIME)</code></td></tr>
+<tr><td><code>InnerClasses</code>, <code>NestHost</code>/<code>NestMembers</code></td><td>класс</td><td>вложенные классы и доступ к private между ними без синтетических методов (Java 11+)</td></tr>
+<tr><td><code>BootstrapMethods</code></td><td>класс</td><td>начальные методы для invokedynamic</td></tr>
+<tr><td><code>Record</code>, <code>PermittedSubclasses</code></td><td>класс</td><td>records и sealed-иерархии</td></tr>
+<tr><td><code>MethodParameters</code></td><td>метод</td><td>имена параметров (<code>-parameters</code>) — нужны Spring для @PathVariable без имени</td></tr>
+</table></div>
+<pre data-title="инструменты"><code class="txt">javap -c -p Hello.class          # байткод всех методов, включая private
+javap -v Hello.class             # всё: пул констант, флаги, атрибуты, StackMapTable
+javap -c -p java.lang.String     # классы JDK тоже можно смотреть
+# программно: java.lang.classfile (Class-File API, финальный в Java 24), ASM, Byte Buddy</code></pre>
+
+<h2 id="quiz"><span class="h-num">2.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Ошибка <code>UnsupportedClassVersionError … class file version 69.0 … only recognizes up to 65.0</code>. Что случилось?</p><ul><li>Повреждён class-файл</li><li>Класс скомпилирован для Java 25, а запускается на Java 21</li><li>Не найден класс</li><li>Нехватка памяти</li></ul><div class="why">major − 44 = версия Java. Компилируйте с --release по минимальной целевой версии.</div></div>
+<div class="mcq" data-ok="3"><p>Где хранится строка «Hi» из <code>println("Hi")</code>?</p><ul><li>Прямо в байткоде инструкции</li><li>В куче при компиляции</li><li>В атрибуте SourceFile</li><li>В пуле констант: String → Utf8; инструкция ldc ссылается на индекс</li></ul><div class="why">При выполнении ldc JVM возвращает интернированный объект String.</div></div>
+<div class="mcq" data-ok="0"><p>Что означает дескриптор <code>(J[Ljava/lang/String;)Z</code>?</p><ul><li><code>boolean m(long, String[])</code></li><li><code>int m(String, long)</code></li><li><code>long m(boolean, String[])</code></li><li><code>void m(Object)</code></li></ul><div class="why">J — long, Z — boolean.</div></div>
+<div class="mcq" data-ok="2"><p>Почему в стектрейсе бывает «Unknown Source» вместо номера строки?</p><ul><li>Класс загружен из сети</li><li>Ошибка JIT</li><li>Класс скомпилирован без отладочной информации (нет SourceFile/LineNumberTable)</li><li>Метод нативный</li></ul><div class="why">Флаги javac -g, -g:none.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как JVM находит поле <code>System.out</code> при выполнении <code>getstatic #7</code>?</summary><div class="a"><p>#7 — Fieldref на Class #8 (java/lang/System) и NameAndType #9 (out : Ljava/io/PrintStream;). При первом выполнении инструкции запись разрешается: загружается и инициализируется класс System, ищется поле с таким именем и дескриптором, проверяется доступ; результат (адрес статического поля в зеркале класса) кэшируется в пуле констант времени выполнения, следующие выполнения берут его сразу. Интерпретатор даже переписывает инструкцию в «быструю» форму.</p></div></details>
+<details class="q"><summary>Зачем знать формат class-файла прикладному разработчику?</summary><div class="a"><p>Чтобы понимать ошибки ClassFormatError/UnsupportedClassVersionError/NoSuchMethodError, работу агентов и инструментирования (Mockito, Hibernate, Spring AOP генерируют и меняют классы через Byte Buddy/ASM/Class-File API), что видит рефлексия (параметры, дженерики, аннотации), как javac компилирует лямбды, строковую конкатенацию, records — и читать javap при разборе производительности.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

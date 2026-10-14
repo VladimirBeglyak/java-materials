@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Fail-fast, modCount и ConcurrentModificationException</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ОСНОВЫ</div>
+  <h1>Fail-fast, modCount и ConcurrentModificationException</h1>
+  <p class="lead"><code>ConcurrentModificationException</code> чаще всего бросается в <b>однопоточном</b> коде: удалили элемент из списка внутри for-each. Разбираемся, как устроен механизм fail-fast через счётчик <code>modCount</code>, почему удаление предпоследнего элемента «проходит» без исключения, как правильно удалять при обходе, и чем fail-fast отличается от итераторов-снимков и слабо согласованных итераторов конкурентных коллекций.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">modCount</span><span class="tag">expectedModCount</span><span class="tag">CME</span><span class="tag">removeIf</span><span class="tag">fail-safe</span><span class="tag">weakly consistent</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="mech"><span class="h-num">3.1</span>Механизм</h2>
+<pre data-title="ArrayList и его итератор (упрощённо, по исходникам JDK)"><code class="java">public class ArrayList&lt;E&gt; … {
+    protected transient int modCount = 0;     // в AbstractList: счётчик структурных изменений
+    public boolean add(E e)   { modCount++; … }
+    public E remove(int i)    { modCount++; … }
+    public E set(int i, E e)  { … }             // НЕ структурное изменение — modCount не меняется
+
+    private class Itr implements Iterator&lt;E&gt; {
+        int cursor;                              // индекс следующего элемента
+        int lastRet = -1;
+        int expectedModCount = modCount;         // снимок при создании итератора
+
+        public boolean hasNext() { return cursor != size; }
+        public E next() {
+            checkForComodification();            // modCount != expectedModCount → CME
+            int i = cursor;
+            if (i &gt;= size) throw new NoSuchElementException();
+            cursor = i + 1;
+            return (E) elementData[lastRet = i];
+        }
+        public void remove() {
+            if (lastRet &lt; 0) throw new IllegalStateException();
+            checkForComodification();
+            ArrayList.this.remove(lastRet);      // modCount++
+            cursor = lastRet; lastRet = -1;
+            expectedModCount = modCount;         // итератор «узаконивает» собственное изменение
+        }
+    }
+}</code></pre>
+<p><b>Структурное изменение</b> — то, что меняет размер или устройство (add, remove, clear, rehash у HashMap). Замена значения (<code>set</code>, <code>put</code> существующего ключа) структурным не считается.</p>
+
+<h2 id="sim"><span class="h-num">3.2</span>Симулятор: удаление внутри for-each</h2>
+<pre style="margin:0"><code class="java">List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("A", "B", "C", "D", "E"));
+for (String s : list) {
+    if (s.equals(TARGET)) list.remove(s);    // удаление в обход итератора
+}</code></pre>
+<div class="widget" id="ffW">
+  <div class="widget-title">Что произойдёт?</div>
+  <div class="controls">
+    <label>TARGET<select id="ffT"><option>A</option><option>B</option><option selected>C</option><option value="D">D (предпоследний)</option><option>E</option></select></label>
+    <label>способ удаления<select id="ffM"><option value="list">list.remove(s) внутри for-each</option><option value="iter">it.remove() явного итератора</option><option value="removeIf">list.removeIf(s -&gt; s.equals(TARGET))</option></select></label>
+    <button class="btn primary" type="button" id="ffStep">Шаг ▶</button>
+    <button class="btn" type="button" id="ffAll">До конца</button>
+    <button class="btn" type="button" id="ffReset">↺</button>
+  </div>
+  <div class="out" id="ffState"></div>
+  <div class="log" id="ffLog"></div>
+  <div class="verdict" id="ffV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, L, cursor, lastRet, mod, exp, log, done, phase, seen;
+  function reset() { L = ["A", "B", "C", "D", "E"]; cursor = 0; lastRet = -1; mod = 0; exp = 0; log = ["iterator(): cursor=0, expectedModCount = modCount = 0"]; done = false; phase = "hasNext"; seen = []; $("ffV").className = "verdict"; $("ffV").textContent = "Нажимайте «Шаг» и следите за cursor, size и modCount."; draw(); }
+  function step() {
+    if (done) return; var t = $("ffT").value, m = $("ffM").value;
+    if (m === "removeIf") { var idx = L.indexOf(t); L = L.filter(function (x) { return x !== t; }); mod++; log.push("removeIf: один проход с отметкой удаляемых (битовая маска), затем один сдвиг массива; modCount++ один раз. Итераторы снаружи не участвуют."); done = true; finish("ok", "Безопасно и быстро: O(n) вместо O(n²) у многократного remove(i). Результат: " + JSON.stringify(L)); draw(); return; }
+    if (phase === "hasNext") {
+      var hn = cursor !== L.length; log.push("hasNext(): cursor " + cursor + " != size " + L.length + " → " + hn);
+      if (!hn) { done = true; finish(seen.length < 5 && L.indexOf(t) < 0 && t === "D" ? "warn" : "ok", t === "D" && m === "list" ? "Цикл завершился без исключения, но элемент E НЕ был обработан! После удаления D size стал 4, а cursor = 4 — hasNext вернул false до проверки modCount. Ошибка спряталась." : "Обход завершён. Список: " + JSON.stringify(L) + ". Обработаны: " + seen.join(", ")); }
+      else phase = "next"; draw(); return;
+    }
+    if (phase === "next") {
+      if (mod !== exp) { log.push("next(): checkForComodification: modCount " + mod + " != expectedModCount " + exp + " → ConcurrentModificationException"); done = true; finish("bad", "ConcurrentModificationException в однопоточном коде: список изменён в обход итератора. Исключение возникает на следующем next(), а не в момент удаления."); draw(); return; }
+      lastRet = cursor; var s = L[cursor++]; seen.push(s); log.push("next() → \"" + s + "\" (cursor=" + cursor + ")");
+      phase = s === t ? "remove" : "hasNext"; draw(); return;
+    }
+    if (phase === "remove") {
+      if (m === "list") { var i2 = L.indexOf(t); L.splice(i2, 1); mod++; log.push("list.remove(\"" + t + "\"): элемент удалён, хвост сдвинут влево, size=" + L.length + ", modCount=" + mod + " (expected остался " + exp + ")"); }
+      else { L.splice(lastRet, 1); mod++; cursor = lastRet; lastRet = -1; exp = mod; log.push("it.remove(): удалён \"" + t + "\", cursor=" + cursor + ", expectedModCount = modCount = " + mod); }
+      phase = "hasNext"; draw();
+    }
+  }
+  function finish(c, t) { $("ffV").className = "verdict " + c; $("ffV").textContent = t; }
+  function draw() {
+    $("ffState").textContent = "elementData: [" + L.map(function (x, i) { return (i === cursor ? "▸" : "") + x; }).join(", ") + (cursor === L.length ? "▸" : "") + "]\ncursor=" + cursor + "  size=" + L.length + "  modCount=" + mod + "  expectedModCount=" + exp;
+    $("ffLog").textContent = log.slice(-9).join("\n"); $("ffLog").scrollTop = 1e6;
+  }
+  $("ffStep").addEventListener("click", step); $("ffAll").addEventListener("click", function () { var g = 0; while (!done && g++ < 60) step(); });
+  $("ffReset").addEventListener("click", reset); ["ffT", "ffM"].forEach(function (i) { $(i).addEventListener("change", reset); });
+  reset();
+})();
+</script>
+
+<h2 id="right"><span class="h-num">3.3</span>Как удалять правильно</h2>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Когда</th></tr>
+<tr><td><code>coll.removeIf(pred)</code></td><td>по условию — лучший вариант: один проход, O(n) для ArrayList</td></tr>
+<tr><td><code>Iterator.remove()</code></td><td>когда решение зависит от состояния обхода, или нужно ещё что-то сделать с элементом</td></tr>
+<tr><td><code>map.entrySet().removeIf(e -&gt; …)</code>, <code>map.values().removeIf(…)</code></td><td>удаление записей Map по ключу или значению</td></tr>
+<tr><td>Собрать в новую коллекцию (<code>stream().filter().toList()</code>)</td><td>когда исходную коллекцию менять нельзя или она неизменяемая</td></tr>
+<tr><td>Обратный индексный цикл <code>for (int i = size - 1; i &gt;= 0; i--)</code></td><td>старый приём для списков; O(n²) на ArrayList при многих удалениях</td></tr>
+</table></div>
+
+<h2 id="kinds"><span class="h-num">3.4</span>Три поведения итераторов</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Fail-fast</th><th>Снимок (snapshot, «fail-safe»)</th><th>Слабо согласованный (weakly consistent)</th></tr>
+<tr><td>Кто</td><td>ArrayList, HashMap, TreeMap, LinkedList, ArrayDeque…</td><td>CopyOnWriteArrayList/Set</td><td>ConcurrentHashMap, ConcurrentLinkedQueue, ConcurrentSkipListMap, LinkedBlockingQueue</td></tr>
+<tr><td>Изменение во время обхода</td><td>CME (по возможности)</td><td>никогда не мешает: итератор обходит массив на момент создания</td><td>не мешает; изменения после создания итератора могут быть видны или нет</td></tr>
+<tr><td>remove через итератор</td><td>да</td><td>нет — UnsupportedOperationException</td><td>да</td></tr>
+<tr><td>Стоимость</td><td>счётчик</td><td>копирование массива на каждую запись</td><td>особые структуры данных</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Fail-fast — лишь «best effort»</span>
+Документация: «поведение fail-fast не гарантируется… следует использовать только для обнаружения ошибок». modCount — не volatile; при изменении из другого потока итератор может не заметить его, прочитать полуизменённую структуру или зациклиться. CME — не механизм синхронизации, а сигнал о баге.
+</div>
+
+<h2 id="quiz"><span class="h-num">3.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему удаление предпоследнего элемента ArrayList внутри for-each не бросает CME?</p><ul><li>Предпоследний элемент особенный</li><li>Удаление в конце не меняет modCount</li><li>После удаления size уменьшился и сравнялся с cursor, hasNext() вернул false — до проверки в next() дело не дошло; последний элемент пропущен</li><li>Это поведение LinkedList</li></ul><div class="why">Тихая ошибка хуже исключения.</div></div>
+<div class="mcq" data-ok="0"><p>Меняет ли <code>list.set(i, x)</code> modCount?</p><ul><li>Нет: это не структурное изменение</li><li>Да</li><li>Только у LinkedList</li><li>Только если x равен null</li></ul><div class="why">Поэтому replaceAll и set внутри обхода безопасны.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает итератор CopyOnWriteArrayList, если во время обхода добавили элемент?</p><ul><li>Бросает CME</li><li>Включает новый элемент в обход</li><li>Блокируется</li><li>Ничего не замечает: обходит снимок массива на момент создания</li></ul><div class="why">Снимок неизменен — запись создаёт новый массив.</div></div>
+<div class="mcq" data-ok="1"><p>Можно ли полагаться на CME для обнаружения гонок между потоками?</p><ul><li>Да, это гарантия</li><li>Нет: fail-fast — best effort, без синхронизации изменения из другого потока могут быть не замечены или испортить обход</li><li>Да, если коллекция synchronized</li><li>Только для HashMap</li></ul><div class="why">Для многопоточности — конкурентные коллекции или синхронизация.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему removeIf у ArrayList быстрее, чем удаление через итератор в цикле?</summary><div class="a"><p>Каждый it.remove() сдвигает хвост массива (System.arraycopy) — k удалений = O(n·k). removeIf проходит массив один раз, отмечает удаляемые элементы в битовой маске, затем одним проходом уплотняет оставшиеся — O(n), и меняет modCount один раз. Плюс, если предикат бросит исключение, список остаётся неизменным.</p></div></details>
+<details class="q"><summary>CME при обходе HashMap внутри одного метода без циклов удаления — где искать?</summary><div class="a"><p>Изменение карты в теле цикла косвенно: вызов метода, который кладёт в эту же карту (например, кэш с computeIfAbsent, рекурсивно меняющий ту же карту — у HashMap computeIfAbsent с изменением внутри функции тоже даёт CME), слушатели и колбэки, обход keySet с put нового ключа. Также — обход в одном потоке при изменении в другом (тогда это гонка, и CME — удача).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

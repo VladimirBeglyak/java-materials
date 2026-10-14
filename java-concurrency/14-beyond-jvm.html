@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Конкурентность за пределами JVM</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · КОНКУРЕНТНОСТЬ В СИСТЕМЕ</div>
+  <h1>Конкурентность за пределами JVM: база данных и распределённые блокировки</h1>
+  <p class="lead">Всё, что было до сих пор, — <code>synchronized</code>, <code>ReentrantLock</code>, атомарные типы — работает внутри одного процесса. Но сервис запущен в трёх экземплярах, а общее состояние лежит в базе данных. Гонки никуда не делись: они переехали на уровень транзакций. Разберём потерянное обновление в БД, оптимистичные и пессимистичные блокировки, идемпотентность и то, почему распределённый лок коварнее, чем кажется.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">lost update</span><span class="tag">SELECT FOR UPDATE</span><span class="tag">@Version</span><span class="tag">fencing token</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="problem"><span class="h-num">14.1</span>Почему synchronized не помогает</h2>
+<pre class="bad-code" data-title="Защита, которая работает только на ноутбуке разработчика"><code class="java">@Service
+class StockService {
+    public synchronized void reserve(long productId, int qty) {      // монитор — в памяти ОДНОГО процесса
+        Product p = repo.findById(productId).orElseThrow();
+        if (p.getStock() &lt; qty) throw new OutOfStockException();
+        p.setStock(p.getStock() - qty);
+        repo.save(p);
+    }
+}</code></pre>
+<div class="flow">
+  <div class="node info"><b>Экземпляр 1</b><small>свой монитор</small></div><span class="to">↘</span>
+  <div class="node acc"><b>PostgreSQL</b><small>products.stock — общее состояние</small></div><span class="to">↙</span>
+  <div class="node info"><b>Экземпляр 2</b><small>свой монитор</small></div>
+</div>
+<p>Два экземпляра сервиса не знают о мониторах друг друга. К тому же даже в одном экземпляре <code>synchronized</code> на методе с <code>@Transactional</code> отпускается <b>до коммита</b> (прокси коммитит после выхода из метода) — второй поток успевает прочитать старое значение. Общее состояние в БД нужно защищать средствами БД.</p>
+
+<h2 id="lost"><span class="h-num">14.2</span>Потерянное обновление в базе</h2>
+<div class="widget" id="luW">
+  <div class="widget-title">Симулятор: два покупателя и последний товар</div>
+  <p class="hint"><code>stock = 1</code>. Две транзакции одновременно резервируют по одной штуке. Выберите способ защиты.</p>
+  <div class="controls"><label>стратегия<select id="luMode" style="max-width:100%">
+    <option value="none">никакой: SELECT → проверка в коде → UPDATE (READ COMMITTED)</option>
+    <option value="atomic">атомарный UPDATE … SET stock = stock - 1 WHERE id = ? AND stock &gt;= 1</option>
+    <option value="forupdate">пессимистичная: SELECT … FOR UPDATE</option>
+    <option value="version">оптимистичная: столбец version (@Version)</option>
+    <option value="serializable">уровень изоляции SERIALIZABLE</option>
+    <option value="rr">уровень изоляции REPEATABLE READ (PostgreSQL)</option>
+  </select></label></div>
+  <div class="grid-2">
+    <div><b style="font-size:14px">Транзакция A</b><div class="log" id="luA" style="max-height:none"></div></div>
+    <div><b style="font-size:14px">Транзакция B</b><div class="log" id="luB" style="max-height:none"></div></div>
+  </div>
+  <div class="verdict" id="luOut"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    none: [["BEGIN", "SELECT stock → 1", "", "проверка: 1 >= 1 ✓", "UPDATE SET stock = 0", "COMMIT", ""], ["BEGIN", "", "SELECT stock → 1", "проверка: 1 >= 1 ✓", "", "UPDATE SET stock = 0   (ждёт A, затем затирает)", "COMMIT"], "bad", "Оба покупателя получили подтверждение, товар один, stock = 0 (при «stock - qty», вычисленном в коде, даже не −1). Read-modify-write в приложении — гонка на любом уровне изоляции ниже REPEATABLE READ."],
+    atomic: [["BEGIN", "UPDATE … SET stock = stock - 1", "   WHERE id = 7 AND stock >= 1", "→ 1 строка изменена ✓", "COMMIT", "", ""], ["BEGIN", "UPDATE … WHERE … stock >= 1", "   (ждёт блокировку строки)", "", "после коммита A условие перепроверено:", "stock = 0 → 0 строк изменено", "→ OutOfStockException, ROLLBACK"], "ok", "Проверка и изменение — одна операция внутри БД; строка блокируется на время UPDATE, и вторая транзакция перечитывает актуальное значение. Самый простой и быстрый способ, когда правило умещается в WHERE. Приложение проверяет число изменённых строк."],
+    forupdate: [["BEGIN", "SELECT … FOR UPDATE → 1  (строка заблокирована)", "проверка в коде ✓", "UPDATE SET stock = 0", "COMMIT (блокировка снята)", "", ""], ["BEGIN", "SELECT … FOR UPDATE", "   …ждёт…", "   …ждёт…", "→ 0  (видит результат A)", "проверка: 0 >= 1 ✘", "OutOfStockException, ROLLBACK"], "ok", "Пессимистичная блокировка: второй ждёт, пока первый закончит. Годится для сложной логики между чтением и записью и при частых конфликтах. Риски: ожидание (нужен lock timeout или NOWAIT / SKIP LOCKED) и deadlock при блокировке нескольких строк в разном порядке."],
+    version: [["BEGIN", "SELECT stock, version → 1, v5", "проверка ✓", "UPDATE SET stock = 0, version = 6", "   WHERE id = 7 AND version = 5 → 1 строка", "COMMIT", ""], ["BEGIN", "SELECT stock, version → 1, v5", "проверка ✓", "UPDATE … WHERE id = 7 AND version = 5", "   (ждёт A) → 0 строк: версия уже 6", "OptimisticLockException", "ROLLBACK → повтор: читает stock = 0 → отказ"], "ok", "Оптимистичная блокировка: никто никого не ждёт на чтении, конфликт обнаруживается при записи. Идеальна при редких конфликтах и для форм «открыл — подумал — сохранил». Требует обработки исключения: повтор или сообщение пользователю."],
+    serializable: [["BEGIN ISOLATION LEVEL SERIALIZABLE", "SELECT stock → 1", "UPDATE SET stock = 0", "COMMIT ✓", "", "", ""], ["BEGIN ISOLATION LEVEL SERIALIZABLE", "SELECT stock → 1", "UPDATE SET stock = 0  (ждёт A)", "ERROR 40001: could not serialize access", "   due to concurrent update", "ROLLBACK → приложение повторяет транзакцию", "повтор: stock = 0 → отказ"], "ok", "БД гарантирует результат, эквивалентный последовательному выполнению, и откатывает «лишнюю» транзакцию. Код простой, но приложение обязано повторять транзакции при SQLState 40001, а пропускная способность под конкуренцией падает."],
+    rr: [["BEGIN ISOLATION LEVEL REPEATABLE READ", "SELECT stock → 1", "UPDATE SET stock = 0", "COMMIT ✓", "", "", ""], ["BEGIN ISOLATION LEVEL REPEATABLE READ", "SELECT stock → 1", "UPDATE SET stock = 0  (ждёт A)", "ERROR 40001: could not serialize access", "   due to concurrent update", "ROLLBACK → повтор", ""], "warn", "В PostgreSQL REPEATABLE READ (снимок) обнаруживает потерянное обновление и откатывает вторую транзакцию. Но это особенность реализации: в MySQL InnoDB на том же уровне обновление будет потеряно. И от write skew (проверка по нескольким строкам) этот уровень не защищает."]
+  };
+  var s = document.getElementById("luMode");
+  function run() { var d = D[s.value]; document.getElementById("luA").textContent = d[0].join("\n"); document.getElementById("luB").textContent = d[1].join("\n"); var o = document.getElementById("luOut"); o.className = "verdict " + d[2]; o.textContent = d[3]; }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="optimistic"><span class="h-num">14.3</span>Оптимистичная и пессимистичная блокировки в коде</h2>
+<pre data-title="JPA: оптимистичная"><code class="java">@Entity
+class Product {
+    @Id Long id;
+    int stock;
+    @Version long version;                      // Hibernate сам добавит «AND version = ?» и увеличит версию
+}
+
+@Retryable(retryFor = ObjectOptimisticLockingFailureException.class, maxAttempts = 3)   // повтор — СНАРУЖИ транзакции
+@Transactional
+public void reserve(long id, int qty) {
+    Product p = repo.findById(id).orElseThrow();
+    if (p.getStock() &lt; qty) throw new OutOfStockException(id);
+    p.setStock(p.getStock() - qty);            // при коммите: UPDATE … WHERE id = ? AND version = ?
+}</code></pre>
+<pre data-title="JPA: пессимистичная"><code class="java">public interface ProductRepository extends JpaRepository&lt;Product, Long&gt; {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)                                         // SELECT … FOR UPDATE
+    @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "2000"))
+    @Query("select p from Product p where p.id = :id")
+    Optional&lt;Product&gt; findForUpdate(long id);
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>Оптимистичная</th><th>Пессимистичная</th><th>Атомарный UPDATE</th></tr>
+<tr><td>Конфликты</td><td>редкие</td><td>частые</td><td>любые</td></tr>
+<tr><td>Ожидание</td><td>нет; проигравший повторяет</td><td>проигравший ждёт</td><td>короткое, на время UPDATE</td></tr>
+<tr><td>Логика между чтением и записью</td><td>любая, даже через «время на подумать» пользователя</td><td>любая, но транзакция должна быть короткой</td><td>только то, что выражается в SQL</td></tr>
+<tr><td>Риски</td><td>шторм повторов под нагрузкой</td><td>deadlock, удержание соединений</td><td>нет</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Очередь задач на SKIP LOCKED</span>
+<code>SELECT … FROM jobs WHERE status = 'NEW' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED</code> — каждый воркер берёт свои строки, пропуская уже заблокированные другими. Простая надёжная очередь на PostgreSQL без дополнительной инфраструктуры.</div>
+
+<h2 id="unique"><span class="h-num">14.4</span>Уникальные ограничения как инструмент конкурентности</h2>
+<pre class="bad-code"><code class="java">if (!repo.existsByEmail(email)) repo.save(new User(email));    // check-then-act: два запроса проходят проверку одновременно</code></pre>
+<pre class="good-code"><code class="java">try {
+    repo.saveAndFlush(new User(email));                         // UNIQUE(email) в схеме — арбитр
+} catch (DataIntegrityViolationException e) {
+    throw new EmailAlreadyUsedException(email);
+}
+// или: INSERT … ON CONFLICT (email) DO NOTHING — и проверить число вставленных строк</code></pre>
+<p>Ограничение уникальности — единственный способ гарантировать «не более одного» при параллельных вставках: блокировать строку, которой ещё нет, нельзя. На этом строится <b>идемпотентность</b>: таблица <code>processed_requests(idempotency_key UNIQUE)</code>, вставка ключа в той же транзакции, что и действие. Повторный запрос с тем же ключом упрётся в ограничение и вернёт сохранённый результат.</p>
+
+<h2 id="distributed"><span class="h-num">14.5</span>Распределённые блокировки</h2>
+<p>Иногда нужно, чтобы операцию выполнял только один экземпляр: запуск задачи по расписанию, обращение к внешнему API без поддержки конкурентности. Варианты: advisory lock PostgreSQL (<code>pg_try_advisory_lock</code>), строка-замок в таблице (ShedLock), Redis (<code>SET key value NX PX 30000</code>), ZooKeeper/etcd.</p>
+<div class="widget stepper" id="flSim">
+  <div class="widget-title">Симулятор: почему лок с таймаутом не даёт гарантии</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="flLock"><h5>Сервис блокировок</h5><div class="items"><span class="chip ok" data-from="1" data-to="3">лок у A, токен 33, TTL 30 с</span><span class="chip" data-from="3" data-to="4">лок истёк</span><span class="chip ok" data-from="4">лок у B, токен 34</span></div></div>
+    <div class="lane node" id="flA"><h5>Клиент A</h5><div class="items"><span class="chip acc" data-from="1" data-to="2">работает</span><span class="chip bad" data-from="2" data-to="5">пауза GC 40 с</span><span class="chip warn" data-from="5">проснулся, считает, что лок его</span></div></div>
+    <div class="lane node" id="flB"><h5>Клиент B</h5><div class="items"><span class="chip acc" data-from="4">работает с токеном 34</span></div></div>
+    <div class="lane node" id="flS"><h5>Хранилище</h5><div class="items"><span class="chip" data-to="4">последний токен: —</span><span class="chip ok" data-from="4" data-to="6">запись B принята, токен 34</span><span class="chip bad" data-from="6">запись A с токеном 33 ОТКЛОНЕНА</span></div></div>
+  </div>
+  <section class="st-step" data-t="A берёт лок" data-hl="flLock flA"><h4>A получает лок с временем жизни</h4><p>TTL обязателен: если клиент упадёт, лок должен освободиться сам. Вместе с локом выдаётся монотонно растущий номер — <b>fencing token</b>.</p></section>
+  <section class="st-step" data-t="A замирает" data-hl="flA"><h4>Stop-the-world пауза</h4><p>Долгая сборка мусора, вытеснение виртуальной машины, сетевая задержка — процесс A «выключен» на 40 секунд и не знает об этом.</p></section>
+  <section class="st-step" data-t="TTL истёк" data-hl="flLock"><h4>Лок освобождается по таймауту</h4><p>Сервис блокировок не может отличить упавшего клиента от медленного.</p></section>
+  <section class="st-step" data-t="B берёт лок" data-hl="flLock flB flS"><h4>B получает лок и токен 34</h4><p>B законно начинает работу и пишет в хранилище, передавая свой токен. Хранилище запоминает наибольший виденный токен.</p></section>
+  <section class="st-step" data-t="A просыпается" data-hl="flA"><h4>A продолжает с того же места</h4><p>Проверка «лок ещё мой?» была выполнена <b>до</b> паузы. С точки зрения A прошло мгновение. Теперь два клиента одновременно считают себя владельцами — взаимное исключение нарушено.</p></section>
+  <section class="st-step" data-t="Защита токеном" data-hl="flS"><h4>Хранилище отклоняет устаревший токен</h4><p>A пишет с токеном 33, хранилище уже видело 34 — запись отклонена. Безопасность обеспечивает не лок, а проверка токена на стороне ресурса (или условная запись по версии).</p>
+    <p>Вывод: распределённый лок с TTL годится для <b>экономии работы</b> (не запускать задачу дважды — не страшно, если иногда запустится). Для <b>корректности</b> нужна проверка на стороне хранилища: fencing token, оптимистичная версия, уникальный ключ.</p></section>
+</div>
+
+<h2 id="idem"><span class="h-num">14.6</span>Идемпотентность — главный инструмент</h2>
+<div class="grid-2">
+  <div class="card"><h4>Почему без неё никак</h4><p>Сеть ненадёжна: клиент не получил ответ и повторил запрос; брокер доставил сообщение дважды; сработал ретрай. «Ровно один раз» по доставке недостижимо — достижимо «ровно один раз по эффекту».</p></div>
+  <div class="card"><h4>Как сделать</h4><p>Естественная идемпотентность (<code>SET status = 'PAID'</code> вместо <code>balance += 100</code>); ключ идемпотентности с уникальным индексом; таблица обработанных сообщений в одной транзакции с изменениями; условные обновления по версии.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">14.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сервис в трёх экземплярах, метод помечен synchronized и @Transactional. Защищён ли остаток товара от гонки?</p><ul><li>Да</li><li>Нет: монитор существует только в одном процессе, и даже в нём освобождается до коммита транзакции</li><li>Да, если БД PostgreSQL</li><li>Да, если метод static</li></ul><div class="why">Общее состояние в БД защищают средствами БД: атомарный UPDATE, блокировки строк, версии.</div></div>
+<div class="mcq" data-ok="2"><p>Когда оптимистичная блокировка лучше пессимистичной?</p><ul><li>При частых конфликтах</li><li>Никогда</li><li>При редких конфликтах и длительном «времени на подумать» между чтением и записью</li><li>Только для чтения</li></ul><div class="why">Она не держит блокировок; цена — повтор при конфликте. При частых конфликтах повторы съедают выигрыш.</div></div>
+<div class="mcq" data-ok="0"><p>Как гарантировать, что email будет зарегистрирован не более одного раза при параллельных запросах?</p><ul><li>Уникальным ограничением в БД и обработкой ошибки вставки</li><li>Проверкой existsByEmail перед вставкой</li><li>synchronized в сервисе</li><li>Кэшем занятых адресов</li></ul><div class="why">Проверка перед вставкой — check-then-act; только ограничение БД атомарно для несуществующей ещё строки.</div></div>
+<div class="mcq" data-ok="3"><p>Зачем fencing token в распределённой блокировке?</p><ul><li>Для шифрования</li><li>Для ускорения получения лока</li><li>Чтобы продлевать TTL</li><li>Чтобы ресурс мог отклонить запись клиента, чей лок уже истёк, но который об этом не знает</li></ul><div class="why">Клиент не может надёжно узнать, что он всё ещё владелец; проверять должен ресурс.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как защититься от потерянного обновления в БД?</summary><div class="a"><p>Атомарный UPDATE с условием в WHERE; пессимистичная блокировка SELECT … FOR UPDATE; оптимистичная блокировка по версии с повтором; более строгий уровень изоляции с повтором транзакций при ошибке сериализации. Выбор — по частоте конфликтов и сложности логики.</p></div></details>
+<details class="q"><summary>Почему распределённый лок на Redis не гарантирует взаимное исключение?</summary><div class="a"><p>Лок с TTL может истечь, пока владелец в паузе (GC, сеть), и перейти другому; владелец об этом не узнает. Плюс отказоустойчивость самого Redis (асинхронная репликация теряет лок при failover). Для корректности нужен fencing token или условная запись на стороне хранилища.</p></div></details>
+<details class="q"><summary>Как сделать обработчик сообщений идемпотентным?</summary><div class="a"><p>У сообщения уникальный id; в одной транзакции с бизнес-изменениями вставить id в таблицу обработанных (уникальный индекс); при нарушении уникальности — пропустить. Или сделать само действие идемпотентным: upsert, установка состояния, условное обновление.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

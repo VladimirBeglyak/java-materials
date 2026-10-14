@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Kafka: гарантии и отказы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · СООБЩЕНИЯ И KAFKA</div>
+  <h1>Kafka: гарантии и отказы</h1>
+  <p class="lead">Что на самом деле означает «exactly-once», где проходит граница этой гарантии, как система должна вести себя при отказе каждого звена — от продюсера до базы данных — и как Kafka Streams собирает всё это в библиотеку потоковой обработки.</p>
+  <div class="meta"><span class="tag">4 конспекта</span><span class="tag">~4 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<div class="table-wrap"><table>
+<tr><th>Гарантия</th><th>Порядок действий потребителя</th><th>Риск</th></tr>
+<tr><td><b>At-most-once</b></td><td>Зафиксировать смещение → обработать</td><td>Сбой после фиксации — сообщение потеряно</td></tr>
+<tr><td><b>At-least-once</b></td><td>Обработать → зафиксировать смещение</td><td>Сбой после обработки — сообщение обработано повторно</td></tr>
+<tr><td><b>Exactly-once</b></td><td>Обработка и фиксация смещения — одно атомарное действие</td><td>Доступно только там, где такая атомарность возможна</td></tr>
+</table></div>
+
+<h2 id="transactions"><span class="h-num">14.1</span>Транзакции Kafka<span class="sk-num">#37</span></h2>
+<p>Транзакция объединяет запись в несколько топиков и фиксацию смещений потребителя в одно действие: либо всё становится видимым, либо ничего. Это решает задачу «прочитал из топика A, обработал, записал в топик B» без дубликатов и потерь.</p>
+<figure class="sketch"><a href="img/37-kafka-transactions.jpg"><img src="img/37-kafka-transactions.jpg" width="1024" height="1536" loading="lazy" alt="Kafka Transactions: поток, свойства, сценарий consume-process-produce, настройки, API"></a><figcaption><b>Конспект #37.</b> Kafka Transactions <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<pre data-title="цикл consume → process → produce"><code class="java">producer.initTransactions();                       // один раз: регистрация transactional.id
+while (running) {
+    ConsumerRecords&lt;String, String&gt; records = consumer.poll(Duration.ofMillis(500));
+    producer.beginTransaction();
+    try {
+        for (var r : records)
+            producer.send(new ProducerRecord&lt;&gt;("topic-b", r.key(), process(r.value())));
+        producer.sendOffsetsToTransaction(offsetsOf(records), consumer.groupMetadata());
+        producer.commitTransaction();              // записи в topic-b и смещения topic-a — атомарно
+    } catch (KafkaException e) {
+        producer.abortTransaction();               // ничего не видно, смещения не сдвинуты — пакет будет прочитан снова
+    }
+}
+</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Настройка</th><th>Сторона</th><th>Роль</th></tr>
+<tr><td><code>transactional.id</code></td><td>продюсер</td><td>Постоянный идентификатор экземпляра. Включает транзакции и защиту от «зомби»</td></tr>
+<tr><td><code>enable.idempotence=true</code></td><td>продюсер</td><td>Обязательное основание транзакций</td></tr>
+<tr><td><code>isolation.level=read_committed</code></td><td>потребитель</td><td>Не показывать записи незавершённых и отменённых транзакций</td></tr>
+<tr><td><code>enable.auto.commit=false</code></td><td>потребитель</td><td>Смещения фиксирует транзакция, а не потребитель</td></tr>
+<tr><td><code>transaction.timeout.ms</code></td><td>продюсер</td><td>Брокер сам отменит транзакцию, зависшую дольше этого времени</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Как это работает внутри</span>
+<ul>
+  <li><b>Записи отменённой транзакции физически остаются в журнале.</b> Их скрывают специальные маркеры commit/abort. Потребитель с <code>read_committed</code> их пропускает, а с уровнем по умолчанию (<code>read_uncommitted</code>) — <i>видит</i>. Транзакции на стороне продюсера бесполезны без правильной настройки читателя.</li>
+  <li><b>Защита от «зомби».</b> Экземпляр завис, его сочли мёртвым и запустили замену с тем же <code>transactional.id</code>. Новый экземпляр при <code>initTransactions()</code> получает следующую «эпоху»; старый, очнувшись, получит <code>ProducerFencedException</code> и не сможет ничего записать.</li>
+  <li><b>Цена.</b> Потребитель <code>read_committed</code> читает только до первой незавершённой транзакции — долгая транзакция задерживает всех читателей партиции. Отсюда совет конспекта «keep transactions short».</li>
+</ul>
+</div>
+<p><b>Уточнение.</b> Строка <code>max.in.flight.requests.per.connection = 1</code> на конспекте — устаревшее требование: идемпотентный продюсер сохраняет порядок при значении до 5 (это и есть значение по умолчанию).</p>
+
+<h2 id="exactly-once"><span class="h-num">14.2</span>Exactly-once<span class="sk-num">#35</span></h2>
+<p>«Ровно один раз» складывается из трёх частей: идемпотентный продюсер исключает дубликаты при записи в Kafka, транзакции делают чтение-обработку-запись атомарными, идемпотентный потребитель исключает повторные побочные эффекты во внешних системах.</p>
+<figure class="sketch"><a href="img/35-kafka-exactly-once.jpg"><img src="img/35-kafka-exactly-once.jpg" width="1024" height="1536" loading="lazy" alt="Exactly Once в Kafka: три составляющие, последовательность, настройки потребителя, сценарий"></a><figcaption><b>Конспект #35.</b> Exactly Once in Kafka <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="callout bad"><span class="c-title">Главное уточнение ко всей теме: транзакция Kafka не включает базу данных</span>
+В таблице сценария на конспекте шаг 6 сформулирован как «commits transaction (offset + DB update + produce) atomically». Это упрощение, которое в реальной системе приводит к ошибкам. Транзакция Kafka атомарна <b>только для записей в Kafka и смещений</b>. Обновление PostgreSQL — отдельная транзакция в отдельной системе; общего коммита у них нет.
+<ul>
+  <li>Зафиксировали базу, упали до коммита Kafka → сообщение будет прочитано снова, база обновится повторно.</li>
+  <li>Зафиксировали Kafka, упали до коммита базы → изменение в базе потеряно, а событие дальше уже отправлено.</li>
+</ul>
+Сам конспект оговаривает это мелким текстом в разделе 7 («for Kafka → DB patterns, use idempotent consumer») — это не примечание, а суть.
+</div>
+<div class="table-wrap"><table>
+<tr><th>Поток</th><th>Как получить «эффективно один раз»</th></tr>
+<tr><td><b>Kafka → Kafka</b></td><td>Транзакции Kafka (или Kafka Streams с <code>exactly_once_v2</code>). Единственный случай настоящей exactly-once средствами платформы</td></tr>
+<tr><td><b>Kafka → база данных</b></td><td>At-least-once + идемпотентный потребитель: таблица обработанных событий в одной транзакции БД с бизнес-изменением (<a href="13-kafka-consumers.html#idempotency">тема 13</a>). Вариант — хранить смещение в той же базе и той же транзакции</td></tr>
+<tr><td><b>База данных → Kafka</b></td><td><b>Transactional outbox</b>: событие записывается в таблицу <code>outbox</code> в одной транзакции с бизнес-данными, отдельный процесс (опрос или CDC — Debezium) публикует его в Kafka. Потребители должны быть идемпотентными</td></tr>
+<tr><td><b>Kafka → внешний API</b></td><td>Ключ идемпотентности в запросе (<a href="04-api.html#idempotency">тема 04</a>), если API его поддерживает. Иначе гарантии нет</td></tr>
+</table></div>
+<div class="callout interview"><span class="c-title">Точная формулировка</span>
+Exactly-once <i>доставки</i> в распределённой системе не существует: отправитель не может отличить потерю сообщения от потери подтверждения. Существует exactly-once <i>обработка</i>, точнее — «эффективно один раз»: сообщение может быть доставлено несколько раз, но наблюдаемый результат таков, будто оно обработано однажды. Достигается либо атомарностью «результат + позиция», либо идемпотентностью.
+</div>
+<div class="callout bad"><span class="c-title">Двойная запись — корень проблемы</span>
+<pre><code class="java">orderRepository.save(order);            // коммит в БД
+kafkaTemplate.send("orders", event);    // а если здесь сбой? Заказ есть, события нет — и никто не узнает
+</code></pre>
+Поменять строки местами — получить событие о заказе, которого нет. <code>@Transactional</code> не помогает: Kafka не участвует в транзакции базы. Правильное решение — outbox.
+</div>
+
+<h2 id="failures"><span class="h-num">14.3</span>Обработка отказов<span class="sk-num">доп.</span></h2>
+<p>Сводная схема: что может сломаться на пути «продюсер → кластер → потребитель → внешняя система» и что с этим делать. Она связывает темы 12–14 в единую картину — удобна для повторения перед собеседованием.</p>
+<figure class="sketch"><a href="img/54-kafka-failure-handling.jpg"><img src="img/54-kafka-failure-handling.jpg" width="1374" height="1145" loading="lazy" alt="Kafka Failure Handling: 15 разделов — модель отказов, репликация, продюсер, потребитель, DLT, мониторинг"></a><figcaption><b>Дополнительная схема.</b> Kafka Failure Handling — Deep Dive <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>Что отказало</th><th>Что происходит</th><th>Как защищаться</th></tr>
+<tr><td>Сеть, смена лидера (продюсер)</td><td>Временная ошибка отправки</td><td>Автоматические повторы с паузой: <code>retries</code>, <code>retry.backoff.ms</code>, общий предел <code>delivery.timeout.ms</code></td></tr>
+<tr><td>Потеря подтверждения</td><td>Повтор создаёт дубликат</td><td><code>enable.idempotence=true</code></td></tr>
+<tr><td>Ошибка сериализации, авторизации</td><td>Повтор бессмыслен</td><td>Не повторять; исправлять данные, права</td></tr>
+<tr><td>Брокер с лидером</td><td>Выборы нового лидера из ISR</td><td>RF = 3, <code>min.insync.replicas</code> = 2, <code>acks=all</code> (<a href="12-kafka-core.html#rf-isr">тема 12</a>)</td></tr>
+<tr><td>Потребитель</td><td>Перебалансировка; новый владелец начинает с последнего зафиксированного смещения</td><td>Ручная фиксация после обработки + идемпотентность (<a href="13-kafka-consumers.html">тема 13</a>)</td></tr>
+<tr><td>База или API за потребителем</td><td>Обработка невозможна</td><td>Не фиксировать смещение, повторять с растущей паузой, после восстановления дочитать</td></tr>
+<tr><td>«Ядовитое» сообщение</td><td>Падает при каждой попытке, блокирует партицию</td><td>Ограниченные повторы → Dead Letter Topic</td></tr>
+<tr><td>Контроллер</td><td>Кворум KRaft выбирает нового</td><td>3 или 5 контроллеров, размещение по зонам</td></tr>
+</table></div>
+<h3>Повторы и Dead Letter Topic</h3>
+<p>Ключевое различие — <b>временная</b> ошибка (база недоступна, таймаут) и <b>постоянная</b> (невалидные данные, ошибка в коде). Первую лечит ожидание, вторую — нет: её повторы только блокируют партицию.</p>
+<div class="vs">
+  <div class="card"><h4>Блокирующие повторы</h4><ul><li>Потребитель повторяет ту же запись, не двигаясь дальше.</li><li>Порядок сохраняется.</li><li>Партиция стоит всё время повторов.</li><li>Подходят, когда недоступна зависимость: остальные записи всё равно бы не обработались.</li></ul></div>
+  <div class="card"><h4>Неблокирующие повторы</h4><ul><li>Запись перекладывается в retry-топик с задержкой, основная обработка идёт дальше.</li><li>Партиция не блокируется.</li><li><b>Порядок по ключу нарушается.</b></li><li>Подходят, когда проблема в отдельной записи.</li></ul></div>
+</div>
+<p>После исчерпания попыток запись уходит в <b>DLT</b> вместе с причиной ошибки в заголовках. DLT — не корзина: на рост числа записей в нём нужен алерт, а для разбора и повторной отправки — процедура. В Spring Kafka: <code>DefaultErrorHandler</code> + <code>DeadLetterPublishingRecoverer</code> для блокирующих повторов, <code>@RetryableTopic</code> — для неблокирующих.</p>
+<div class="callout ok"><span class="c-title">Что мониторить</span>
+<b>Consumer lag</b> по группам и партициям — главная метрика. <b>Under-replicated partitions</b> и сокращение ISR — признак больного брокера. Частота перебалансировок. Доля ошибок отправки и обработки. Число записей в DLT. Диск брокеров: заполнение диска останавливает кластер.
+</div>
+
+<h2 id="streams"><span class="h-num">14.4</span>Kafka Streams<span class="sk-num">#38</span></h2>
+<p>Kafka Streams — библиотека для Java, превращающая обычное приложение в потоковый обработчик: читает топики, преобразует, соединяет, агрегирует и пишет результат в другие топики. Отдельный кластер обработки не нужен — масштабирование, состояние и отказоустойчивость обеспечиваются самой Kafka.</p>
+<figure class="sketch"><a href="img/38-kafka-streams.jpg"><img src="img/38-kafka-streams.jpg" width="1024" height="1536" loading="lazy" alt="Kafka Streams: как работает, понятия, пример подсчёта слов, state stores, окна, операции"></a><figcaption><b>Конспект #38.</b> Kafka Streams <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>Абстракция</th><th>Что представляет</th><th>Пример</th></tr>
+<tr><td><b>KStream</b></td><td>Поток независимых событий: каждая запись — факт</td><td>Клики, платежи, показания датчика</td></tr>
+<tr><td><b>KTable</b></td><td>Таблица текущих значений: новая запись с тем же ключом заменяет старую</td><td>Профиль пользователя, остаток на складе</td></tr>
+<tr><td><b>GlobalKTable</b></td><td>Таблица, целиком загруженная на каждый экземпляр</td><td>Небольшой справочник для обогащения</td></tr>
+</table></div>
+<p><b>Двойственность потока и таблицы.</b> Таблица — это свёрнутый поток изменений; поток — это журнал изменений таблицы. Из потока событий «+5, −2, +10» получается таблица «баланс = 13», а из изменений таблицы — снова поток. На этом построены и агрегации, и восстановление состояния.</p>
+<pre data-title="подсчёт слов с конспекта"><code class="java">KStream&lt;String, String&gt; lines = builder.stream("input-topic");
+lines.flatMapValues(line -&gt; Arrays.asList(line.toLowerCase().split("\\s+")))
+     .groupBy((key, word) -&gt; word)       // смена ключа => автоматический repartition-топик
+     .count()                            // состояние в локальном хранилище + changelog-топик
+     .toStream()
+     .to("output-topic", Produced.with(Serdes.String(), Serdes.Long()));
+</code></pre>
+<div class="callout info"><span class="c-title">Состояние и его восстановление</span>
+Агрегации и соединения требуют памяти о прошлом. Она хранится в <b>state store</b> — локальной RocksDB на диске экземпляра. Каждое изменение хранилища дублируется в служебный <b>changelog-топик</b> Kafka. Экземпляр упал — другой получает его партиции и восстанавливает хранилище, прочитав changelog. Чтобы не ждать восстановления больших хранилищ, настраивают резервные копии (<code>num.standby.replicas</code>).
+</div>
+<ul>
+  <li><b>Параллелизм — снова партиции.</b> Каждая входная партиция обрабатывается отдельной задачей; экземпляры приложения делят задачи как обычная группа потребителей.</li>
+  <li><b>Время события и время обработки.</b> Окна (tumbling — непересекающиеся, hopping — с перекрытием, session — по паузам активности) считают по времени события из записи. Опоздавшие события принимаются в течение grace period; после него окно закрывается.</li>
+  <li><b>Exactly-once одной настройкой</b>: <code>processing.guarantee=exactly_once_v2</code> — чтение, обновление состояния (через changelog) и запись результата объединяются в транзакцию Kafka. Работает потому, что всё остаётся внутри Kafka; вызов внешнего API из обработчика под эту гарантию не попадает.</li>
+</ul>
+<p><b>Когда использовать</b>: агрегаты и обогащение в реальном времени на Java, когда источник и приёмник — Kafka. Для SQL-подобных запросов без кода — ksqlDB; для тяжёлой аналитики, множества источников и очень большого состояния — Apache Flink.</p>
+
+<h2 id="sim"><span class="h-num">14.5</span>Интерактив: потеряется или задвоится</h2>
+<div class="widget" id="dsW">
+  <div class="widget-title">Симулятор гарантий доставки: от продюсера до обработчика</div>
+  <div class="controls">
+    <label>acks продюсера<select id="dsAcks"><option value="0">acks = 0</option><option value="1">acks = 1</option><option value="all" selected>acks = all, min.insync.replicas = 2</option></select></label>
+    <label>продюсер<select id="dsIdem"><option value="yes">enable.idempotence = true</option><option value="no">идемпотентность выключена, retries &gt; 0</option></select></label>
+    <label>сбой на стороне брокера<select id="dsFail" style="max-width:100%"><option value="none">нет</option><option value="leader">лидер упал сразу после записи, до репликации</option><option value="ack">лидер записал, но подтверждение потерялось в сети</option></select></label>
+    <label>потребитель коммитит offset<select id="dsCommit"><option value="after">после обработки</option><option value="before">до обработки (или автокоммит по таймеру)</option></select></label>
+    <label>сбой потребителя<select id="dsCrash"><option value="none">нет</option><option value="mid">падает между обработкой и коммитом (или между коммитом и обработкой)</option></select></label>
+  </div>
+  <div class="log" id="dsLog"></div>
+  <div class="verdict" id="dsOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var acks = $("dsAcks").value, idem = $("dsIdem").value === "yes", fail = $("dsFail").value, commit = $("dsCommit").value, crash = $("dsCrash").value === "mid";
+    var L = [], lost = false, dup = false;
+    if (acks === "0") { L.push("Продюсер: отправил и не ждёт ответа."); if (fail !== "none") { lost = fail === "leader"; L.push(fail === "leader" ? "Брокер: лидер упал — сообщение пропало, продюсер об этом не узнает." : "Брокер: сообщение записано; подтверждения никто и не ждал."); } }
+    else if (acks === "1") {
+      L.push("Продюсер: ждёт подтверждения только от лидера.");
+      if (fail === "leader") { lost = true; L.push("Брокер: лидер подтвердил запись и упал до репликации. Новый лидер сообщения не имеет → ПОТЕРЯНО, хотя продюсер получил успех."); }
+      else if (fail === "ack") { L.push("Брокер: записано, подтверждение потерялось → продюсер повторяет отправку."); if (!idem) { dup = true; L.push("  без идемпотентности брокер запишет сообщение ВТОРОЙ раз."); } else L.push("  брокер узнаёт повтор по (producerId, sequence) и не записывает дубль."); }
+    } else {
+      L.push("Продюсер: ждёт, пока запись подтвердят все реплики из ISR (минимум 2).");
+      if (fail === "leader") L.push("Брокер: лидер упал до репликации → подтверждения не было → продюсер повторяет на новом лидере. Сообщение не потеряно.");
+      if (fail === "ack") { L.push("Брокер: записано и реплицировано, подтверждение потерялось → повтор."); if (!idem) { dup = true; L.push("  без идемпотентности — дубль в журнале."); } else L.push("  идемпотентный продюсер: дубль отброшен брокером."); }
+    }
+    if (!lost) {
+      if (commit === "after") { L.push("Потребитель: обработал → коммит offset."); if (crash) { dup = true; L.push("  упал после обработки, до коммита → после перезапуска сообщение придёт СНОВА."); } }
+      else { L.push("Потребитель: коммит offset → обработка."); if (crash) { lost = true; L.push("  упал после коммита, до обработки → сообщение считается прочитанным и больше не придёт: ПОТЕРЯНО для бизнеса."); } }
+    }
+    $("dsLog").textContent = L.join("\n");
+    var o = $("dsOut"), cls, msg;
+    if (lost && dup) { cls = "bad"; msg = "Возможны и потери, и дубли."; }
+    else if (lost) { cls = "bad"; msg = "At-most-once: сообщение может быть потеряно. Допустимо для метрик и логов, недопустимо для заказов и платежей."; }
+    else if (dup) { cls = "warn"; msg = "At-least-once: потерь нет, возможны дубли. Это рабочий стандарт — при условии идемпотентного обработчика (уникальный идентификатор события + проверка в той же транзакции, что и изменение)."; }
+    else { cls = "ok"; msg = "В этом сценарии сообщение доставлено и обработано ровно один раз. Но гарантировать это при любых сбоях нельзя одними настройками: надёжная схема — acks = all + идемпотентный продюсер + коммит после обработки + идемпотентный обработчик."; }
+    o.className = "verdict " + cls; o.textContent = msg;
+  }
+  ["dsAcks", "dsIdem", "dsFail", "dsCommit", "dsCrash"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">«Exactly-once» в Kafka — что это на самом деле</span>
+Транзакции Kafka атомарно связывают чтение, обработку и запись <b>внутри Kafka</b>: выходные сообщения и сдвиг offset входного топика коммитятся вместе (Kafka Streams, <code>processing.guarantee=exactly_once_v2</code>). Как только в обработке появляется внешний эффект — запись в базу, HTTP-вызов, письмо — гарантия заканчивается, и остаётся at-least-once плюс идемпотентность.</div>
+
+<h2 id="quiz"><span class="h-num">14.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что даёт enable.idempotence = true у продюсера?</p><ul><li>Exactly-once во всей системе</li><li>Повторная отправка при ретрае не создаёт дубль в партиции: брокер отбрасывает сообщения с уже виденным номером последовательности</li><li>Шифрование</li><li>Порядок между партициями</li></ul><div class="why">Защищает только участок «продюсер → брокер» в пределах сессии продюсера. Включено по умолчанию с Kafka 3.0.</div></div>
+<div class="mcq" data-ok="2"><p>Сообщение невозможно обработать ни с какой попытки (ошибка в данных). Что делать?</p><ul><li>Повторять бесконечно</li><li>Молча пропустить</li><li>После ограниченного числа попыток отправить в dead letter topic с причиной и продолжить обработку партиции</li><li>Остановить потребителя</li></ul><div class="why">«Ядовитое» сообщение не должно блокировать партицию. DLT нужен мониторинг и процедура разбора.</div></div>
+<div class="mcq" data-ok="0"><p>Почему нельзя атомарно записать в базу данных и отправить сообщение в Kafka?</p><ul><li>Это две разные системы без общей транзакции; надёжное решение — outbox: событие пишется в таблицу в транзакции БД и доставляется в Kafka отдельным процессом</li><li>Kafka не поддерживает запись</li><li>Можно, достаточно @Transactional</li><li>Мешает уровень изоляции</li></ul><div class="why">Двойная запись даёт либо событие-призрак, либо потерянное событие.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Продюсер использует транзакции, а потребитель видит записи отменённых транзакций. В чём дело?</summary><div class="a"><p>У потребителя уровень изоляции по умолчанию — <code>read_uncommitted</code>. Записи отменённой транзакции физически находятся в журнале и скрываются только от читателей с <code>isolation.level=read_committed</code>.</p></div></details>
+<details class="q"><summary>Сервис читает из Kafka и обновляет PostgreSQL. Можно ли обеспечить exactly-once транзакциями Kafka?</summary><div class="a"><p>Нет. Транзакция Kafka охватывает только записи в топики и смещения. Для базы данных нужна идемпотентность потребителя: таблица обработанных идентификаторов с уникальным ограничением в одной транзакции БД с изменением данных, либо хранение смещения в той же базе, либо естественно идемпотентные операции.</p></div></details>
+<details class="q"><summary>Что такое transactional outbox и какую проблему он решает?</summary><div class="a"><p>Проблему двойной записи — невозможность атомарно изменить базу и отправить событие в брокер. Событие записывается в таблицу <code>outbox</code> той же транзакцией, что и бизнес-данные, поэтому они либо оба сохранены, либо оба нет. Отдельный процесс (опрос таблицы или CDC по журналу базы) публикует события в Kafka с гарантией at-least-once.</p></div></details>
+<details class="q"><summary>Сообщение с невалидным JSON попало в топик. Что произойдёт с потребителем без обработки ошибок и как правильно?</summary><div class="a"><p>Потребитель упадёт на десериализации, перезапустится, прочитает то же сообщение и упадёт снова — партиция заблокирована навсегда, отставание растёт. Правильно: обработчик ошибок десериализации, ограниченное число попыток и отправка записи в Dead Letter Topic с сохранением причины; обработка следующих записей продолжается.</p></div></details>
+<details class="q"><summary>Чем неблокирующие повторы через retry-топики опасны?</summary><div class="a"><p>Они нарушают порядок: запись, ушедшая в retry-топик, будет обработана позже следующих записей с тем же ключом. Если событие «заказ оплачен» ждёт повтора, а «заказ отменён» уже обработано, итоговое состояние неверно. Для сущностей, чувствительных к порядку, нужны блокирующие повторы или проверка версии при обработке.</p></div></details>
+<details class="q"><summary>Как Kafka Streams восстанавливает состояние агрегации после падения экземпляра?</summary><div class="a"><p>Локальное хранилище состояния (RocksDB) зеркалируется в changelog-топик. Задачи упавшего экземпляра переходят к другому, и он восстанавливает хранилище, проиграв changelog с начала (или с контрольной точки). Резервные реплики состояния сокращают время восстановления.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

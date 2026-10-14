@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · TLS и PKI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ПРИКЛАДНОЙ УРОВЕНЬ · РОАДМАП m6</div>
+  <h1>TLS и PKI</h1>
+  <p class="lead">TLS превращает TCP-соединение в защищённый канал: никто по пути не прочитает и не изменит данные, а клиент уверен, что говорит именно с <code>bank.by</code>. Разбираем рукопожатие TLS 1.3, цепочку доверия сертификатов и ошибки, которые чаще всего видит Java-разработчик.</p>
+  <div class="meta"><span class="tag">~3,5 часа</span><span class="tag">RFC 8446</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="goals"><span class="h-num">9.1</span>Три гарантии и инструменты для них</h2>
+<div class="table-wrap"><table>
+<tr><th>Гарантия</th><th>Механизм</th><th>Примеры</th></tr>
+<tr><td><b>Конфиденциальность</b></td><td>симметричное шифрование общим ключом сессии (быстро)</td><td>AES-128/256-GCM, ChaCha20-Poly1305</td></tr>
+<tr><td><b>Целостность</b></td><td>AEAD: шифр сразу проверяет, что данные не изменены</td><td>GCM, Poly1305</td></tr>
+<tr><td><b>Аутентификация</b></td><td>сертификат + цифровая подпись приватным ключом сервера</td><td>ECDSA, RSA, Ed25519</td></tr>
+<tr><td>Общий ключ без передачи ключа</td><td>обмен Диффи–Хеллмана на эллиптических кривых, эфемерные ключи</td><td>ECDHE (X25519), гибридный X25519+ML-KEM (постквантовый)</td></tr>
+</table></div>
+<p><b>Forward secrecy</b>: ключи сессии получены из эфемерных ключей ECDHE, которые уничтожаются после рукопожатия. Даже если позже украдут приватный ключ сервера, записанный ранее трафик не расшифровать. В TLS 1.3 это обязательно; старый обмен ключами RSA (без FS) удалён.</p>
+
+<h2 id="handshake"><span class="h-num">9.2</span>Рукопожатие TLS 1.3</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 380" role="img" aria-label="Рукопожатие TLS 1.3">
+  <defs><marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
+  <marker id="h2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="120" y="22" text-anchor="middle" font-weight="700">Клиент</text><text x="680" y="22" text-anchor="middle" font-weight="700">Сервер</text>
+  <path d="M120 30 V370" class="ln"/><path d="M680 30 V370" class="ln"/>
+  <rect x="20" y="36" width="760" height="24" rx="4" class="box"/><text x="400" y="53" text-anchor="middle" font-size="12">TCP-рукопожатие — 1 RTT</text>
+  <path d="M120 74 L676 124" class="ln" marker-end="url(#h1)"/>
+  <rect x="160" y="70" width="300" height="70" rx="6" class="box-info"/>
+  <text x="170" y="88" class="mono" font-size="11.5" font-weight="700">ClientHello</text>
+  <text x="170" y="104" class="mono" font-size="11">шифры, key_share (X25519 pub)</text>
+  <text x="170" y="118" class="mono" font-size="11">SNI: api.bank.by  ALPN: h2, http/1.1</text>
+  <text x="170" y="132" class="mono" font-size="11">случайное число клиента</text>
+  <path d="M680 150 L124 214" class="ln-acc" marker-end="url(#h2)"/>
+  <rect x="340" y="146" width="330" height="110" rx="6" class="box-acc"/>
+  <text x="350" y="164" class="mono" font-size="11.5" font-weight="700">ServerHello  (key_share сервера)</text>
+  <text x="350" y="180" class="mono" font-size="11" fill="var(--accent)">— дальше всё зашифровано —</text>
+  <text x="350" y="196" class="mono" font-size="11">EncryptedExtensions (ALPN = h2)</text>
+  <text x="350" y="212" class="mono" font-size="11">Certificate (цепочка)</text>
+  <text x="350" y="228" class="mono" font-size="11">CertificateVerify (подпись хэша рукопожатия)</text>
+  <text x="350" y="244" class="mono" font-size="11">Finished (MAC всего рукопожатия)</text>
+  <path d="M120 270 L676 316" class="ln" marker-end="url(#h1)"/>
+  <rect x="160" y="268" width="290" height="40" rx="6" class="box-ok"/>
+  <text x="170" y="285" class="mono" font-size="11.5">Finished + GET /accounts (данные!)</text>
+  <text x="170" y="300" class="mono" font-size="11">проверил цепочку, имя и подпись</text>
+  <path d="M680 330 L124 362" class="ln" marker-end="url(#h1)"/><text x="400" y="340" text-anchor="middle" class="mono" font-size="11.5">HTTP-ответ</text>
+  <text x="20" y="232" font-size="12" fill="var(--accent)">TLS 1.3:</text><text x="20" y="248" font-size="12" fill="var(--accent)">+1 RTT</text>
+</svg>
+<figcaption>Клиент сразу отправляет свою часть обмена ключами, угадывая кривую, поэтому сервер может вычислить общий секрет и зашифровать остаток рукопожатия уже в первом ответе. TLS 1.2 требовал 2 RTT. При повторном подключении (PSK resumption) сертификат не передаётся; в режиме <b>0-RTT</b> данные уходят прямо в первом сообщении.</figcaption>
+</figure>
+<div class="callout warn"><span class="c-title">0-RTT и повторное воспроизведение</span>
+Ранние данные 0-RTT злоумышленник может записать и отправить повторно — у них нет защиты от replay. Поэтому 0-RTT допустим только для идемпотентных запросов (GET без побочных эффектов). Платёжный POST в 0-RTT — уязвимость. CDN обычно ставят заголовок <code>Early-Data: 1</code>, а сервер может ответить 425 Too Early.
+</div>
+
+<h2 id="pki"><span class="h-num">9.3</span>Сертификаты и цепочка доверия</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 250" role="img" aria-label="Цепочка доверия">
+  <defs><marker id="h3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="20" y="20" width="220" height="90" rx="10" class="box-bad"/><text x="130" y="46" text-anchor="middle" font-weight="700">Корневой CA</text><text x="130" y="66" text-anchor="middle" font-size="12">самоподписанный</text><text x="130" y="84" text-anchor="middle" font-size="12">в хранилище ОС / JDK cacerts</text><text x="130" y="100" text-anchor="middle" font-size="11" class="muted">ключ офлайн в сейфе</text>
+  <rect x="290" y="20" width="220" height="90" rx="10" class="box-warn"/><text x="400" y="46" text-anchor="middle" font-weight="700">Промежуточный CA</text><text x="400" y="66" text-anchor="middle" font-size="12">подписан корнем</text><text x="400" y="84" text-anchor="middle" font-size="12">сервер обязан прислать его</text>
+  <rect x="560" y="20" width="220" height="90" rx="10" class="box-ok"/><text x="670" y="46" text-anchor="middle" font-weight="700">Сертификат сайта</text><text x="670" y="66" text-anchor="middle" font-size="12">SAN: api.bank.by</text><text x="670" y="84" text-anchor="middle" font-size="12">публичный ключ сервера</text>
+  <path d="M240 65 H286" class="ln" marker-end="url(#h3)"/><path d="M510 65 H556" class="ln" marker-end="url(#h3)"/>
+  <text x="263" y="56" text-anchor="middle" font-size="11">подпись</text><text x="533" y="56" text-anchor="middle" font-size="11">подпись</text>
+  <text x="20" y="146" font-weight="700" font-size="13">Клиент проверяет:</text>
+  <text x="20" y="168" font-size="12.5">1) каждую подпись в цепочке до корня из своего хранилища доверенных;  2) срок действия (notBefore / notAfter);</text>
+  <text x="20" y="188" font-size="12.5">3) имя хоста совпадает с SAN (CN давно не используется);  4) назначение ключа (serverAuth);</text>
+  <text x="20" y="208" font-size="12.5">5) отзыв (OCSP stapling / CRL);  6) CertificateVerify — сервер владеет приватным ключом.</text>
+  <text x="20" y="234" font-size="12.5" class="muted">Без шага 6 сертификат можно было бы просто скопировать — он публичный.</text>
+</svg>
+</figure>
+<ul>
+  <li><b>Let's Encrypt и ACME</b>: бесплатные сертификаты на 90 дней с автоматическим продлением. Индустрия идёт к ещё более коротким срокам — автоматизация ротации обязательна.</li>
+  <li><b>Wildcard</b> <code>*.bank.by</code> покрывает один уровень поддоменов (<code>api.bank.by</code>, но не <code>a.b.bank.by</code>).</li>
+  <li><b>Certificate Transparency</b>: все публичные сертификаты попадают в открытые журналы — можно мониторить выпуск сертификатов на свой домен (crt.sh).</li>
+</ul>
+
+<h2 id="sni"><span class="h-num">9.4</span>SNI, ALPN, mTLS, терминация</h2>
+<div class="grid-2">
+  <div class="card"><h4>SNI</h4><p>Имя сайта в ClientHello — чтобы один IP обслуживал много доменов с разными сертификатами. Передаётся открыто (по нему работают блокировки); ECH (Encrypted Client Hello) его шифрует.</p></div>
+  <div class="card"><h4>ALPN</h4><p>Согласование прикладного протокола в рукопожатии без лишнего RTT: <code>h2</code>, <code>http/1.1</code>. Без ALPN HTTP/2 по TLS не включится.</p></div>
+  <div class="card"><h4>mTLS</h4><p>Сервер тоже запрашивает сертификат клиента. Стандарт для межсервисного взаимодействия (service mesh, Istio/Linkerd), API банковских партнёров и open banking. Удостоверение сервиса — сертификат, а не IP.</p></div>
+  <div class="card"><h4>Где завершать TLS</h4><p>На балансировщике (проще, L7-маршрутизация, WAF) — тогда до бэкенда трафик открыт или шифруется заново. End-to-end / passthrough — для строгих требований (PCI DSS). Во внутренней сети zero-trust предполагает шифрование везде.</p></div>
+</div>
+
+<h2 id="java"><span class="h-num">9.5</span>TLS в Java</h2>
+<div class="table-wrap"><table>
+<tr><th>Понятие</th><th>Что это</th></tr>
+<tr><td><b>KeyStore</b></td><td>свои приватные ключи и сертификаты (сервер; клиент при mTLS). Формат PKCS12 (<code>.p12</code>), JKS устарел.</td></tr>
+<tr><td><b>TrustStore</b></td><td>кому доверяем: корневые CA. По умолчанию <code>$JAVA_HOME/lib/security/cacerts</code>. Корпоративный CA добавляется сюда или в свой truststore.</td></tr>
+<tr><td><code>SSLContext</code></td><td>связывает KeyManager и TrustManager; передаётся в <code>HttpClient.newBuilder().sslContext(...)</code>, Netty, драйверы БД.</td></tr>
+</table></div>
+<pre data-title="Клиент с корпоративным truststore и mTLS"><code class="java">KeyStore trust = KeyStore.getInstance("PKCS12");
+try (InputStream in = Files.newInputStream(Path.of("/etc/certs/truststore.p12"))) {
+    trust.load(in, trustPassword);
+}
+TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+tmf.init(trust);
+
+KeyStore identity = KeyStore.getInstance("PKCS12");
+try (InputStream in = Files.newInputStream(Path.of("/etc/certs/client.p12"))) {
+    identity.load(in, keyPassword);
+}
+KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+kmf.init(identity, keyPassword);
+
+SSLContext ctx = SSLContext.getInstance("TLSv1.3");
+ctx.init(kmf.getKeyManagers(), tmf.getTrustManagers(), null);
+
+HttpClient client = HttpClient.newBuilder()
+        .sslContext(ctx)
+        .connectTimeout(Duration.ofSeconds(2))
+        .build();</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Ошибка</th><th>Причина</th></tr>
+<tr><td><code>PKIX path building failed: unable to find valid certification path</code></td><td>цепочка не доходит до доверенного корня: самоподписанный/корпоративный CA не в truststore или сервер не прислал промежуточный сертификат</td></tr>
+<tr><td><code>No subject alternative names matching IP address / name</code></td><td>подключаетесь по IP или другому имени, чем в SAN</td></tr>
+<tr><td><code>CertificateExpiredException</code></td><td>просроченный сертификат — нужен мониторинг сроков</td></tr>
+<tr><td><code>handshake_failure</code> / <code>protocol_version</code></td><td>нет общих версий/шифров; mTLS — сервер не получил клиентский сертификат</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Никогда</span>
+«Доверять всем» (<code>TrustManager</code> с пустыми проверками, <code>HostnameVerifier</code>, всегда возвращающий true) — это отключение аутентификации: любой в сети может выдать себя за сервер. Правильное решение ошибки PKIX — добавить нужный CA в truststore. Отладка: <code>-Djavax.net.debug=ssl:handshake</code>.
+</div>
+
+<h2 id="lab"><span class="h-num">9.6</span>Лабораторная</h2>
+<pre><code class="sh">$ openssl s_client -connect github.com:443 -servername github.com -alpn h2 &lt;/dev/null
+# смотрите: Certificate chain, Protocol: TLSv1.3, Cipher, ALPN protocol: h2, Verify return code: 0
+$ openssl s_client -connect github.com:443 -showcerts &lt;/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+$ curl -v https://example.com 2&gt;&amp;1 | grep -E "TLS|ALPN|subject|issuer|expire"
+$ keytool -list -cacerts | head          # корни, которым доверяет ваша JVM</code></pre>
+
+<h2 id="sim"><span class="h-num">9.7</span>Интерактив: рукопожатие TLS 1.3 и что видит наблюдатель</h2>
+<div class="widget stepper" id="tlsSim">
+  <div class="widget-title">Симулятор: от ClientHello до зашифрованных данных</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="tlC"><h5>Клиент знает</h5><div class="items"><span class="chip" data-from="1">свой эфемерный ключ x, X = g^x</span><span class="chip ok" data-from="3">общий секрет g^xy</span><span class="chip ok" data-from="4">сервер подлинный</span></div></div>
+    <div class="lane node" id="tlS"><h5>Сервер знает</h5><div class="items"><span class="chip">закрытый ключ сертификата</span><span class="chip" data-from="2">свой эфемерный ключ y, Y = g^y</span><span class="chip ok" data-from="2">общий секрет g^xy</span></div></div>
+    <div class="lane node" id="tlE"><h5>Наблюдатель в сети видит</h5><div class="items"><span class="chip warn" data-from="1">IP-адреса, порт 443</span><span class="chip warn" data-from="1">SNI: api.shop.ru</span><span class="chip warn" data-from="1">X</span><span class="chip warn" data-from="2">Y</span><span class="chip bad" data-from="3">дальше — только шифротекст и размеры записей</span></div></div>
+  </div>
+  <section class="st-step" data-t="ClientHello" data-hl="tlC tlE" data-log="C → S  ClientHello: версии, наборы шифров, key_share = X, SNI = api.shop.ru, ALPN = h2"><h4>ClientHello (открытым текстом)</h4><p>Клиент сразу отправляет свою половину обмена ключами (X25519) — не дожидаясь выбора сервера. Это и сокращает рукопожатие до одного RTT. Расширение SNI называет хост — по нему сервер выберет сертификат, а балансировщик — бэкенд. SNI не зашифрован (ECH решает это, но пока не везде).</p></section>
+  <section class="st-step" data-t="ServerHello" data-hl="tlS tlE" data-log="S → C  ServerHello: TLS_AES_128_GCM_SHA256, key_share = Y"><h4>ServerHello: обмен Диффи — Хеллмана завершён</h4><p>Сервер выбирает шифр и присылает Y. Обе стороны вычисляют общий секрет: клиент — Y^x, сервер — X^y. Наблюдатель видел X и Y, но получить g^xy из них не может (задача дискретного логарифма). Ключи эфемерные: утечка закрытого ключа сертификата в будущем не раскроет записанный сегодня трафик — <b>forward secrecy</b>.</p></section>
+  <section class="st-step" data-t="Шифрованная часть" data-hl="tlC tlE" data-log="S → C  {EncryptedExtensions, Certificate, CertificateVerify, Finished}  — уже зашифровано"><h4>Всё остальное рукопожатие зашифровано</h4><p>Из общего секрета через HKDF выводятся ключи рукопожатия. Сертификат сервера идёт уже под шифром — наблюдатель не видит даже его (в TLS 1.2 видел).</p></section>
+  <section class="st-step" data-t="Проверка сертификата" data-hl="tlC" data-log="C: цепочка api.shop.ru ← R11 ← ISRG Root X1 (в хранилище доверенных) ✓; имя, срок ✓; подпись CertificateVerify ✓"><h4>Клиент проверяет подлинность</h4><ol><li>Цепочка подписей ведёт к корневому сертификату из хранилища доверенных (truststore).</li><li>Имя хоста совпадает с <code>subjectAltName</code>, срок действия не истёк.</li><li><code>CertificateVerify</code> — подпись всего рукопожатия закрытым ключом сервера: доказывает, что собеседник владеет ключом, а не просто переслал чужой сертификат.</li></ol><p>Ошибка на любом шаге — <code>SSLHandshakeException: PKIX path building failed</code> / <code>No subject alternative names matching</code>.</p></section>
+  <section class="st-step" data-t="Finished" data-hl="tlC tlS" data-log="C → S  {Finished}  + сразу {HTTP-запрос}"><h4>Finished и первые данные</h4><p>MAC от всей переписки подтверждает, что рукопожатие никто не изменил (например, не убрал сильные шифры из списка). Клиент отправляет запрос приложения в том же пакете. Итог: <b>1 RTT</b> на TLS (в TLS 1.2 было 2). При возобновлении сессии по PSK возможен 0-RTT — данные в первом же пакете, но с риском повторного воспроизведения (только для идемпотентных запросов).</p></section>
+  <section class="st-step" data-t="Данные приложения" data-hl="tlE" data-log="C ⇄ S  {Application Data}  AES-GCM: шифрование + проверка целостности каждой записи"><h4>Защищённый канал</h4><p>Симметричный AEAD-шифр даёт конфиденциальность и целостность. Наблюдатель видит адреса, время, размеры и SNI — этого достаточно, чтобы понять, <i>куда</i> вы ходите, но не <i>что</i> передаёте.</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">9.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что даёт forward secrecy?</p><ul><li>Ускоряет рукопожатие</li><li>Компрометация долговременного закрытого ключа сервера не позволяет расшифровать ранее записанный трафик</li><li>Скрывает IP-адрес клиента</li><li>Заменяет сертификаты</li></ul><div class="why">Сеансовые ключи получаются из эфемерного обмена Диффи — Хеллмана и нигде не сохраняются. В TLS 1.3 это обязательно.</div></div>
+<div class="mcq" data-ok="2"><p>Java-клиент падает с «PKIX path building failed». Что это значит?</p><ul><li>Сервер недоступен</li><li>Истёк таймаут</li><li>Не удалось построить цепочку от сертификата сервера до доверенного корня: в truststore нет нужного CA или сервер не прислал промежуточный сертификат</li><li>Неверный пароль</li></ul><div class="why">Проверьте цепочку: <code>openssl s_client -connect host:443 -showcerts</code>. Отключать проверку сертификатов нельзя — это снимает защиту от подмены.</div></div>
+<div class="mcq" data-ok="0"><p>Чем mTLS отличается от обычного TLS?</p><ul><li>Клиент тоже предъявляет сертификат, и сервер проверяет его — взаимная аутентификация</li><li>Используется два шифра</li><li>Соединение устанавливается дважды</li><li>Не используются сертификаты</li></ul><div class="why">Типично для связи сервис — сервис и service mesh: идентичность сервиса подтверждается сертификатом.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему TLS 1.3 требует 1 RTT, а TLS 1.2 — 2?</summary><div class="a"><p>В 1.3 клиент сразу шлёт key_share для предполагаемой группы, сервер в первом же ответе завершает обмен ключами и отправляет сертификат и Finished в зашифрованном виде. В 1.2 сначала согласовывались параметры (Hello), затем отдельным обменом — ключи.</p></div></details>
+<details class="q"><summary>Что именно доказывает сертификат, а что — CertificateVerify?</summary><div class="a"><p>Сертификат (через подпись CA) связывает имя хоста с публичным ключом. CertificateVerify — подпись хэша текущего рукопожатия приватным ключом — доказывает, что собеседник владеет приватным ключом этого сертификата именно сейчас.</p></div></details>
+<details class="q"><summary>Что такое forward secrecy и как её обеспечивает TLS 1.3?</summary><div class="a"><p>Компрометация долгосрочного ключа сервера не раскрывает прошлые сессии. Ключи сессий выводятся из эфемерного ECDHE, который не сохраняется. Приватный ключ сертификата используется только для подписи, а не для шифрования ключа сессии.</p></div></details>
+<details class="q"><summary>Java-клиент падает с PKIX path building failed на внутреннем сервисе. Ваши действия?</summary><div class="a"><p>Посмотреть цепочку (<code>openssl s_client -showcerts</code>): присылает ли сервер промежуточный сертификат, кем выпущен. Если корпоративным CA — добавить его корень в truststore приложения (или в образ), если не хватает промежуточного — исправить конфигурацию сервера. Не отключать проверку.</p></div></details>
+<details class="q"><summary>Почему 0-RTT опасен для POST /payments?</summary><div class="a"><p>Ранние данные не защищены от повторного воспроизведения: перехвативший их может отправить тот же запрос ещё раз, и сервер его выполнит. Допустимо только для идемпотентных операций; для платежей — ключ идемпотентности и отказ от 0-RTT.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

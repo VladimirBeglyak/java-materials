@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · AbstractQueuedSynchronizer изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.aq { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 10px 0; font: 12.5px var(--font-mono); }
+.aq span { padding: 7px 10px; border: 1.5px solid var(--line); border-radius: 6px; background: var(--bg-sunk); }
+.aq span.head { border-style: dashed; } .aq span.own { border-color: var(--ok); background: var(--ok-soft); } .aq span.cx { opacity: .4; text-decoration: line-through; }
+.aqt { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin: 8px 0; }
+.aqt .lane { padding: 8px; } .aqt .lane .controls { margin: 4px 0 0; }
+@media (max-width: 640px) { .aqt { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · LOCKS</div>
+  <h1>AbstractQueuedSynchronizer изнутри</h1>
+  <p class="lead">AQS — каркас, на котором построены ReentrantLock, ReentrantReadWriteLock, Semaphore, CountDownLatch, ThreadPoolExecutor.Worker и десяток других классов. Идея проста: одно атомарное <code>int state</code>, смысл которого задаёт наследник, и FIFO-очередь потоков, которые не смогли его захватить и спят в <code>park</code>. Симулятор с четырьмя потоками покажет захват, очередь, освобождение с передачей следующему и отмену по таймауту; в конце — свой синхронизатор за 15 строк.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">state</span><span class="tag">CLH-очередь</span><span class="tag">exclusive/shared</span><span class="tag">tryAcquire</span><span class="tag">отмена</span><span class="tag">свой синхронизатор</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="idea"><span class="h-num">8.1</span>Шаблонный метод</h2>
+<p>AQS реализует всю сложную часть — очередь, парковку, пробуждение, таймауты, прерывания, условия. Наследник определяет только, <b>что значит захват</b>:</p>
+<div class="table-wrap"><table>
+<tr><th>Метод наследника</th><th>Смысл</th><th>Пример</th></tr>
+<tr><td><code>tryAcquire(arg)</code></td><td>попытаться захватить эксклюзивно, без ожидания</td><td>ReentrantLock: CAS state 0 → 1 или повторный вход владельца</td></tr>
+<tr><td><code>tryRelease(arg)</code></td><td>освободить; true, если ожидающих можно будить</td><td>state − 1; при 0 — владелец = null</td></tr>
+<tr><td><code>tryAcquireShared(arg)</code></td><td>разделяемый захват: ≥ 0 — успех</td><td>Semaphore: уменьшить разрешения; CountDownLatch: успех, если state == 0</td></tr>
+<tr><td><code>tryReleaseShared(arg)</code></td><td>разделяемое освобождение</td><td>Semaphore: вернуть разрешения; CountDownLatch: countDown</td></tr>
+<tr><td><code>isHeldExclusively()</code></td><td>для Condition</td><td>владелец == текущий поток</td></tr>
+</table></div>
+<pre data-title="публичная часть, которую вызывают классы-обёртки"><code class="java">public final void acquire(int arg) {
+    if (!tryAcquire(arg))              // быстрый путь: без очереди
+        acquire(null, arg, false, false, false, 0L);   // медленный: в очередь и park (JDK 14+)
+}
+public final boolean release(int arg) {
+    if (tryRelease(arg)) { signalNext(head); return true; }   // разбудить первого ожидающего
+    return false;
+}
+// а также acquireInterruptibly, tryAcquireNanos, acquireShared, releaseShared, hasQueuedPredecessors, getQueueLength…</code></pre>
+
+<h2 id="sim"><span class="h-num">8.2</span>Симулятор эксклюзивного захвата</h2>
+<div class="widget" id="aqW">
+  <div class="widget-title">Мьютекс на AQS: state 0 — свободен, 1 — захвачен</div>
+  <div class="aqt" id="aqT"></div>
+  <div class="aq" id="aqQ"></div>
+  <div class="out" id="aqS"></div>
+  <div class="log" id="aqLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, state, owner, queue, st, log;
+  var T = ["T1", "T2", "T3", "T4"];
+  function reset() { state = 0; owner = null; queue = []; st = { T1: "run", T2: "run", T3: "run", T4: "run" }; log = ["state = 0, очередь пуста (head/tail = null — создаются лениво при первой конкуренции)"]; draw(); }
+  function acquire(t) {
+    if (st[t] !== "run") return;
+    if (state === 0 && (queue.length === 0)) { state = 1; owner = t; st[t] = "own"; log.push(t + ": tryAcquire → CAS(state, 0, 1) успешен — быстрый путь, без очереди"); }
+    else if (owner === t) { log.push(t + ": уже владелец (этот простой мьютекс не реентерабелен → в ReentrantLock state++)"); }
+    else { queue.push(t); st[t] = "wait"; log.push(t + ": tryAcquire неудачен → узел в хвост очереди (CAS tail), короткий спин, затем park()"); }
+    draw();
+  }
+  function release(t) {
+    if (owner !== t) { log.push(t + ": release без владения → IllegalMonitorStateException"); draw(); return; }
+    state = 0; owner = null; st[t] = "run"; log.push(t + ": tryRelease → state = 0; signalNext(head) → unpark первого живого узла");
+    var next = queue.find(function (q) { return st[q] === "wait"; });
+    if (next) { queue.splice(queue.indexOf(next), 1); state = 1; owner = next; st[next] = "own"; log.push("  " + next + ": проснулся, он первый после head → tryAcquire успешен, его узел становится новым head"); }
+    queue = queue.filter(function (q) { return st[q] === "wait"; });
+    draw();
+  }
+  function cancel(t) {
+    if (st[t] !== "wait") return; st[t] = "cx"; log.push(t + ": истёк tryLock(timeout) / прерывание → узел помечен CANCELLED, будет вычищен из очереди при обходе; поток возвращается с false / InterruptedException"); st[t] = "run"; queue.splice(queue.indexOf(t), 1); draw();
+  }
+  function draw() {
+    $("aqT").innerHTML = T.map(function (t) { var s = st[t]; return '<div class="lane"><h5>' + t + " — " + (s === "own" ? "владеет" : s === "wait" ? "в очереди (park)" : "работает") + '</h5><div class="controls"><button class="btn" type="button" data-t="' + t + '" data-a="acq"' + (s !== "run" ? " disabled" : "") + '>acquire</button><button class="btn" type="button" data-t="' + t + '" data-a="rel"' + (s !== "own" ? " disabled" : "") + '>release</button><button class="btn" type="button" data-t="' + t + '" data-a="cx"' + (s !== "wait" ? " disabled" : "") + ">таймаут</button></div></div>"; }).join("");
+    $("aqQ").innerHTML = "очередь: " + (queue.length ? '<span class="head">head (фиктивный / бывший владелец)</span>→' + queue.map(function (q) { return "<span>" + q + " · WAITING</span>"; }).join("→") + " ← tail" : "<i>пусто</i>");
+    $("aqS").textContent = "state = " + state + "   exclusiveOwnerThread = " + (owner || "null") + "   hasQueuedThreads = " + (queue.length > 0);
+    $("aqLog").textContent = log.slice(-7).join("\n"); $("aqLog").scrollTop = 1e6;
+  }
+  $("aqT").addEventListener("click", function (e) { var b = e.target.closest("button"); if (!b || b.disabled) return; var t = b.getAttribute("data-t"), a = b.getAttribute("data-a"); if (a === "acq") acquire(t); else if (a === "rel") release(t); else cancel(t); });
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Что попробовать</span>
+T1 acquire, затем T2, T3, T4 acquire — они выстроятся в очередь. Таймаут у T3 — узел отменяется. T1 release — управление перейдёт строго первому живому в очереди (T2). Обратите внимание: этот симулятор «честный»; в нечестном ReentrantLock только что пришедший поток может перехватить блокировку раньше проснувшегося (тема 09).
+</div>
+
+<h2 id="queue"><span class="h-num">8.3</span>Очередь</h2>
+<ul>
+  <li>Вариант очереди CLH (Craig, Landin, Hagersten): двусвязный список узлов с фиктивной головой; добавление в хвост — CAS по <code>tail</code>, поэтому вставка неблокирующая.</li>
+  <li>Голова — узел потока, который сейчас владеет (или фиктивный). Будится только следующий за головой — без «стада» одновременно проснувшихся потоков.</li>
+  <li>Перед park поток немного крутится (спин), если он первый в очереди — часто блокировку освобождают за микросекунды.</li>
+  <li>Узлы условий (<code>ConditionObject</code>) живут в отдельной однонаправленной очереди и переносятся в основную при <code>signal</code> (тема 10).</li>
+  <li>В режиме shared освобождение распространяется: проснувшийся узел будит следующий, если ресурс ещё доступен (так все ожидающие CountDownLatch.await просыпаются каскадом).</li>
+</ul>
+
+<h2 id="own"><span class="h-num">8.4</span>Свой синхронизатор</h2>
+<pre data-title="одноразовый «сигнал» (как CountDownLatch(1)) — пример из Javadoc AQS"><code class="java">final class BooleanLatch {
+    private static final class Sync extends AbstractQueuedSynchronizer {
+        boolean isSignalled() { return getState() != 0; }
+        protected int tryAcquireShared(int ignore) { return isSignalled() ? 1 : -1; }   // ждём, пока state != 0
+        protected boolean tryReleaseShared(int ignore) { setState(1); return true; }    // разбудить всех
+    }
+    private final Sync sync = new Sync();
+    public boolean isSignalled()           { return sync.isSignalled(); }
+    public void signal()                   { sync.releaseShared(1); }
+    public void await() throws InterruptedException { sync.acquireSharedInterruptibly(1); }
+}</code></pre>
+<p>Обёртка делегирует внутреннему классу <code>Sync</code>, а не наследует AQS сама — чтобы не выставлять наружу методы <code>acquire/release</code>. Так устроены все синхронизаторы JDK. <code>AbstractQueuedLongSynchronizer</code> — то же с <code>long state</code>.</p>
+
+<h2 id="quiz"><span class="h-num">8.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что наследник AQS обязан определить для эксклюзивного синхронизатора?</p><ul><li>Очередь ожидающих</li><li>tryAcquire и tryRelease — смысл state</li><li>park/unpark</li><li>Обработку прерываний</li></ul><div class="why">Остальное делает AQS.</div></div>
+<div class="mcq" data-ok="3"><p>Кого будит release в эксклюзивном режиме?</p><ul><li>Все ожидающие потоки</li><li>Случайный поток</li><li>Последний пришедший</li><li>Первый неотменённый узел после головы очереди</li></ul><div class="why">FIFO-передача без «стада».</div></div>
+<div class="mcq" data-ok="0"><p>Почему вставка в очередь AQS не требует блокировки?</p><ul><li>Узел присоединяется к хвосту CAS-ом по полю tail</li><li>Очередь — ThreadLocal</li><li>Вставка делается под synchronized</li><li>Очередь не меняется</li></ul><div class="why">AQS сам построен без блокировок — на CAS и park.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите, как работает ReentrantLock.lock() при занятой блокировке.</summary><div class="a"><p>lock → acquire(1) → tryAcquire: state != 0 и владелец другой → false. Медленный путь: создать узел, CAS-ом прицепить к хвосту, если узел первый после головы — повторить tryAcquire и немного покрутиться; затем LockSupport.park(this). Владелец вызывает unlock → release → tryRelease уменьшает state до 0, обнуляет владельца → signalNext будит первый узел; тот в цикле повторяет tryAcquire, при успехе становится головой и выходит из lock().</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

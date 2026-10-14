@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Запуск Spring Boot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · SPRING BOOT</div>
+  <h1>Запуск Spring Boot: от main() до ApplicationReadyEvent</h1>
+  <p class="lead">Spring Boot — не другой фреймворк, а надстройка над Spring Framework: готовые наборы зависимостей, автоконфигурация, встроенный сервер и единая система настроек. Строка <code>SpringApplication.run(App.class, args)</code> делает много работы до и после <code>refresh()</code>. Разберём её по шагам и посмотрим, как устроен исполняемый jar.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">SpringApplication</span><span class="tag">события старта</span><span class="tag">fat jar</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="what"><span class="h-num">6.1</span>Что добавляет Boot к Spring Framework</h2>
+<div class="grid-3">
+  <div class="card"><h4>Стартеры и BOM</h4><p><code>spring-boot-starter-webmvc</code> (в Boot 4; прежний <code>spring-boot-starter-web</code> объявлен устаревшим) — набор согласованных зависимостей. Версии всех библиотек задаёт BOM <code>spring-boot-dependencies</code>: вы не пишете версию Jackson или Hibernate.</p></div>
+  <div class="card"><h4>Автоконфигурация</h4><p>Бины по умолчанию создаются, если на classpath есть библиотека и вы не определили свой бин (тема 07).</p></div>
+  <div class="card"><h4>Внешняя конфигурация</h4><p>Единый порядок источников свойств, <code>@ConfigurationProperties</code>, профили (тема 08).</p></div>
+  <div class="card"><h4>Встроенный сервер</h4><p>Tomcat/Jetty/Netty внутри приложения — запуск через <code>java -jar</code>, без установки сервера.</p></div>
+  <div class="card"><h4>Исполняемый jar</h4><p>Один артефакт со всеми зависимостями и своим загрузчиком классов.</p></div>
+  <div class="card"><h4>Продакшен</h4><p>Actuator: health, метрики, пробы Kubernetes, graceful shutdown (тема 15).</p></div>
+</div>
+
+<h2 id="annotation"><span class="h-num">6.2</span>Что внутри @SpringBootApplication</h2>
+<pre><code class="java">@SpringBootConfiguration                 // = @Configuration (+ поиск конфигурации тестами)
+@EnableAutoConfiguration                 // @Import(AutoConfigurationImportSelector) + @AutoConfigurationPackage
+@ComponentScan(excludeFilters = {        // сканирует пакет этого класса и все подпакеты
+    @Filter(type = CUSTOM, classes = TypeExcludeFilter.class),
+    @Filter(type = CUSTOM, classes = AutoConfigurationExcludeFilter.class) })
+public @interface SpringBootApplication { }
+
+@SpringBootApplication
+public class ShopApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ShopApplication.class, args);
+    }
+}</code></pre>
+<div class="callout warn"><span class="c-title">Пакет главного класса имеет значение</span>
+Сканирование компонентов и <code>@AutoConfigurationPackage</code> (откуда Spring Data ищет репозитории и сущности) берут пакет главного класса. Класс в <code>com.shop</code> не увидит бины в <code>com.common</code>. Главный класс в пакете по умолчанию (без <code>package</code>) заставит сканировать весь classpath, включая библиотеки.
+</div>
+
+<h2 id="run"><span class="h-num">6.3</span>SpringApplication.run() пошагово</h2>
+<p>Конструктор <code>SpringApplication</code> определяет тип приложения по classpath (в Boot 3 — <code>WebApplicationType.deduceFromClasspath</code>, в Boot 4 — <code>deduce()</code> через реализации <code>WebApplicationType.Deducer</code>: есть <code>DispatcherServlet</code> → SERVLET; только <code>DispatcherHandler</code> из WebFlux → REACTIVE; нет Servlet API → NONE) и загружает из <code>META-INF/spring.factories</code> инициализаторы и слушатели. Дальше работает <code>run()</code>:</p>
+
+<div class="widget stepper" id="br">
+  <div class="widget-title">Симулятор: SpringApplication.run()</div>
+  <p class="hint">Справа — события, которые получают слушатели. Слушатели ранних событий (до создания контекста) регистрируются через <code>spring.factories</code> или <code>app.addListeners()</code>: бины ещё не существуют, и <code>@EventListener</code> на бине их не получит.</p>
+  <div class="lanes st-stage">
+    <div class="lane node" id="brEnv"><h5>Environment</h5><div class="items">
+      <span class="chip" data-from="3">commandLineArgs</span><span class="chip" data-from="3">systemProperties</span><span class="chip" data-from="3">systemEnvironment</span><span class="chip" data-from="3">random</span><span class="chip ok" data-from="3">application.yml</span><span class="chip ok" data-from="3">application-prod.yml</span></div></div>
+    <div class="lane node" id="brCtx"><h5>ApplicationContext</h5><div class="items">
+      <span class="chip" data-from="5">AnnotationConfigServletWebServerApplicationContext</span><span class="chip" data-from="6">definition: shopApplication</span><span class="chip ok" data-from="7">refresh() выполнен</span><span class="chip ok" data-from="7">Tomcat :8080</span></div></div>
+    <div class="lane node" id="brEv"><h5>События</h5><div class="items">
+      <span class="chip info" data-from="2">ApplicationStartingEvent</span><span class="chip info" data-from="3">ApplicationEnvironmentPreparedEvent</span><span class="chip info" data-from="6">ApplicationContextInitializedEvent</span><span class="chip info" data-from="6">ApplicationPreparedEvent</span><span class="chip" data-from="7">ContextRefreshedEvent</span><span class="chip info" data-from="8">ApplicationStartedEvent</span><span class="chip" data-from="8">Liveness: CORRECT</span><span class="chip ok" data-from="10">ApplicationReadyEvent</span><span class="chip ok" data-from="10">Readiness: ACCEPTING_TRAFFIC</span></div></div>
+  </div>
+  <section class="st-step" data-t="new SpringApplication()">
+    <h4>1. Конструктор</h4>
+    <p>Определяется <code>WebApplicationType</code>; через <code>SpringFactoriesLoader</code> загружаются <code>BootstrapRegistryInitializer</code>, <code>ApplicationContextInitializer</code> и <code>ApplicationListener</code> из всех <code>META-INF/spring.factories</code> на classpath; по стеку вызовов находится класс с <code>main</code>.</p>
+  </section>
+  <section class="st-step" data-t="starting" data-hl="brEv">
+    <h4>2. Запуск слушателей: starting()</h4>
+    <p>Создаётся <code>DefaultBootstrapContext</code> (для объектов, нужных до контекста, например клиента Config Server). <code>EventPublishingRunListener</code> публикует <code>ApplicationStartingEvent</code>. <code>LoggingApplicationListener</code> уже на этом событии выбирает систему логирования (Logback по умолчанию).</p>
+  </section>
+  <section class="st-step" data-t="prepareEnvironment" data-hl="brEnv brEv">
+    <h4>3. prepareEnvironment()</h4>
+    <p>Создаётся <code>ApplicationServletEnvironment</code>, добавляются аргументы командной строки. Публикуется <code>ApplicationEnvironmentPreparedEvent</code>; его слушатель <code>EnvironmentPostProcessorApplicationListener</code> запускает все <code>EnvironmentPostProcessor</code>:</p>
+    <ul><li><code>ConfigDataEnvironmentPostProcessor</code> — читает <code>application.properties/yml</code>, профильные файлы, <code>spring.config.import</code> (Vault, Consul, configtree);</li><li><code>RandomValuePropertySourceEnvironmentPostProcessor</code> — добавляет <code>RandomValuePropertySource</code> (<code>${random.uuid}</code>);</li><li><code>SpringApplicationJsonEnvironmentPostProcessor</code> — <code>SPRING_APPLICATION_JSON</code>.</li></ul>
+    <p>Затем <code>LoggingApplicationListener</code> применяет <code>logging.level.*</code>, а свойства <code>spring.main.*</code> привязываются к самому <code>SpringApplication</code>.</p>
+  </section>
+  <section class="st-step" data-t="printBanner">
+    <h4>4. Баннер</h4>
+    <p>Печатается баннер (<code>banner.txt</code> или стандартный). Отключается <code>spring.main.banner-mode=off</code>.</p>
+  </section>
+  <section class="st-step" data-t="createApplicationContext" data-hl="brCtx">
+    <h4>5. createApplicationContext()</h4>
+    <p><code>ApplicationContextFactory</code> по типу приложения создаёт контекст: для SERVLET — <code>AnnotationConfigServletWebServerApplicationContext</code>, для REACTIVE — <code>AnnotationConfigReactiveWebServerApplicationContext</code>, для NONE — <code>AnnotationConfigApplicationContext</code>. Его конструктор регистрирует внутренние процессоры (ConfigurationClassPostProcessor и др.).</p>
+  </section>
+  <section class="st-step" data-t="prepareContext" data-hl="brCtx brEv">
+    <h4>6. prepareContext()</h4>
+    <ul>
+      <li>контексту передаётся Environment;</li>
+      <li>вызываются <code>ApplicationContextInitializer</code>-ы (например, <code>ConditionEvaluationReportLoggingListener</code> — он потом печатает отчёт условий при <code>--debug</code> или ошибке) → <code>ApplicationContextInitializedEvent</code>;</li>
+      <li>регистрируются singleton-ы <code>springApplicationArguments</code>, <code>springBootBanner</code>; при <code>spring.main.lazy-initialization=true</code> — <code>LazyInitializationBeanFactoryPostProcessor</code>;</li>
+      <li><code>BeanDefinitionLoader</code> регистрирует описание главного класса — отсюда <code>ConfigurationClassPostProcessor</code> начнёт разбор всей конфигурации;</li>
+      <li>слушатели из spring.factories переносятся в контекст → <code>ApplicationPreparedEvent</code>.</li>
+    </ul>
+  </section>
+  <section class="st-step" data-t="refreshContext" data-hl="brCtx">
+    <h4>7. refreshContext() → refresh()</h4>
+    <p>Те самые 12 шагов из темы 02: сканирование, автоконфигурация, создание бинов, Tomcat создаётся в <code>onRefresh</code> и открывает порт в <code>finishRefresh</code>. Регистрируется shutdown hook JVM (<code>SpringApplicationShutdownHook</code>) — он закроет контекст по SIGTERM.</p>
+  </section>
+  <section class="st-step" data-t="started" data-hl="brEv">
+    <h4>8. started()</h4>
+    <p>В лог пишется «Started ShopApplication in 2.41 seconds (process running for 2.9)». Публикуются <code>ApplicationStartedEvent</code> и <code>AvailabilityChangeEvent(LivenessState.CORRECT)</code>: процесс жив, но ещё не готов принимать трафик.</p>
+  </section>
+  <section class="st-step" data-t="callRunners">
+    <h4>9. callRunners()</h4>
+    <p>Вызываются все бины <code>ApplicationRunner</code> и <code>CommandLineRunner</code>, отсортированные по <code>@Order</code>. Здесь все прокси работают — место для прогрева кэшей и разовых задач. Исключение в runner-е считается провалом запуска.</p>
+  </section>
+  <section class="st-step" data-t="ready" data-hl="brEv">
+    <h4>10. ready()</h4>
+    <p><code>ApplicationReadyEvent</code> и <code>AvailabilityChangeEvent(ReadinessState.ACCEPTING_TRAFFIC)</code>. Readiness-проба Kubernetes (<code>/actuator/health/readiness</code>) начинает отвечать UP — балансировщик пускает трафик.</p>
+    <p>При исключении на любом шаге: <code>ApplicationFailedEvent</code>, <code>FailureAnalyzers</code> печатают блок «APPLICATION FAILED TO START» с описанием и действием, контекст закрывается.</p>
+  </section>
+</div>
+
+<h2 id="hooks"><span class="h-num">6.4</span>Куда встроить свой код при старте</h2>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Когда выполняется</th><th>Регистрация</th><th>Типичное применение</th></tr>
+<tr><td><code>EnvironmentPostProcessor</code> (в Boot 4 — <code>org.springframework.boot.EnvironmentPostProcessor</code>; старый из пакета <code>boot.env</code> устарел)</td><td>шаг 3, до создания контекста</td><td><code>META-INF/spring.factories</code></td><td>добавить свой PropertySource (секреты из хранилища)</td></tr>
+<tr><td><code>ApplicationContextInitializer</code></td><td>шаг 6, контекст создан, но не обновлён</td><td>spring.factories, <code>app.addInitializers</code>, <code>context.initializer.classes</code></td><td>программная регистрация бинов, настройка контекста в тестах</td></tr>
+<tr><td><code>ApplicationListener</code> ранних событий</td><td>шаги 2–6</td><td>spring.factories, <code>app.addListeners</code></td><td>реакция на подготовку окружения</td></tr>
+<tr><td><code>SmartInitializingSingleton</code></td><td>шаг 7, после создания всех singleton-ов</td><td>бин</td><td>проверки согласованности бинов</td></tr>
+<tr><td><code>SmartLifecycle</code></td><td>шаг 7, finishRefresh; стоп при закрытии</td><td>бин</td><td>запуск/остановка фоновых процессов (consumers)</td></tr>
+<tr><td><code>ApplicationRunner</code></td><td>шаг 9</td><td>бин</td><td>разовые задачи старта, прогрев</td></tr>
+<tr><td><code>@EventListener(ApplicationReadyEvent.class)</code></td><td>шаг 10</td><td>бин</td><td>действия, когда приложение полностью готово</td></tr>
+<tr><td><code>FailureAnalyzer</code></td><td>при падении старта</td><td>spring.factories</td><td>понятное сообщение для своих исключений</td></tr>
+</table></div>
+
+<h2 id="jar"><span class="h-num">6.5</span>Исполняемый jar изнутри</h2>
+<p>Обычный jar не умеет содержать другие jar: стандартный <code>URLClassLoader</code> не читает вложенные архивы. Boot решает это своим загрузчиком.</p>
+<pre data-title="Структура shop-1.0.jar"><code class="txt">META-INF/MANIFEST.MF
+    Main-Class: org.springframework.boot.loader.launch.JarLauncher
+    Start-Class: com.shop.ShopApplication
+    Spring-Boot-Classes: BOOT-INF/classes/
+    Spring-Boot-Lib: BOOT-INF/lib/
+org/springframework/boot/loader/...      ← классы загрузчика, лежат несжатыми в корне
+BOOT-INF/classes/                        ← ваши классы и application.yml
+BOOT-INF/lib/                            ← зависимости как вложенные jar (храниться без сжатия)
+BOOT-INF/classpath.idx                   ← порядок jar на classpath
+BOOT-INF/layers.idx                      ← слои для Docker</code></pre>
+<ol class="steps">
+  <li>JVM запускает <code>JarLauncher.main</code> (из MANIFEST).</li>
+  <li>Лаунчер строит <code>LaunchedClassLoader</code> с URL на <code>BOOT-INF/classes</code> и каждый jar из <code>BOOT-INF/lib</code>, регистрируя свой обработчик URL для вложенных архивов (<code>jar:nested:...</code>).</li>
+  <li>Через рефлексию вызывает <code>main</code> класса из <code>Start-Class</code> в новом загрузчике.</li>
+</ol>
+<div class="grid-2">
+  <div class="card"><h4>Слои для Docker</h4><p><code>java -Djarmode=tools -jar app.jar extract --layers --launcher</code> раскладывает jar на слои: dependencies, spring-boot-loader, snapshot-dependencies, application. В Dockerfile слои копируются отдельно, и при изменении кода пересобирается только тонкий слой application.</p></div>
+  <div class="card"><h4>Ускорение старта</h4><p>CDS (Class Data Sharing, <code>-XX:SharedArchiveFile</code>) и AOT cache из JDK 24+ кэшируют загруженные классы между запусками. GraalVM native image — старт за десятки миллисекунд ценой долгой сборки и ограничений (тема 15).</p></div>
+</div>
+
+<h2 id="server"><span class="h-num">6.6</span>Встроенный сервер</h2>
+<p><code>TomcatServletWebServerAutoConfiguration</code> из модуля spring-boot-tomcat (в Boot 3 — <code>ServletWebServerFactoryAutoConfiguration</code>) регистрирует <code>TomcatServletWebServerFactory</code> (в Boot 4 — пакет <code>org.springframework.boot.tomcat.servlet</code>) (если на classpath Tomcat). Настраивается свойствами <code>server.*</code> или бином-кастомайзером:</p>
+<pre><code class="java">@Bean
+WebServerFactoryCustomizer&lt;TomcatServletWebServerFactory&gt; tomcatCustomizer() {
+    return f -&gt; f.addConnectorCustomizers(c -&gt; c.setProperty("relaxedQueryChars", "[]|"));
+}</code></pre>
+<pre data-title="application.yml — важные настройки Tomcat"><code class="yaml">server:
+  port: 8080
+  shutdown: graceful              # по умолчанию с Boot 3.4: дождаться активных запросов
+  tomcat:
+    threads:
+      max: 200                    # рабочие потоки (по умолчанию 200)
+      min-spare: 10
+    accept-count: 100             # очередь соединений ОС, когда все потоки заняты
+    max-connections: 8192         # одновременно открытых соединений (NIO)
+    connection-timeout: 20s
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+  threads:
+    virtual:
+      enabled: true               # JDK 21+: запросы на виртуальных потоках (тема 10)</code></pre>
+
+<h2 id="quiz"><span class="h-num">6.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Где читается application.yml?</p><ul><li>В ConfigurationClassPostProcessor на шаге refresh()</li><li>В конструкторе SpringApplication</li><li>В ConfigDataEnvironmentPostProcessor при ApplicationEnvironmentPreparedEvent, до создания контекста</li><li>В @PropertySource главного класса</li></ul><div class="why">Конфигурация нужна до создания контекста (например, чтобы знать активные профили), поэтому её загружает EnvironmentPostProcessor на этапе prepareEnvironment.</div></div>
+<div class="mcq" data-ok="1"><p>Бин с @EventListener(ApplicationStartingEvent.class). Получит ли он событие?</p><ul><li>Да</li><li>Нет: событие публикуется до создания контекста и бинов</li><li>Да, но асинхронно</li><li>Только при --debug</li></ul><div class="why">ApplicationStartingEvent, EnvironmentPrepared, ContextInitialized публикуются раньше, чем бины созданы. Такие слушатели регистрируют через spring.factories или SpringApplication.addListeners.</div></div>
+<div class="mcq" data-ok="3"><p>Что в MANIFEST.MF указано как Main-Class у Boot fat jar?</p><ul><li>Ваш класс с @SpringBootApplication</li><li>org.springframework.boot.SpringApplication</li><li>java.lang.ClassLoader</li><li>JarLauncher из spring-boot-loader, а ваш класс — в Start-Class</li></ul><div class="why">Сначала нужен загрузчик, умеющий читать вложенные jar. JarLauncher строит его и вызывает main из Start-Class.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что происходит при вызове SpringApplication.run()? Назовите ключевые шаги.</summary><div class="a"><p>Определение типа приложения и загрузка инициализаторов/слушателей из spring.factories → ApplicationStartingEvent → подготовка Environment (EnvironmentPostProcessor-ы, application.yml, профили) → баннер → создание контекста по типу → prepareContext (инициализаторы, регистрация главного класса) → refresh() (автоконфигурация, бины, веб-сервер) → ApplicationStartedEvent → runners → ApplicationReadyEvent.</p></div></details>
+<details class="q"><summary>Чем ApplicationRunner отличается от @PostConstruct для логики при старте?</summary><div class="a"><p>@PostConstruct выполняется при инициализации конкретного бина: другие бины могут быть ещё не созданы, прокси этого бина ещё нет (транзакции, @Async не работают), веб-сервер не запущен. ApplicationRunner вызывается после полного refresh: все бины готовы и обёрнуты, порт открыт, доступны аргументы командной строки.</p></div></details>
+<details class="q"><summary>Как Spring Boot определяет, что приложение веб и какого типа?</summary><div class="a"><p>В Boot 4 — <code>WebApplicationType.deduce()</code>: реализации <code>WebApplicationType.Deducer</code> из spring.factories опрашиваются по порядку. Сначала WebMvc (@Order(10)): есть Servlet API, DispatcherServlet и ConfigurableWebApplicationContext → SERVLET; затем WebFlux (@Order(20)): есть Mono и DispatcherHandler → REACTIVE; иначе есть Servlet API → SERVLET, нет → NONE. (В Boot 3 это был <code>deduceFromClasspath()</code> с проверкой Jersey.) Переопределяется <code>spring.main.web-application-type</code>.</p></div></details>
+<details class="q"><summary>Как устроен исполняемый jar Spring Boot и зачем layered jar?</summary><div class="a"><p>Классы приложения в BOOT-INF/classes, зависимости как вложенные jar в BOOT-INF/lib, загрузчик Boot в корне; JarLauncher создаёт ClassLoader для вложенных jar и вызывает Start-Class. Слои позволяют Docker кэшировать редко меняющиеся зависимости отдельно от часто меняющегося кода — быстрее сборка и меньше трафик при деплое.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

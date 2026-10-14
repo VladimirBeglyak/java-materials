@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Generics и стирание типов</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ТИПЫ И КОЛЛЕКЦИИ</div>
+  <h1>Generics и стирание типов</h1>
+  <p class="lead">Обобщённые типы переносят ошибки приведения из времени выполнения во время компиляции. Но существуют они только для компилятора: в байткоде параметров типов нет. Это одно решение объясняет все странности — от запрета <code>new T()</code> до правила PECS.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">type erasure</span><span class="tag">wildcards</span><span class="tag">PECS</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">7.1</span>Зачем нужны generics</h2>
+<pre data-title="до Java 5: ошибка обнаруживается при выполнении" class="bad-code"><code class="java">List names = new ArrayList();
+names.add("Alice");
+names.add(42);                            // компилятор не возражает
+String first = (String) names.get(0);     // приведение вручную
+String second = (String) names.get(1);    // ClassCastException — далеко от места ошибки</code></pre>
+<pre data-title="с generics: ошибка компиляции в месте ошибки" class="good-code"><code class="java">List&lt;String&gt; names = new ArrayList&lt;&gt;();
+names.add("Alice");
+names.add(42);                            // не компилируется
+String first = names.get(0);              // приведение вставит компилятор</code></pre>
+<pre data-title="обобщённый класс, метод и ограничения"><code class="java">class Box&lt;T&gt; {                                         // параметр типа класса
+    private final T value;
+    Box(T value) { this.value = value; }
+    T get() { return value; }
+    &lt;R&gt; Box&lt;R&gt; map(Function&lt;? super T, ? extends R&gt; f) { // параметр типа метода
+        return new Box&lt;&gt;(f.apply(value));
+    }
+}
+
+// ограничение сверху: T обязан быть сравнимым
+static &lt;T extends Comparable&lt;? super T&gt;&gt; T max(Collection&lt;? extends T&gt; items) { … }
+// несколько ограничений через &amp;
+static &lt;T extends Number &amp; Comparable&lt;T&gt;&gt; T clamp(T v, T lo, T hi) { … }</code></pre>
+
+<h2 id="erasure"><span class="h-num">7.2</span>Стирание типов</h2>
+<p>Чтобы новый код работал со старыми библиотеками, generics реализовали <b>стиранием</b>: компилятор проверяет типы, а затем заменяет каждый параметр типа его верхней границей (<code>Object</code>, если границы нет) и вставляет приведения. JVM о параметрах типов не знает.</p>
+<div class="grid-2">
+<pre data-title="вы пишете"><code class="java">List&lt;String&gt; list = new ArrayList&lt;&gt;();
+list.add("x");
+String s = list.get(0);
+
+class Box&lt;T extends Number&gt; {
+    T value;
+}</code></pre>
+<pre data-title="в байткоде"><code class="java">List list = new ArrayList();
+list.add("x");
+String s = (String) list.get(0);
+
+class Box {
+    Number value;
+}</code></pre>
+</div>
+<pre><code class="java">// true: при выполнении класс один — ArrayList
+new ArrayList&lt;String&gt;().getClass() == new ArrayList&lt;Integer&gt;().getClass();</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Что запрещено</th><th>Почему</th><th>Чем заменить</th></tr>
+<tr><td><code>new T()</code></td><td>При выполнении неизвестно, какой класс создавать</td><td>Передать <code>Supplier&lt;T&gt;</code> или <code>Class&lt;T&gt;</code></td></tr>
+<tr><td><code>new T[n]</code></td><td>Массив обязан знать тип элементов при выполнении</td><td><code>(T[]) new Object[n]</code> внутри класса; <code>IntFunction&lt;T[]&gt;</code>: <code>toArray(String[]::new)</code></td></tr>
+<tr><td><code>obj instanceof List&lt;String&gt;</code></td><td>Параметра типа у объекта нет</td><td><code>instanceof List&lt;?&gt;</code> и проверка элементов</td></tr>
+<tr><td><code>List&lt;int&gt;</code></td><td>Стирание до <code>Object</code>, а примитив — не объект</td><td><code>List&lt;Integer&gt;</code>, <code>int[]</code>, <code>IntStream</code></td></tr>
+<tr><td><code>static T field</code></td><td>Статическое поле одно на класс, а не на каждую параметризацию</td><td>—</td></tr>
+<tr><td><code>void f(List&lt;String&gt;)</code> и <code>void f(List&lt;Integer&gt;)</code></td><td>После стирания сигнатуры совпадают</td><td>Разные имена методов</td></tr>
+<tr><td><code>catch (MyError&lt;String&gt; e)</code>, обобщённый класс исключения</td><td>Выбор <code>catch</code> происходит при выполнении</td><td>—</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Мостовые методы</span>
+<code>class Money implements Comparable&lt;Money&gt;</code> объявляет <code>compareTo(Money)</code>, но после стирания интерфейс требует <code>compareTo(Object)</code>. Компилятор сам добавляет синтетический <b>bridge-метод</b> <code>compareTo(Object o) { return compareTo((Money) o); }</code>. Его видно в <code>javap</code> и в стектрейсах; из-за него рефлексия иногда возвращает «лишний» метод.
+</div>
+<div class="callout ok"><span class="c-title">Где информация о типах всё-таки сохраняется</span>
+Стирается тип у <i>объектов</i>. Но <i>объявления</i> — поля, параметры и возвращаемые типы методов, указание суперкласса — записаны в class-файле полностью и доступны через рефлексию (<code>getGenericType</code>, <code>getGenericSuperclass</code>). На этом основан приём «super type token»: анонимный подкласс фиксирует параметр типа в своём объявлении.
+<pre><code class="java">List&lt;Order&gt; orders = mapper.readValue(json, new TypeReference&lt;List&lt;Order&gt;&gt;() { });   // Jackson
+// то же — ParameterizedTypeReference в Spring RestClient</code></pre>
+Именно поэтому Spring умеет внедрить <code>List&lt;PaymentHandler&gt;</code>, а Jackson — разобрать поле <code>Map&lt;String, List&lt;Item&gt;&gt;</code>.
+</div>
+
+<h2 id="variance"><span class="h-num">7.3</span>Инвариантность</h2>
+<p><code>Integer</code> — подтип <code>Number</code>, но <code>List&lt;Integer&gt;</code> — <b>не</b> подтип <code>List&lt;Number&gt;</code>. Если бы это было разрешено, типобезопасность сломалась бы:</p>
+<pre><code class="java">List&lt;Integer&gt; ints = new ArrayList&lt;&gt;();
+List&lt;Number&gt; nums = ints;       // предположим, это компилируется
+nums.add(3.14);                 // Double — это Number, всё законно
+Integer i = ints.get(0);        // ClassCastException: в списке Integer лежит Double</code></pre>
+<p>Массивы устроены иначе — они <b>ковариантны</b> — и расплачиваются проверкой при каждой записи:</p>
+<pre><code class="java">Integer[] ints = new Integer[1];
+Number[] nums = ints;           // компилируется
+nums[0] = 3.14;                 // ArrayStoreException при выполнении</code></pre>
+<p>Отсюда совет: не смешивать массивы и generics, предпочитать коллекции.</p>
+
+<h2 id="wildcards"><span class="h-num">7.4</span>Wildcards и правило PECS</h2>
+<p>Инвариантность слишком строга: метод суммирования чисел должен принимать и <code>List&lt;Integer&gt;</code>, и <code>List&lt;Double&gt;</code>. Гибкость возвращают <b>подстановочные типы</b> — ценой ограничения операций.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 210" role="img" aria-label="Диапазоны типов для extends и super">
+  <rect x="340" y="16" width="120" height="36" rx="7" class="box"/><text x="400" y="39" text-anchor="middle" class="mono" font-size="13">Object</text>
+  <rect x="340" y="84" width="120" height="36" rx="7" class="box-info"/><text x="400" y="107" text-anchor="middle" class="mono" font-size="13">Number</text>
+  <rect x="290" y="152" width="100" height="36" rx="7" class="box-ok"/><text x="340" y="175" text-anchor="middle" class="mono" font-size="13">Integer</text>
+  <rect x="410" y="152" width="100" height="36" rx="7" class="box-ok"/><text x="460" y="175" text-anchor="middle" class="mono" font-size="13">Double</text>
+  <path d="M400 52 V84" class="ln"/><path d="M400 120 V136 H340 V152" class="ln"/><path d="M400 136 H460 V152" class="ln"/>
+  <path d="M270 16 H256 V188 H270" class="ln-acc"/>
+  <text x="244" y="70" text-anchor="end" font-weight="700" class="mono" font-size="13">List&lt;? super Integer&gt;</text>
+  <text x="244" y="92" text-anchor="end" font-size="12.5">Integer или любой его предок</text>
+  <text x="244" y="112" text-anchor="end" font-size="12.5">класть Integer — можно</text>
+  <text x="244" y="132" text-anchor="end" font-size="12.5" class="muted">читать — только как Object</text>
+  <path d="M530 84 H544 V188 H530" class="ln-acc"/>
+  <text x="556" y="108" font-weight="700" class="mono" font-size="13">List&lt;? extends Number&gt;</text>
+  <text x="556" y="130" font-size="12.5">Number или любой его потомок</text>
+  <text x="556" y="150" font-size="12.5">читать как Number — можно</text>
+  <text x="556" y="170" font-size="12.5" class="muted">класть — нельзя (кроме null)</text>
+</svg>
+</figure>
+<div class="table-wrap"><table>
+<tr><th>Объявление</th><th>Принимает</th><th>Чтение</th><th>Запись</th><th>Роль</th></tr>
+<tr><td><code>List&lt;? extends Number&gt;</code></td><td><code>List&lt;Number&gt;</code>, <code>List&lt;Integer&gt;</code>, <code>List&lt;Double&gt;</code></td><td>как <code>Number</code></td><td>нельзя</td><td><b>Producer</b> — источник данных</td></tr>
+<tr><td><code>List&lt;? super Integer&gt;</code></td><td><code>List&lt;Integer&gt;</code>, <code>List&lt;Number&gt;</code>, <code>List&lt;Object&gt;</code></td><td>как <code>Object</code></td><td><code>Integer</code></td><td><b>Consumer</b> — приёмник данных</td></tr>
+<tr><td><code>List&lt;?&gt;</code></td><td>Любой список</td><td>как <code>Object</code></td><td>нельзя</td><td>Тип элементов не важен</td></tr>
+</table></div>
+<p>Почему в <code>List&lt;? extends Number&gt;</code> нельзя писать: это может быть <code>List&lt;Integer&gt;</code>, а может <code>List&lt;Double&gt;</code> — компилятор не знает, какой именно, и не может проверить ни одно добавление.</p>
+<div class="callout ok"><span class="c-title">PECS: Producer Extends, Consumer Super</span>
+Если параметр только <b>отдаёт</b> элементы — <code>? extends T</code>. Если только <b>принимает</b> — <code>? super T</code>. Если и то и другое — точный тип <code>T</code>.
+<pre><code class="java">static double sum(Collection&lt;? extends Number&gt; src) {       // из src читаем
+    double total = 0;
+    for (Number n : src) total += n.doubleValue();
+    return total;
+}
+static void fill(List&lt;? super Integer&gt; dst, int n) {        // в dst пишем
+    for (int i = 0; i &lt; n; i++) dst.add(i);
+}
+// классика из JDK: источник — extends, приёмник — super
+public static &lt;T&gt; void copy(List&lt;? super T&gt; dest, List&lt;? extends T&gt; src)</code></pre>
+</div>
+<p>Тем же правилом объясняются сигнатуры стандартной библиотеки: <code>Comparator&lt;? super T&gt;</code> — компаратор <i>потребляет</i> элементы, значит, компаратор для <code>Object</code> годится для сортировки строк; <code>Function&lt;? super T, ? extends R&gt;</code> — потребляет <code>T</code>, производит <code>R</code>. Wildcards пишут в параметрах методов и никогда — в возвращаемом типе: вызывающему придётся с ними бороться.</p>
+<div class="table-wrap"><table>
+<tr><th></th><th><code>List&lt;Object&gt;</code></th><th><code>List&lt;?&gt;</code></th><th><code>List</code> (сырой тип)</th></tr>
+<tr><td>Можно присвоить <code>List&lt;String&gt;</code></td><td>нет</td><td>да</td><td>да, с предупреждением</td></tr>
+<tr><td>Можно добавить элемент</td><td>любой</td><td>только <code>null</code></td><td>любой — <b>без проверки</b></td></tr>
+<tr><td>Типобезопасность</td><td>да</td><td>да</td><td>нет</td></tr>
+</table></div>
+
+<h2 id="pollution"><span class="h-num">7.5</span>Сырые типы и загрязнение кучи</h2>
+<p>Сырой тип (<code>List</code> без параметра) оставлен для совместимости и отключает проверки. Через него в коллекцию попадает объект чужого типа, а исключение возникает позже и в другом месте — там, где компилятор вставил приведение. Это называется <b>heap pollution</b>.</p>
+<pre class="bad-code"><code class="java">List&lt;String&gt; strings = new ArrayList&lt;&gt;();
+List raw = strings;                 // предупреждение unchecked, но компилируется
+raw.add(42);
+// … сотни строк спустя, возможно в другом классе:
+String s = strings.get(0);          // ClassCastException — в строке, где нет ни одного приведения</code></pre>
+<ul>
+  <li><b>Предупреждения <code>unchecked</code> и <code>rawtypes</code> — не шум.</b> Каждое означает: компилятор больше не гарантирует отсутствие <code>ClassCastException</code>. <code>@SuppressWarnings("unchecked")</code> ставят на минимальную область с комментарием, почему приведение безопасно.</li>
+  <li><b>Обобщённые varargs</b> (<code>List&lt;String&gt;... lists</code>) создают массив обобщённого типа — тот же риск. Если метод не записывает в массив и не отдаёт его наружу, его помечают <code>@SafeVarargs</code> (как <code>List.of</code>, <code>Arrays.asList</code>).</li>
+</ul>
+
+<h2 id="tricks"><span class="h-num">7.6</span>Приёмы</h2>
+<pre data-title="вместо new T() — фабрика или токен типа"><code class="java">static &lt;T&gt; List&lt;T&gt; createMany(Supplier&lt;T&gt; factory, int n) {
+    List&lt;T&gt; result = new ArrayList&lt;&gt;(n);
+    for (int i = 0; i &lt; n; i++) result.add(factory.get());
+    return result;
+}
+createMany(Order::new, 3);
+
+&lt;T&gt; T find(Class&lt;T&gt; type, long id) {                       // Class&lt;T&gt; — носитель типа во время выполнения
+    return type.cast(storage.load(type.getName(), id));    // так устроены EntityManager.find, ObjectMapper.readValue
+}</code></pre>
+<pre data-title="рекурсивное ограничение"><code class="java">static &lt;T extends Comparable&lt;? super T&gt;&gt; void sort(List&lt;T&gt; list)
+// «T умеет сравниваться с собой или со своим предком»:
+// позволяет сортировать List&lt;java.sql.Date&gt;, хотя Comparable реализован в родителе java.util.Date
+
+abstract class Builder&lt;B extends Builder&lt;B&gt;&gt; {     // self-type: методы родителя возвращают тип наследника
+    abstract B self();
+    B name(String n) { /* … */ return self(); }
+}</code></pre>
+
+<h2 id="lab"><span class="h-num">7.7</span>Интерактив: скомпилируется ли? PECS на практике</h2>
+<div class="widget" id="pcW">
+  <div class="widget-title">Проверка компилятором: wildcards</div>
+  <p class="hint">Иерархия: <code>Object ← Number ← Integer</code>, <code>Number ← Double</code>. Выберите тип переменной и операцию.</p>
+  <div class="controls">
+    <label>объявление<select id="pcDecl"><option value="inv">List&lt;Number&gt; list</option><option value="ext">List&lt;? extends Number&gt; list</option><option value="sup">List&lt;? super Integer&gt; list</option><option value="any">List&lt;?&gt; list</option><option value="raw">List list (сырой тип)</option></select></label>
+    <label>операция<select id="pcOp"><option value="asInt">list = new ArrayList&lt;Integer&gt;()</option><option value="asNum">list = new ArrayList&lt;Number&gt;()</option><option value="asObj">list = new ArrayList&lt;Object&gt;()</option><option value="addInt">list.add(Integer.valueOf(1))</option><option value="addDbl">list.add(Double.valueOf(1.5))</option><option value="addNull">list.add(null)</option><option value="getNum">Number n = list.get(0)</option><option value="getInt">Integer i = list.get(0)</option><option value="getObj">Object o = list.get(0)</option></select></label>
+  </div>
+  <div class="verdict" id="pcOut"></div>
+</div>
+<script>
+(function () {
+  var T = {
+    inv: { asInt: [0, "List<Integer> не является List<Number>: generics инвариантны. Иначе через list можно было бы положить Double в список Integer."], asNum: [1, "Точное совпадение параметра типа."], asObj: [0, "List<Object> — не List<Number> по той же причине инвариантности."], addInt: [1, "Integer — подтип Number."], addDbl: [1, "Double — подтип Number."], addNull: [1, "null подходит любому ссылочному типу."], getNum: [1, "Элементы объявлены как Number."], getInt: [0, "Элемент — Number, а не обязательно Integer: нужен явный cast."], getObj: [1, "Number — подтип Object."] },
+    ext: { asInt: [1, "? extends Number принимает список любого подтипа Number — ковариантность."], asNum: [1, "Number — тоже «extends Number»."], asObj: [0, "Object не является подтипом Number."], addInt: [0, "Компилятор не знает точный тип: вдруг это List<Double>? Запись запрещена. Producer Extends — только чтение."], addDbl: [0, "То же самое: реальный список может быть List<Integer>."], addNull: [1, "null — единственное, что можно добавить: он подходит под любой тип."], getNum: [1, "Что бы там ни было, это точно Number. Список — «производитель» (producer)."], getInt: [0, "Гарантирован только Number."], getObj: [1, "Number — подтип Object."] },
+    sup: { asInt: [1, "Integer — «super Integer» (сам тип входит)."], asNum: [1, "Number — супертип Integer — контравариантность."], asObj: [1, "Object — супертип Integer."], addInt: [1, "Какой бы супертип там ни был (Integer, Number, Object) — Integer в него положить можно. Consumer Super — запись."], addDbl: [0, "Реальный список может быть List<Integer>, Double туда нельзя."], addNull: [1, "null можно всегда."], getNum: [0, "Реальный тип может быть List<Object> — гарантии, что элемент Number, нет."], getInt: [0, "Тем более нет гарантии Integer."], getObj: [1, "Единственное, что известно о читаемом элементе, — это Object."] },
+    any: { asInt: [1, "List<?> принимает список чего угодно."], asNum: [1, "Аналогично."], asObj: [1, "Аналогично."], addInt: [0, "Тип элементов неизвестен — добавлять нельзя ничего, кроме null."], addDbl: [0, "Тип элементов неизвестен."], addNull: [1, "Только null."], getNum: [0, "Читается только Object."], getInt: [0, "Читается только Object."], getObj: [1, "List<?> — «список неизвестно чего, который можно читать как Object»: для size(), contains(), итерации."] },
+    raw: { asInt: [2, "Компилируется: сырой тип отключает проверки generics."], asNum: [2, "Компилируется."], asObj: [2, "Компилируется."], addInt: [2, "Компилируется с предупреждением unchecked call."], addDbl: [2, "Компилируется с предупреждением — и так в список Integer попадает Double (heap pollution). ClassCastException возникнет позже и в другом месте."], addNull: [2, "Компилируется."], getNum: [0, "Сырой get возвращает Object: нужен cast."], getInt: [0, "Сырой get возвращает Object: нужен cast."], getObj: [2, "Возвращается Object."] }
+  };
+  var d = document.getElementById("pcDecl"), o = document.getElementById("pcOp"), out = document.getElementById("pcOut");
+  function run() {
+    var r = T[d.value][o.value];
+    out.className = "verdict " + (r[0] === 1 ? "ok" : (r[0] === 2 ? "warn" : "bad"));
+    out.innerHTML = "<b>" + (r[0] === 1 ? "Компилируется. " : (r[0] === 2 ? "Компилируется, но без проверки типов. " : "Ошибка компиляции. ")) + "</b>" + SG.esc(r[1]) + (r[0] === 2 ? " Сырые типы существуют только для совместимости с кодом до Java 5." : "");
+  }
+  d.addEventListener("change", run); o.addEventListener("change", run); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">PECS одной строкой</span>
+<code>static &lt;T&gt; void copy(List&lt;? super T&gt; dst, List&lt;? extends T&gt; src)</code> — из <code>src</code> читаем (producer → extends), в <code>dst</code> пишем (consumer → super). Так объявлен <code>Collections.copy</code>.</div>
+
+<h2 id="quiz"><span class="h-num">7.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему нельзя написать <code>new T()</code> или <code>T[] arr = new T[10]</code> в обобщённом классе?</p><ul><li>Это запрещено стилем кодирования</li><li>Из-за стирания типов: в рантайме T неизвестен, остаётся Object или граница типа</li><li>T — зарезервированное слово</li><li>Можно, если T extends Object</li></ul><div class="why">Информация о T существует только при компиляции. Обход: передать <code>Class&lt;T&gt;</code> или <code>Supplier&lt;T&gt;</code>.</div></div>
+<div class="mcq" data-ok="3"><p>Скомпилируется ли класс с методами <code>void process(List&lt;String&gt; l)</code> и <code>void process(List&lt;Integer&gt; l)</code>?</p><ul><li>Да, это перегрузка</li><li>Да, с предупреждением</li><li>Только если один из них static</li><li>Нет: после стирания оба имеют сигнатуру process(List) — name clash</li></ul><div class="why">Перегрузка различается по стёртым сигнатурам, а они одинаковы.</div></div>
+<div class="mcq" data-ok="0"><p>Что вернёт <code>new ArrayList&lt;String&gt;().getClass() == new ArrayList&lt;Integer&gt;().getClass()</code>?</p><ul><li>true — в рантайме существует один класс ArrayList</li><li>false</li><li>Ошибку компиляции</li><li>ClassCastException</li></ul><div class="why">Параметры типа стираются; отдельных классов для каждого параметра (как шаблоны C++) в Java нет.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое стирание типов и зачем оно было выбрано?</summary><div class="a"><p>Компилятор проверяет параметры типов, затем заменяет их верхней границей и вставляет приведения; в байткоде и у объектов параметров типов нет. Так сделано ради совместимости: код с generics работает с библиотеками, написанными до Java 5, и наоборот, без изменения JVM и формата классов.</p></div></details>
+<details class="q"><summary>Почему <code>List&lt;Integer&gt;</code> нельзя присвоить переменной <code>List&lt;Number&gt;</code>?</summary><div class="a"><p>Через ссылку <code>List&lt;Number&gt;</code> можно было бы добавить <code>Double</code>, и список целых оказался бы испорчен. Обобщённые типы инвариантны. Если нужно только читать числа — <code>List&lt;? extends Number&gt;</code>.</p></div></details>
+<details class="q"><summary>Расшифруйте PECS и приведите пример из JDK.</summary><div class="a"><p>Producer Extends, Consumer Super. Параметр, из которого читают, объявляют <code>? extends T</code>; параметр, в который пишут, — <code>? super T</code>. Пример: <code>Collections.copy(List&lt;? super T&gt; dest, List&lt;? extends T&gt; src)</code>; <code>Collection.addAll(Collection&lt;? extends E&gt;)</code>; <code>List.sort(Comparator&lt;? super E&gt;)</code>.</p></div></details>
+<details class="q"><summary>Чем <code>List&lt;?&gt;</code> отличается от <code>List&lt;Object&gt;</code> и от сырого <code>List</code>?</summary><div class="a"><p><code>List&lt;Object&gt;</code> — список именно объектов: ему нельзя присвоить <code>List&lt;String&gt;</code>, зато можно добавить что угодно. <code>List&lt;?&gt;</code> — список неизвестного типа: присвоить можно любой, добавить нельзя ничего, кроме <code>null</code>. Сырой <code>List</code> отключает проверки вовсе.</p></div></details>
+<details class="q"><summary>Почему нельзя написать <code>new T[10]</code>, но можно <code>new ArrayList&lt;T&gt;()</code>?</summary><div class="a"><p>Массив хранит тип элементов и проверяет его при каждой записи, поэтому для создания нужен реальный класс, а <code>T</code> стёрт. <code>ArrayList</code> внутри держит <code>Object[]</code> и типа элементов не знает — ему стирание не мешает.</p></div></details>
+<details class="q"><summary>Как Jackson узнаёт, что нужно создать <code>List&lt;Order&gt;</code>, если типы стёрты?</summary><div class="a"><p>Стирание касается объектов, но не объявлений. <code>new TypeReference&lt;List&lt;Order&gt;&gt;() { }</code> создаёт анонимный подкласс, в описании которого записан полный обобщённый суперкласс; он читается рефлексией через <code>getGenericSuperclass()</code>. Для полей и параметров методов тип так же доступен из class-файла.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

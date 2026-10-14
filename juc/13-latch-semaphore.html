@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · CountDownLatch и Semaphore</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.th6 { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; margin: 10px 0; }
+.th6 button { font: 12px var(--font-mono); padding: 10px 2px; border-radius: 6px; border: 1.5px solid var(--line); background: var(--bg-sunk); color: var(--fg); cursor: pointer; }
+.th6 button.run { background: var(--ok-soft); border-color: var(--ok); } .th6 button.wait { background: var(--warn-soft); border-color: var(--warn); }
+.permits { display: flex; gap: 6px; margin: 8px 0; } .permits span { width: 34px; height: 34px; border-radius: 50%; border: 2px solid var(--accent); display: flex; align-items: center; justify-content: center; font: 12px var(--font-mono); }
+.permits span.used { opacity: .25; }
+@media (max-width: 640px) { .th6 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+</style>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · СИНХРОНИЗАТОРЫ</div>
+  <h1>CountDownLatch и Semaphore</h1>
+  <p class="lead">Два самых простых синхронизатора — оба на разделяемом режиме AQS. <code>CountDownLatch</code> — одноразовые ворота: открываются, когда счётчик дошёл до нуля. <code>Semaphore</code> — пул разрешений: не больше N потоков одновременно. Разбираем, как каждый выражается через <code>state</code>, типичные схемы использования (стартовые и финишные ворота, ограничение параллелизма для виртуальных потоков) и ловушки: семафор без владельца и «утечка» разрешений.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">AQS shared</span><span class="tag">стартовые/финишные ворота</span><span class="tag">permits</span><span class="tag">bulkhead</span><span class="tag">fair</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="latch"><span class="h-num">13.1</span>CountDownLatch</h2>
+<pre data-title="CountDownLatch.Sync — вся реализация"><code class="java">private static final class Sync extends AbstractQueuedSynchronizer {
+    Sync(int count) { setState(count); }
+    protected int tryAcquireShared(int acquires) { return (getState() == 0) ? 1 : -1; }   // await проходит, только когда 0
+    protected boolean tryReleaseShared(int releases) {                                   // countDown
+        for (;;) {
+            int c = getState();
+            if (c == 0) return false;                  // уже открыт — лишние countDown игнорируются
+            int nc = c - 1;
+            if (compareAndSetState(c, nc)) return nc == 0;   // true → разбудить ВСЕХ ожидающих каскадом
+        }
+    }
+}</code></pre>
+<pre data-title="стартовые и финишные ворота для теста производительности"><code class="java">CountDownLatch start = new CountDownLatch(1), done = new CountDownLatch(nThreads);
+for (int i = 0; i &lt; nThreads; i++) executor.submit(() -&gt; {
+    try { start.await(); work(); }                  // все стартуют одновременно
+    catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    finally { done.countDown(); }                   // countDown — в finally, иначе при исключении await зависнет навсегда
+});
+long t0 = System.nanoTime(); start.countDown();
+if (!done.await(30, TimeUnit.SECONDS)) throw new TimeoutException();   // всегда с таймаутом в продакшене
+long elapsed = System.nanoTime() - t0;</code></pre>
+<p>Счётчик нельзя увеличить или сбросить — защёлка одноразовая. Для многократного использования — <code>CyclicBarrier</code> или <code>Phaser</code> (тема 14). <code>countDown()</code> имеет семантику release, <code>await()</code> — acquire: действия до countDown видны после await.</p>
+
+<h2 id="semaphore"><span class="h-num">13.2</span>Semaphore</h2>
+<div class="widget" id="smW">
+  <div class="widget-title">Semaphore(2): нажимайте на потоки — acquire / release</div>
+  <div class="controls">
+    <label>режим<select id="smF"><option value="nf">нечестный (по умолчанию)</option><option value="f">честный (true)</option></select></label>
+    <button class="btn" type="button" id="smExtra">release() из постороннего потока</button>
+    <button class="btn" type="button" id="smR">↺</button>
+  </div>
+  <div class="permits" id="smP"></div>
+  <div class="th6" id="smT"></div>
+  <div class="log" id="smLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, permits, st, q, log, total;
+  function reset() { permits = 2; total = 2; st = {}; for (var i = 1; i <= 6; i++) st["T" + i] = "idle"; q = []; log = ["permits = 2 (state AQS = число свободных разрешений)"]; draw(); }
+  function grant() { while (permits > 0 && q.length) { var t = q.shift(); permits--; st[t] = "run"; log.push("  release → разбужен " + t + " из очереди, получил разрешение"); } }
+  function click(t) {
+    if (st[t] === "idle") {
+      var fair = $("smF").value === "f";
+      if (permits > 0 && (!fair || q.length === 0)) { permits--; st[t] = "run"; log.push(t + ": acquire → CAS(state, " + (permits + 1) + ", " + permits + ") — работает"); }
+      else { q.push(t); st[t] = "wait"; log.push(t + ": acquire → " + (permits > 0 ? "разрешение есть, но честный режим: очередь не пуста → ждать" : "разрешений нет → в очередь AQS, park")); }
+    } else if (st[t] === "run") { permits++; st[t] = "idle"; log.push(t + ": release → permits = " + permits); grant(); }
+    else log.push(t + " ждёт разрешения");
+    draw();
+  }
+  function draw() {
+    var h = ""; for (var i = 0; i < Math.max(total, permits); i++) h += '<span class="' + (i < permits ? "" : "used") + '">' + (i < permits ? "✓" : "·") + "</span>";
+    $("smP").innerHTML = h + '<span style="border:none;width:auto">свободно ' + permits + "</span>";
+    $("smT").innerHTML = Object.keys(st).map(function (t) { return '<button type="button" class="' + st[t] + '" data-t="' + t + '">' + t + "<br>" + (st[t] === "run" ? "работает → release" : st[t] === "wait" ? "ждёт" : "acquire") + "</button>"; }).join("");
+    $("smLog").textContent = log.slice(-7).join("\n"); $("smLog").scrollTop = 1e6;
+  }
+  $("smT").addEventListener("click", function (e) { var b = e.target.closest("button"); if (b) click(b.getAttribute("data-t")); });
+  $("smExtra").addEventListener("click", function () { permits++; total = Math.max(total, permits); log.push("посторонний поток: release() без acquire → permits = " + permits + "! У Semaphore нет владельца: разрешений стало больше, чем задумано"); grant(); draw(); });
+  $("smR").addEventListener("click", reset); $("smF").addEventListener("change", reset);
+  reset();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Особенность</th><th>Следствие</th></tr>
+<tr><td>Нет владельца</td><td>release можно вызвать из любого потока, даже без acquire — ошибки в учёте молча увеличивают лимит. Всегда <code>acquire</code> перед <code>try</code>, <code>release</code> в <code>finally</code>.</td></tr>
+<tr><td>acquire(n) / release(n)</td><td>ресурсы разного «веса» (байты, токены); в нечестном режиме большой запрос может голодать</td></tr>
+<tr><td><code>tryAcquire(timeout)</code></td><td>отказ при перегрузке вместо бесконечного ожидания</td></tr>
+<tr><td>Semaphore(1)</td><td>двоичный семафор — «блокировка без владельца»: отпустить может другой поток (иногда это и нужно), но нет реентерабельности</td></tr>
+</table></div>
+<pre data-title="bulkhead: не больше 20 одновременных вызовов внешнего API из виртуальных потоков"><code class="java">private final Semaphore apiPermits = new Semaphore(20);
+Response call(Request r) throws InterruptedException, TimeoutException {
+    if (!apiPermits.tryAcquire(500, TimeUnit.MILLISECONDS)) throw new TimeoutException("API перегружен");
+    try { return client.send(r); }
+    finally { apiPermits.release(); }
+}
+// с виртуальными потоками пул не ограничивает параллелизм — ограничивайте ресурс семафором</code></pre>
+
+<h2 id="quiz"><span class="h-num">13.3</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему countDown() надо вызывать в finally?</p><ul><li>Так быстрее</li><li>Иначе не скомпилируется</li><li>Если работа бросит исключение, счётчик не дойдёт до нуля, и await зависнет навсегда</li><li>Для сброса счётчика</li></ul><div class="why">И всегда await с таймаутом.</div></div>
+<div class="mcq" data-ok="0"><p>Что будет, если вызвать semaphore.release() без предшествующего acquire()?</p><ul><li>Число разрешений увеличится — у семафора нет владельца</li><li>IllegalMonitorStateException</li><li>Ничего</li><li>Deadlock</li></ul><div class="why">Отличие от Lock: учёт целиком на совести кода.</div></div>
+<div class="mcq" data-ok="3"><p>Можно ли повторно использовать CountDownLatch после того, как счётчик дошёл до нуля?</p><ul><li>Да, через reset()</li><li>Да, через countUp()</li><li>Да, если создать заново в том же поле</li><li>Нет: защёлка одноразовая; для повторяющихся фаз — CyclicBarrier или Phaser</li></ul><div class="why">Пересоздание объекта — уже другая защёлка.</div></div>
+<div class="mcq" data-ok="1"><p>Как ограничить число одновременных запросов к БД из 10 000 виртуальных потоков?</p><ul><li>Пул платформенных потоков на 20</li><li>Semaphore на 20 разрешений (или ограниченный пул соединений)</li><li>synchronized</li><li>CountDownLatch(20)</li></ul><div class="why">Ограничивают ресурс, а не потоки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как выразить через AQS семантику Semaphore и CountDownLatch?</summary><div class="a"><p>Оба используют разделяемый режим. Semaphore: state — число свободных разрешений; tryAcquireShared вычитает запрошенное CAS-ом и возвращает остаток (отрицательный — ждать); tryReleaseShared прибавляет. Честный вариант сначала проверяет hasQueuedPredecessors. CountDownLatch: state — счётчик; acquire успешен только при 0; release уменьшает и возвращает true при достижении нуля — тогда AQS будит всех ожидающих каскадом.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

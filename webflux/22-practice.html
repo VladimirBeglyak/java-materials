@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Практикум и собеседование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="22">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>Практикум и собеседование</h1>
+  <p class="lead">Закрепляем всё пособие на практике: тренажёр код-ревью с типичными реактивными ошибками, разбор проектирования реального эндпоинта-агрегатора, чек-лист перед продакшеном и подборка вопросов с собеседований — от «что такое backpressure» до «почему контекст безопасности потерялся».</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">код-ревью</span><span class="tag">агрегатор</span><span class="tag">чек-лист</span><span class="tag">вопросы с собеседований</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="review"><span class="h-num">22.1</span>Тренажёр код-ревью</h2>
+<div class="widget" id="crW">
+  <div class="widget-title">Найдите главную проблему во фрагменте</div>
+  <div class="controls"><button class="btn" id="crPrev">← назад</button><span id="crNum" style="align-self:center"></span><button class="btn" id="crNext">дальше →</button></div>
+  <pre data-title="Фрагмент"><code class="java" id="crCode"></code></pre>
+  <div class="controls" id="crOpts"></div>
+  <div class="verdict" id="crV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var Q = [
+    { c: "@GetMapping(\"/users/{id}\")\nMono<User> get(@PathVariable long id) {\n    User u = jdbcTemplate.queryForObject(SQL, mapper, id);\n    return Mono.just(u);\n}", o: ["Блокирующий JDBC в event loop", "Mono.just нельзя возвращать", "Нужен Flux", "Нет @ResponseBody"], a: 0, w: "JDBC выполняется прямо в reactor-http-nio, ещё при вызове метода. Обернуть: Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic()) — или перейти на R2DBC." },
+    { c: "Mono<Void> notify(Order o) {\n    return repo.save(o)\n        .doOnNext(saved -> mailClient.send(saved))   // send возвращает Mono<Void>\n        .then();\n}", o: ["save не подписан", "Письмо не отправится: Mono из send не подписан", "doOnNext запрещён после save", "then() теряет ошибку"], a: 1, w: "doOnNext выбрасывает возвращённый Mono. Нужно .flatMap(saved -> mailClient.send(saved)) или .delayUntil(mailClient::send)." },
+    { c: "Flux<Price> prices(List<String> skus) {\n    return Flux.fromIterable(skus)               // 20 000 элементов\n        .flatMap(sku -> pricing.get(sku));\n}", o: ["Порядок не сохранится — это баг", "До 256 одновременных запросов: перегрузка сервиса и пула", "flatMap выполнит запросы последовательно", "fromIterable блокирует"], a: 1, w: "Без явного concurrency flatMap держит до 256 вызовов в полёте, исчерпывая пул соединений и бомбя pricing. flatMap(pricing::get, 16) — плюс батч-эндпоинт, если он есть." },
+    { c: "@Transactional\npublic Mono<Void> pay(long id) {\n    audit.log(id).subscribe();\n    return orders.markPaid(id).then();\n}", o: ["@Transactional не работает с Mono", "audit.log выполняется вне транзакции и вне жизненного цикла запроса", "markPaid не выполнится", "then() отменит транзакцию"], a: 1, w: "subscribe() создаёт отдельную подписку без транзакционного Context: запись аудита в autocommit, ошибки теряются, отмена не распространяется. Встроить: return audit.log(id).then(orders.markPaid(id)).then()." },
+    { c: "Mono<String> token = Mono.just(authClient.fetchToken().block())\n    .cache(Duration.ofMinutes(5));", o: ["cache не работает с Duration", "block() при сборке, и токен вычислен один раз — cache бесполезен", "Нужен Flux", "Ошибок нет"], a: 1, w: "block() выполняется сразу (и в event loop бросит исключение), а Mono.just хранит одно значение навсегда — cache не будет обновлять токен. Правильно: authClient.fetchToken().cache(t -> t.ttl().minusSeconds(30), e -> Duration.ZERO, () -> Duration.ZERO)." },
+    { c: "return repo.findById(id)\n    .contextWrite(Context.of(\"tenant\", tenant))\n    .flatMap(o -> Mono.deferContextual(ctx ->\n        enrich(o, ctx.get(\"tenant\"))));", o: ["Context неизменяемый — запись невозможна", "flatMap ниже contextWrite не увидит tenant", "deferContextual устарел", "findById не поддерживает Context"], a: 1, w: "Контекст распространяется снизу вверх: contextWrite виден только операторам выше. Его место — в конце цепочки (или в WebFilter)." },
+    { c: "@GetMapping(value = \"/ticks\", produces = TEXT_EVENT_STREAM_VALUE)\nFlux<Long> ticks() {\n    return Flux.interval(Duration.ofMillis(1))\n        .publishOn(Schedulers.single())\n        .map(this::slowFormat);   // ~5 мс\n}", o: ["SSE не поддерживает Long", "interval не умеет замедляться: OverflowException", "publishOn нельзя в контроллере", "single() слишком медленный"], a: 1, w: "Таймер выдаёт 1000 событий/с, потребитель обрабатывает 200. Очередь publishOn (256) переполнится за доли секунды. Нужна стратегия: onBackpressureDrop/Latest перед publishOn — или sample(Duration)." },
+    { c: "webClient.get().uri(\"/report\")\n    .exchangeToMono(resp -> resp.statusCode().is2xxSuccessful()\n        ? resp.bodyToMono(Report.class)\n        : Mono.error(new ReportFailed()));", o: ["Тело ответа с ошибкой не освобождено — утечка соединения", "exchangeToMono устарел", "Ошибок нет: exchangeToMono освобождает тело сам", "Нужно retrieve()"], a: 2, w: "exchangeToMono после завершения функции сам освобождает непрочитанное тело (в отличие от удалённого exchange()). Здесь всё корректно; но для читаемости обработку статусов чаще пишут через retrieve().onStatus(...)." }
+  ];
+  var i = 0, ans = {};
+  function draw() {
+    var q = Q[i]; $("crNum").textContent = (i + 1) + " / " + Q.length + " · верно: " + Object.keys(ans).filter(function (k) { return ans[k]; }).length;
+    $("crCode").textContent = q.c;
+    $("crOpts").innerHTML = q.o.map(function (o, k) { return '<button class="btn" data-k="' + k + '">' + o + "</button>"; }).join("");
+    var bs = $("crOpts").querySelectorAll("button");
+    for (var b = 0; b < bs.length; b++) bs[b].addEventListener("click", pick);
+    $("crV").className = "verdict"; $("crV").textContent = "Выберите ответ.";
+  }
+  function pick(e) {
+    var k = +e.target.getAttribute("data-k"), q = Q[i], ok = k === q.a;
+    if (!(i in ans)) ans[i] = ok;
+    $("crV").className = "verdict " + (ok ? "ok" : "bad"); $("crV").textContent = (ok ? "Верно. " : "Нет. Правильный ответ: «" + q.o[q.a] + "». ") + q.w;
+    $("crNum").textContent = (i + 1) + " / " + Q.length + " · верно: " + Object.keys(ans).filter(function (x) { return ans[x]; }).length;
+  }
+  $("crPrev").addEventListener("click", function () { i = (i + Q.length - 1) % Q.length; draw(); });
+  $("crNext").addEventListener("click", function () { i = (i + 1) % Q.length; draw(); });
+  draw();
+})();
+</script>
+
+<h2 id="design"><span class="h-num">22.2</span>Проектирование: эндпоинт-агрегатор</h2>
+<p>Задача: <code>GET /api/dashboard/{userId}</code> собирает профиль (обязательный), 10 последних заказов (обязательные), рекомендации (некритичные, медленные) и баланс бонусов (некритичный). SLA — 500 мс p99.</p>
+<pre data-title="Решение" class="good-code"><code class="java">@GetMapping("/api/dashboard/{userId}")
+Mono&lt;Dashboard&gt; dashboard(@PathVariable String userId) {
+    Mono&lt;Profile&gt; profile = profiles.get(userId)
+        .timeout(Duration.ofMillis(300))
+        .retryWhen(Retry.backoff(1, Duration.ofMillis(50)).filter(this::transient));
+    Mono&lt;List&lt;Order&gt;&gt; orders = orderRepo.findTop10ByUserIdOrderByCreatedAtDesc(userId)
+        .collectList()
+        .timeout(Duration.ofMillis(300));
+    Mono&lt;List&lt;Reco&gt;&gt; recos = recoClient.forUser(userId)
+        .take(5).collectList()
+        .timeout(Duration.ofMillis(200))
+        .onErrorReturn(List.of());                       // деградация вместо ошибки
+    Mono&lt;Optional&lt;Balance&gt;&gt; balance = bonus.balance(userId)
+        .map(Optional::of)
+        .timeout(Duration.ofMillis(200))
+        .onErrorReturn(Optional.empty())
+        .defaultIfEmpty(Optional.empty());               // пустой Mono не должен обнулить zip
+    return Mono.zip(profile, orders, recos, balance)
+        .map(t -&gt; new Dashboard(t.getT1(), t.getT2(), t.getT3(), t.getT4().orElse(null)))
+        .timeout(Duration.ofMillis(450))                  // общий бюджет
+        .name("dashboard").tap(Micrometer.observation(registry));
+}</code></pre>
+<ul>
+  <li>Все четыре вызова параллельны (zip) — время ≈ максимум, а не сумма.</li>
+  <li>Обязательные части падают целиком (ответ 5xx/504), некритичные деградируют.</li>
+  <li>Бюджеты таймаутов вложены: части меньше общего, общий меньше SLA.</li>
+  <li>Пустой Mono в zip обезврежен через Optional/defaultIfEmpty.</li>
+  <li>Наблюдаемость: имя последовательности и Observation.</li>
+</ul>
+
+<h2 id="checklist"><span class="h-num">22.3</span>Чек-лист перед продакшеном</h2>
+<div class="checks col">
+  <label><input type="checkbox"> BlockHound в интеграционных тестах, ни одного блокирующего вызова в event loop</label>
+  <label><input type="checkbox"> Все блокирующие зависимости обёрнуты в boundedElastic (или убраны)</label>
+  <label><input type="checkbox"> У каждого внешнего вызова — таймаут, у идемпотентных — retry с backoff и фильтром</label>
+  <label><input type="checkbox"> flatMap над большими коллекциями — с явным concurrency</label>
+  <label><input type="checkbox"> Отдельные ConnectionProvider для критичных зависимостей, maxIdleTime меньше таймаута балансировщика</label>
+  <label><input type="checkbox"> spring.http.codecs.max-in-memory-size осознанно задан для сервера и WebClient</label>
+  <label><input type="checkbox"> Нет subscribe() в бизнес-коде; нет block() вне тестов и main</label>
+  <label><input type="checkbox"> context-propagation включён: traceId/requestId в логах</label>
+  <label><input type="checkbox"> ReactorDebugAgent включён, checkpoint на границах модулей</label>
+  <label><input type="checkbox"> Метрики: http.server.requests, пулы Netty и R2DBC, event loop pending tasks</label>
+  <label><input type="checkbox"> Стратегии противодавления у всех горячих источников (Sinks, interval, сокеты)</label>
+  <label><input type="checkbox"> Нагрузочный тест открытой моделью, сравнение p99 с целевым SLA</label>
+</div>
+
+<h2 id="interview"><span class="h-num">22.4</span>Вопросы с собеседований</h2>
+<div class="quiz">
+<details class="q"><summary>Что такое backpressure и как он реализован в Reactor?</summary><div class="a"><p>Механизм, позволяющий потребителю ограничить скорость производителя. По протоколу Reactive Streams подписчик вызывает <code>Subscription.request(n)</code>, и издатель не имеет права выдать больше. Операторы с очередями (publishOn, flatMap) запрашивают prefetch и пополняют его по порогу 75%. Для источников, не умеющих замедляться, — стратегии onBackpressureBuffer/Drop/Latest/Error.</p></div></details>
+<details class="q"><summary>Разница между map и flatMap, flatMap и concatMap?</summary><div class="a"><p>map — синхронное преобразование 1→1. flatMap — асинхронное 1→Publisher, подписывается на внутренние издатели параллельно (до concurrency=256) и выдаёт по готовности. concatMap — по одному внутреннему издателю, сохраняет порядок. flatMapSequential — параллельно, но выдаёт в исходном порядке. switchMap — отменяет предыдущий внутренний при новом элементе.</p></div></details>
+<details class="q"><summary>Чем publishOn отличается от subscribeOn?</summary><div class="a"><p>publishOn переключает поток для операторов ниже себя (сигналы onNext/onComplete). subscribeOn переключает поток, в котором происходит подписка и запросы вверх, — то есть поток синхронного источника; где бы он ни стоял, действует на всю цепочку до первого publishOn; из нескольких побеждает ближайший к источнику. На асинхронный источник (WebClient) subscribeOn не влияет.</p></div></details>
+<details class="q"><summary>Что значит «ничего не происходит, пока не подпишешься»?</summary><div class="a"><p>Операторы при вызове лишь строят описание конвейера (assembly). Работа — запросы к БД, HTTP-вызовы — начинается при subscribe() и выполняется заново для каждой подписки (для холодных издателей). В WebFlux подписывается фреймворк на Mono, возвращённый контроллером.</p></div></details>
+<details class="q"><summary>Hot и cold publishers — примеры и как превратить один в другой?</summary><div class="a"><p>Cold: каждый подписчик получает свою последовательность с начала — WebClient-запрос, R2DBC-запрос, Flux.range. Hot: данные идут независимо от подписчиков — Sinks.many().multicast(), события UI, котировки. Превращение: share() (publish().refCount()), publish().autoConnect(n), replay(n), cache().</p></div></details>
+<details class="q"><summary>Как передать requestId или пользователя через реактивную цепочку?</summary><div class="a"><p>Через Reactor Context: contextWrite в WebFilter (в конце цепочки), чтение — Mono.deferContextual / transformDeferredContextual. Для логов и трассировки — spring.reactor.context-propagation=auto и Micrometer context-propagation, которые восстанавливают MDC из Context на каждом сигнале. ThreadLocal напрямую не работает: цепочка перескакивает между потоками.</p></div></details>
+<details class="q"><summary>Что произойдёт, если вызвать block() в контроллере WebFlux?</summary><div class="a"><p>Reactor обнаружит, что поток помечен как NonBlocking (event loop Netty, parallel), и бросит IllegalStateException «block()/blockFirst()/blockLast() are blocking, which is not supported in thread reactor-http-nio-N». Даже если бы не бросил — заблокированный event loop остановил бы все соединения потока.</p></div></details>
+<details class="q"><summary>Как работают транзакции в реактивном Spring?</summary><div class="a"><p>ReactiveTransactionManager (R2dbcTransactionManager) хранит транзакционное соединение в Reactor Context. @Transactional работает на методах, возвращающих Publisher: транзакция начинается при подписке и фиксируется/откатывается по терминальному сигналу (при отмене — откат). Операции вне возвращённой цепочки (отдельный subscribe) в транзакцию не попадают. Программный вариант — TransactionalOperator.</p></div></details>
+<details class="q"><summary>Как обработать ошибку одного элемента и продолжить Flux?</summary><div class="a"><p>Внутри flatMap: <code>flux.flatMap(x -&gt; call(x).onErrorResume(e -&gt; Mono.empty()))</code>. Ошибка, дошедшая до внешнего потока, его завершает. onErrorContinue существует, но поддерживается не всеми операторами и ведёт себя неочевидно — его не рекомендуют.</p></div></details>
+<details class="q"><summary>Нужен ли WebFlux, если есть виртуальные потоки?</summary><div class="a"><p>Для типичного CRUD поверх JDBC — обычно нет: MVC на виртуальных потоках проще и масштабируется сопоставимо. WebFlux оправдан для стриминга с противодавлением, шлюзов, богатой асинхронной композиции и полностью неблокирующего стека (тема 21).</p></div></details>
+<details class="q"><summary>Почему пустой Mono из контроллера даёт 200, а не 404?</summary><div class="a"><p>Пустота — нормальное завершение без значения, а не ошибка. ResponseBodyResultHandler пишет пустое тело с 200. Для 404 — Mono&lt;ResponseEntity&gt; с defaultIfEmpty(notFound) или switchIfEmpty(Mono.error(new ResponseStatusException(NOT_FOUND))).</p></div></details>
+<details class="q"><summary>Как протестировать код с delay на час?</summary><div class="a"><p>StepVerifier.withVirtualTime(() -&gt; publisher) — издатель создаётся внутри Supplier, чтобы операторы времени взяли VirtualTimeScheduler; затем thenAwait(Duration.ofHours(1)) и проверки. Тест выполняется за миллисекунды.</p></div></details>
+</div>
+
+<h2 id="quiz"><span class="h-num">22.5</span>Итоговый тест</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В какой момент выполняется запрос к БД, если сервис вернул <code>repo.findById(id).map(...)</code>?</p><ul><li>При вызове сервиса</li><li>При подписке на возвращённый Mono</li><li>При старте приложения</li><li>При вызове map</li></ul><div class="why">Ленивость — основа модели.</div></div>
+<div class="mcq" data-ok="3"><p>Какой оператор параллельно вызывает сервис для каждого элемента, но выдаёт результаты в исходном порядке?</p><ul><li>flatMap</li><li>concatMap</li><li>switchMap</li><li>flatMapSequential</li></ul><div class="why">Параллельно + буферизация для порядка.</div></div>
+<div class="mcq" data-ok="0"><p>Где поставить contextWrite, чтобы контекст увидели все операторы обработки запроса?</p><ul><li>В конце цепочки, например в WebFilter после chain.filter(...)</li><li>Сразу после источника</li><li>В середине</li><li>Не важно</li></ul><div class="why">Контекст виден операторам выше записи.</div></div>
+<div class="mcq" data-ok="2"><p>Какой планировщик для обёртки блокирующего вызова?</p><ul><li>parallel()</li><li>single()</li><li>boundedElastic()</li><li>immediate()</li></ul><div class="why">parallel — только для неблокирующей CPU-работы.</div></div>
+<div class="mcq" data-ok="1"><p>Flux SSE выдал 3 события и упал. Что получит браузер?</p><ul><li>500 с телом ошибки</li><li>Обрыв потока после трёх событий; EventSource переподключится</li><li>Повтор с начала</li><li>Ничего</li></ul><div class="why">Статус 200 уже отправлен; соединение закрывается.</div></div>
+
+</div></main>
+</div>
+</body>
+</html>

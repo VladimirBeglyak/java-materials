@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · VarHandle и режимы доступа к памяти</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ФУНДАМЕНТ</div>
+  <h1>VarHandle и режимы доступа к памяти</h1>
+  <p class="lead"><code>VarHandle</code> (Java 9) — официальная замена <code>sun.misc.Unsafe</code>: типобезопасная ссылка на поле, элемент массива или участок памяти, через которую можно выполнять атомарные операции и выбирать <b>силу упорядочивания</b> каждого обращения — plain, opaque, release/acquire, volatile. На нём построены все атомики и AQS. С лакмус-тестами покажем, какие результаты возможны в каждом режиме на x86 и ARM.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">findVarHandle</span><span class="tag">plain/opaque</span><span class="tag">release/acquire</span><span class="tag">volatile</span><span class="tag">лакмус-тесты</span><span class="tag">fences</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="obtain"><span class="h-num">3.1</span>Получение и операции</h2>
+<pre data-title="VarHandle на поле — как в исходниках JDK"><code class="java">final class Node {
+    volatile Node next;
+    private static final VarHandle NEXT;
+    static {
+        try {
+            NEXT = MethodHandles.lookup().findVarHandle(Node.class, "next", Node.class);
+        } catch (ReflectiveOperationException e) { throw new ExceptionInInitializerError(e); }
+    }
+    boolean casNext(Node expect, Node update) { return NEXT.compareAndSet(this, expect, update); }
+    void lazySetNext(Node n)                  { NEXT.setRelease(this, n); }
+}
+// массив:       MethodHandles.arrayElementVarHandle(long[].class)
+// байты как int: MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN)
+// внешняя память (FFM): ValueLayout.JAVA_INT.varHandle()</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Группа</th><th>Методы</th></tr>
+<tr><td>Чтение</td><td><code>get</code> (plain), <code>getOpaque</code>, <code>getAcquire</code>, <code>getVolatile</code></td></tr>
+<tr><td>Запись</td><td><code>set</code>, <code>setOpaque</code>, <code>setRelease</code>, <code>setVolatile</code></td></tr>
+<tr><td>CAS</td><td><code>compareAndSet</code> (volatile), <code>compareAndExchange[Acquire|Release]</code> (возвращает фактическое значение), <code>weakCompareAndSet[Plain|Acquire|Release]</code></td></tr>
+<tr><td>Атомарные изменения</td><td><code>getAndSet</code>, <code>getAndAdd</code>, <code>getAndBitwiseOr/And/Xor</code> + варианты Acquire/Release</td></tr>
+<tr><td>Барьеры (статические)</td><td><code>VarHandle.fullFence()</code>, <code>acquireFence()</code>, <code>releaseFence()</code>, <code>loadLoadFence()</code>, <code>storeStoreFence()</code></td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Производительность</span>
+VarHandle — сигнатурно-полиморфный: вызов <code>NEXT.compareAndSet(this, a, b)</code> компилируется в точный дескриптор, а JIT встраивает его до одной инструкции — но только если VarHandle лежит в <code>static final</code> поле (константа для JIT). Неверные типы аргументов дают <code>WrongMethodTypeException</code> в рантайме.
+</div>
+
+<h2 id="modes"><span class="h-num">3.2</span>Четыре силы упорядочивания</h2>
+<div class="table-wrap"><table>
+<tr><th>Режим</th><th>Гарантии</th><th>Аналог</th><th>Когда</th></tr>
+<tr><td><b>Plain</b></td><td>никаких межпоточных: компилятор и CPU могут переупорядочивать, кэшировать в регистре, для long/double — даже разрывать на половины</td><td>обычное поле</td><td>данные, защищённые блокировкой или публикуемые через более сильные операции</td></tr>
+<tr><td><b>Opaque</b></td><td>атомарность, когерентность одной переменной (все потоки видят её изменения в одном порядке), «прогресс» — запись рано или поздно станет видна; никакого порядка относительно других переменных</td><td>C++ <code>memory_order_relaxed</code></td><td>флаги прогресса, счётчики статистики, «стоп» для цикла</td></tr>
+<tr><td><b>Release / Acquire</b></td><td>запись release не переставляется с предшествующими обращениями; чтение acquire — с последующими; acquire, увидевший release-запись, видит всё, что было до неё</td><td>C++ <code>release/acquire</code></td><td>публикация данных одним потоком другому (message passing), lazySet</td></tr>
+<tr><td><b>Volatile</b></td><td>всё выше + последовательная согласованность: единый общий порядок всех volatile-операций (запрещена и перестановка Store→Load)</td><td><code>volatile</code>, C++ <code>seq_cst</code></td><td>алгоритмы типа Деккера, где каждый поток пишет своё и читает чужое</td></tr>
+</table></div>
+
+<h2 id="litmus"><span class="h-num">3.3</span>Лакмус-тесты</h2>
+<div class="widget" id="lmW">
+  <div class="widget-title">Какие результаты разрешены?</div>
+  <div class="controls">
+    <label>тест<select id="lmT"><option value="mp">Message passing (публикация)</option><option value="sb">Store buffering (Деккер)</option><option value="co">Чтение одной переменной (когерентность)</option></select></label>
+    <label>режим<select id="lmM"><option value="plain">plain</option><option value="opaque">opaque</option><option value="ra">release / acquire</option><option value="vol">volatile</option></select></label>
+    <label>архитектура<select id="lmA"><option value="x86">x86-64</option><option value="arm">ARMv8 / POWER</option></select></label>
+  </div>
+  <pre style="margin:0"><code class="java" id="lmC"></code></pre>
+  <div class="table-wrap"><table id="lmR"></table></div>
+  <div class="verdict" id="lmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var CODE = {
+    mp: "int data = 0;  int flag = 0;\n// Поток 1                          // Поток 2\ndata = 42;                         r1 = FLAG.get…(flag);\nFLAG.set…(flag, 1);                r2 = data;",
+    sb: "int x = 0, y = 0;\n// Поток 1                          // Поток 2\nX.set…(x, 1);                      Y.set…(y, 1);\nr1 = Y.get…(y);                    r2 = X.get…(x);",
+    co: "int x = 0;\n// Поток 1          // Поток 2                    // Поток 3\nX.set…(x, 1);       X.set…(x, 2);                 r1 = X.get…(x); r2 = X.get…(x);"
+  };
+  function run() {
+    var t = $("lmT").value, m = $("lmM").value, a = $("lmA").value, rows, msg, cls;
+    $("lmC").textContent = CODE[t].replace(/set…/g, { plain: "set", opaque: "setOpaque", ra: "setRelease", vol: "setVolatile" }[m]).replace(/get…/g, { plain: "get", opaque: "getOpaque", ra: "getAcquire", vol: "getVolatile" }[m]);
+    if (t === "mp") {
+      var bad = m === "plain" || m === "opaque";
+      var happens = bad && (a === "arm" || m === "plain");
+      rows = [["r1=0, r2=0", "да", "флаг ещё не виден"], ["r1=0, r2=42", "да", "данные видны раньше флага — безвредно"], ["r1=1, r2=42", "да", "ожидаемый результат"], ["r1=1, r2=0", bad ? "ДА" : "нет", bad ? "флаг виден, данные — ещё нет: читаем неинициализированный объект" : "запрещено: acquire видит всё до release"]];
+      cls = bad ? "bad" : "ok";
+      msg = bad ? (m === "plain" ? "Plain: разрешено моделью памяти Java на любой архитектуре — компилятор может переставить запись data после flag или вынести чтение data. " : "Opaque не упорядочивает разные переменные. ") + (a === "x86" && m === "opaque" ? "На x86 железо этого не сделает (TSO сохраняет порядок записей), но JIT вправе переставить — код некорректен." : "На ARM процессор действительно переупорядочивает записи и чтения.") : "Release/acquire (и тем более volatile) — минимально достаточный режим для публикации: так работают lazySet, setRelease в очередях, публикация через AtomicReference.";
+    } else if (t === "sb") {
+      var allowed = m !== "vol";
+      rows = [["r1=1, r2=1", "да", ""], ["r1=0, r2=1", "да", ""], ["r1=1, r2=0", "да", ""], ["r1=0, r2=0", allowed ? "ДА" : "нет", allowed ? "оба потока не увидели запись другого — обе записи «застряли» в буферах записи" : "запрещено: единый порядок volatile-операций"]];
+      cls = allowed ? "bad" : "ok";
+      msg = allowed ? "Даже release/acquire допускает r1 = r2 = 0: перестановка Store→Load разрешена и реально происходит на x86 (буфер записи). Алгоритмы взаимного исключения в стиле Деккера/Петерсона требуют volatile (последовательной согласованности) или fullFence между записью и чтением." : "Volatile запрещает Store→Load-перестановку (на x86 — барьер lock add после записи). Это самая дорогая гарантия — используйте её, только когда алгоритм её требует.";
+    } else {
+      var inc = m === "plain";
+      rows = [["r1=1, r2=2 или r1=2, r2=1 (в порядке модификации)", "да", "второе чтение не «откатывается» назад"], ["r1=2, r2=1 при порядке модификации 1→2", inc ? "ДА" : "нет", inc ? "plain-чтения могут быть переупорядочены или прочитаны из разных источников" : "когерентность: значения не идут назад"]];
+      cls = inc ? "warn" : "ok";
+      msg = inc ? "Plain даже для одной переменной не гарантирует когерентности и прогресса: JIT может прочитать поле один раз и держать в регистре — классический бесконечный цикл while (!stop). " : "Начиная с opaque, у переменной есть единый порядок модификаций, и чтение никогда не увидит более старое значение после более нового; запись рано или поздно станет видна. Для флага остановки цикла opaque достаточно.";
+    }
+    $("lmR").innerHTML = "<tr><th>Результат</th><th>Возможен?</th><th>Почему</th></tr>" + rows.map(function (r) { return "<tr><td><code>" + r[0] + "</code></td><td" + (r[1] === "ДА" ? ' style="color:var(--bad);font-weight:700"' : "") + ">" + r[1] + "</td><td>" + r[2] + "</td></tr>"; }).join("");
+    $("lmV").className = "verdict " + cls; $("lmV").textContent = msg;
+  }
+  ["lmT", "lmM", "lmA"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Проверяйте jcstress</span>
+Рассуждения о переупорядочиваниях обманчивы. OpenJDK jcstress запускает лакмус-тесты миллионы раз на реальном железе и показывает, какие исходы наблюдались. Тот же MP-тест с plain-доступом на x86 может «пройти», а на ARM — нет.
+</div>
+
+<h2 id="spin"><span class="h-num">3.4</span>Thread.onSpinWait и ожидание в цикле</h2>
+<pre data-title="правильный короткий спин"><code class="java">while (!READY.getAcquire(this)) {
+    Thread.onSpinWait();      // x86: инструкция PAUSE — экономит энергию и даёт ресурсы соседнему гиперпотоку
+}                             // для долгого ожидания — LockSupport.park (тема 07), а не спин</code></pre>
+
+<h2 id="quiz"><span class="h-num">3.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой минимальный режим нужен, чтобы безопасно опубликовать объект: записать поля, затем ссылку-флаг?</p><ul><li>plain</li><li>opaque</li><li>setRelease для флага и getAcquire для чтения</li><li>только synchronized</li></ul><div class="why">Release/acquire гарантирует видимость всего, что было до release.</div></div>
+<div class="mcq" data-ok="3"><p>Почему release/acquire недостаточно для алгоритма Деккера?</p><ul><li>Он не атомарен</li><li>Он медленнее volatile</li><li>Он не работает на x86</li><li>Он допускает перестановку записи и последующего чтения другой переменной — оба потока могут не увидеть флаги друг друга</li></ul><div class="why">Нужна последовательная согласованность (volatile) или fullFence.</div></div>
+<div class="mcq" data-ok="0"><p>Почему VarHandle держат в static final поле?</p><ul><li>JIT считает его константой и встраивает операцию до одной инструкции</li><li>Иначе он не скомпилируется</li><li>Так требует GC</li><li>Для сериализации</li></ul><div class="why">То же правило, что для MethodHandle.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое lazySet и почему он быстрее volatile-записи?</summary><div class="a"><p>lazySet (AtomicXxx.lazySet, VarHandle.setRelease) — release-запись: предыдущие записи не переставятся после неё, но последующие чтения могут обогнать её (нет StoreLoad-барьера). На x86 это обычная mov без lock-барьера — в разы дешевле volatile-записи. Подходит, когда записывает один поток (обнуление ссылки, публикация в очереди с одним производителем).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

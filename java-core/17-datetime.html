@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Дата и время: java.time</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Дата и время: java.time</h1>
+  <p class="lead">Время — источник самых дорогих и трудноуловимых ошибок: отчёт сдвинулся на день, подписка продлилась на час раньше, тест падает только в ночь перевода часов. Почти все они происходят от одной причины — перепутаны «момент времени» и «дата на календаре». Пакет <code>java.time</code> разводит эти понятия по разным типам; нужно понимать, какой тип что означает.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">Instant</span><span class="tag">ZonedDateTime</span><span class="tag">DST</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="legacy"><span class="h-num">17.1</span>Почему не Date и Calendar</h2>
+<div class="table-wrap"><table>
+<tr><th>Проблема старого API</th><th>Пример</th><th>В java.time</th></tr>
+<tr><td>Изменяемость</td><td><code>date.setTime(...)</code> меняет объект, который уже отдали наружу</td><td>все типы неизменяемы и потокобезопасны</td></tr>
+<tr><td>Путаница смыслов</td><td><code>java.util.Date</code> — это момент времени, но <code>toString()</code> печатает его в зоне JVM</td><td>отдельные типы для момента, даты, времени, зоны</td></tr>
+<tr><td>Нумерация</td><td>месяцы с 0, год от 1900: <code>new Date(2026, 1, 1)</code> — это 1 февраля 3926 года</td><td><code>LocalDate.of(2026, 1, 1)</code>, enum <code>Month</code></td></tr>
+<tr><td>Потоки</td><td><code>SimpleDateFormat</code> в static-поле портит данные под нагрузкой</td><td><code>DateTimeFormatter</code> неизменяем</td></tr>
+</table></div>
+<p>Мост со старым кодом: <code>date.toInstant()</code>, <code>Date.from(instant)</code>, <code>timestamp.toLocalDateTime()</code>, <code>calendar.toZonedDateTime()</code>.</p>
+
+<h2 id="types"><span class="h-num">17.2</span>Карта типов</h2>
+<div class="table-wrap"><table>
+<tr><th>Тип</th><th>Что хранит</th><th>Пример</th><th>Для чего</th></tr>
+<tr><td><code>Instant</code></td><td>точку на временной оси: наносекунды от 1970-01-01T00:00:00Z</td><td><code>2026-10-10T09:15:30Z</code></td><td>«когда это произошло»: логи, события, <code>created_at</code></td></tr>
+<tr><td><code>LocalDate</code></td><td>дату без времени и зоны</td><td><code>2026-10-10</code></td><td>день рождения, дата отчёта, праздник</td></tr>
+<tr><td><code>LocalTime</code></td><td>время суток без даты и зоны</td><td><code>09:15:30</code></td><td>«магазин открывается в 9:00»</td></tr>
+<tr><td><code>LocalDateTime</code></td><td>дату и время «на стене», без зоны</td><td><code>2026-10-10T09:15:30</code></td><td>расписание в местном времени; <b>не момент времени</b></td></tr>
+<tr><td><code>ZonedDateTime</code></td><td>дату, время и регион с правилами перевода часов</td><td><code>2026-10-10T12:15:30+03:00[Europe/Moscow]</code></td><td>будущие события для людей: встреча, рейс</td></tr>
+<tr><td><code>OffsetDateTime</code></td><td>дату, время и фиксированное смещение от UTC</td><td><code>2026-10-10T12:15:30+03:00</code></td><td>обмен данными: JSON, <code>timestamptz</code></td></tr>
+<tr><td><code>Duration</code></td><td>количество времени в секундах и наносекундах</td><td><code>PT1H30M</code></td><td>таймауты, длительность операции</td></tr>
+<tr><td><code>Period</code></td><td>количество в годах, месяцах, днях календаря</td><td><code>P1M15D</code></td><td>«через месяц», возраст</td></tr>
+<tr><td><code>ZoneId</code> / <code>ZoneOffset</code></td><td>регион с правилами / фиксированное смещение</td><td><code>Europe/Berlin</code> / <code>+02:00</code></td><td>перевод между моментом и местным временем</td></tr>
+</table></div>
+
+<div class="widget" id="dtPick">
+  <div class="widget-title">Какой тип выбрать</div>
+  <div class="controls"><label>что нужно сохранить<select id="dtCase">
+    <option value="created">время создания заказа</option><option value="birthday">дату рождения</option><option value="meeting">встречу 15 марта в 10:00 по Берлину</option>
+    <option value="opening">часы работы магазина</option><option value="timeout">таймаут HTTP-клиента</option><option value="subscription">подписку «на один месяц»</option>
+    <option value="json">поле времени в JSON API</option><option value="report">отчёт «за вчера» для московского офиса</option><option value="measure">замер длительности операции в коде</option></select></label></div>
+  <div class="verdict" id="dtOut"></div>
+</div>
+<script>
+(function () {
+  var A = {
+    created: ["Instant", "Это момент на временной оси, одинаковый для всех зон. В БД — timestamptz (PostgreSQL) или UTC. Показывая пользователю, переводите в его зону: instant.atZone(userZone)."],
+    birthday: ["LocalDate", "Дата рождения не зависит от часового пояса и не имеет времени. Если хранить её как Instant в полночь, при смене зоны она «уедет» на день."],
+    meeting: ["ZonedDateTime (или LocalDateTime + ZoneId отдельными полями)", "Будущее событие привязано к местному времени. Если правительство отменит перевод часов, встреча всё равно должна быть в 10:00 по Берлину — а заранее вычисленный Instant окажется на час неверным."],
+    opening: ["LocalTime (+ DayOfWeek)", "«С 9:00 до 21:00» — время суток без даты. Зона магазина хранится отдельно."],
+    timeout: ["Duration", "Точное количество времени: Duration.ofSeconds(5). В конфигурации Spring Boot — '5s'."],
+    subscription: ["Period", "«Месяц» — календарное понятие разной длины: date.plus(Period.ofMonths(1)). 31 января + 1 месяц = 28 (или 29) февраля — java.time сам обрезает до последнего дня."],
+    json: ["Instant или OffsetDateTime в формате ISO-8601", "Строка вида 2026-10-10T09:15:30Z однозначна. Никогда не передавайте LocalDateTime между системами: получатель не знает, в какой это зоне."],
+    report: ["LocalDate + ZoneId для вычисления границ", "«Вчера» зависит от зоны: LocalDate.now(zone).minusDays(1); границы — date.atStartOfDay(zone).toInstant() и следующий день. Именно atStartOfDay, а не 00:00: в некоторых зонах полночь в день перевода часов не существует."],
+    measure: ["System.nanoTime() или Duration между двумя Instant.now() от монотонных часов", "System.currentTimeMillis() и Instant.now() могут прыгать назад при синхронизации часов (NTP). Для интервалов — только nanoTime: он монотонен, но не привязан к календарю."]
+  };
+  var s = document.getElementById("dtCase"), o = document.getElementById("dtOut");
+  function run() { var a = A[s.value]; o.className = "verdict ok"; o.innerHTML = "<b>" + SG.esc(a[0]) + ".</b> " + SG.esc(a[1]); }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="rule"><span class="h-num">17.3</span>Главное правило: момент и «время на стене»</h2>
+<div class="flow">
+  <div class="node info"><b>Instant</b><small>2026-10-10T09:15:30Z</small></div><span class="to">+ ZoneId →</span>
+  <div class="node acc"><b>ZonedDateTime</b><small>12:15:30 Europe/Moscow</small></div><span class="to">→ toLocalDateTime →</span>
+  <div class="node warn"><b>LocalDateTime</b><small>2026-10-10T12:15:30 — зона потеряна</small></div>
+</div>
+<pre><code class="java">Instant now = Instant.now();                                  // момент: одинаков во всём мире
+ZonedDateTime moscow = now.atZone(ZoneId.of("Europe/Moscow")); // тот же момент глазами москвича
+ZonedDateTime tokyo  = now.atZone(ZoneId.of("Asia/Tokyo"));    // и токийца
+moscow.toInstant().equals(tokyo.toInstant());                  // true — это один момент
+
+LocalDateTime wall = moscow.toLocalDateTime();                 // «12:15 на стене» — без зоны это НЕ момент
+Instant back = wall.atZone(ZoneId.of("Europe/Moscow")).toInstant();   // чтобы вернуться, зону нужно знать</code></pre>
+<div class="callout bad"><span class="c-title">Типичная ошибка</span>
+<code>LocalDateTime.now()</code> берёт время в зоне по умолчанию JVM. На ноутбуке разработчика это Москва, в контейнере — UTC: одно и то же значение в БД означает разные моменты. Для событий используйте <code>Instant.now()</code>, а зону сервера (<code>-Duser.timezone=UTC</code>) делайте явной.
+</div>
+
+<h2 id="dst"><span class="h-num">17.4</span>Часовые пояса и перевод часов</h2>
+<p>Смещение региона от UTC меняется: летнее время, решения властей. Поэтому <code>ZoneId.of("Europe/Berlin")</code> — это не «+01:00», а набор правил (<code>ZoneRules</code>) из базы tzdata, которая обновляется вместе с JDK. Дважды в год местное время ведёт себя странно:</p>
+<div class="widget" id="dstW">
+  <div class="widget-title">Симулятор: Europe/Berlin в дни перевода часов</div>
+  <div class="controls"><label>операция<select id="dstCase">
+    <option value="gap">LocalDateTime 2026-03-29T02:30 → atZone(Berlin)</option>
+    <option value="overlap">LocalDateTime 2026-10-25T02:30 → atZone(Berlin)</option>
+    <option value="plusDay">2026-03-28T12:00 Berlin  .plusDays(1)</option>
+    <option value="plus24">2026-03-28T12:00 Berlin  .plus(Duration.ofHours(24))</option>
+    <option value="between">Duration.between(полночь 29 марта, полночь 30 марта)</option>
+    <option value="cron">задача «каждый день в 02:30» в день перехода</option></select></label></div>
+  <div class="out" id="dstOut"></div>
+  <div class="verdict" id="dstV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    gap: ["29 марта 2026: в 02:00 часы переводятся на 03:00 (CET +01:00 → CEST +02:00)\nместного времени 02:00–02:59 в этот день НЕ существует (gap)\n\nLocalDateTime.of(2026, 3, 29, 2, 30).atZone(berlin)\n→ 2026-03-29T03:30+02:00[Europe/Berlin]", "warn", "java.time молча сдвигает время вперёд на длину разрыва. Строгая проверка: ZonedDateTime.ofStrict(ldt, offset, zone) или ZoneRules.getValidOffsets(ldt).isEmpty()."],
+    overlap: ["25 октября 2026: в 03:00 часы переводятся на 02:00 (CEST +02:00 → CET +01:00)\nместное время 02:00–02:59 наступает ДВАЖДЫ (overlap)\n\nLocalDateTime.of(2026, 10, 25, 2, 30).atZone(berlin)\n→ 2026-10-25T02:30+02:00[Europe/Berlin]      (первое, «летнее» вхождение)\n.withLaterOffsetAtOverlap()\n→ 2026-10-25T02:30+01:00[Europe/Berlin]      (второе, на час позже)", "warn", "По умолчанию выбирается более раннее смещение. Два разных момента имеют одинаковое «время на стене» — ещё одна причина хранить события как Instant."],
+    plusDay: ["2026-03-28T12:00+01:00[Europe/Berlin].plusDays(1)\n→ 2026-03-29T12:00+02:00[Europe/Berlin]\n\nместное время сохранилось (12:00), но реально прошло 23 часа", "ok", "plusDays/plusMonths работают по календарю: «тот же час завтра». Это ожидаемо для будильника или ежедневной встречи."],
+    plus24: ["2026-03-28T12:00+01:00[Europe/Berlin].plus(Duration.ofHours(24))\n→ 2026-03-29T13:00+02:00[Europe/Berlin]\n\nпрошло ровно 24 часа, но на часах 13:00", "ok", "Duration — физическое время на оси Instant. Period.ofDays(1) и Duration.ofDays(1) в день перевода часов дают разный результат — выбирайте по смыслу задачи."],
+    between: ["start = LocalDate.of(2026, 3, 29).atStartOfDay(berlin)   → 00:00+01:00\nend   = LocalDate.of(2026, 3, 30).atStartOfDay(berlin)   → 00:00+02:00\nDuration.between(start, end) → PT23H", "warn", "В сутках не всегда 24 часа: бывает 23 и 25. Расчёты «оплата за сутки», «лимит в день» через умножение на 86 400 секунд ошибаются дважды в год."],
+    cron: ["весной: 02:30 не существует — задача либо пропускается, либо выполняется в 03:00/03:30\nосенью: 02:30 наступает дважды — задача может выполниться ДВА раза\n\n(Spring CronExpression: весной сработает в 03:00… осенью — один раз; cron в Linux — зависит от реализации)", "bad", "Не планируйте важные задачи между 01:00 и 04:00 местного времени. Надёжнее планировать в UTC, где перевода часов нет."]
+  };
+  var s = document.getElementById("dstCase");
+  function run() { var d = D[s.value]; document.getElementById("dstOut").textContent = d[0]; var v = document.getElementById("dstV"); v.className = "verdict " + d[1]; v.textContent = d[2]; }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="arith"><span class="h-num">17.5</span>Арифметика и сравнение</h2>
+<pre><code class="java">LocalDate d = LocalDate.of(2026, 1, 31);
+d.plusMonths(1);                                   // 2026-02-28 — обрезается до конца месяца
+d.plusMonths(1).plusMonths(1);                     // 2026-03-28 — не 31: операция не обратима!
+d.with(TemporalAdjusters.lastDayOfMonth());        // 2026-01-31
+d.with(TemporalAdjusters.next(DayOfWeek.MONDAY));  // следующий понедельник
+
+Period age = Period.between(LocalDate.of(1990, 5, 20), LocalDate.now());   // годы, месяцы, дни
+long days  = ChronoUnit.DAYS.between(start, end);                           // всего дней
+
+Instant deadline = Instant.now().plus(Duration.ofMinutes(15));
+if (Instant.now().isAfter(deadline)) { /* просрочено */ }
+
+instant.truncatedTo(ChronoUnit.SECONDS);           // отбросить доли секунды — важно при сравнении с БД
+// PostgreSQL хранит микросекунды, Instant — наносекунды: после сохранения и чтения equals может вернуть false</code></pre>
+<p>Сравнивайте через <code>isBefore</code>/<code>isAfter</code>/<code>equals</code>. У <code>ZonedDateTime</code> и <code>OffsetDateTime</code> метод <code>equals</code> учитывает зону и смещение: один и тот же момент в Москве и Токио — «не равны»; для сравнения моментов есть <code>isEqual</code> или <code>toInstant()</code>.</p>
+
+<h2 id="format"><span class="h-num">17.6</span>Форматирование и разбор</h2>
+<pre><code class="java">private static final DateTimeFormatter RU = DateTimeFormatter.ofPattern("d MMMM uuuu, HH:mm", Locale.forLanguageTag("ru"));
+
+ZonedDateTime.now().format(RU);                               // 10 октября 2026, 12:15
+Instant.parse("2026-10-10T09:15:30Z");                        // ISO-8601 разбирается без форматтера
+LocalDate.parse("10.10.2026", DateTimeFormatter.ofPattern("dd.MM.uuuu"));
+DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(OffsetDateTime.now());   // для API и логов</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Ошибка в шаблоне</th><th>Что получится</th><th>Правильно</th></tr>
+<tr><td><code>YYYY</code></td><td>год «по неделям» (week-based): 29 декабря 2025 уже покажет 2026</td><td><code>yyyy</code> или <code>uuuu</code></td></tr>
+<tr><td><code>hh</code> без <code>a</code></td><td>12-часовой формат: 15:00 превратится в 03:00</td><td><code>HH</code></td></tr>
+<tr><td><code>DD</code></td><td>день года (283), а не месяца</td><td><code>dd</code></td></tr>
+<tr><td><code>mm</code> вместо <code>MM</code></td><td>минуты вместо месяца</td><td><code>MM</code> — месяц, <code>mm</code> — минуты</td></tr>
+<tr><td>нет <code>Locale</code></td><td>названия месяцев на языке сервера</td><td>всегда указывать Locale</td></tr>
+</table></div>
+
+<h2 id="clock"><span class="h-num">17.7</span>Тестируемость: Clock</h2>
+<pre><code class="java">@Service
+class TrialService {
+    private final Clock clock;                                   // бин: Clock.systemUTC()
+    TrialService(Clock clock) { this.clock = clock; }
+
+    boolean isExpired(Instant startedAt) {
+        return Instant.now(clock).isAfter(startedAt.plus(Duration.ofDays(14)));
+    }
+}
+
+// тест: время под контролем, никаких Thread.sleep и «тест падает после полуночи»
+Clock fixed = Clock.fixed(Instant.parse("2026-10-10T00:00:00Z"), ZoneOffset.UTC);
+assertTrue(new TrialService(fixed).isExpired(Instant.parse("2026-09-01T00:00:00Z")));</code></pre>
+<p>Правило: в бизнес-коде нет вызовов <code>Instant.now()</code>/<code>LocalDate.now()</code> без аргумента — только с внедрённым <code>Clock</code>.</p>
+
+<h2 id="storage"><span class="h-num">17.8</span>База данных и JSON</h2>
+<div class="table-wrap"><table>
+<tr><th>Java</th><th>PostgreSQL</th><th>Замечание</th></tr>
+<tr><td><code>Instant</code>, <code>OffsetDateTime</code></td><td><code>timestamptz</code></td><td>хранится момент в UTC; исходное смещение не сохраняется</td></tr>
+<tr><td><code>LocalDateTime</code></td><td><code>timestamp</code></td><td>без зоны; для моментов не использовать</td></tr>
+<tr><td><code>LocalDate</code></td><td><code>date</code></td><td></td></tr>
+<tr><td><code>Duration</code></td><td><code>interval</code> или <code>bigint</code> (мс)</td><td></td></tr>
+</table></div>
+<p>В Jackson нужен модуль <code>jackson-datatype-jsr310</code> (в Spring Boot подключён) и отключённый <code>WRITE_DATES_AS_TIMESTAMPS</code> — тогда даты пишутся строками ISO-8601, а не массивами чисел.</p>
+
+<h2 id="quiz"><span class="h-num">17.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сервис сохраняет <code>LocalDateTime.now()</code> как время создания заказа. Сервис перенесли из Москвы в контейнер с зоной UTC. Что произойдёт?</p><ul><li>Ничего, LocalDateTime учитывает зону</li><li>Новые записи будут на 3 часа «раньше» старых: значение без зоны интерпретируется по-разному</li><li>Ошибка при записи в БД</li><li>JVM автоматически пересчитает старые записи</li></ul><div class="why">LocalDateTime — не момент времени. Для событий — Instant.</div></div>
+<div class="mcq" data-ok="2"><p>Чем Period отличается от Duration?</p><ul><li>Period точнее</li><li>Duration только для дат</li><li>Period — календарные годы, месяцы, дни; Duration — точное количество секунд и наносекунд</li><li>Ничем</li></ul><div class="why">«Плюс месяц» и «плюс 30 × 24 часа» — разные операции; в дни перевода часов различаются даже «плюс день» и «плюс 24 часа».</div></div>
+<div class="mcq" data-ok="0"><p>Шаблон <code>"YYYY-MM-dd"</code> для даты 29 декабря 2025 года выдаст…</p><ul><li>2026-12-29 — YYYY означает год по неделям, а эта неделя относится к 2026</li><li>2025-12-29</li><li>Ошибку</li><li>2025-52-29</li></ul><div class="why">Классический баг, проявляющийся раз в год в последних числах декабря. Нужно yyyy или uuuu.</div></div>
+<div class="mcq" data-ok="3"><p>Как сделать тестируемым код, зависящий от текущего времени?</p><ul><li>Вызывать Thread.sleep в тестах</li><li>Менять системные часы</li><li>Использовать System.currentTimeMillis()</li><li>Внедрять java.time.Clock и в тесте подставлять Clock.fixed</li></ul><div class="why">Clock — стандартная абстракция источника времени; все now()-методы принимают его аргументом.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>В каком виде хранить и передавать время события?</summary><div class="a"><p>Как момент: Instant (в БД — timestamptz/UTC, в JSON — ISO-8601 с Z или смещением). Преобразование в местное время — только на границе с пользователем, с его ZoneId.</p></div></details>
+<details class="q"><summary>Когда хранить Instant недостаточно?</summary><div class="a"><p>Для будущих событий, заданных местным временем (встреча, рейс, расписание): правила зоны могут измениться, и сохранённый Instant станет неверным. Хранят LocalDateTime + ZoneId и вычисляют момент при необходимости.</p></div></details>
+<details class="q"><summary>Что такое gap и overlap и как java.time их обрабатывает?</summary><div class="a"><p>Gap — несуществующее местное время при переводе часов вперёд: atZone сдвигает на длину разрыва. Overlap — время, наступающее дважды при переводе назад: выбирается более раннее смещение, второе — withLaterOffsetAtOverlap(). Проверка — ZoneRules.getValidOffsets.</p></div></details>
+<details class="q"><summary>Почему для замера длительности нельзя использовать Instant.now()?</summary><div class="a"><p>Системные часы корректируются (NTP, ручная установка) и могут скакнуть назад или вперёд. System.nanoTime() монотонен и предназначен именно для интервалов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

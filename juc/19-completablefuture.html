@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · CompletableFuture изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ИСПОЛНИТЕЛИ</div>
+  <h1>CompletableFuture изнутри</h1>
+  <p class="lead"><code>CompletableFuture</code> — это одно поле результата и стек зависимых действий. Как только результат установлен, стек «разматывается» и запускает продолжения. Отсюда главный практический вопрос — <b>в каком потоке выполнится колбэк</b> — и ответ на него в симуляторе. Затем — распространение ошибок по цепочке (тоже интерактивно), таймауты, комбинаторы и почему <code>cancel</code> ничего не прерывает.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">result + стек Completion</span><span class="tag">выбор потока</span><span class="tag">*Async</span><span class="tag">ошибки</span><span class="tag">orTimeout</span><span class="tag">allOf/anyOf</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="struct"><span class="h-num">19.1</span>Устройство</h2>
+<pre data-title="CompletableFuture (упрощённо)"><code class="java">public class CompletableFuture&lt;T&gt; implements Future&lt;T&gt;, CompletionStage&lt;T&gt; {
+    volatile Object result;       // null — не завершён; AltResult(null) — значение null; AltResult(ex) — исключение
+    volatile Completion stack;    // стек Трайбера зависимых действий (thenApply, thenCompose, …)
+
+    boolean completeValue(T t) { return RESULT.compareAndSet(this, null, (t == null) ? NIL : t); }   // завершить можно ровно один раз
+    final void postComplete() { /* снять все Completion со стека и выполнить их (каждое может завершить свой CF и т.д.) */ }
+}
+// thenApply(fn): если результат уже есть — fn выполняется СРАЗУ в вызывающем потоке;
+//                иначе в стек кладётся UniApply, и fn выполнит тот поток, который завершит исходный CF.</code></pre>
+
+<h2 id="thread"><span class="h-num">19.2</span>В каком потоке выполнится колбэк</h2>
+<div class="widget" id="thW">
+  <div class="widget-title">cf.thenApply / thenApplyAsync — кто выполнит функцию?</div>
+  <div class="controls">
+    <label>исходный CF создан<select id="thSrc"><option value="pool">supplyAsync(task, ioPool)</option><option value="common">supplyAsync(task) — без executor</option><option value="manual">new CompletableFuture&lt;&gt;(), complete() вызовет HTTP-клиент</option></select></label>
+    <label>к моменту регистрации колбэка<select id="thWhen"><option value="not">ещё не завершён</option><option value="done">уже завершён</option></select></label>
+    <label>метод<select id="thM"><option value="sync">thenApply(fn)</option><option value="async">thenApplyAsync(fn)</option><option value="asyncEx">thenApplyAsync(fn, cpuPool)</option></select></label>
+  </div>
+  <div class="verdict" id="thV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var src = $("thSrc").value, when = $("thWhen").value, m = $("thM").value, who, cls = "ok", note = "";
+    var completer = src === "pool" ? "поток ioPool, выполнивший задачу" : src === "common" ? "поток ForkJoinPool.commonPool, выполнивший задачу" : "поток HTTP-клиента (I/O selector!), вызвавший complete()";
+    if (m === "asyncEx") { who = "поток cpuPool"; note = "Явный executor — предсказуемо. Рекомендуемый вариант для тяжёлых этапов."; }
+    else if (m === "async") { who = "поток ForkJoinPool.commonPool()"; note = "Async без executor — общий пул (если его параллелизм < 2, то новый поток на каждую задачу). Блокирующий код здесь задушит общий пул."; cls = "warn"; }
+    else if (when === "done") { who = "вызывающий поток — тот, что вызвал thenApply"; note = "Результат уже готов — функция выполняется синхронно прямо внутри thenApply. Если это поток обработчика HTTP или event loop — тяжёлая функция заблокирует его."; cls = "warn"; }
+    else { who = completer; note = "Функция выполнится в потоке, который завершит исходный CF (внутри postComplete)." + (src === "manual" ? " Здесь это поток I/O-библиотеки: тяжёлая или блокирующая функция остановит обработку всех соединений! Используйте thenApplyAsync(fn, executor)." : ""); cls = src === "manual" ? "bad" : "ok"; }
+    $("thV").className = "verdict " + cls; $("thV").innerHTML = "<b>Выполнит: " + who + "</b><br>" + note;
+  }
+  ["thSrc", "thWhen", "thM"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="errors"><span class="h-num">19.3</span>Как ошибка идёт по цепочке</h2>
+<div class="widget" id="erW">
+  <div class="widget-title">Цепочка этапов</div>
+  <div class="controls"><label>исключение бросает<select id="erS"><option value="none">никто</option><option value="1">supplyAsync (загрузка)</option><option value="2">thenApply (парсинг)</option></select></label></div>
+  <pre style="margin:0"><code class="java">supplyAsync(() -&gt; load())                 // 1
+    .thenApply(raw -&gt; parse(raw))         // 2
+    .thenApply(doc -&gt; enrich(doc))        // 3
+    .exceptionally(ex -&gt; fallback(ex))    // 4
+    .thenApply(doc -&gt; render(doc))        // 5
+    .whenComplete((r, ex) -&gt; log(r, ex)); // 6</code></pre>
+  <div class="table-wrap"><table id="erT"></table></div>
+  <div class="verdict" id="erV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("erS").value, rows = [], failed = false;
+    var stages = [["1 supplyAsync", "src"], ["2 thenApply(parse)", "apply"], ["3 thenApply(enrich)", "apply"], ["4 exceptionally", "exc"], ["5 thenApply(render)", "apply"], ["6 whenComplete", "when"]];
+    stages.forEach(function (st, i) {
+      var n = i + 1, res;
+      if (st[1] === "src" || st[1] === "apply") {
+        if (failed) res = ["пропущен", "завершается тем же исключением (CompletionException с исходной причиной), функция НЕ вызывается"];
+        else if (String(n) === s) { failed = true; res = ["бросил", "этап завершается исключительно: CompletionException(cause)"]; }
+        else res = ["выполнен", "значение передаётся дальше"];
+      } else if (st[1] === "exc") { if (failed) { failed = false; res = ["выполнен", "получает исключение, возвращает запасное значение — цепочка снова «здорова»"]; } else res = ["пропущен", "ошибки нет — значение проходит насквозь"]; }
+      else res = ["выполнен", "вызывается всегда: (результат, null) или (null, исключение); не меняет результат"];
+      rows.push("<tr><td>" + st[0] + '</td><td style="color:' + (res[0] === "бросил" ? "var(--bad)" : res[0] === "пропущен" ? "var(--fg-muted)" : "var(--ok)") + '">' + res[0] + "</td><td>" + res[1] + "</td></tr>");
+    });
+    $("erT").innerHTML = "<tr><th>Этап</th><th>Итог</th><th>Почему</th></tr>" + rows.join("");
+    $("erV").className = "verdict ok"; $("erV").textContent = s === "none" ? "Ошибок нет: exceptionally пропускается." : "Ошибка «перепрыгивает» обычные этапы до первого обработчика (exceptionally, handle, whenComplete видит, но не исправляет). Без обработчика join() бросит CompletionException, get() — ExecutionException с исходной причиной.";
+  }
+  $("erS").addEventListener("change", run); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Когда вызывается</th><th>Меняет результат</th></tr>
+<tr><td><code>exceptionally(ex -&gt; v)</code></td><td>только при ошибке</td><td>да — восстановление</td></tr>
+<tr><td><code>handle((v, ex) -&gt; r)</code></td><td>всегда</td><td>да</td></tr>
+<tr><td><code>whenComplete((v, ex) -&gt; …)</code></td><td>всегда</td><td>нет (побочные эффекты: лог, метрики)</td></tr>
+<tr><td><code>exceptionallyCompose</code> (12)</td><td>при ошибке</td><td>да, асинхронной операцией (повтор запроса)</td></tr>
+</table></div>
+
+<h2 id="combine"><span class="h-num">19.4</span>Комбинирование и таймауты</h2>
+<pre data-title="параллельно, с таймаутом и запасным значением"><code class="java">CompletableFuture&lt;User&gt;   user   = supplyAsync(() -&gt; users.find(id), io);
+CompletableFuture&lt;Orders&gt; orders = supplyAsync(() -&gt; orderApi.list(id), io)
+        .completeOnTimeout(Orders.empty(), 300, MILLISECONDS);         // запасное значение, если не успел
+CompletableFuture&lt;Page&gt; page = user.thenCombine(orders, Page::new)    // оба результата
+        .orTimeout(1, SECONDS);                                         // TimeoutException по истечении
+
+CompletableFuture.allOf(a, b, c).thenRun(…);                           // allOf возвращает Void — результаты берите из a, b, c (join())
+CompletableFuture.anyOf(r1, r2).thenAccept(…);                          // первый завершившийся (в том числе с ошибкой!)
+user.thenCompose(u -&gt; supplyAsync(() -&gt; prefs.load(u), io));           // flatMap: функция возвращает CF</code></pre>
+<div class="callout warn"><span class="c-title">cancel не прерывает и таймаут не останавливает</span>
+<code>cf.cancel(true)</code> лишь завершает CF исключением CancellationException — параметр игнорируется, работа задачи в пуле продолжается. <code>orTimeout</code> так же завершает только CF (через служебный поток-«Delayer»), а не саму операцию. Останавливайте операции собственными таймаутами I/O и проверкой флага.
+</div>
+
+<h2 id="quiz"><span class="h-num">19.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>CF уже завершён. В каком потоке выполнится <code>cf.thenApply(fn)</code>?</p><ul><li>В commonPool</li><li>В потоке, который его завершил</li><li>В вызывающем потоке, синхронно внутри thenApply</li><li>В новом потоке</li></ul><div class="why">Неочевидная, но важная деталь.</div></div>
+<div class="mcq" data-ok="0"><p>Что сделает thenApply, если предыдущий этап завершился исключением?</p><ul><li>Не вызовет функцию и передаст исключение дальше</li><li>Вызовет функцию с null</li><li>Проглотит исключение</li><li>Бросит его в вызывающем потоке</li></ul><div class="why">До первого exceptionally/handle.</div></div>
+<div class="mcq" data-ok="3"><p>Прервёт ли cf.cancel(true) выполняющуюся задачу supplyAsync?</p><ul><li>Да</li><li>Только с true</li><li>Только в виртуальном потоке</li><li>Нет: CompletableFuture не связан с выполняющим потоком, отмена лишь завершает его CancellationException</li></ul><div class="why">Отличие от FutureTask.</div></div>
+<div class="mcq" data-ok="1"><p>Что возвращает allOf(a, b, c)?</p><ul><li>Список результатов</li><li>CompletableFuture&lt;Void&gt;, завершающийся, когда завершились все; результаты берутся из a, b, c</li><li>Первый результат</li><li>Массив Future</li></ul><div class="why">Если хоть один упал — allOf завершится исключением после завершения всех.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как устроена цепочка CompletableFuture внутри, и почему она не блокирует потоки?</summary><div class="a"><p>Каждый этап — отдельный CompletableFuture; регистрация зависимости (thenApply и др.) кладёт объект Completion в стек источника (CAS). Когда источник получает результат (CAS по полю result), вызывается postComplete: он снимает и выполняет все Completion; каждый вычисляет свою функцию и завершает свой CF, который запускает уже свои зависимые. Никто не ждёт в get — продолжения выполняются по мере появления результатов в потоках, которые эти результаты установили (или в указанных executor-ах).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Архитектура JVM и запуск</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · ПЛАТФОРМА И БАЙТКОД</div>
+  <h1>Архитектура JVM и запуск</h1>
+  <p class="lead">JVM — это спецификация абстрактной машины и её реализации, из которых в продакшене почти всегда работает HotSpot. Здесь — карта подсистем (загрузка классов, области памяти, движок исполнения, сборщик мусора, нативный интерфейс), что именно происходит между командой <code>java -jar app.jar</code> и первой строкой <code>main</code>, как JVM сама подбирает настройки под машину и как читать её флаги.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">спецификация и HotSpot</span><span class="tag">подсистемы</span><span class="tag">запуск по шагам</span><span class="tag">эргономика</span><span class="tag">флаги</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="spec"><span class="h-num">1.1</span>Спецификация и реализации</h2>
+<p><b>The Java Virtual Machine Specification</b> (JVMS) описывает формат class-файла, набор инструкций, модель загрузки и линковки, области данных времени выполнения — но не говорит, как устроить сборщик мусора, JIT или раскладку объектов. Это свобода реализаций:</p>
+<div class="table-wrap"><table>
+<tr><th>Реализация</th><th>Особенности</th></tr>
+<tr><td><b>HotSpot</b> (OpenJDK: Oracle, Temurin, Corretto, Zulu, Liberica…)</td><td>эталон и 95%+ продакшена: интерпретатор + C1/C2, G1/ZGC/Shenandoah/Parallel/Serial. Всё в этом курсе — про него, если не сказано иное</td></tr>
+<tr><td><b>Eclipse OpenJ9</b> (IBM Semeru)</td><td>меньше памяти, быстрый старт, общий кэш классов, свои сборщики (gencon, balanced)</td></tr>
+<tr><td><b>GraalVM</b></td><td>HotSpot с JIT-компилятором Graal (написан на Java) + Native Image — AOT-компиляция в исполняемый файл (тема 20)</td></tr>
+<tr><td>Android ART</td><td>не JVM: свой байткод (dex), AOT/JIT — другая спецификация</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">JDK, JRE, JVM</span>
+JVM исполняет байткод; JRE = JVM + стандартная библиотека (с Java 11 отдельно не поставляется — собирается <code>jlink</code>); JDK = JRE + компилятор <code>javac</code> и инструменты (<code>jcmd</code>, <code>jfr</code>, <code>javap</code>, <code>jlink</code>). Сама JVM — нативная библиотека <code>libjvm.so</code> / <code>jvm.dll</code>, написанная на C++.
+</div>
+
+<h2 id="map"><span class="h-num">1.2</span>Подсистемы</h2>
+<figure class="diagram">
+<svg viewBox="0 0 820 400" role="img" aria-label="Подсистемы JVM">
+  <rect x="20" y="15" width="780" height="60" rx="9" class="box-acc"/>
+  <text x="40" y="40" font-weight="700">Подсистема загрузки классов</text>
+  <text x="40" y="62" class="mono" font-size="12.5">Loading → Linking (verify · prepare · resolve) → Initialization   · темы 05–08</text>
+
+  <rect x="20" y="92" width="780" height="150" rx="9" class="box-info"/>
+  <text x="40" y="117" font-weight="700">Области данных времени выполнения   · темы 09–11</text>
+  <rect x="40" y="130" width="230" height="96" rx="7" class="box"/>
+  <text x="55" y="152" font-weight="700" font-size="14">Общие для всех потоков</text>
+  <text x="55" y="174" class="mono" font-size="12">куча (heap)</text>
+  <text x="55" y="193" class="mono" font-size="12">metaspace (классы)</text>
+  <text x="55" y="212" class="mono" font-size="12">code cache (JIT-код)</text>
+  <rect x="290" y="130" width="230" height="96" rx="7" class="box"/>
+  <text x="305" y="152" font-weight="700" font-size="14">На каждый поток</text>
+  <text x="305" y="174" class="mono" font-size="12">стек JVM (кадры)</text>
+  <text x="305" y="193" class="mono" font-size="12">PC-регистр</text>
+  <text x="305" y="212" class="mono" font-size="12">нативный стек</text>
+  <rect x="540" y="130" width="240" height="96" rx="7" class="box"/>
+  <text x="555" y="152" font-weight="700" font-size="14">Вне кучи</text>
+  <text x="555" y="174" class="mono" font-size="12">direct buffers, mmap</text>
+  <text x="555" y="193" class="mono" font-size="12">стеки потоков, GC-структуры</text>
+  <text x="555" y="212" class="mono" font-size="12">память нативных библиотек</text>
+
+  <rect x="20" y="258" width="520" height="62" rx="9" class="box-ok"/>
+  <text x="40" y="283" font-weight="700">Движок исполнения   · темы 03, 04, 16–18</text>
+  <text x="40" y="305" class="mono" font-size="12.5">интерпретатор · JIT C1/C2 · safepoints · потоки</text>
+  <rect x="560" y="258" width="240" height="62" rx="9" class="box-warn"/>
+  <text x="580" y="283" font-weight="700">Сборщик мусора</text>
+  <text x="580" y="305" class="mono" font-size="12.5">G1 · ZGC · …   темы 12–15</text>
+
+  <rect x="20" y="336" width="780" height="50" rx="9" class="box-bad"/>
+  <text x="40" y="366" font-weight="700">Нативный интерфейс: JNI, FFM API, JVMTI, Attach API   · темы 19, 21</text>
+</svg>
+<figcaption>Байткод попадает в JVM через загрузчики, его метаданные живут в metaspace, объекты — в куче, исполняет его интерпретатор или скомпилированный JIT-код, память освобождает GC.</figcaption>
+</figure>
+
+<h2 id="startup"><span class="h-num">1.3</span>Что происходит при <code>java -jar app.jar</code></h2>
+<div class="widget stepper" id="bootSim">
+  <div class="widget-title">Запуск JVM по шагам</div>
+  <div class="flow st-stage">
+    <div class="node" id="bLauncher"><b>launcher</b><small>java, libjli</small></div><span class="to">→</span>
+    <div class="node" id="bJvm"><b>libjvm</b><small>JNI_CreateJavaVM</small></div><span class="to">→</span>
+    <div class="node" id="bHeap"><b>память</b><small>куча, metaspace</small></div><span class="to">→</span>
+    <div class="node" id="bCore"><b>java.base</b><small>Object, String, System</small></div><span class="to">→</span>
+    <div class="node" id="bLoaders"><b>загрузчики</b><small>app class loader</small></div><span class="to">→</span>
+    <div class="node" id="bMain"><b>main()</b></div><span class="to">→</span>
+    <div class="node" id="bExit"><b>выход</b></div>
+  </div>
+  <section class="st-step" data-t="Лаунчер" data-hl="bLauncher" data-log="java: разбор аргументов, JDK_JAVA_OPTIONS, @argfiles, -jar → Main-Class из MANIFEST.MF"><p>Исполняемый файл <code>java</code> — небольшая программа на C (libjli). Она разбирает командную строку и переменную <code>JDK_JAVA_OPTIONS</code>, файлы аргументов <code>@args.txt</code>, для <code>-jar</code> читает <code>META-INF/MANIFEST.MF</code> (Main-Class, Class-Path), выбирает вариант JVM и загружает <code>libjvm</code>. Главный поток лаунчера создаёт новый поток с большим стеком — он станет потоком <code>main</code>.</p></section>
+  <section class="st-step" data-t="Создание VM" data-hl="bJvm" data-log="JNI_CreateJavaVM → Threads::create_vm: флаги, эргономика, ОС-интерфейс, safepoint, JVMTI"><p><code>JNI_CreateJavaVM</code> → <code>Threads::create_vm</code>: разбор флагов <code>-XX</code>, <b>эргономика</b> (выбор GC, размера кучи и числа потоков под машину — см. ниже), инициализация слоя ОС, механизма safepoint, агентов JVMTI (<code>-javaagent</code> загружается позже, но регистрируется здесь).</p></section>
+  <section class="st-step" data-t="Память и GC" data-hl="bHeap" data-log="резервирование виртуального адресного пространства кучи (Xmx), metaspace, code cache; старт потоков GC и JIT"><p>Резервируется (но ещё не занимается физически) адресное пространство кучи размера <code>-Xmx</code>, создаются metaspace и code cache, запускаются служебные потоки: GC, компиляторы C1/C2, VM Thread (выполняет операции в safepoint), Signal Dispatcher, Reference Handler, Finalizer.</p></section>
+  <section class="st-step" data-t="Базовые классы" data-hl="bCore" data-log="bootstrap loader: Object, String, Class, Thread… ; System.initPhase1/2/3; boot layer модулей"><p>Встроенный (bootstrap) загрузчик загружает ядро <code>java.base</code> — из файла <code>lib/modules</code> (формат jimage) или из архива CDS (тема 20), что гораздо быстрее. Выполняются <code>System.initPhase1</code> (свойства, потоки ввода-вывода), <code>initPhase2</code> (система модулей: boot layer), <code>initPhase3</code> (SecurityManager-наследие, системный загрузчик).</p></section>
+  <section class="st-step" data-t="Загрузчик приложения" data-hl="bLoaders" data-log="ClassLoader.getSystemClassLoader() = AppClassLoader; classpath/модульный путь"><p>Создаются платформенный и прикладной (system / app) загрузчики. Прикладной знает classpath (или module path) — именно он загрузит ваш главный класс.</p></section>
+  <section class="st-step" data-t="Вызов main" data-hl="bMain" data-log="LauncherHelper.checkAndLoadMain → загрузка, линковка, инициализация Main → CallStaticVoidMethod(main)"><p><code>sun.launcher.LauncherHelper.checkAndLoadMain</code> загружает главный класс, проверяет наличие <code>main</code> (с Java 21+ — и «экземплярного» main без <code>static</code> и аргументов), затем лаунчер через JNI вызывает его. Первое обращение к классу запускает его линковку и <code>&lt;clinit&gt;</code> (тема 06).</p></section>
+  <section class="st-step" data-t="Завершение" data-hl="bExit" data-log="main вернулся → DestroyJavaVM ждёт все не-daemon потоки → shutdown hooks → выход"><p>Когда <code>main</code> вернулся, поток вызывает <code>DestroyJavaVM</code>: ждёт завершения всех <b>не-daemon</b> потоков, затем выполняет shutdown hooks (<code>Runtime.addShutdownHook</code>) и завершает процесс. <code>System.exit(n)</code> запускает hooks сразу, не дожидаясь потоков; <code>kill -9</code> — без hooks вообще.</p></section>
+</div>
+<pre data-title="увидеть запуск своими глазами"><code class="txt">java -Xlog:startuptime -Xlog:class+load:file=classes.txt -jar app.jar   # что и когда загружалось
+java -Xshare:dump                                                       # (пере)создать CDS-архив JDK
+java -verbose:class -version | head                                     # первые загружаемые классы
+jcmd &lt;pid&gt; Thread.print | grep '"' | head -20                           # служебные потоки JVM</code></pre>
+
+<h2 id="ergonomics"><span class="h-num">1.4</span>Эргономика: настройки по умолчанию</h2>
+<p>Если флаги не заданы, HotSpot выбирает их по числу процессоров и объёму памяти — с учётом ограничений контейнера (тема 22). Это частый источник сюрпризов: одна и та же программа ведёт себя по-разному на ноутбуке и в поде с лимитом 1 CPU.</p>
+<div class="widget" id="ergW">
+  <div class="widget-title">Что выберет JVM (JDK 21+)</div>
+  <div class="controls">
+    <label>доступно памяти, МБ<input type="number" id="ergM" value="2048" min="128"></label>
+    <label>доступно CPU<input type="number" id="ergC" value="2" min="1" max="256"></label>
+    <label>-XX:MaxRAMPercentage<select id="ergP"><option value="25" selected>не задан (25%)</option><option value="50">50</option><option value="75">75</option></select></label>
+  </div>
+  <div class="out" id="ergOut"></div>
+  <div class="verdict" id="ergV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var m = Math.max(128, +$("ergM").value), c = Math.max(1, +$("ergC").value), p = +$("ergP").value;
+    var server = c >= 2 && m >= 1792, gc = server ? "G1" : "Serial";
+    var maxHeap = m <= 256 ? m * 0.5 : m * p / 100, initHeap = m / 64;
+    var pgt = c <= 8 ? c : Math.floor(8 + (c - 8) * 5 / 8), cgt = Math.max(1, Math.floor((pgt + 2) / 4));
+    var ci = c <= 1 ? 1 : Math.max(2, Math.floor(Math.log2(c) * Math.log2(Math.log2(c) || 1) * 3 / 2));
+    $("ergOut").textContent = "GC: " + gc + (server ? "" : "  (машина «клиентского класса»: < 2 CPU или < 1792 МБ)") +
+      "\n-Xmx ≈ " + Math.round(maxHeap) + " МБ   (" + (m <= 256 ? "50% при памяти ≤ 256 МБ" : p + "% от " + m + " МБ") + ")" +
+      "\n-Xms ≈ " + Math.round(initHeap) + " МБ   (1/64 памяти)" +
+      "\nParallelGCThreads = " + pgt + ", ConcGCThreads ≈ " + cgt + ", CICompilerCount ≈ " + Math.max(2, ci) +
+      "\nActiveProcessorCount = " + c + " → common ForkJoinPool parallelism = " + Math.max(1, c - 1);
+    var v = $("ergV");
+    if (!server) { v.className = "verdict warn"; v.textContent = "В маленьком контейнере JVM выберет Serial GC и 25% памяти под кучу: паузы на всю сборку и много неиспользованной памяти. Задайте явно: -XX:MaxRAMPercentage=70..75 и при необходимости -XX:+UseG1GC (тема 22)."; }
+    else if (p === 25) { v.className = "verdict warn"; v.textContent = "По умолчанию куча — только четверть доступной памяти. Для сервиса, который один в контейнере, обычно ставят MaxRAMPercentage 60–75%, оставляя запас на metaspace, стеки потоков, code cache и direct-память."; }
+    else { v.className = "verdict ok"; v.textContent = "Разумная конфигурация для сервиса в контейнере. Проверьте фактические значения: java -XX:+PrintFlagsFinal -version | grep -E 'MaxHeapSize|UseG1GC|ParallelGCThreads'."; }
+  }
+  ["ergM", "ergC", "ergP"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="flags"><span class="h-num">1.5</span>Флаги JVM</h2>
+<div class="table-wrap"><table>
+<tr><th>Вид</th><th>Пример</th><th>Комментарий</th></tr>
+<tr><td>стандартные</td><td><code>-cp</code>, <code>-D</code>, <code>-jar</code>, <code>--add-opens</code></td><td>поддерживаются всеми реализациями</td></tr>
+<tr><td><code>-X</code></td><td><code>-Xmx2g</code>, <code>-Xss512k</code>, <code>-Xlog</code></td><td>нестандартные, но стабильные</td></tr>
+<tr><td><code>-XX:</code> product</td><td><code>-XX:+UseZGC</code>, <code>-XX:MaxRAMPercentage=75</code></td><td>булевы через +/−, числовые через =</td></tr>
+<tr><td>diagnostic</td><td><code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintCompilation</code></td><td>требуют разблокировки</td></tr>
+<tr><td>experimental</td><td><code>-XX:+UnlockExperimentalVMOptions …</code></td><td>для экспериментов, не для продакшена</td></tr>
+<tr><td>manageable</td><td><code>jcmd &lt;pid&gt; VM.set_flag HeapDumpOnOutOfMemoryError true</code></td><td>меняются на лету</td></tr>
+</table></div>
+<pre data-title="узнать, с чем реально работает процесс"><code class="txt">java -XX:+PrintFlagsFinal -version | grep -E 'UseG1GC|MaxHeapSize|MaxMetaspaceSize'
+java -XX:+PrintCommandLineFlags -version
+jcmd &lt;pid&gt; VM.flags -all | grep ':='        # := отмечает значения, изменённые эргономикой или вами
+jcmd &lt;pid&gt; VM.command_line</code></pre>
+
+<h2 id="quiz"><span class="h-num">1.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что определяет спецификация JVM, а что оставляет реализации?</p><ul><li>Определяет алгоритм GC и раскладку объектов</li><li>Определяет только синтаксис Java</li><li>Определяет формат class-файла, инструкции и загрузку классов; GC, JIT и раскладка объектов — на усмотрение реализации</li><li>Ничего не определяет, всё — HotSpot</li></ul><div class="why">Поэтому OpenJ9 и HotSpot исполняют одни и те же class-файлы по-разному внутри.</div></div>
+<div class="mcq" data-ok="0"><p>Программа запустила поток и main() завершился. Когда закончится процесс?</p><ul><li>Когда завершатся все не-daemon потоки (затем shutdown hooks)</li><li>Сразу после main</li><li>Никогда</li><li>Через 30 секунд</li></ul><div class="why">DestroyJavaVM ждёт не-daemon потоки — частая причина «зависших» утилит.</div></div>
+<div class="mcq" data-ok="1"><p>Какой GC выберет JDK 21 в контейнере с 1 CPU и 1 ГБ памяти без флагов?</p><ul><li>G1</li><li>Serial</li><li>ZGC</li><li>Parallel</li></ul><div class="why">Меньше 2 процессоров или 1792 МБ — машина «клиентского класса».</div></div>
+<div class="mcq" data-ok="3"><p>Как узнать фактическое значение MaxHeapSize у работающего процесса?</p><ul><li>Посмотреть Dockerfile</li><li>Runtime.freeMemory()</li><li>По умолчанию всегда 1 ГБ</li><li><code>jcmd &lt;pid&gt; VM.flags</code> или <code>-XX:+PrintFlagsFinal</code></li></ul><div class="why">Эргономика могла выбрать не то, что вы ожидаете.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите, что происходит от команды java до первой строки main.</summary><div class="a"><p>Лаунчер разбирает аргументы и манифест, загружает libjvm и вызывает JNI_CreateJavaVM: флаги и эргономика, резервирование кучи и metaspace, запуск служебных потоков (GC, JIT, VM Thread), загрузка базовых классов bootstrap-загрузчиком (часто из CDS-архива), инициализация System в три фазы и boot layer модулей, создание платформенного и прикладного загрузчиков. Затем LauncherHelper загружает главный класс, его линковка и инициализация, вызов main через JNI.</p></div></details>
+<details class="q"><summary>Какие служебные потоки есть в любой JVM и что они делают?</summary><div class="a"><p>VM Thread — выполняет операции, требующие safepoint (некоторые фазы GC, деоптимизация, дампы потоков); потоки GC (рабочие и конкурентные); C1/C2 CompilerThread — JIT-компиляция; Reference Handler — ставит очищенные ссылки в очереди; Finalizer — вызывает finalize; Signal Dispatcher — обработка сигналов (например, SIGQUIT для дампа потоков); Common-Cleaner; Attach Listener — подключение jcmd/агентов; Notification Thread, Service Thread.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

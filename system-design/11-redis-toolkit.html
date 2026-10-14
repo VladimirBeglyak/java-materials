@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Redis: инструменты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · КЭШ И REDIS</div>
+  <h1>Redis: инструменты</h1>
+  <p class="lead">Redis давно больше, чем кэш. Пять возможностей, из которых собирают типовые решения: мгновенная рассылка событий, надёжный журнал сообщений, атомарные скрипты, вероятностная проверка принадлежности и распределённая блокировка.</p>
+  <div class="meta"><span class="tag">5 конспектов</span><span class="tag">~3,5 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pubsub"><span class="h-num">11.1</span>Pub/Sub<span class="sk-num">#44</span></h2>
+<p>Издатель отправляет сообщение в <b>канал</b>, все подписчики, подключённые в этот момент, получают его немедленно. Никакого хранения: Redis доставил сообщение тем, кто слушает, и забыл о нём — модель «fire and forget».</p>
+<figure class="sketch"><a href="img/44-redis-pubsub.jpg"><img src="img/44-redis-pubsub.jpg" width="1024" height="1536" loading="lazy" alt="Redis Pub/Sub: как работает, команды, пример, сравнение со Streams"></a><figcaption><b>Конспект #44.</b> Redis Pub/Sub <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<pre data-title="redis-cli"><code class="txt">SUBSCRIBE order-events              # подписаться на канал
+PSUBSCRIBE order-*                  # подписаться по шаблону
+PUBLISH order-events "OrderCreated:123"
+(integer) 3                         # число подписчиков, получивших сообщение
+</code></pre>
+<div class="callout bad"><span class="c-title">Гарантия доставки — «не более одного раза»</span>
+Подписчик перезапускался, потерял соединение или не успевал читать — сообщения для него пропали безвозвратно. Нет подтверждений, повторов и истории. <code>PUBLISH</code>, вернувший <code>0</code>, означает, что сообщение не получил никто, и это не ошибка.
+</div>
+<p><b>Для чего подходит</b>: события, потеря которых безвредна, потому что следующее событие исправит картину, — сброс локальных кэшей на всех экземплярах сервиса, рассылка по WebSocket-соединениям между узлами, обновление «живых» дашбордов. <b>Для чего не подходит</b>: заказы, платежи, любые задачи, которые должны быть выполнены.</p>
+
+<h2 id="streams"><span class="h-num">11.2</span>Streams<span class="sk-num">#45</span></h2>
+<p>Stream — хранимый журнал сообщений, в который можно только дописывать. Сообщения остаются после прочтения, у каждого есть упорядоченный идентификатор, а <b>группы потребителей</b> распределяют работу между обработчиками и отслеживают подтверждения. По сути это «маленькая Kafka» внутри Redis.</p>
+<figure class="sketch"><a href="img/45-redis-streams.jpg"><img src="img/45-redis-streams.jpg" width="1024" height="1536" loading="lazy" alt="Redis Streams: концепции, команды, поток группы потребителей, сравнение"></a><figcaption><b>Конспект #45.</b> Redis Streams <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<pre data-title="жизненный цикл сообщения"><code class="txt">XADD orders * productId 123 quantity 2            # добавить; * — сгенерировать ID вида 1657818941050-0
+XGROUP CREATE orders order-group $                # создать группу потребителей
+XREADGROUP GROUP order-group c1 COUNT 2 STREAMS orders >   # прочитать новые сообщения как потребитель c1
+XACK orders order-group 1657818941050-0           # подтвердить обработку
+XAUTOCLAIM orders order-group c2 60000 0          # забрать сообщения, висящие без подтверждения дольше 60 с
+</code></pre>
+<p><b>Pending Entries List (PEL)</b> — список сообщений, выданных потребителю, но ещё не подтверждённых. Если потребитель упал, его сообщения остаются в PEL, и другой потребитель забирает их через <code>XCLAIM</code> / <code>XAUTOCLAIM</code>. Отсюда гарантия «не менее одного раза» — и обязанность обработчика быть идемпотентным.</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>Pub/Sub</th><th>Streams</th><th>Kafka</th></tr>
+<tr><td>Хранение</td><td>Нет</td><td>Да, в памяти Redis</td><td>Да, на диске</td></tr>
+<tr><td>Доставка</td><td>Не более одного раза</td><td>Не менее одного раза (с ack)</td><td>Не менее одного раза / exactly-once</td></tr>
+<tr><td>Подписчик был отключён</td><td>Сообщения потеряны</td><td>Дочитает позже</td><td>Дочитает позже</td></tr>
+<tr><td>Повторное чтение истории</td><td>Нет</td><td>Да</td><td>Да</td></tr>
+<tr><td>Масштаб одного журнала</td><td>—</td><td>Один ключ = один узел, объём ограничен памятью</td><td>Партиции на многих брокерах, терабайты</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Когда Streams, а когда Kafka</span>
+Streams удобны, когда Redis уже есть, поток событий умеренный, а история нужна на часы или дни: фоновые задачи, уведомления, обмен между парой сервисов. Обязательно ограничивайте длину (<code>XADD … MAXLEN ~ 100000</code>) — иначе журнал съест память. Kafka нужна, когда событий много, история хранится долго, читателей много и важны партиции и порядок по ключу (<a href="12-kafka-core.html">тема 12</a>). И помните о гарантиях Redis: при переключении на реплику подтверждённые сообщения могут пропасть (<a href="10-redis-ha.html#replication">тема 10</a>).
+</div>
+
+<h2 id="lua"><span class="h-num">11.3</span>Lua-скрипты<span class="sk-num">#46</span></h2>
+<p>Скрипт на Lua выполняется на сервере Redis как одна команда: между его шагами не вклинится ни один другой клиент. Это решает главную проблему составных операций — гонку между «прочитал» и «записал» — и заменяет несколько сетевых обменов одним.</p>
+<figure class="sketch"><a href="img/46-redis-lua.jpg"><img src="img/46-redis-lua.jpg" width="1024" height="1536" loading="lazy" alt="Redis Lua Script: как работает, примеры атомарного инкремента и лимитера, EVAL и EVALSHA"></a><figcaption><b>Конспект #46.</b> Redis Lua Script <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<pre data-title="лимитер: не более N запросов за окно (с конспекта)"><code class="txt">-- KEYS[1] = ключ счётчика, ARGV[1] = лимит, ARGV[2] = окно в секундах
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+if current > tonumber(ARGV[1]) then return 0 else return 1 end
+
+-- вызов: EVAL "&lt;текст скрипта&gt;" 1 user:123 5 60   — вернёт 1 (разрешено) или 0 (отклонено)
+</code></pre>
+<p>Без скрипта между <code>INCR</code> и <code>EXPIRE</code> клиент может упасть — и счётчик останется без срока жизни навсегда, заблокировав пользователя. В скрипте обе команды выполняются неразрывно.</p>
+<ul>
+  <li><b><code>EVAL</code> и <code>EVALSHA</code>.</b> <code>EVAL</code> передаёт текст скрипта при каждом вызове. <code>SCRIPT LOAD</code> загружает скрипт один раз и возвращает SHA1-хэш, а <code>EVALSHA</code> вызывает его по хэшу — меньше трафика. Клиентские библиотеки делают это автоматически.</li>
+  <li><b>Ключи — только через <code>KEYS</code>.</b> В кластере Redis по ним определяет узел, и все ключи скрипта должны лежать в одном слоте (<a href="10-redis-ha.html#cluster">тема 10</a>).</li>
+</ul>
+<div class="callout warn"><span class="c-title">Уточнения к конспекту</span>
+<ul>
+  <li><b>«Атомарно» не значит «с откатом».</b> Скрипт не прерывается другими командами, но если он упал на середине, уже выполненные записи <i>остаются</i>. Это изоляция, а не транзакция в смысле ACID.</li>
+  <li><b>Долгий скрипт останавливает весь Redis</b> — тот же единственный поток. Никаких циклов по большим коллекциям; скрипт должен завершаться за доли миллисекунды.</li>
+  <li><b>Redis Functions</b> (с версии 7.0) — развитие идеи: именованные функции, которые хранятся на сервере, реплицируются и переживают перезапуск; вызываются через <code>FCALL</code>.</li>
+</ul>
+</div>
+
+<h2 id="bloom"><span class="h-num">11.4</span>Фильтр Блума<span class="sk-num">#47</span></h2>
+<p>Вероятностная структура данных, которая отвечает на вопрос «есть ли элемент в множестве?» за постоянное время и с очень малым расходом памяти. Цена — асимметричная ошибка: ответ «<b>точно нет</b>» всегда верен, ответ «<b>возможно, есть</b>» иногда ложен.</p>
+<figure class="sketch"><a href="img/47-redis-bloom-filter.jpg"><img src="img/47-redis-bloom-filter.jpg" width="1024" height="1536" loading="lazy" alt="Redis Bloom Filter: принцип работы, команды, применение, варианты"></a><figcaption><b>Конспект #47.</b> Redis Bloom Filter <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<p><b>Как работает.</b> Есть массив из <i>m</i> бит и <i>k</i> хэш-функций. Добавление: вычислить k хэшей элемента и установить соответствующие биты в 1. Проверка: если хотя бы один из k битов равен 0 — элемента точно не было; если все равны 1 — вероятно, был (но биты могли выставить другие элементы — это и есть ложное срабатывание).</p>
+<div class="table-wrap"><table>
+<tr><th>Допустимая доля ложных срабатываний</th><th>Бит на элемент</th><th>Хэш-функций</th><th>Память на 1 млн элементов</th></tr>
+<tr><td>1%</td><td>≈ 9,6</td><td>7</td><td>≈ 1,2 МБ</td></tr>
+<tr><td>0,1%</td><td>≈ 14,4</td><td>10</td><td>≈ 1,8 МБ</td></tr>
+</table></div>
+<p>Сравните: множество из миллиона UUID в виде строк заняло бы десятки мегабайт. Размер фильтра не зависит от размера самих элементов.</p>
+<pre data-title="команды"><code class="txt">BF.RESERVE users 0.01 1000000     # ошибка 1%, ёмкость 1 млн
+BF.ADD users user123
+BF.EXISTS users user123           # 1 — возможно есть
+BF.EXISTS users user999           # 0 — точно нет
+</code></pre>
+<p><b>Главное применение в системном дизайне</b> — защита от cache penetration (<a href="09-caching.html#failures">тема 09</a>): перед обращением к кэшу и базе проверить, существует ли вообще такой идентификатор. «Точно нет» отсекает запрос сразу; редкое ложное «возможно» просто приводит к обычному запросу в базу, который вернёт пустой результат. Другие применения: «этот логин уже занят?», дедупликация URL у поискового робота, «показывали ли уже эту рекомендацию».</p>
+<div class="callout warn"><span class="c-title">Ограничения и уточнение</span>
+<ul>
+  <li><b>Удалять нельзя</b>: сброс бита задел бы другие элементы. Если нужны удаления — Cuckoo filter (<code>CF.*</code>) или счётный фильтр Блума.</li>
+  <li><b>Ёмкость задаётся заранее.</b> При переполнении доля ложных срабатываний растёт; RedisBloom в этом случае наращивает фильтр слоями, что стоит памяти и скорости.</li>
+  <li><b>Про «модуль RedisBloom».</b> Конспект называет фильтр модулем — так было исторически (Redis Stack). Начиная с Redis 8 вероятностные структуры входят в основную поставку. В управляемых сервисах уточняйте, поддерживаются ли команды <code>BF.*</code>.</li>
+  <li>Родственные структуры из того же набора: <b>Count-Min Sketch</b> — приблизительная частота элементов, <b>Top-K</b> — самые частые, <b>T-Digest</b> — перцентили.</li>
+</ul>
+</div>
+
+<h2 id="lock"><span class="h-num">11.5</span>Распределённая блокировка<span class="sk-num">#48</span></h2>
+<p>Когда у сервиса несколько экземпляров, <code>synchronized</code> и <code>ReentrantLock</code> не помогают — они действуют в пределах одного процесса. Распределённая блокировка гарантирует, что общий ресурс в каждый момент обрабатывает только один экземпляр: задача по расписанию выполняется один раз, один заказ не обрабатывается дважды.</p>
+<figure class="sketch"><a href="img/48-redis-distributed-lock.jpg"><img src="img/48-redis-distributed-lock.jpg" width="1024" height="1536" loading="lazy" alt="Redis Distributed Lock: захват через SET NX EX, освобождение Lua-скриптом, Redlock"></a><figcaption><b>Конспект #48.</b> Redis Distributed Lock <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<pre data-title="захват и безопасное освобождение"><code class="txt">SET lock:order:123 550e8400-e29b-41d4-a716-446655440000 NX EX 10
+# NX — установить, только если ключа нет; EX 10 — срок жизни 10 с
+# "OK" — блокировка получена, (nil) — уже занята
+
+-- освобождение: удалить, только если блокировка всё ещё наша
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Деталь</th><th>Зачем</th><th>Что будет без неё</th></tr>
+<tr><td><code>NX</code> и <code>EX</code> в одной команде</td><td>Атомарность захвата</td><td><code>SETNX</code> + <code>EXPIRE</code> отдельно: упали между ними — блокировка вечная</td></tr>
+<tr><td>Срок жизни</td><td>Блокировка освободится, даже если владелец упал</td><td>Взаимоблокировка до ручного вмешательства</td></tr>
+<tr><td>Уникальное значение (UUID)</td><td>Отличить свою блокировку от чужой</td><td>Удалим блокировку, которую уже взял другой</td></tr>
+<tr><td>Освобождение Lua-скриптом</td><td>«Проверить и удалить» неразрывно</td><td>Между <code>GET</code> и <code>DEL</code> блокировка истечёт и перейдёт к другому</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Чего нет на конспекте: блокировка может истечь, пока вы работаете</span>
+Экземпляр A взял блокировку на 10 секунд и «завис» на 15 — пауза сборщика мусора, медленный внешний вызов, заморозка виртуальной машины. Блокировка истекла, её взял B. A просыпается, уверенный, что блокировка у него, — и оба пишут одновременно. Никакой Redis-блокировкой, включая Redlock, это не исключается.
+<ul>
+  <li><b>Продление (watchdog)</b>: фоновый поток продлевает срок жизни, пока владелец жив. Так работает <code>RLock</code> в Redisson. Сужает окно, но не закрывает его.</li>
+  <li><b>Fencing token</b> — настоящее решение: вместе с блокировкой выдаётся монотонно растущий номер, и <i>сам ресурс</i> отклоняет запись с номером меньше уже виденного. В базе данных это то же, что оптимистичная блокировка по версии (<a href="07-transactions.html#optimistic">тема 07</a>).</li>
+</ul>
+</div>
+<div class="callout interview"><span class="c-title">Эффективность или корректность</span>
+Полезный вопрос к любой блокировке: что случится, если двое всё-таки окажутся внутри? Если всего лишь лишняя работа (дважды пересчитали кэш, дважды отправили письмо) — блокировка в одном Redis достаточна. Если повреждение данных (двойное списание) — блокировка может быть лишь оптимизацией поверх настоящей защиты: уникального ограничения, проверки версии, идемпотентности. <b>Redlock</b> с конспекта (захват на большинстве из 3–5 независимых мастеров) повышает доступность, но его пригодность для строгих гарантий оспаривается; для них берут системы с консенсусом — ZooKeeper, etcd — и fencing.
+</div>
+
+<h2 id="sim"><span class="h-num">11.6</span>Интерактив: фильтр Блума своими руками</h2>
+<div class="widget" id="blW">
+  <div class="widget-title">Симулятор: 32 бита, 3 хэш-функции</div>
+  <p class="hint">Добавляйте слова и проверяйте наличие. Найдите слово, которого вы не добавляли, но фильтр ответит «возможно, есть».</p>
+  <div class="controls">
+    <label>слово<input type="text" id="blIn" value="apple"></label>
+    <button class="btn primary" type="button" id="blAdd">добавить</button>
+    <button class="btn" type="button" id="blChk">проверить</button>
+    <button class="btn" type="button" id="blFill">добавить 8 случайных</button>
+    <button class="btn" type="button" id="blReset">↺ очистить</button>
+  </div>
+  <div class="buckets" id="blBits" style="grid-template-columns:repeat(16,minmax(0,1fr))"></div>
+  <div class="out" id="blStat"></div>
+  <div class="verdict" id="blOut"></div>
+</div>
+<script>
+(function () {
+  var M = 32, bits, added, last = [], $ = function (i) { return document.getElementById(i); };
+  function h(s, seed) { var x = 2166136261 ^ seed; for (var i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); } x ^= x >>> 13; x = Math.imul(x, 0x5bd1e995); x ^= x >>> 15; return (x >>> 0) % M; }
+  function pos(s) { return [h(s, 1), h(s, 77), h(s, 1999)]; }
+  function reset() { bits = new Array(M).fill(0); added = []; last = []; }
+  function render(msg, cls) {
+    $("blBits").innerHTML = bits.map(function (b, i) { return '<div class="bucket ' + (last.indexOf(i) >= 0 ? "coll" : (b ? "used" : "")) + '" style="text-align:center;padding:3px;min-height:40px"><b>' + i + "</b><br>" + b + "</div>"; }).join("");
+    var set = bits.filter(Boolean).length, fp = Math.pow(set / M, 3);
+    $("blStat").textContent = "добавлено слов: " + added.length + (added.length ? " [" + added.slice(-10).join(", ") + "]" : "") + "\nустановлено бит: " + set + " из " + M + "\nвероятность ложного срабатывания сейчас ≈ (" + set + "/" + M + ")³ = " + (fp * 100).toFixed(1) + "%";
+    if (msg) { $("blOut").className = "verdict " + cls; $("blOut").textContent = msg; }
+  }
+  $("blAdd").addEventListener("click", function () { var w = $("blIn").value.trim(); if (!w) return; last = pos(w); last.forEach(function (p) { bits[p] = 1; }); if (added.indexOf(w) < 0) added.push(w); render("«" + w + "» → позиции " + last.join(", ") + " установлены в 1. Само слово нигде не хранится — только три бита.", "ok"); });
+  $("blChk").addEventListener("click", function () {
+    var w = $("blIn").value.trim(); if (!w) return; last = pos(w);
+    var all = last.every(function (p) { return bits[p]; }), really = added.indexOf(w) >= 0;
+    if (!all) render("«" + w + "» → позиции " + last.join(", ") + ": есть нулевой бит → ТОЧНО НЕТ. Ложных отрицаний не бывает: если бы слово добавляли, все три бита были бы единицами.", "ok");
+    else if (really) render("«" + w + "» → все три бита равны 1 → ВОЗМОЖНО, ЕСТЬ (и действительно есть).", "ok");
+    else render("«" + w + "» → все три бита равны 1 → ВОЗМОЖНО, ЕСТЬ. Но это слово не добавлялось! Его биты установлены другими словами — ложное срабатывание. Поэтому после «возможно, есть» идут проверять настоящее хранилище.", "bad");
+  });
+  $("blFill").addEventListener("click", function () { var words = ["kafka", "redis", "nginx", "mongo", "spring", "docker", "linux", "java", "raft", "http", "quic", "etcd", "grpc", "tls", "dns", "tcp"]; last = []; for (var i = 0; i < 8; i++) { var w = words[Math.floor(Math.random() * words.length)] + Math.floor(Math.random() * 90 + 10); pos(w).forEach(function (p) { bits[p] = 1; }); added.push(w); } render("Добавлено 8 слов. Чем плотнее заполнен массив, тем чаще ложные срабатывания: попробуйте проверить слова banana, orange, cherry.", "warn"); });
+  $("blReset").addEventListener("click", function () { reset(); render("Фильтр пуст. Удалять отдельные элементы из классического фильтра нельзя: сброс бита сломал бы другие слова (для удаления — counting Bloom или Cuckoo filter).", "ok"); });
+  reset(); render("Фильтр пуст: любое слово — «точно нет».", "ok");
+})();
+</script>
+<div class="grid-2">
+  <div class="card"><h4>Размер под задачу</h4><p>Для <i>n</i> элементов и вероятности ошибки <i>p</i>: бит <code>m = −n·ln p / (ln 2)²</code>, хэш-функций <code>k = (m/n)·ln 2</code>. На 1% ошибок нужно ~9,6 бита на элемент: миллиард ключей — 1,2 ГБ вместо десятков гигабайт самих ключей.</p></div>
+  <div class="card"><h4>Где применяется</h4><p>LSM-базы (Cassandra, RocksDB): не читать с диска файл, в котором ключа точно нет. Защита кэша от запросов несуществующих ключей. «Занят ли логин», списки вредоносных URL в браузере, дедупликация.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">11.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какие ошибки возможны у фильтра Блума?</p><ul><li>Ложные отрицания</li><li>И ложные отрицания, и ложные срабатывания</li><li>Только ложные срабатывания: «возможно, есть», когда элемента нет</li><li>Никаких</li></ul><div class="why">«Нет» — всегда правда. «Есть» — требует проверки в настоящем хранилище.</div></div>
+<div class="mcq" data-ok="1"><p>Почему Redis Pub/Sub не подходит для надёжной доставки задач?</p><ul><li>Он слишком медленный</li><li>Сообщение получают только подключённые сейчас подписчики и нигде не сохраняется: отключился — пропустил</li><li>Он не поддерживает шаблоны каналов</li><li>В нём нет каналов</li></ul><div class="why">Для надёжности — Streams с группами потребителей и подтверждениями (XACK) или настоящий брокер.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем проверку и изменение значения в Redis оформляют Lua-скриптом?</p><ul><li>Скрипт выполняется атомарно: между чтением и записью не вклинится другой клиент</li><li>Lua быстрее Redis</li><li>Для шифрования</li><li>Чтобы обойти лимит памяти</li></ul><div class="why">Redis однопоточен при выполнении команд; скрипт — одна «команда». Так реализуют лимитеры и безопасное снятие блокировки («удалить, только если значение моё»).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Нужно сбросить локальный кэш справочника на всех 20 экземплярах сервиса. Pub/Sub или Streams?</summary><div class="a"><p>Pub/Sub. Сообщение должны получить все экземпляры одновременно (в Streams группа потребителей отдала бы его одному), а потеря не критична, если у локального кэша есть TTL как страховка. Экземпляр, пропустивший сообщение при переподключении, обновится по TTL.</p></div></details>
+<details class="q"><summary>Что такое PEL в Redis Streams и что с ним случается, если потребитель упал?</summary><div class="a"><p>Pending Entries List — сообщения, выданные потребителю группы и не подтверждённые через <code>XACK</code>. При падении потребителя они остаются в PEL и не выдаются другим автоматически. Другой потребитель должен забрать их через <code>XAUTOCLAIM</code> (или <code>XPENDING</code> + <code>XCLAIM</code>) по истечении времени простоя. Обработчик должен быть идемпотентным: сообщение может быть обработано дважды.</p></div></details>
+<details class="q"><summary>Почему лимитер из <code>INCR</code> и <code>EXPIRE</code> двумя отдельными командами ненадёжен?</summary><div class="a"><p>Между командами клиент может упасть или потерять соединение: счётчик создан, срок жизни не установлен. Ключ останется навсегда, счётчик дойдёт до лимита, и пользователь будет заблокирован бессрочно. Lua-скрипт выполняет обе команды как одну.</p></div></details>
+<details class="q"><summary>Фильтр Блума ответил «возможно, есть». Что делает система дальше и почему это не проблема?</summary><div class="a"><p>Выполняет обычную проверку — запрос в кэш и базу. В ~1% случаев (при настроенной ошибке 1%) элемента на самом деле нет, и запрос вернёт пусто. Это лишь небольшая лишняя работа. Важно, что обратной ошибки не бывает: «точно нет» никогда не отсечёт существующий элемент.</p></div></details>
+<details class="q"><summary>Зачем в распределённой блокировке уникальное значение и почему нельзя освобождать её простым <code>DEL</code>?</summary><div class="a"><p>Если работа заняла больше срока жизни, блокировка истекла и её взял другой экземпляр. Простой <code>DEL</code> удалит уже чужую блокировку, и внутрь войдёт третий. Уникальное значение позволяет проверить владельца, а Lua-скрипт делает проверку и удаление неразрывными.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

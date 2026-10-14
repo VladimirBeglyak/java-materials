@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · PriorityQueue: двоичная куча</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+#hpSvg { width: 100%; display: block; margin: 6px 0; }
+#hpSvg line { stroke: var(--fg-muted); stroke-width: 1.4; }
+#hpSvg circle { fill: var(--info-soft); stroke: var(--info); stroke-width: 1.5; }
+#hpSvg circle.sw { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 3; }
+#hpSvg text { font: bold 12px var(--font-mono); fill: var(--fg); }
+#hpSvg text.ix { font: 10px var(--font-mono); fill: var(--fg-muted); }
+.ha { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0; }
+.ha span { min-width: 36px; text-align: center; font: 12px var(--font-mono); padding: 6px 2px; border: 1.5px solid var(--line); border-radius: 4px; background: var(--info-soft); }
+.ha span small { display: block; font-size: 9px; color: var(--fg-muted); }
+.ha span.sw { background: var(--accent-soft); border-color: var(--accent); }
+</style>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · УПОРЯДОЧЕННЫЕ СТРУКТУРЫ</div>
+  <h1>PriorityQueue: двоичная куча</h1>
+  <p class="lead"><code>PriorityQueue</code> всегда знает минимальный элемент, но не хранит элементы отсортированными. Внутри — двоичная куча, уложенная в обычный массив: дети узла i лежат в 2i+1 и 2i+2. Добавление «всплывает» вверх, извлечение «тонет» вниз — O(log n). Симулятор покажет каждый обмен, а заодно — почему итерация по PriorityQueue выдаёт «перемешанный» порядок.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">куча в массиве</span><span class="tag">siftUp/siftDown</span><span class="tag">heapify O(n)</span><span class="tag">top-K</span><span class="tag">порядок итерации</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="heap"><span class="h-num">13.1</span>Куча в массиве</h2>
+<p>Мин-куча: каждый узел не больше своих детей; минимум — в корне <code>queue[0]</code>. Дерево полное (заполняется по уровням слева направо), поэтому его можно хранить без ссылок: родитель узла i — <code>(i − 1) &gt;&gt;&gt; 1</code>, дети — <code>2i + 1</code> и <code>2i + 2</code>.</p>
+<div class="widget" id="hpW">
+  <div class="widget-title">PriorityQueue&lt;Integer&gt; (мин-куча)</div>
+  <div class="controls">
+    <label>значение<input type="number" id="hpV" value="3"></label>
+    <button class="btn primary" type="button" id="hpOffer">offer</button>
+    <button class="btn" type="button" id="hpPoll">poll</button>
+    <button class="btn" type="button" id="hpStep">Шаг ▶</button>
+    <button class="btn" type="button" id="hpHeapify">heapify [9,4,7,1,8,2,6,3,5]</button>
+    <button class="btn" type="button" id="hpR">↺</button>
+  </div>
+  <svg id="hpSvg" viewBox="0 0 700 210" role="img" aria-label="Двоичная куча"></svg>
+  <div class="ha" id="hpArr"></div>
+  <div class="out" id="hpOut"></div>
+  <div class="log" id="hpLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, q, pending, log, hl;
+  function reset() { q = [2, 5, 4, 9, 7, 8, 6]; pending = []; log = ["куча из 7 элементов; корень q[0] — минимум"]; hl = []; draw(); }
+  function offer(v) {
+    q.push(v); var k = q.length - 1; log.push("offer(" + v + "): кладём в конец массива q[" + k + "] и поднимаем (siftUp)"); pending = [];
+    while (k > 0) { var p = (k - 1) >>> 1; if (q[p] <= q[k]) { pending.push({ a: -1, b: k, msg: "  q[" + p + "]=" + q[p] + " ≤ " + q[k] + " → остановка" }); break; } pending.push({ a: p, b: k, msg: "  " + q[k] + " < родителя q[" + p + "]=" + q[p] + " → обмен" }); var t = q[p]; q[p] = q[k]; q[k] = t; k = p; }
+    // откатываем, чтобы показывать по шагам
+    replay(v, "up");
+  }
+  var snapshot = null;
+  function replay(v, dir) { var steps = pending.slice(); snapshot = q.slice(); var base = q.slice();
+    // восстановим начальное состояние для пошагового показа
+    for (var i = steps.length - 1; i >= 0; i--) { var s = steps[i]; if (s.a >= 0) { var t = base[s.a]; base[s.a] = base[s.b]; base[s.b] = t; } }
+    q = base; pending = steps; hl = [q.length - 1]; draw(); }
+  function step() {
+    if (!pending.length) { log.push("шагов нет"); draw(); return; }
+    var s = pending.shift(); if (s.a >= 0) { var t = q[s.a]; q[s.a] = q[s.b]; q[s.b] = t; hl = [s.a, s.b]; } else hl = [s.b]; log.push(s.msg); draw();
+  }
+  function poll() {
+    while (pending.length) step();
+    if (!q.length) { log.push("poll(): пусто → null"); draw(); return; }
+    var min = q[0], last = q.pop(); log.push("poll() → " + min + ": последний элемент " + (q.length ? last + " ставим в корень и опускаем (siftDown)" : "был единственным"));
+    if (!q.length) { hl = []; draw(); return; }
+    q[0] = last; var k = 0, steps = [], arr = q.slice();
+    while (true) { var l = 2 * k + 1, r = l + 1, m = k; if (l < arr.length && arr[l] < arr[m]) m = l; if (r < arr.length && arr[r] < arr[m]) m = r; if (m === k) { steps.push({ a: -1, b: k, msg: "  оба ребёнка не меньше " + arr[k] + " → остановка" }); break; } steps.push({ a: k, b: m, msg: "  " + arr[k] + " > меньшего ребёнка q[" + m + "]=" + arr[m] + " → обмен" }); var t = arr[k]; arr[k] = arr[m]; arr[m] = t; k = m; }
+    pending = steps; hl = [0]; draw();
+  }
+  function heapify() {
+    q = [9, 4, 7, 1, 8, 2, 6, 3, 5]; log = ["new PriorityQueue<>(collection): heapify — siftDown для всех внутренних узлов с конца, O(n), а не n·log n"];
+    var steps = [], arr = q.slice();
+    for (var i = (arr.length >>> 1) - 1; i >= 0; i--) { var k = i; steps.push({ a: -1, b: i, msg: "siftDown(" + i + ")" });
+      while (true) { var l = 2 * k + 1, r = l + 1, m = k; if (l < arr.length && arr[l] < arr[m]) m = l; if (r < arr.length && arr[r] < arr[m]) m = r; if (m === k) break; steps.push({ a: k, b: m, msg: "  обмен q[" + k + "]=" + arr[k] + " ↔ q[" + m + "]=" + arr[m] }); var t = arr[k]; arr[k] = arr[m]; arr[m] = t; k = m; } }
+    pending = steps; hl = []; draw();
+  }
+  function draw() {
+    var s = "", W = 700;
+    for (var i = 0; i < q.length; i++) {
+      var d = Math.floor(Math.log2(i + 1)), pos = i - (Math.pow(2, d) - 1), cnt = Math.pow(2, d), x = W * (pos + 0.5) / cnt, y = 24 + d * 48;
+      if (i > 0) { var p = (i - 1) >>> 1, pd = Math.floor(Math.log2(p + 1)), pp = p - (Math.pow(2, pd) - 1), px = W * (pp + 0.5) / Math.pow(2, pd), py = 24 + pd * 48; s = '<line x1="' + px + '" y1="' + py + '" x2="' + x + '" y2="' + y + '"/>' + s; }
+      s += '<circle class="' + (hl.indexOf(i) >= 0 ? "sw" : "") + '" cx="' + x + '" cy="' + y + '" r="16"/><text x="' + x + '" y="' + (y + 4) + '" text-anchor="middle">' + q[i] + '</text><text class="ix" x="' + (x + 18) + '" y="' + (y - 10) + '">' + i + "</text>";
+    }
+    $("hpSvg").innerHTML = s;
+    $("hpArr").innerHTML = q.map(function (v, i) { return '<span class="' + (hl.indexOf(i) >= 0 ? "sw" : "") + '">' + v + "<small>[" + i + "]</small></span>"; }).join("");
+    $("hpOut").textContent = "size = " + q.length + ", peek() = " + (q.length ? q[0] : "null") + (pending.length ? "  ·  осталось шагов: " + pending.length + " (кнопка «Шаг»)" : "") + "\nfor-each / toString выдаст порядок массива: " + JSON.stringify(q) + " — это НЕ сортировка";
+    $("hpLog").textContent = log.slice(-8).join("\n"); $("hpLog").scrollTop = 1e6;
+  }
+  $("hpOffer").addEventListener("click", function () { while (pending.length) step(); offer(+$("hpV").value); });
+  $("hpPoll").addEventListener("click", poll); $("hpStep").addEventListener("click", step);
+  $("hpHeapify").addEventListener("click", heapify); $("hpR").addEventListener("click", reset);
+  reset();
+})();
+</script>
+
+<h2 id="api"><span class="h-num">13.2</span>API и сложность</h2>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Сложность</th><th>Комментарий</th></tr>
+<tr><td><code>offer/add</code></td><td>O(log n)</td><td>siftUp; рост массива: малые почти вдвое (+старая ёмкость + 2), большие — в 1,5 раза</td></tr>
+<tr><td><code>poll/remove()</code></td><td>O(log n)</td><td>siftDown</td></tr>
+<tr><td><code>peek/element</code></td><td>O(1)</td><td>queue[0]</td></tr>
+<tr><td><code>remove(Object)</code>, <code>contains</code></td><td>O(n)</td><td>линейный поиск по массиву</td></tr>
+<tr><td>конструктор из коллекции</td><td>O(n)</td><td>heapify</td></tr>
+<tr><td>итерация, toString, stream</td><td>O(n)</td><td>в порядке массива, не по приоритету!</td></tr>
+</table></div>
+<pre data-title="получить элементы по порядку и задачи с кучей"><code class="java">// по порядку — только через poll (разрушающе) или сортировку копии
+while (!pq.isEmpty()) process(pq.poll());
+List&lt;Task&gt; ordered = pq.stream().sorted(pq.comparator()).toList();
+
+// макс-куча
+PriorityQueue&lt;Integer&gt; max = new PriorityQueue&lt;&gt;(Comparator.reverseOrder());
+
+// top-K наибольших за O(n log k): мин-куча размера k
+PriorityQueue&lt;Long&gt; top = new PriorityQueue&lt;&gt;(k + 1);
+for (long x : data) { top.offer(x); if (top.size() &gt; k) top.poll(); }   // выбрасываем минимум
+
+// слияние k отсортированных списков: в куче — по одному «текущему» элементу из каждого
+// планировщик задач по времени: PriorityQueue&lt;Job&gt; по nextRunAt (так устроен ScheduledThreadPoolExecutor — DelayedWorkQueue)</code></pre>
+<div class="callout warn"><span class="c-title">Изменяемый приоритет</span>
+Если изменить поле, по которому сравниваются элементы, уже внутри очереди — куча «сломается» без исключения: элемент окажется не на своём месте. Правильно: удалить (<code>remove(o)</code>, O(n)), изменить, добавить снова; или хранить неизменяемые записи (приоритет, задача) и игнорировать устаревшие при извлечении (ленивое удаление — стандартный приём в алгоритме Дейкстры).
+</div>
+
+<h2 id="quiz"><span class="h-num">13.3</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>В PriorityQueue по очереди добавили 3, 1, 2. Что выведет <code>System.out.println(pq)</code>?</p><ul><li>[1, 2, 3]</li><li>[3, 2, 1]</li><li>[1, 3, 2] — порядок массива кучи, а не сортировка</li><li>[3, 1, 2]</li></ul><div class="why">После offer(1) единица всплыла в корень, 3 ушла в q[1]; 2 добавилась в q[2] и осталась там (родитель 1 меньше). По порядку — только через poll.</div></div>
+<div class="mcq" data-ok="0"><p>Где в массиве кучи лежат дети элемента с индексом 3?</p><ul><li>7 и 8</li><li>6 и 7</li><li>4 и 5</li><li>1 и 2</li></ul><div class="why">2i + 1 и 2i + 2.</div></div>
+<div class="mcq" data-ok="3"><p>Сколько стоит построить кучу из n элементов конструктором PriorityQueue(collection)?</p><ul><li>O(n²)</li><li>O(n log n)</li><li>O(log n)</li><li>O(n)</li></ul><div class="why">Heapify снизу вверх: большинство узлов внизу и тонут на малую глубину.</div></div>
+<div class="mcq" data-ok="1"><p>Как найти 10 самых больших чисел из миллиона экономно по памяти?</p><ul><li>Отсортировать все и взять последние 10</li><li>Мин-куча размера 10: добавлять и выбрасывать минимум при превышении</li><li>Макс-куча из всех элементов</li><li>TreeSet из всех элементов</li></ul><div class="why">O(n log k) времени и O(k) памяти; осторожно с дубликатами в TreeSet.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему PriorityQueue не годится как «отсортированный список»?</summary><div class="a"><p>Куча поддерживает только частичный порядок (родитель ≤ детей): минимум за O(1), но произвольный элемент или k-й по порядку — нет; итерация идёт по массиву. Для постоянно отсортированного набора с поиском и диапазонами — TreeSet/TreeMap; для разовой сортировки — список и sort.</p></div></details>
+<details class="q"><summary>Как реализовать алгоритм Дейкстры с PriorityQueue, если у вершины уменьшается расстояние?</summary><div class="a"><p>Java PriorityQueue не умеет decrease-key. Стандартный приём — ленивое удаление: при улучшении расстояния класть в очередь новую пару (расстояние, вершина), а при извлечении пропускать пары, где расстояние больше уже известного. Очередь содержит дубликаты, но сложность остаётся O((V + E) log V).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

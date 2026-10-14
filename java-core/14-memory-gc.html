@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Память JVM и сборка мусора</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · ПЛАТФОРМА ИЗНУТРИ</div>
+  <h1>Память JVM и сборка мусора</h1>
+  <p class="lead">Автоматическое управление памятью не означает, что о ней можно не думать: утечки в Java существуют, паузы сборщика влияют на время ответа, а контейнер убивает процесс без единой строки в логе. Глава о том, где живут объекты, как JVM решает, что они больше не нужны, и что делать, когда память закончилась.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">heap</span><span class="tag">G1 / ZGC</span><span class="tag">утечки</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="areas"><span class="h-num">14.1</span>Области памяти</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 262" role="img" aria-label="Области памяти JVM: куча с поколениями, Metaspace, стеки потоков, code cache, прямая память">
+  <rect x="20" y="30" width="504" height="134" rx="10" class="box" stroke-dasharray="5 4"/>
+  <text x="34" y="52" font-weight="700" font-size="13">Куча (heap) — объекты и массивы · -Xmx</text>
+  <text x="36" y="76" font-size="12" class="muted">молодое поколение</text><text x="344" y="76" font-size="12" class="muted">старое поколение</text>
+  <rect x="36" y="84" width="150" height="66" rx="7" class="box-ok"/><text x="111" y="113" text-anchor="middle" font-weight="700" font-size="13">Eden</text><text x="111" y="131" text-anchor="middle" font-size="11.5">новые объекты</text>
+  <rect x="194" y="84" width="62" height="66" rx="7" class="box-ok"/><text x="225" y="121" text-anchor="middle" font-weight="700" font-size="13">S0</text>
+  <rect x="264" y="84" width="62" height="66" rx="7" class="box-ok"/><text x="295" y="121" text-anchor="middle" font-weight="700" font-size="13">S1</text>
+  <rect x="344" y="84" width="164" height="66" rx="7" class="box-info"/><text x="426" y="113" text-anchor="middle" font-weight="700" font-size="13">Old</text><text x="426" y="131" text-anchor="middle" font-size="11.5">пережившие сборки</text>
+  <rect x="550" y="30" width="230" height="58" rx="9" class="box-warn"/><text x="566" y="54" font-weight="700" font-size="13">Metaspace</text><text x="566" y="74" font-size="11.5">метаданные классов · вне кучи</text>
+  <rect x="550" y="106" width="230" height="58" rx="9" class="box"/><text x="566" y="130" font-weight="700" font-size="13">Code cache</text><text x="566" y="150" font-size="11.5">машинный код от JIT</text>
+  <rect x="20" y="186" width="370" height="58" rx="9" class="box-acc"/><text x="36" y="210" font-weight="700" font-size="13">Стеки потоков · -Xss</text><text x="36" y="230" font-size="11.5">кадры методов: локальные переменные, ссылки</text>
+  <rect x="410" y="186" width="370" height="58" rx="9" class="box"/><text x="426" y="210" font-weight="700" font-size="13">Прямая память (direct)</text><text x="426" y="230" font-size="11.5">буферы NIO, нативные библиотеки</text>
+</svg>
+<figcaption>Параметр <code>-Xmx</code> ограничивает только кучу. Реальное потребление процесса больше: к куче добавляются все остальные области и служебные структуры сборщика.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<tr><th>Область</th><th>Что хранит</th><th>Чья</th><th>Ошибка при исчерпании</th></tr>
+<tr><td><b>Куча</b></td><td>Все объекты и массивы</td><td>Общая для потоков; управляется сборщиком мусора</td><td><code>OutOfMemoryError: Java heap space</code></td></tr>
+<tr><td><b>Стек потока</b></td><td>Кадр на каждый вызов метода: параметры, локальные переменные, промежуточные значения</td><td>Свой у каждого потока; обычно до 1 МБ</td><td><code>StackOverflowError</code></td></tr>
+<tr><td><b>Metaspace</b></td><td>Описания классов, методов, пул констант</td><td>Нативная память; растёт по мере загрузки классов</td><td><code>OutOfMemoryError: Metaspace</code></td></tr>
+<tr><td><b>Code cache</b></td><td>Скомпилированный JIT машинный код</td><td>Нативная память</td><td>JIT отключается, код замедляется</td></tr>
+<tr><td><b>Прямая память</b></td><td>Буферы <code>ByteBuffer.allocateDirect</code></td><td>Нативная память</td><td><code>OutOfMemoryError: Direct buffer memory</code></td></tr>
+</table></div>
+<p>До Java 8 метаданные классов лежали в <b>PermGen</b> — области фиксированного размера внутри кучи, отсюда знаменитая ошибка <code>PermGen space</code>. Metaspace заменил его и по умолчанию ограничен только памятью машины.</p>
+<h3>Как устроен объект и его создание</h3>
+<ul>
+  <li><b>Заголовок объекта</b> — 12 байт: служебное слово (хэш, возраст, состояние блокировки) и указатель на класс. Размер объекта выравнивается до 8 байт, поэтому <code>new Object()</code> занимает 16 байт, <code>Integer</code> — тоже 16. В Java 25 можно включить компактные заголовки по 8 байт (<code>-XX:+UseCompactObjectHeaders</code>).</li>
+  <li><b>Сжатые ссылки.</b> При куче до 32 ГБ ссылка занимает 4 байта вместо 8. Куча в 33 ГБ может вмещать меньше объектов, чем куча в 31 ГБ.</li>
+  <li><b>Выделение памяти дёшево.</b> У каждого потока свой участок Eden (TLAB), и <code>new</code> сводится к сдвигу указателя — несколько машинных команд, без блокировок. Дорого не создание объектов, а их долгая жизнь.</li>
+  <li><b>Объект может вовсе не попасть в кучу.</b> Если JIT докажет, что объект не покидает метод (escape analysis), он заменит его набором локальных переменных. Поэтому короткоживущие мелкие объекты — итераторы, <code>Optional</code>, записи — в горячем коде часто бесплатны.</li>
+</ul>
+
+<h2 id="reachability"><span class="h-num">14.2</span>Достижимость</h2>
+<p>Сборщик не считает ссылки на объект. Он определяет <b>достижимость</b>: объект жив, если до него можно дойти по цепочке ссылок от одного из <b>корней</b> (GC roots). Всё остальное — мусор, даже если объекты ссылаются друг на друга по кругу.</p>
+<div class="grid-2">
+  <div class="card"><h4>Корни</h4><ul><li>Локальные переменные и параметры в стеках всех потоков.</li><li>Статические поля загруженных классов.</li><li>Сами работающие потоки.</li><li>Ссылки из нативного кода (JNI).</li><li>Объекты, используемые как мониторы.</li></ul></div>
+  <div class="card"><h4>Следствия</h4><ul><li>Циклические ссылки — не проблема.</li><li>Присваивать <code>null</code> локальной переменной в конце метода бессмысленно.</li><li><b>Статическое поле — корень</b>, живущий, пока загружен класс: всё, что из него достижимо, не будет собрано.</li><li><code>System.gc()</code> — просьба, а не команда; в рабочем коде не вызывают.</li></ul></div>
+</div>
+
+<h2 id="generations"><span class="h-num">14.3</span>Поколения</h2>
+<p>Наблюдение, на котором построены почти все сборщики: <b>большинство объектов умирает молодыми</b>. Временные строки, DTO запроса, итераторы живут миллисекунды. Поэтому кучу делят на поколения и чаще всего убирают только молодое.</p>
+<ol class="steps">
+  <li>Новый объект создаётся в <b>Eden</b>.</li>
+  <li>Eden заполнен — <b>малая сборка</b> (minor GC): живые объекты из Eden и занятого Survivor копируются во второй Survivor; всё остальное пространство объявляется свободным. Цена пропорциональна числу <i>живых</i> объектов, а их мало.</li>
+  <li>У каждого пережившего сборку объекта увеличивается возраст. Пережившие несколько сборок (порог до 15) переводятся в <b>Old</b>.</li>
+  <li>Old заполняется медленно; его сборка — дороже и реже. Полная сборка всей кучи (<b>full GC</b>) с остановкой приложения — признак проблемы.</li>
+</ol>
+<div class="callout info"><span class="c-title">Stop-the-world</span>
+На некоторых этапах сборщику нужно, чтобы граф объектов не менялся, и он останавливает все потоки приложения. Различие между сборщиками — в том, какую часть работы они выполняют во время такой паузы, а какую — параллельно с приложением. Паузы сборщика напрямую складываются с временем ответа сервиса и объясняют «необъяснимые» выбросы p99.
+</div>
+
+<h2 id="collectors"><span class="h-num">14.4</span>Сборщики мусора</h2>
+<div class="table-wrap"><table>
+<tr><th>Сборщик</th><th>Флаг</th><th>Как работает</th><th>Для чего</th></tr>
+<tr><td><b>Serial</b></td><td><code>-XX:+UseSerialGC</code></td><td>Один поток, вся работа в паузе</td><td>Маленькие кучи, одно ядро</td></tr>
+<tr><td><b>Parallel</b></td><td><code>-XX:+UseParallelGC</code></td><td>Много потоков, вся работа в паузе</td><td>Максимальная пропускная способность: пакетная обработка, где паузы не важны. По умолчанию в Java 8</td></tr>
+<tr><td><b>G1</b></td><td><code>-XX:+UseG1GC</code></td><td>Куча — сетка регионов; разметка параллельно с приложением, перенос объектов — в коротких паузах с целевой длительностью</td><td><b>По умолчанию с Java 9.</b> Универсальный выбор для серверов</td></tr>
+<tr><td><b>ZGC</b></td><td><code>-XX:+UseZGC</code></td><td>Почти всё, включая перенос объектов, — параллельно с приложением; паузы меньше миллисекунды независимо от размера кучи</td><td>Сервисы, чувствительные к задержке; кучи от сотен мегабайт до терабайт</td></tr>
+<tr><td><b>Shenandoah</b></td><td><code>-XX:+UseShenandoahGC</code></td><td>Тоже параллельный перенос объектов</td><td>Те же задачи, что ZGC; есть не во всех сборках JDK</td></tr>
+</table></div>
+<ul>
+  <li><b>G1</b>: цель паузы задаётся <code>-XX:MaxGCPauseMillis</code> (по умолчанию 200 мс) — это ориентир, а не гарантия. Объект размером от половины региона считается «огромным» (humongous) и размещается отдельно; обилие таких объектов — частая причина проблем.</li>
+  <li><b>ZGC</b> платит за короткие паузы процессорным временем и памятью: фоновая работа отнимает часть пропускной способности. С Java 21 он поколенческий, с Java 24 — только поколенческий.</li>
+  <li><b>CMS</b>, упоминаемый в старых материалах, удалён в Java 14.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Ловушка контейнеров: неожиданный Serial GC</span>
+JVM выбирает сборщик по ресурсам машины. Если контейнеру выделено меньше двух процессоров или менее ~2 ГБ памяти, по умолчанию будет выбран <b>Serial</b>, а не G1 — с однопоточными паузами. В настройках сервиса сборщик стоит указывать явно, а в логе запуска — проверять, какой выбран (<code>-Xlog:gc</code>).
+</div>
+
+<h2 id="references"><span class="h-num">14.5</span>Виды ссылок</h2>
+<div class="table-wrap"><table>
+<tr><th>Ссылка</th><th>Когда объект собирается</th><th>Применение</th></tr>
+<tr><td><b>Сильная</b> — обычная</td><td>Никогда, пока достижим</td><td>Всё по умолчанию</td></tr>
+<tr><td><b><code>SoftReference</code></b></td><td>Когда памяти не хватает — перед <code>OutOfMemoryError</code></td><td>Задумана для кэшей; на практике ведёт себя непредсказуемо — лучше кэш с явным ограничением размера</td></tr>
+<tr><td><b><code>WeakReference</code></b></td><td>При ближайшей сборке, если нет сильных ссылок</td><td><code>WeakHashMap</code>, метаданные, привязанные к времени жизни объекта; слушатели</td></tr>
+<tr><td><b><code>PhantomReference</code></b></td><td>Объект уже недостижим; ссылка лишь сообщает об этом через очередь</td><td>Освобождение нативных ресурсов; на ней построен <code>Cleaner</code></td></tr>
+</table></div>
+<p><b><code>finalize()</code> устарел</b> и готовится к удалению: он вызывается неизвестно когда (или никогда), замедляет сборку и позволяет «воскресить» объект. Ресурсы освобождают через <code>AutoCloseable</code> и try-with-resources; <code>Cleaner</code> — только страховка на случай забытого <code>close()</code>.</p>
+
+<h2 id="leaks"><span class="h-num">14.6</span>Утечки памяти</h2>
+<p>Утечка в Java — это объект, который программе больше не нужен, но остаётся <b>достижимым</b>. Сборщик работает правильно: он не может знать, что ссылка «забыта».</p>
+<pre data-title="классика: коллекция в статическом поле растёт без ограничения" class="bad-code"><code class="java">class SessionRegistry {
+    private static final Map&lt;String, Session&gt; SESSIONS = new HashMap&lt;&gt;();   // корень GC
+    void login(Session s) { SESSIONS.put(s.id(), s); }
+    // logout() забывает вызвать remove — каждая сессия остаётся навсегда
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Источник</th><th>Механизм</th><th>Лечение</th></tr>
+<tr><td>Статические коллекции и самодельные кэши</td><td>Записи добавляются и не удаляются</td><td>Ограничение размера и времени жизни: Caffeine</td></tr>
+<tr><td><code>ThreadLocal</code> в пуле потоков</td><td>Поток живёт вечно, значение — вместе с ним</td><td><code>remove()</code> в <code>finally</code></td></tr>
+<tr><td>Слушатели и подписки</td><td>Издатель держит ссылку на подписчика</td><td>Отписываться; слабые ссылки</td></tr>
+<tr><td>Внутренние и анонимные классы</td><td>Скрытая ссылка на внешний объект (<a href="04-oop.html#nested">тема 04</a>)</td><td><code>static</code>-вложенные классы, лямбды</td></tr>
+<tr><td>Изменённый ключ в <code>HashMap</code></td><td>Запись недостижима для <code>remove</code> (<a href="05-object-contract.html#hashcode">тема 05</a>)</td><td>Неизменяемые ключи</td></tr>
+<tr><td>Незакрытые ресурсы</td><td>Соединения, потоки, прямые буферы</td><td>try-with-resources</td></tr>
+<tr><td>Загрузчики классов</td><td>Одна ссылка на объект из старого загрузчика удерживает все его классы</td><td>Проявляется как рост Metaspace при переразвёртывании</td></tr>
+<tr><td><code>subList</code>, большие массивы «на всякий случай»</td><td>Маленький объект держит большой</td><td>Копировать нужную часть</td></tr>
+</table></div>
+<h3>Что означает каждая ошибка</h3>
+<div class="table-wrap"><table>
+<tr><th>Сообщение</th><th>Причина</th></tr>
+<tr><td><code>Java heap space</code></td><td>Куча заполнена живыми объектами: утечка, слишком большой запрос (выгрузка всей таблицы в список) или куча мала для нагрузки</td></tr>
+<tr><td><code>GC overhead limit exceeded</code></td><td>Почти всё время уходит на сборку, а освобождается менее 2% — агония перед исчерпанием кучи</td></tr>
+<tr><td><code>Metaspace</code></td><td>Слишком много классов: утечка загрузчиков, бесконтрольная генерация классов</td></tr>
+<tr><td><code>Direct buffer memory</code></td><td>Исчерпан лимит прямой памяти: утечка буферов в сетевом коде</td></tr>
+<tr><td><code>unable to create native thread</code></td><td>ОС не дала создать поток: лимит процессов или нет памяти под стеки. Куча ни при чём</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">OOMKilled — это не OutOfMemoryError</span>
+Контейнер завершается с кодом 137, в логе приложения — ничего. Это ядро ОС убило процесс за превышение лимита памяти контейнера. Куча могла быть наполовину пуста: лимит считается по всей памяти процесса — куча + Metaspace + стеки потоков + прямые буферы + структуры сборщика + нативные библиотеки. Дамп кучи не создаётся. Решение — оставлять запас: куча обычно 50–75% лимита контейнера, остальное — на всё остальное; для разбора — Native Memory Tracking (<code>-XX:NativeMemoryTracking=summary</code>).
+</div>
+
+<h2 id="diagnostics"><span class="h-num">14.7</span>Настройка и диагностика</h2>
+<pre data-title="минимальный набор параметров для сервиса"><code class="txt">-XX:MaxRAMPercentage=70                   # куча как доля памяти контейнера (по умолчанию 25%)
+-XX:+UseG1GC                              # явный выбор сборщика
+-XX:+HeapDumpOnOutOfMemoryError           # снять дамп кучи при OOM
+-XX:HeapDumpPath=/dumps
+-XX:+ExitOnOutOfMemoryError               # не продолжать работу в непредсказуемом состоянии
+-Xlog:gc*:file=/logs/gc.log:time,uptime   # журнал сборок</code></pre>
+<pre data-title="диагностика работающей JVM"><code class="txt">jcmd &lt;pid&gt; GC.heap_info                   # заполнение областей кучи
+jcmd &lt;pid&gt; GC.class_histogram             # сколько объектов какого класса — первый шаг при подозрении на утечку
+jcmd &lt;pid&gt; GC.heap_dump /tmp/heap.hprof   # дамп кучи для Eclipse MAT / VisualVM
+jcmd &lt;pid&gt; VM.native_memory summary       # память вне кучи
+jcmd &lt;pid&gt; JFR.start duration=60s filename=/tmp/rec.jfr   # запись профиля: аллокации, паузы, блокировки
+jstat -gcutil &lt;pid&gt; 1000                  # заполнение поколений и счётчики сборок раз в секунду</code></pre>
+<div class="callout ok"><span class="c-title">Как искать утечку</span>
+<ol style="margin:6px 0 0">
+  <li>Посмотреть график занятости кучи <b>после</b> сборок: при утечке нижняя граница «пилы» неуклонно растёт.</li>
+  <li>Снять два дампа или две гистограммы классов с интервалом и сравнить: какие классы прибавились.</li>
+  <li>В анализаторе (Eclipse MAT) открыть дерево доминаторов: какой объект удерживает больше всего памяти (<i>retained size</i>).</li>
+  <li>Проследить путь от него до корня GC — он покажет, какое поле не даёт объектам умереть.</li>
+</ol>
+</div>
+<p><b>Настройка сборщика — последний шаг, а не первый.</b> Сначала измерить (журнал сборок, JFR), затем уменьшить объём создаваемых и долго живущих объектов, подобрать размер кучи — и только потом менять параметры сборщика. Большинство «проблем GC» оказываются проблемами приложения: утечкой, огромной выборкой из базы, кэшем без границ.</p>
+
+<h2 id="lab"><span class="h-num">14.8</span>Интерактив: сборка мусора по поколениям</h2>
+<div class="widget" id="gcW">
+  <div class="widget-title">Симулятор: Eden → Survivor → Old</div>
+  <p class="hint">Eden вмещает 8 объектов, каждый Survivor — 4. Объект, переживший 3 сборки, переходит в Old (порог <code>MaxTenuringThreshold</code>, здесь 3; в HotSpot по умолчанию 15). Зелёные объекты достижимы, красные — мусор.</p>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="alloc">new × 3</button>
+    <button class="btn" type="button" data-a="drop">потерять ссылки на часть объектов</button>
+    <button class="btn" type="button" data-a="big">new byte[огромный]</button>
+    <button class="btn primary" type="button" data-a="minor">Minor GC</button>
+    <button class="btn" type="button" data-a="major">Full GC</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="lanes">
+    <div class="lane"><h5>Eden</h5><div class="items" id="gcEden"></div></div>
+    <div class="lane"><h5>Survivor S0</h5><div class="items" id="gcS0"></div></div>
+    <div class="lane"><h5>Survivor S1</h5><div class="items" id="gcS1"></div></div>
+    <div class="lane"><h5>Old generation</h5><div class="items" id="gcOld"></div></div>
+  </div>
+  <div class="log" id="gcLog"></div>
+</div>
+<script>
+(function () {
+  var eden, s0, s1, old, from, id, log, minorN, fullN;
+  var $ = function (i) { return document.getElementById(i); };
+  function reset() { eden = []; s0 = []; s1 = []; old = []; from = 0; id = 0; minorN = 0; fullN = 0; log = ["Куча пуста. Все новые объекты создаются в Eden: выделение — это сдвиг указателя в TLAB потока, наносекунды."]; }
+  function minor(reason) {
+    minorN++;
+    var src = from === 0 ? s0 : s1, dst = [], promoted = 0, dead = 0;
+    eden.concat(src).forEach(function (o) {
+      if (!o.live) { dead++; return; }
+      o.age++;
+      if (o.age >= 3) { old.push(o); promoted++; }
+      else if (dst.length < 4) dst.push(o);
+      else { old.push(o); promoted++; o.early = true; }
+    });
+    eden = []; if (from === 0) { s0 = []; s1 = dst; from = 1; } else { s1 = []; s0 = dst; from = 0; }
+    log.unshift("Minor GC #" + minorN + (reason ? " (" + reason + ")" : "") + ": живые скопированы в S" + from + " — " + dst.length + ", повышено в Old — " + promoted + ", мусора просто забыто — " + dead + ". Eden и второй Survivor пусты. Пауза пропорциональна числу ЖИВЫХ объектов, а не размеру кучи.");
+  }
+  function act(a) {
+    if (a === "reset") reset();
+    else if (a === "alloc") { for (var i = 0; i < 3; i++) { if (eden.length >= 8) minor("Allocation Failure: Eden заполнен"); eden.push({ id: ++id, age: 0, live: true }); } log.unshift("Создано 3 объекта в Eden"); }
+    else if (a === "drop") { var n = 0; eden.concat(s0, s1, old).forEach(function (o, i) { if (o.live && (o.id + i) % 2 === 0) { o.live = false; n++; } }); log.unshift("Ссылки потеряны на " + n + " объектов — они стали недостижимы от GC roots, но память пока занимают"); }
+    else if (a === "big") { old.push({ id: ++id, age: 0, live: true, big: true }); log.unshift("Огромный объект (humongous в G1 — больше половины региона) создан сразу в Old, минуя молодое поколение"); }
+    else if (a === "minor") minor();
+    else if (a === "major") { fullN++; var before = old.length; old = old.filter(function (o) { return o.live; }); var removed = before - old.length; minor("часть Full GC"); log.unshift("Full GC #" + fullN + ": обход ВСЕЙ кучи, из Old удалено " + removed + " мёртвых объектов + уплотнение. Самая длинная пауза — в проде частые Full GC означают проблему."); }
+    render();
+  }
+  function chips(arr) { return arr.map(function (o) { return '<span class="chip ' + (o.live ? "ok" : "bad") + '">' + (o.big ? "BIG" : "#" + o.id) + (o.big ? "" : " · " + o.age) + "</span>"; }).join("") || '<span class="chip">пусто</span>'; }
+  function render() {
+    $("gcEden").innerHTML = chips(eden) + '<span class="chip">' + eden.length + "/8</span>"; $("gcS0").innerHTML = chips(s0); $("gcS1").innerHTML = chips(s1); $("gcOld").innerHTML = chips(old);
+    $("gcLog").textContent = log.slice(0, 12).join("\n");
+  }
+  document.querySelectorAll("#gcW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  reset(); render();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) создавайте объекты и сразу теряйте ссылки — почти ничего не доходит до Old: это «слабая гипотеза о поколениях» в действии. (2) Создайте много объектов, не теряя ссылок: Survivor переполняется, и объекты уходят в Old раньше срока (преждевременное повышение) — причина роста Old и частых Full GC. Число на объекте — возраст (сколько сборок он пережил).</p>
+
+<h2 id="quiz"><span class="h-num">14.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как сборщик мусора определяет, что объект можно удалить?</p><ul><li>По счётчику ссылок на объект</li><li>По времени жизни объекта</li><li>По недостижимости от GC roots: локальных переменных в стеках потоков, статических полей, JNI-ссылок</li><li>По вызову System.gc()</li></ul><div class="why">Подсчёт ссылок не справляется с циклами. Java обходит граф от корней; всё, до чего не дошли, — мусор, даже если объекты ссылаются друг на друга.</div></div>
+<div class="mcq" data-ok="1"><p>Что вызывает OutOfMemoryError: Java heap space, если мусор собирается исправно?</p><ul><li>Слишком много потоков</li><li>Утечка: объекты остаются достижимыми (статическая коллекция, кэш без лимита, ThreadLocal в пуле потоков, слушатели без отписки)</li><li>Слишком большой стек</li><li>Нехватка места на диске</li></ul><div class="why">GC не может удалить то, на что есть ссылка. Диагностика: heap dump (<code>-XX:+HeapDumpOnOutOfMemoryError</code>) и анализ dominator tree в MAT.</div></div>
+<div class="mcq" data-ok="0"><p>Какой сборщик используется по умолчанию на серверной машине в современных JDK и чем он характерен?</p><ul><li>G1: куча из регионов, цель по длительности паузы (MaxGCPauseMillis), сборка самых «мусорных» регионов первыми</li><li>Serial: один поток, полная остановка</li><li>CMS</li><li>Epsilon</li></ul><div class="why">G1 — по умолчанию с Java 9. Для пауз менее миллисекунды на больших кучах — ZGC (поколенческий с Java 21) или Shenandoah.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что хранится в стеке, а что в куче?</summary><div class="a"><p>В стеке потока — кадры вызовов: параметры, локальные переменные примитивных типов и ссылки на объекты. В куче — сами объекты и массивы, включая их поля. Стек свой у каждого потока и освобождается при возврате из метода; куча общая и очищается сборщиком мусора.</p></div></details>
+<details class="q"><summary>Как сборщик понимает, что объект — мусор? Что с циклическими ссылками?</summary><div class="a"><p>По достижимости: объект жив, если до него можно дойти от корней — локальных переменных в стеках, статических полей, активных потоков, ссылок JNI. Подсчёт ссылок не используется, поэтому группа объектов, ссылающихся друг на друга, но недостижимых от корней, собирается целиком.</p></div></details>
+<details class="q"><summary>Зачем куча разделена на поколения?</summary><div class="a"><p>Большинство объектов живёт очень недолго. Собирая только молодое поколение копированием выживших, JVM тратит время пропорционально числу живых объектов, которых мало, и делает это часто и быстро. Долгоживущие объекты переносятся в старое поколение и проверяются редко.</p></div></details>
+<details class="q"><summary>Возможна ли утечка памяти в Java? Приведите три примера.</summary><div class="a"><p>Да: ненужный объект остаётся достижимым. Примеры: растущая статическая коллекция или кэш без ограничения; <code>ThreadLocal</code> без <code>remove()</code> в потоке из пула; незарегистрированный отписавшийся слушатель; экземпляр внутреннего класса, удерживающий внешний объект; ключ <code>HashMap</code>, изменённый после вставки.</p></div></details>
+<details class="q"><summary>Под сервиса перезапускается с кодом 137, в логах нет OutOfMemoryError. Что происходит?</summary><div class="a"><p>Процесс убит ядром за превышение лимита памяти контейнера. Суммарная память процесса (куча, Metaspace, стеки, прямые буферы, структуры сборщика) превысила лимит, хотя куча могла быть не заполнена. Нужно уменьшить долю кучи или увеличить лимит и разобраться с памятью вне кучи через Native Memory Tracking.</p></div></details>
+<details class="q"><summary>G1 или ZGC?</summary><div class="a"><p>G1 — разумное значение по умолчанию: хорошая пропускная способность, паузы в десятки–сотни миллисекунд. ZGC — когда важна задержка (жёсткие требования к p99, большие кучи): паузы меньше миллисекунды ценой дополнительного расхода процессора и памяти. Выбор подтверждают измерением на своей нагрузке.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

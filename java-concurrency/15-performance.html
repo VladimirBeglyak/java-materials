@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Производительность конкурентного кода</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · КОНКУРЕНТНОСТЬ В СИСТЕМЕ</div>
+  <h1>Производительность конкурентного кода</h1>
+  <p class="lead">Добавили потоков — стало медленнее. Это обычная история: параллелизм упирается в последовательную часть программы, в блокировки, в кэш процессора. Разберём два закона, которые предсказывают предел масштабирования, источники накладных расходов, приёмы снижения конкуренции и способ измерять всё это без самообмана — JMH.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">закон Амдала</span><span class="tag">USL</span><span class="tag">contention</span><span class="tag">JMH</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="laws"><span class="h-num">15.1</span>Пределы масштабирования</h2>
+<p><b>Закон Амдала</b>: если доля <i>p</i> программы выполняется параллельно, а остальное — последовательно, то ускорение на <i>N</i> ядрах не больше <code>1 / ((1 − p) + p / N)</code>. При бесконечном числе ядер — не больше <code>1 / (1 − p)</code>.</p>
+<p><b>Универсальный закон масштабируемости (USL)</b> Гюнтера добавляет второй тормоз — согласование между потоками (инвалидация кэшей, обмен данными): <code>C(N) = N / (1 + α(N − 1) + βN(N − 1))</code>. Из-за слагаемого с β пропускная способность после некоторого N начинает <b>падать</b>.</p>
+<div class="widget" id="amW">
+  <div class="widget-title">Калькулятор масштабирования</div>
+  <div class="controls">
+    <label>последовательная доля (под локом, I/O в очередь), %<input type="number" id="amS" value="5" min="0" max="100" step="1"></label>
+    <label>согласование β, %<input type="number" id="amB" value="0.1" min="0" max="5" step="0.05"></label>
+    <label>ядер<input type="number" id="amN" value="16" min="1" max="256"></label>
+  </div>
+  <div id="amBars"></div>
+  <div class="verdict" id="amOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var a = Math.min(100, Math.max(0, +$("amS").value)) / 100, b = Math.max(0, +$("amB").value) / 100, n = Math.max(1, Math.round(+$("amN").value));
+    function usl(k) { return k / (1 + a * (k - 1) + b * k * (k - 1)); }
+    var pts = [1, 2, 4, 8, 16, 32, 64, 128].filter(function (k) { return k <= Math.max(n, 8); }); if (pts.indexOf(n) < 0) pts.push(n); pts.sort(function (x, y) { return x - y; });
+    var max = Math.max.apply(null, pts.map(usl)), h = "", peakN = 1, peak = 1;
+    for (var k = 1; k <= 256; k++) if (usl(k) > peak) { peak = usl(k); peakN = k; }
+    pts.forEach(function (k) {
+      var v = usl(k), am = 1 / (a + (1 - a) / k);
+      h += '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px;flex-wrap:wrap"><span><b>' + k + "</b> " + (k === 1 ? "ядро" : "ядер") + (k === n ? " ← выбрано" : "") + '</span><span style="font-family:var(--font-mono)">×' + v.toFixed(2) + "   (по Амдалу ×" + am.toFixed(2) + ", эффективность " + Math.round(v / k * 100) + "%)</span></div>" +
+        '<div class="bar ' + (v / k > 0.5 ? "ok" : "bad") + '"><i style="width:' + Math.max(2, v / max * 100) + '%"></i></div>';
+    });
+    $("amBars").innerHTML = h;
+    var lim = a > 0 ? (1 / a).toFixed(1) : "∞", o = $("amOut"), msg = "Предел по Амдалу при любом числе ядер: ×" + lim + ". ";
+    if (b > 0) msg += "С учётом согласования максимум ×" + peak.toFixed(1) + " достигается на " + peakN + " ядрах; дальше добавление потоков СНИЖАЕТ пропускную способность. ";
+    if (usl(n) / n < 0.5) { o.className = "verdict bad"; msg += "На " + n + " ядрах больше половины мощности тратится впустую: сокращайте последовательную часть (время под блокировкой), а не добавляйте потоки."; }
+    else { o.className = "verdict ok"; msg += "На " + n + " ядрах эффективность " + Math.round(usl(n) / n * 100) + "%."; }
+    o.textContent = msg;
+  }
+  ["amS", "amB", "amN"].forEach(function (id) { $(id).addEventListener("input", run); });
+  run();
+})();
+</script>
+<p><b>Попробуйте:</b> последовательная доля 5% — и 64 ядра дают всего ×15. Доля 1% — уже ×39. Каждый процент времени под общей блокировкой стоит дороже, чем кажется.</p>
+
+<h2 id="costs"><span class="h-num">15.2</span>Откуда берутся накладные расходы</h2>
+<div class="table-wrap"><table>
+<tr><th>Источник</th><th>Порядок величины</th><th>Когда проявляется</th></tr>
+<tr><td>Неконкурентный <code>synchronized</code> / CAS</td><td>~20 нс</td><td>всегда; обычно пренебрежимо</td></tr>
+<tr><td>Конкурентная блокировка: park/unpark потока</td><td>микросекунды + переключение контекста</td><td>много потоков на один лок</td></tr>
+<tr><td>Переключение контекста</td><td>1–10 мкс напрямую + остывший кэш процессора</td><td>потоков больше, чем ядер; частые блокировки</td></tr>
+<tr><td>Промах кэша (чтение из RAM)</td><td>~100 нс против ~1 нс для L1</td><td>структуры из указателей, миграция потока на другое ядро</td></tr>
+<tr><td>False sharing</td><td>замедление в 2–10 раз</td><td>независимые счётчики потоков в одной кэш-линии (64 байта)</td></tr>
+<tr><td>Создание платформенного потока</td><td>~50–100 мкс, ~1 МБ стека</td><td>поток на задачу без пула</td></tr>
+<tr><td>Аллокации и GC</td><td>паузы и нагрузка на шину памяти</td><td>высокая скорость выделения в нескольких потоках</td></tr>
+</table></div>
+<div class="callout info">Главная цена блокировки — не сама операция, а то, что остальные потоки в это время стоят. Мерой служит не «сколько стоит lock()», а <b>время удержания × частота захвата</b>.</div>
+
+<h2 id="reduce"><span class="h-num">15.3</span>Как снижать конкуренцию за блокировку</h2>
+<pre class="bad-code" data-title="Было: всё под одним локом, включая I/O"><code class="java">public synchronized Report build(String userId) {
+    User u = users.get(userId);
+    List&lt;Order&gt; orders = httpClient.fetchOrders(userId);     // сетевой вызов под блокировкой: все ждут
+    stats.merge(u.region(), 1, Integer::sum);
+    return render(u, orders);                                 // тяжёлое вычисление под блокировкой
+}</code></pre>
+<pre class="good-code" data-title="Стало: под локом — только общее состояние"><code class="java">public Report build(String userId) {
+    User u = users.get(userId);                               // ConcurrentHashMap — без общего лока
+    List&lt;Order&gt; orders = httpClient.fetchOrders(userId);      // вне блокировок
+    stats.merge(u.region(), 1, Integer::sum);                 // блокируется один бакет на наносекунды
+    return render(u, orders);                                 // локальные данные — блокировка не нужна
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Приём</th><th>Суть</th><th>Пример</th></tr>
+<tr><td>Сократить критическую секцию</td><td>вынести из-под лока всё, что не трогает общее состояние</td><td>вычисления, I/O, логирование — снаружи</td></tr>
+<tr><td>Разделить блокировку (lock splitting)</td><td>независимые данные — под разными локами</td><td>отдельный лок для очереди и для статистики</td></tr>
+<tr><td>Раздробить (lock striping)</td><td>N локов на части одной структуры</td><td>бакеты ConcurrentHashMap, ячейки LongAdder</td></tr>
+<tr><td>Разделить чтение и запись</td><td>читатели не мешают друг другу</td><td>ReadWriteLock, StampedLock, CopyOnWrite, volatile-ссылка на неизменяемый снимок</td></tr>
+<tr><td>Отказаться от разделения</td><td>у каждого потока свои данные</td><td>ThreadLocal, локальные переменные, акторы, очередь к одному потоку-владельцу</td></tr>
+<tr><td>Неизменяемость</td><td>читать можно без синхронизации</td><td>record, List.copyOf, замена ссылки целиком</td></tr>
+<tr><td>Lock-free</td><td>CAS вместо блокировки</td><td>Atomic*, ConcurrentLinkedQueue</td></tr>
+</table></div>
+<pre data-title="Снимок вместо блокировки на чтение"><code class="java">final class RateTable {
+    private volatile Map&lt;String, BigDecimal&gt; rates = Map.of();      // неизменяемая карта
+
+    BigDecimal rate(String currency) { return rates.get(currency); }  // чтение: одно volatile-чтение, без локов
+    void reload(Map&lt;String, BigDecimal&gt; fresh) { rates = Map.copyOf(fresh); }   // запись: подменить ссылку целиком
+}</code></pre>
+
+<h2 id="jmh"><span class="h-num">15.4</span>Измерять правильно: JMH</h2>
+<p>Самодельный замер через <code>System.nanoTime()</code> вокруг цикла почти всегда врёт: JIT ещё не прогрелся, компилятор выбросил «мёртвый» код, результат которого не используется, или свернул константы; сборка мусора попала в один из замеров. JMH (Java Microbenchmark Harness) — инструмент от авторов JVM, который учитывает всё это.</p>
+<pre><code class="java">@BenchmarkMode(Mode.Throughput)
+@OutputTimeUnit(TimeUnit.MICROSECONDS)
+@Warmup(iterations = 5, time = 1)          // прогрев JIT
+@Measurement(iterations = 5, time = 1)
+@Fork(2)                                    // две свежие JVM: исключить влияние профиля предыдущего теста
+@State(Scope.Benchmark)                     // состояние общее для всех потоков — мерим конкуренцию
+public class CounterBenchmark {
+    private final AtomicLong atomic = new AtomicLong();
+    private final LongAdder adder = new LongAdder();
+    private long plain; private final Object lock = new Object();
+
+    @Benchmark @Threads(8) public long atomic() { return atomic.incrementAndGet(); }
+    @Benchmark @Threads(8) public void adder()  { adder.increment(); }
+    @Benchmark @Threads(8) public long locked() { synchronized (lock) { return ++plain; } }
+
+    @Benchmark public void consume(Blackhole bh) { bh.consume(compute()); }   // Blackhole не даёт JIT выбросить вычисление
+}
+// Типичный результат на 8 потоках: adder ≫ atomic &gt; locked. На 1 потоке — все примерно равны.</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Ловушки микробенчмарков</h4><p>Результат не возвращён и не отдан в Blackhole — код удалён компилятором. Константы на входе — выражение вычислено при компиляции. Один fork — случайный профиль JIT. Замер на ноутбуке с троттлингом и фоновыми процессами.</p></div>
+  <div class="card"><h4>Что бенчмарк не скажет</h4><p>Как код поведёт себя в приложении: с другим распределением данных, другой нагрузкой на кэш, другими соседями по блокировкам. Микробенчмарк сравнивает варианты; узкое место всего сервиса ищут профилировщиком под реалистичной нагрузкой.</p></div>
+</div>
+
+<h2 id="profile"><span class="h-num">15.5</span>Как найти узкое место в работающем сервисе</h2>
+<div class="table-wrap"><table>
+<tr><th>Инструмент</th><th>Что показывает</th></tr>
+<tr><td>Thread dump × 3 с интервалом</td><td>где стоят потоки: много BLOCKED на одном мониторе — конкуренция; WAITING в пуле соединений — нехватка ресурса</td></tr>
+<tr><td>JFR: события <code>jdk.JavaMonitorEnter</code>, <code>jdk.ThreadPark</code></td><td>на каких блокировках и сколько времени ждали потоки, со стектрейсами; накладные расходы ~1%</td></tr>
+<tr><td>async-profiler: режимы <code>cpu</code>, <code>wall</code>, <code>lock</code>, <code>alloc</code></td><td>flame graph: где тратится процессор, где — ожидание, какие локи горячие, кто аллоцирует</td></tr>
+<tr><td>Метрики пулов</td><td>активные потоки, длина очереди, время ожидания соединения — насыщение ресурсов</td></tr>
+<tr><td><code>vmstat</code>, <code>pidstat -w</code></td><td>число переключений контекста, очередь на выполнение, доля sys-времени</td></tr>
+</table></div>
+<div class="callout interview"><span class="c-title">Порядок действий</span>
+1. Измерить: пропускная способность и латентность под нагрузкой. 2. Понять, что насыщено: CPU (вычисления), потоки (BLOCKED/WAITING), внешний ресурс. 3. Найти конкретное место профилировщиком. 4. Изменить одно. 5. Измерить снова. Оптимизация без измерения в конкурентном коде чаще добавляет ошибки, чем скорость.
+</div>
+
+<h2 id="quiz"><span class="h-num">15.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>10% времени программа проводит под общей блокировкой. Максимальное ускорение на любом числе ядер?</p><ul><li>×100</li><li>×90</li><li>×10</li><li>Не ограничено</li></ul><div class="why">Закон Амдала: 1 / (1 − p) = 1 / 0,1.</div></div>
+<div class="mcq" data-ok="1"><p>Сервис на 32 потоках работает медленнее, чем на 16. Возможная причина?</p><ul><li>Закон Амдала запрещает больше 16 потоков</li><li>Рост конкуренции за блокировки и согласования кэшей (β в USL), переключения контекста</li><li>JVM ограничивает число потоков</li><li>Так не бывает</li></ul><div class="why">После пика пропускная способность падает: потоки мешают друг другу больше, чем помогают.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем в JMH Blackhole?</p><ul><li>Чтобы JIT не удалил вычисление, результат которого иначе никому не нужен</li><li>Чтобы очищать память</li><li>Чтобы замедлять тест</li><li>Для синхронизации потоков</li></ul><div class="why">Удаление мёртвого кода превращает бенчмарк в замер пустого цикла.</div></div>
+<div class="mcq" data-ok="3"><p>Какой приём уменьшает конкуренцию сильнее всего?</p><ul><li>Замена synchronized на ReentrantLock</li><li>Увеличение числа потоков</li><li>Повышение приоритета потоков</li><li>Отказ от общего изменяемого состояния: неизменяемые данные, данные потока, дробление блокировок</li></ul><div class="why">Самая быстрая блокировка — та, которой нет. Смена типа лока при том же времени удержания почти ничего не даёт.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое закон Амдала и что из него следует на практике?</summary><div class="a"><p>Ускорение ограничено последовательной долей: S = 1 / ((1 − p) + p/N). Следствие: сокращать время под общими блокировками и в последовательных участках важнее, чем добавлять ядра; небольшая общая блокировка определяет потолок всей системы.</p></div></details>
+<details class="q"><summary>Как уменьшить конкуренцию за блокировку?</summary><div class="a"><p>Сократить критическую секцию; разделить или раздробить блокировку; разделить чтение и запись; заменить на lock-free или неизменяемые снимки; отказаться от разделения (данные потока, акторы). Сначала измерить, что блокировка действительно горячая.</p></div></details>
+<details class="q"><summary>Почему нельзя мерить производительность циклом с System.nanoTime()?</summary><div class="a"><p>Нет прогрева JIT, возможны удаление мёртвого кода и свёртка констант, OSR-компиляция искажает цикл, GC и фоновые процессы дают шум, один запуск не показывает разброс. JMH решает это прогревом, форками, Blackhole и статистикой.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

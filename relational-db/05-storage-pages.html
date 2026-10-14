@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Хранение: страницы и кортежи</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ВНУТРЕННЕЕ УСТРОЙСТВО</div>
+  <h1>Хранение: страницы и кортежи</h1>
+  <p class="lead">База читает и пишет не строки, а страницы. Как устроена страница в 8 КБ, что лежит в заголовке каждой строки, почему порядок столбцов влияет на размер таблицы, куда деваются длинные значения и как PostgreSQL обновляет строку, не трогая индексы (HOT).</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">страница</span><span class="tag">кортеж</span><span class="tag">TOAST</span><span class="tag">fillfactor</span><span class="tag">HOT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="files"><span class="h-num">5.1</span>Файлы таблицы</h2>
+<p>Каждая таблица и каждый индекс — набор файлов в каталоге данных (<code>base/&lt;oid базы&gt;/&lt;relfilenode&gt;</code>), разрезанных на сегменты по 1 ГБ. У таблицы есть «вилки» (forks):</p>
+<div class="table-wrap"><table>
+<tr><th>Файл</th><th>Содержимое</th><th>Зачем</th></tr>
+<tr><td><code>16384</code></td><td>основные данные (main fork)</td><td>страницы со строками</td></tr>
+<tr><td><code>16384_fsm</code></td><td>карта свободного места (free space map)</td><td>быстро найти страницу, куда поместится новая строка</td></tr>
+<tr><td><code>16384_vm</code></td><td>карта видимости (visibility map): по 2 бита на страницу</td><td>«все строки страницы видны всем» — VACUUM пропускает такие страницы, а Index Only Scan не ходит в таблицу</td></tr>
+</table></div>
+<pre data-title="где лежит таблица и сколько занимает"><code class="sql">SELECT pg_relation_filepath('orders');          -- base/16384/24576
+SELECT pg_size_pretty(pg_relation_size('orders')),          -- только данные
+       pg_size_pretty(pg_table_size('orders')),             -- + TOAST, FSM, VM
+       pg_size_pretty(pg_total_relation_size('orders'));    -- + все индексы</code></pre>
+
+<h2 id="page"><span class="h-num">5.2</span>Устройство страницы</h2>
+<p>Страница (блок) — 8 КБ, единица чтения, записи и кэширования. Указатели растут сверху, данные — снизу, свободное место — посередине:</p>
+<div class="flow col">
+  <div class="node info"><b>Заголовок страницы, 24 байта</b><small>LSN последней записи WAL, контрольная сумма, границы свободного места (pd_lower, pd_upper)</small></div>
+  <div class="node acc"><b>Массив указателей (line pointers), по 4 байта</b><small>(1) → смещение 8100, (2) → 8040, (3) → 7980 … — адрес строки (ctid) = (номер страницы, номер указателя)</small></div>
+  <div class="node off"><b>свободное место</b><small>указатели растут вниз, кортежи — вверх, навстречу друг другу</small></div>
+  <div class="node ok"><b>Кортежи (версии строк)</b><small>записываются с конца страницы к началу</small></div>
+  <div class="node"><b>Special space</b><small>пусто у таблиц; у индексов — служебные данные (ссылки на соседние страницы B-дерева)</small></div>
+</div>
+<div class="callout info"><span class="c-title">Зачем косвенность через указатели</span>
+Индекс хранит ctid = (страница, номер указателя), а не смещение байтов. Поэтому внутри страницы кортежи можно передвигать при уплотнении — указатель меняется, ссылки из индексов остаются верными.
+</div>
+
+<h2 id="tuple"><span class="h-num">5.3</span>Заголовок строки и выравнивание</h2>
+<p>У каждой версии строки есть заголовок в 23 байта (с выравниванием — 24):</p>
+<div class="table-wrap"><table>
+<tr><th>Поле</th><th>Смысл</th></tr>
+<tr><td><code>xmin</code></td><td>номер транзакции, создавшей версию</td></tr>
+<tr><td><code>xmax</code></td><td>номер транзакции, удалившей или заблокировавшей версию (0 — жива)</td></tr>
+<tr><td><code>ctid</code></td><td>адрес этой или более новой версии строки — так строятся цепочки обновлений</td></tr>
+<tr><td><code>infomask</code></td><td>флаги: есть ли NULL, «xmin зафиксирована» (hint bits), HOT-обновление и др.</td></tr>
+<tr><td>битовая карта NULL</td><td>по биту на столбец, если в строке есть NULL; сами NULL места не занимают</td></tr>
+</table></div>
+<pre data-title="служебные столбцы видны в любом запросе"><code class="sql">SELECT ctid, xmin, xmax, id, status FROM orders WHERE id = 105;
+--  ctid   | xmin | xmax |  id | status
+-- (12,4)  |  731 |    0 | 105 | new</code></pre>
+<p>Значения выравниваются по своему размеру: <code>bigint</code>, <code>timestamptz</code>, <code>double</code> — по 8 байт, <code>int</code> — по 4, <code>smallint</code> — по 2, <code>boolean</code> — по 1. Между ними вставляются пустые байты. Поэтому порядок столбцов в <code>CREATE TABLE</code> влияет на размер: сначала широкие фиксированные, потом узкие, в конце — переменной длины.</p>
+
+<div class="widget" id="alW">
+  <div class="widget-title">Калькулятор: выравнивание и размер строки</div>
+  <p class="hint">Отметьте столбцы и меняйте порядок кнопками ↑. Показан один кортеж: заголовок 24 байта + данные с выравниванием (text — 1 байт длины + 10 символов).</p>
+  <div class="rows" id="alRows"></div>
+  <div class="controls"><button class="btn" type="button" id="alBest">Упорядочить оптимально</button><button class="btn" type="button" id="alBad">Худший порядок</button></div>
+  <div class="out" id="alMap"></div>
+  <div class="verdict" id="alOut"></div>
+</div>
+<script>
+(function () {
+  var cols = [
+    ["is_paid", "boolean", 1, 1], ["id", "bigint", 8, 8], ["status_code", "smallint", 2, 2], ["created_at", "timestamptz", 8, 8],
+    ["qty", "integer", 4, 4], ["flag_b", "boolean", 1, 1], ["amount", "numeric", 11, 4], ["customer_id", "bigint", 8, 8], ["note", "text", 11, 1]
+  ];
+  var on = cols.map(function () { return true; });
+  var $ = function (i) { return document.getElementById(i); };
+  function layout(list) {
+    var off = 0, map = "", pad = 0;
+    list.forEach(function (c) {
+      var p = (c[3] - off % c[3]) % c[3];
+      if (p) { map += "·".repeat(p); pad += p; off += p; }
+      map += c[0].charAt(0).toUpperCase().repeat(c[2]); off += c[2];
+    });
+    return { size: off, pad: pad, map: map };
+  }
+  function draw() {
+    $("alRows").innerHTML = cols.map(function (c, i) {
+      return '<div class="row"><input type="checkbox" data-i="' + i + '"' + (on[i] ? " checked" : "") + '><span><b>' + c[0] + "</b> " + c[1] + " · " + c[2] + " Б, выравнивание " + c[3] + '</span><button class="btn" type="button" data-up="' + i + '"' + (i ? "" : " disabled") + ">↑</button></div>";
+    }).join("");
+    var act = cols.filter(function (c, i) { return on[i]; }), L = layout(act);
+    var best = layout(act.slice().sort(function (a, b) { return b[3] - a[3] || (a[1] === "text") - (b[1] === "text"); }));
+    var total = 24 + L.size, rows = Math.floor((8192 - 24) / (total + (8 - total % 8) % 8 + 4));
+    $("alMap").textContent = "данные: " + L.map + "\n(буква — байт столбца, · — пустой байт выравнивания)\nразмер кортежа: 24 + " + L.size + " = " + total + " Б, из них пустых " + L.pad + " Б\nстрок на страницу ≈ " + rows + ";  на 100 млн строк ≈ " + (1e8 / rows * 8192 / Math.pow(1024, 3)).toFixed(1) + " ГБ";
+    var o = $("alOut");
+    if (L.pad > best.pad) { o.className = "verdict warn"; o.textContent = "Потери на выравнивании: " + L.pad + " Б на строку. При оптимальном порядке — " + best.pad + " Б. Перестановка столбцов в существующей таблице требует её пересоздания, поэтому думайте о порядке при создании."; }
+    else { o.className = "verdict ok"; o.textContent = "Порядок оптимален: пустых байтов " + L.pad + "."; }
+    $("alRows").querySelectorAll("input").forEach(function (b) { b.addEventListener("change", function () { on[+b.getAttribute("data-i")] = b.checked; draw(); }); });
+    $("alRows").querySelectorAll("[data-up]").forEach(function (b) { b.addEventListener("click", function () { var i = +b.getAttribute("data-up"); cols.splice(i - 1, 0, cols.splice(i, 1)[0]); on.splice(i - 1, 0, on.splice(i, 1)[0]); draw(); }); });
+  }
+  function reorder(cmp) { var z = cols.map(function (c, i) { return [c, on[i]]; }).sort(function (a, b) { return cmp(a[0], b[0]); }); cols = z.map(function (x) { return x[0]; }); on = z.map(function (x) { return x[1]; }); draw(); }
+  $("alBest").addEventListener("click", function () { reorder(function (a, b) { return b[3] - a[3] || (a[1] === "text") - (b[1] === "text"); }); });
+  $("alBad").addEventListener("click", function () {
+    var z = cols.map(function (c, i) { return [c, on[i]]; }), big = z.filter(function (x) { return x[0][3] === 8; }), small = z.filter(function (x) { return x[0][3] !== 8; }), r = [];
+    small.sort(function (a, b) { return a[0][3] - b[0][3]; });
+    while (big.length || small.length) { if (small.length) r.push(small.shift()); if (big.length) r.push(big.shift()); }
+    cols = r.map(function (x) { return x[0]; }); on = r.map(function (x) { return x[1]; }); draw();
+  });
+  draw();
+})();
+</script>
+
+<h2 id="toast"><span class="h-num">5.4</span>TOAST: длинные значения</h2>
+<p>Строка должна поместиться в страницу, а длинный <code>text</code>, <code>jsonb</code> или <code>bytea</code> может весить мегабайты. Если кортеж больше ~2 КБ, PostgreSQL сначала сжимает длинные значения, а если не помогло — выносит их в отдельную TOAST-таблицу кусками по ~2 КБ; в строке остаётся ссылка на 18 байт.</p>
+<div class="grid-2">
+  <div class="card"><h4>Плюс</h4><p>Запрос, не читающий большой столбец, его и не трогает: <code>SELECT id, status</code> не распаковывает 1 МБ описания. Таблица остаётся компактной.</p></div>
+  <div class="card"><h4>Минусы</h4><p><code>SELECT *</code> тянет всё; изменение одного ключа в большом <code>jsonb</code> переписывает значение целиком (новая версия в TOAST); частые обновления больших документов — источник раздувания и объёма WAL.</p></div>
+</div>
+<p>Стратегию задают на столбец: <code>ALTER TABLE t ALTER COLUMN body SET STORAGE EXTERNAL</code> (выносить без сжатия — быстрее подстроки), с PostgreSQL 14 — алгоритм сжатия <code>SET COMPRESSION lz4</code>.</p>
+
+<h2 id="hot"><span class="h-num">5.5</span>HOT-обновления и fillfactor</h2>
+<p>UPDATE создаёт новую версию строки (тема 11). Наивно новую версию пришлось бы добавить во <b>все</b> индексы таблицы, даже если индексированные столбцы не менялись. HOT (heap-only tuple) избегает этого, если выполнены два условия: не изменён ни один индексированный столбец и новая версия помещается <b>на ту же страницу</b>.</p>
+<div class="widget stepper" id="hotSim">
+  <div class="widget-title">Симулятор: страница 12 при обновлениях</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Индекс orders_pkey</h5><div class="items"><span class="chip" id="hIdx">105 → (12,4)</span><span class="chip off" id="hIdx2">105 → (13,1)</span></div></div>
+    <div class="lane"><h5>Указатели страницы 12</h5><div class="items"><span class="chip" id="hLp4">(4) → кортеж A</span><span class="chip off" id="hLp7">(7) → кортеж B</span><span class="chip off" id="hLp8">(8) → кортеж C</span></div></div>
+    <div class="lane"><h5>Кортежи</h5><div class="items"><span class="chip ok" id="hA">A: status=new</span><span class="chip off" id="hB">B: status=paid</span><span class="chip off" id="hC">C: status=shipped</span></div></div>
+  </div>
+  <section class="st-step" data-t="Исходное состояние" data-hl="hIdx hLp4 hA" data-log="page 12: (4)→A [xmin 731, xmax 0]; индекс: 105 → (12,4)"><p>Строка 105 — кортеж A по адресу (12,4). Индекс первичного ключа указывает на этот адрес. На странице осталось свободное место — его даёт <code>fillfactor</code> (о нём ниже).</p></section>
+  <section class="st-step" data-t="UPDATE status → HOT" data-hl="hLp7 hB hA" data-log="UPDATE … SET status='paid' → A.xmax=742, A.ctid=(12,7), флаг HOT_UPDATED; B флаг HEAP_ONLY"><p><code>status</code> не входит в индексы, место на странице есть → HOT. Новая версия B ложится на ту же страницу, A получает ссылку ctid на B. Индекс <b>не меняется</b>: поиск по 105 приходит в (12,4) и идёт по цепочке A → B.</p></section>
+  <section class="st-step" data-t="Ещё одно обновление" data-hl="hLp8 hC hB" data-log="UPDATE … SET status='shipped' → цепочка A → B → C, индекс всё ещё → (12,4)"><p>Цепочка растёт: A → B → C. Индексов по-прежнему ноль изменений — экономия записи и WAL пропорциональна числу индексов.</p></section>
+  <section class="st-step" data-t="Очистка страницы (pruning)" data-hl="hLp4 hC" data-log="prune: A и B мертвы для всех → (4) становится перенаправлением → (8); место A и B освобождено"><p>Когда старые версии уже никому не видны, любой процесс, читающий страницу, может её «подрезать» (page pruning) без VACUUM: указатель (4) превращается в перенаправление на (8), место A и B освобождается для следующих HOT-обновлений.</p></section>
+  <section class="st-step" data-t="Не HOT: страница полна" data-hl="hIdx2" data-log="UPDATE: на странице 12 нет места → версия в (13,1); новые записи во ВСЕ индексы таблицы"><p>Если места на странице нет или изменился индексированный столбец, новая версия уходит на другую страницу, и в каждый индекс добавляется новая запись. При пяти индексах одно UPDATE = 1 запись в таблицу + 5 в индексы + WAL на всё это.</p></section>
+</div>
+<pre data-title="доля HOT-обновлений и настройка fillfactor"><code class="sql">SELECT relname, n_tup_upd, n_tup_hot_upd,
+       round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0), 1) AS hot_pct
+FROM pg_stat_user_tables ORDER BY n_tup_upd DESC LIMIT 10;
+
+-- часто обновляемая таблица: оставить 20% страницы под новые версии
+ALTER TABLE orders SET (fillfactor = 80);   -- действует для новых страниц; старые — после VACUUM FULL / pg_repack</code></pre>
+<div class="callout warn"><span class="c-title">Практический вывод</span>
+Каждый лишний индекс не только замедляет вставку, но и может лишить таблицу HOT-обновлений: индекс на <code>updated_at</code> делает каждое UPDATE не-HOT. Проверяйте <code>hot_pct</code> у горячих таблиц.
+</div>
+
+<h2 id="innodb"><span class="h-num">5.6</span>Для сравнения: страница InnoDB</h2>
+<p>Страница InnoDB — 16 КБ, и это лист кластерного индекса: строки упорядочены по первичному ключу. UPDATE меняет строку на месте, а старое значение пишется в undo-журнал — поэтому «HOT» там не нужен, но вторичные индексы обновляются при изменении их столбцов, а поиск по вторичному индексу идёт через первичный ключ. Длинные значения уходят на overflow-страницы (аналог TOAST).</p>
+
+<h2 id="quiz"><span class="h-num">5.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что хранит индекс PostgreSQL в качестве ссылки на строку?</p><ul><li>Значение первичного ключа</li><li>Смещение в байтах от начала файла</li><li>ctid — номер страницы и номер указателя на ней</li><li>Хэш строки</li></ul><div class="why">Косвенность через массив указателей позволяет двигать кортеж внутри страницы.</div></div>
+<div class="mcq" data-ok="1"><p>UPDATE поменял <code>status</code>. На таблице есть индекс по <code>status</code>. Будет ли обновление HOT?</p><ul><li>Да, если на странице есть место</li><li>Нет: изменён индексированный столбец</li><li>Да, всегда</li><li>Только при fillfactor = 100</li></ul><div class="why">HOT возможен, только если ни один индексированный столбец не изменился и версия помещается на ту же страницу.</div></div>
+<div class="mcq" data-ok="3"><p>Почему <code>(boolean, bigint, boolean, bigint)</code> занимает больше, чем <code>(bigint, bigint, boolean, boolean)</code>?</p><ul><li>boolean хранится как 8 байт</li><li>Порядок не влияет на размер</li><li>Таблица с чередованием типов сжимается хуже TOAST</li><li>bigint выравнивается по 8 байт — после каждого boolean вставляется 7 пустых байт</li></ul><div class="why">32 байта против 18: выравнивание — реальная цена на миллиардах строк.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужна карта видимости (visibility map)?</p><ul><li>Отмечает страницы, где все строки видимы всем: VACUUM их пропускает, Index Only Scan не читает таблицу</li><li>Хранит права доступа к строкам</li><li>Показывает, какие страницы в кэше</li><li>Хранит удалённые строки</li></ul><div class="why">2 бита на страницу: all-visible и all-frozen.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое HOT-обновление и как увеличить их долю?</summary><div class="a"><p>Новая версия строки размещается на той же странице без новых записей в индексах; старая ссылается на новую через ctid. Условия: не изменены индексированные столбцы, на странице есть место. Увеличить: убрать индексы на часто меняющиеся столбцы, снизить fillfactor у часто обновляемых таблиц (80–90), следить за n_tup_hot_upd.</p></div></details>
+<details class="q"><summary>Почему <code>SELECT *</code> по таблице с большим jsonb медленнее, чем выбор нужных столбцов?</summary><div class="a"><p>Большие значения лежат в TOAST, часто сжатые: <code>SELECT *</code> читает дополнительные страницы TOAST-таблицы и распаковывает данные, а затем гонит их по сети и в память приложения. Выбор только нужных столбцов эти расходы убирает и даёт шанс на Index Only Scan.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

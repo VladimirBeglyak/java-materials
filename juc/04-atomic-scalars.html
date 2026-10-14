@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · AtomicInteger, AtomicLong, AtomicReference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.sch { display: grid; grid-template-columns: 1fr 120px 1fr; gap: 8px; margin: 10px 0; font: 13px var(--font-mono); }
+.sch .col { border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 120px; }
+.sch .col div { padding: 3px 6px; border-radius: 4px; margin: 2px 0; }
+.sch .col div.done { background: var(--ok-soft); } .sch .col div.next { border: 1.5px dashed var(--accent); } .sch .col div.fail { background: var(--bad-soft); }
+.sch .mem { text-align: center; border: 2px solid var(--accent); border-radius: 8px; padding: 10px 4px; align-self: start; }
+.sch .mem b { display: block; font-size: 26px; }
+@media (max-width: 640px) { .sch { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ATOMIC</div>
+  <h1>AtomicInteger, AtomicLong, AtomicReference</h1>
+  <p class="lead">Атомики — это volatile-поле плюс атомарные операции над ним через CAS. Разберём на симуляторе с ручным планированием потоков, почему <code>count++</code> над volatile теряет обновления, а <code>incrementAndGet</code> и CAS-цикл — нет; как работают <code>updateAndGet</code> и <code>accumulateAndGet</code> (и почему функция может вызываться несколько раз); и мощный приём — неизменяемое состояние в <code>AtomicReference</code>.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">потерянное обновление</span><span class="tag">incrementAndGet</span><span class="tag">CAS-цикл</span><span class="tag">updateAndGet</span><span class="tag">AtomicReference</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="sim"><span class="h-num">4.1</span>Планировщик в ваших руках</h2>
+<div class="widget" id="scW">
+  <div class="widget-title">Два потока увеличивают общий счётчик (вы выбираете, кто делает шаг)</div>
+  <div class="controls">
+    <label>код<select id="scM"><option value="vol">volatile int count; count++</option><option value="atomic">AtomicInteger.incrementAndGet()</option><option value="cas">CAS-цикл: do { v = get(); } while (!compareAndSet(v, v + 1))</option></select></label>
+    <button class="btn primary" type="button" id="scT1">шаг потока 1</button>
+    <button class="btn primary" type="button" id="scT2">шаг потока 2</button>
+    <button class="btn" type="button" id="scBad">«злое» расписание</button>
+    <button class="btn" type="button" id="scR">↺</button>
+  </div>
+  <div class="sch"><div class="col" id="scC1"></div><div class="mem" id="scMem"></div><div class="col" id="scC2"></div></div>
+  <div class="verdict" id="scV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, mem, th, mode;
+  function prog() {
+    if (mode === "vol") return [["read", "r = count"], ["add", "r = r + 1"], ["write", "count = r"]];
+    if (mode === "atomic") return [["xadd", "lock xadd count, 1 (одна атомарная инструкция)"]];
+    return [["read", "v = count (volatile-чтение)"], ["cas", "CAS(count, v, v + 1)"]];
+  }
+  function reset() { mode = $("scM").value; mem = 0; th = [{ pc: 0, r: 0, log: [], done: false }, { pc: 0, r: 0, log: [], done: false }]; draw(); }
+  function step(i) {
+    var t = th[i], p = prog(); if (t.done) return;
+    var op = p[t.pc][0], txt = p[t.pc][1], cls = "done";
+    if (op === "read") { t.r = mem; txt += "  → " + t.r; }
+    else if (op === "add") { t.r += 1; txt += "  → " + t.r; }
+    else if (op === "write") { mem = t.r; txt += "  → count = " + mem; }
+    else if (op === "xadd") { mem += 1; txt += "  → " + mem; }
+    else if (op === "cas") { if (mem === t.r) { mem = t.r + 1; txt += "  ✔ успех → " + mem; } else { txt += "  ✘ count = " + mem + " ≠ " + t.r + " → повтор"; cls = "fail"; t.log.push([txt, cls]); t.pc = 0; draw(); return; } }
+    t.log.push([txt, cls]); t.pc++; if (t.pc >= p.length) { t.done = true; t.log.push(["готово", "done"]); }
+    draw();
+  }
+  function draw() {
+    var p = prog();
+    [0, 1].forEach(function (i) { var t = th[i]; $("scC" + (i + 1)).innerHTML = "<b>Поток " + (i + 1) + "</b>" + t.log.map(function (l) { return '<div class="' + l[1] + '">' + l[0] + "</div>"; }).join("") + (t.done ? "" : '<div class="next">' + p[t.pc][1] + "</div>") + '<div style="color:var(--fg-muted)">регистр: ' + t.r + "</div>"; });
+    $("scMem").innerHTML = "count<b>" + mem + "</b>память";
+    var v = $("scV");
+    if (th[0].done && th[1].done) { if (mem === 2) { v.className = "verdict ok"; v.textContent = "count = 2 — оба увеличения учтены."; } else { v.className = "verdict bad"; v.textContent = "count = " + mem + " вместо 2 — потерянное обновление! volatile гарантирует видимость, но не атомарность чтения-изменения-записи: оба потока прочитали одно значение."; } }
+    else { v.className = "verdict"; v.textContent = "Делайте шаги в разном порядке. Попробуйте «злое» расписание."; }
+  }
+  $("scT1").addEventListener("click", function () { step(0); }); $("scT2").addEventListener("click", function () { step(1); });
+  $("scBad").addEventListener("click", function () { reset(); var plan = mode === "vol" ? [0, 1, 0, 1, 0, 1] : mode === "cas" ? [0, 1, 0, 1, 1, 1] : [0, 1]; plan.forEach(step); });
+  $("scR").addEventListener("click", reset); $("scM").addEventListener("change", reset);
+  reset();
+})();
+</script>
+
+<h2 id="api"><span class="h-num">4.2</span>API атомиков</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th><th>Реализация</th></tr>
+<tr><td><code>get()</code> / <code>set(v)</code></td><td>volatile-чтение/запись</td><td>VarHandle getVolatile/setVolatile</td></tr>
+<tr><td><code>lazySet(v)</code> / <code>setRelease</code>; <code>getAcquire</code>, <code>getOpaque</code>, <code>getPlain</code></td><td>ослабленные режимы (тема 03)</td><td>—</td></tr>
+<tr><td><code>getAndIncrement</code>, <code>incrementAndGet</code>, <code>getAndAdd</code></td><td>атомарное изменение, вернуть старое/новое</td><td>одна инструкция <code>lock xadd</code> — не проваливается</td></tr>
+<tr><td><code>compareAndSet(expect, update)</code></td><td>атомарная условная запись</td><td><code>lock cmpxchg</code></td></tr>
+<tr><td><code>compareAndExchange</code></td><td>то же, но возвращает фактическое значение (удобно для повтора без лишнего get)</td><td>—</td></tr>
+<tr><td><code>getAndUpdate(f)</code>, <code>updateAndGet(f)</code></td><td>применить функцию атомарно</td><td>CAS-цикл: <b>f может вызываться многократно</b> — без побочных эффектов!</td></tr>
+<tr><td><code>getAndAccumulate(x, f)</code>, <code>accumulateAndGet</code></td><td>f(текущее, x)</td><td>CAS-цикл</td></tr>
+</table></div>
+<pre data-title="максимум, пороги, однократное выполнение"><code class="java">AtomicLong max = new AtomicLong(Long.MIN_VALUE);
+max.accumulateAndGet(latencyNs, Math::max);             // атомарный максимум
+
+AtomicInteger inFlight = new AtomicInteger();
+if (inFlight.incrementAndGet() &gt; LIMIT) { inFlight.decrementAndGet(); throw new RejectedException(); }
+
+AtomicBoolean started = new AtomicBoolean();
+public void start() {
+    if (!started.compareAndSet(false, true)) return;      // ровно один поток пройдёт дальше
+    …
+}</code></pre>
+
+<h2 id="ref"><span class="h-num">4.3</span>AtomicReference и неизменяемое состояние</h2>
+<p>Когда несколько полей должны меняться согласованно, их можно упаковать в неизменяемый объект и атомарно заменять ссылку на него — без блокировок, с согласованными снимками для читателей.</p>
+<pre data-title="конфигурация и статистика без блокировок"><code class="java">record Stats(long count, long sum, long max) {
+    Stats add(long v) { return new Stats(count + 1, sum + v, Math.max(max, v)); }
+}
+private final AtomicReference&lt;Stats&gt; stats = new AtomicReference&lt;&gt;(new Stats(0, 0, 0));
+void record(long v) { stats.updateAndGet(s -&gt; s.add(v)); }    // CAS-цикл: при конкуренции новый объект создаётся заново
+Stats snapshot()   { return stats.get(); }                     // всегда согласованный снимок трёх полей
+
+// «горячая» замена конфигурации
+private final AtomicReference&lt;Config&gt; config = new AtomicReference&lt;&gt;(load());
+void reload() { config.set(load()); }                          // читатели видят старую или новую — не смесь</code></pre>
+<div class="callout warn"><span class="c-title">Когда атомики хуже блокировки</span>
+При сильной конкуренции CAS-цикл с тяжёлой функцией повторяет работу и создаёт мусор (новые объекты на каждую неудачную попытку). Если состояние большое или обновления частые и дорогие — блокировка (ReentrantLock) честнее и экономнее. Для простых счётчиков под нагрузкой — LongAdder (тема 06).
+</div>
+
+<h2 id="quiz"><span class="h-num">4.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему <code>volatile int count; count++</code> из двух потоков теряет обновления?</p><ul><li>volatile не гарантирует видимость</li><li>count++ — три операции (чтение, сложение, запись); volatile не делает их атомарными</li><li>int не атомарен</li><li>JIT удаляет инкремент</li></ul><div class="why">Нужен incrementAndGet или блокировка.</div></div>
+<div class="mcq" data-ok="3"><p>Почему функция в updateAndGet должна быть без побочных эффектов?</p><ul><li>Так требует компилятор</li><li>Она выполняется под блокировкой</li><li>Она выполняется в другом потоке</li><li>При неудачном CAS она вызывается повторно</li></ul><div class="why">Логирование или отправка сообщений внутри — дублируются.</div></div>
+<div class="mcq" data-ok="0"><p>Как атомарно обновить три связанных значения без блокировки?</p><ul><li>Неизменяемый объект в AtomicReference и CAS-замена ссылки</li><li>Три AtomicLong</li><li>volatile-поля</li><li>Это невозможно</li></ul><div class="why">Три отдельных атомика не дают согласованного снимка.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>incrementAndGet против CAS-цикла: в чём разница на уровне процессора?</summary><div class="a"><p>getAndAdd/incrementAndGet компилируются в lock xadd — одна инструкция, которая всегда успешна, даже при конкуренции (хотя ядра всё равно сериализуются на кэш-линии). CAS-цикл (updateAndGet) может проваливаться и повторяться, тратя время и пересчитывая функцию. Поэтому для простых сложений используйте специализированные методы, а не updateAndGet(x -&gt; x + 1).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

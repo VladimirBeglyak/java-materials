@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Резервное копирование и PITR</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ЭКСПЛУАТАЦИЯ И МАСШТАБ</div>
+  <h1>Резервное копирование и PITR</h1>
+  <p class="lead">Реплика защищает от отказа сервера, но не от <code>DELETE FROM orders</code> без WHERE, ошибочной миграции или шифровальщика — эти изменения реплицируются мгновенно. От них защищает только резервная копия с восстановлением на момент времени. Логические и физические копии, архив WAL, PITR по шагам, инструменты и главное правило: бэкап, который не восстанавливали, не существует.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">pg_dump</span><span class="tag">pg_basebackup</span><span class="tag">архив WAL</span><span class="tag">PITR</span><span class="tag">pgBackRest</span><span class="tag">RPO/RTO</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="kinds"><span class="h-num">19.1</span>Логические и физические копии</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Логическая: <code>pg_dump</code></th><th>Физическая: базовая копия + WAL</th></tr>
+<tr><td>Что сохраняет</td><td>SQL/архив: схему и данные одной базы</td><td>файлы всего кластера + поток журнала</td></tr>
+<tr><td>Точка восстановления</td><td>только момент снятия дампа</td><td>любая секунда (PITR) между копиями</td></tr>
+<tr><td>Скорость на 1 ТБ</td><td>часы на дамп, ещё дольше — восстановление (перестроение индексов)</td><td>копирование файлов со скоростью диска/сети + проигрывание WAL</td></tr>
+<tr><td>Переносимость</td><td>между версиями и платформами, выборочно таблицы</td><td>та же мажорная версия и платформа</td></tr>
+<tr><td>Когда</td><td>небольшие базы, перенос, выгрузка отдельных таблиц, вспомогательная копия</td><td>основная стратегия для продакшена</td></tr>
+</table></div>
+<pre data-title="логическая копия"><code class="txt">pg_dump -h db -U backup -Fc -j 8 -f shop.dump shop      # custom-формат, 8 потоков (с -Fd)
+pg_restore -h newdb -U admin -d shop -j 8 shop.dump      # параллельное восстановление
+pg_restore -l shop.dump | grep orders                    # оглавление: восстановить отдельную таблицу
+pg_dumpall --globals-only &gt; globals.sql                   # роли и табличные пространства — pg_dump их не включает!</code></pre>
+
+<h2 id="pitr"><span class="h-num">19.2</span>Восстановление на момент времени</h2>
+<div class="widget stepper" id="pitrSim">
+  <div class="widget-title">Симулятор: в 14:32 миграция удалила столбец с данными</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Хранилище копий (S3)</h5><div class="items"><span class="chip" id="pB">базовая копия 02:00</span><span class="chip" id="pW">WAL 02:00 → сейчас</span></div></div>
+    <div class="lane"><h5>Новый сервер</h5><div class="items"><span class="chip off" id="pR">файлы копии</span><span class="chip off" id="pRe">replay WAL</span><span class="chip off" id="pT">остановка в 14:31:59</span></div></div>
+    <div class="lane"><h5>Продакшен</h5><div class="items"><span class="chip bad" id="pP">14:32 DROP COLUMN 💥</span><span class="chip off" id="pS">переключение / перенос данных</span></div></div>
+  </div>
+  <section class="st-step" data-t="Что у нас есть" data-hl="pB pW pP" data-log="ночная базовая копия (pgBackRest/WAL-G) + непрерывный архив WAL каждые ≤60 с"><p>Каждую ночь снимается базовая копия (физическая, без остановки базы), а все сегменты WAL непрерывно архивируются в объектное хранилище (<code>archive_command</code> или потоковый приём). В 14:32 ошибочная миграция удалила столбец.</p></section>
+  <section class="st-step" data-t="Определить момент" data-hl="pP" data-log="из журнала деплоя/логов БД: миграция началась в 14:32:05 → цель 14:32:00 (или LSN / имя транзакции)"><p>Находим точное время или LSN ошибки: журнал деплоя, <code>log_statement = 'ddl'</code>, <code>pg_waldump</code>. Цель восстановления — момент перед ней.</p></section>
+  <section class="st-step" data-t="Восстановить копию" data-hl="pR pB" data-log="pgbackrest --stanza=main --type=time --target='2026-10-10 14:32:00+03' restore"><p>На <b>отдельном</b> сервере (не поверх продакшена!) разворачиваем базовую копию 02:00 и указываем цель восстановления.</p></section>
+  <section class="st-step" data-t="Проиграть WAL" data-hl="pRe pW" data-log="recovery: restore_command достаёт сегменты WAL из архива, применяет 12,5 ч изменений"><p>Сервер стартует в режиме восстановления и через <code>restore_command</code> по одному достаёт сегменты WAL из архива, применяя их. Время зависит от объёма WAL с момента копии — поэтому копии делают чаще для нагруженных баз.</p></section>
+  <section class="st-step" data-t="Остановиться в цели" data-hl="pT" data-log="recovery_target_time достигнут → recovery_target_action = pause: проверяем данные, затем promote"><p>Достигнув <code>recovery_target_time</code>, восстановление встаёт на паузу: можно проверить данные запросами и, если цель неудачна, перезапустить с другой.</p></section>
+  <section class="st-step" data-t="Вернуть данные" data-hl="pS" data-log="вариант A: выгрузить пострадавшие данные и загрузить в прод; вариант B: переключить приложение на восстановленный сервер"><p>Чаще всего — точечно: выгрузить удалённые данные с восстановленного сервера и вернуть их в продакшен (там уже есть новые заказы после 14:32, терять их нельзя). Полное переключение — только при массовом повреждении.</p></section>
+</div>
+<pre data-title="postgresql.conf на продакшене: архив WAL"><code class="txt">wal_level = replica
+archive_mode = on
+archive_command = 'pgbackrest --stanza=main archive-push %p'     # или wal-g wal-push %p
+archive_timeout = 60          # переключать сегмент не реже раза в минуту → RPO ≤ 1 мин при простое
+# проверка: SELECT * FROM pg_stat_archiver;  -- failed_count, last_failed_wal</code></pre>
+
+<h2 id="rpo"><span class="h-num">19.3</span>RPO и RTO стратегии</h2>
+<div class="widget" id="bkW">
+  <div class="widget-title">Калькулятор: сколько потеряем и сколько будем восстанавливаться</div>
+  <div class="controls">
+    <label>размер базы, ГБ<input type="number" id="bkS" value="500" min="1"></label>
+    <label>WAL в сутки, ГБ<input type="number" id="bkW2" value="200" min="1"></label>
+    <label>стратегия<select id="bkT">
+      <option value="dump">ночной pg_dump</option>
+      <option value="base">ночная базовая копия + архив WAL</option>
+      <option value="base4">базовая копия каждые 6 ч (инкрементальные) + архив WAL</option>
+      <option value="sync">+ синхронная реплика и отложенная реплика (4 ч)</option>
+    </select></label>
+    <label>скорость восстановления, МБ/с<input type="number" id="bkV" value="300" min="10"></label>
+  </div>
+  <div class="out" id="bkOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function h(x) { return x < 1 ? Math.round(x * 60) + " мин" : x.toFixed(1) + " ч"; }
+  function run() {
+    var s = Math.max(1, +$("bkS").value), w = Math.max(1, +$("bkW2").value), t = $("bkT").value, v = Math.max(10, +$("bkV").value);
+    var copy = s * 1024 / v / 3600, rpo, rto, note;
+    if (t === "dump") { rpo = "до 24 ч"; rto = copy * 4; note = "pg_restore перестраивает индексы и ограничения — в 3–5 раз дольше копирования файлов. Подходит для небольших и некритичных баз."; }
+    else if (t === "base") { rpo = "≤ 1 мин (archive_timeout)"; rto = copy + (w * 1024 / (v * 1.5)) / 3600; note = "В худшем случае (сбой перед ночной копией) проигрывается WAL почти за сутки."; }
+    else if (t === "base4") { rpo = "≤ 1 мин"; rto = copy + (w / 4 * 1024 / (v * 1.5)) / 3600; note = "Инкрементальные копии (pgBackRest, WAL-G, PostgreSQL 17 pg_basebackup --incremental) дешёвые — их можно делать часто и сокращать проигрывание WAL."; }
+    else { rpo = "0 при отказе сервера; ≤ 1 мин при логической ошибке"; rto = 0.05; note = "Отказ сервера — переключение на синхронную реплику за секунды. Логическая ошибка, замеченная в течение 4 ч, — данные берутся с отложенной реплики (recovery_min_apply_delay = '4h') без восстановления из архива. Копии с PITR — по-прежнему обязательны."; }
+    $("bkOut").textContent = "RPO (потеря данных): " + rpo + "\nRTO (время восстановления) ≈ " + h(rto) + "\n  копирование " + s + " ГБ ≈ " + h(copy) + "\n\n" + note;
+  }
+  ["bkS", "bkW2", "bkT", "bkV"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="tools"><span class="h-num">19.4</span>Инструменты и правила</h2>
+<div class="grid-3">
+  <div class="card"><h4>pgBackRest</h4><p>Полные, разностные и инкрементальные копии, параллельность, сжатие, шифрование, проверка контрольных сумм, S3/GCS/Azure, восстановление с дельтой.</p></div>
+  <div class="card"><h4>WAL-G</h4><p>Компактный инструмент для облачных хранилищ, дельта-копии, популярен в Kubernetes-операторах.</p></div>
+  <div class="card"><h4>Barman</h4><p>Централизованный сервер копий для многих кластеров, потоковый приём WAL.</p></div>
+</div>
+<div class="callout bad"><span class="c-title">Правила, нарушение которых обнаруживают в день аварии</span>
+<b>Проверяйте восстановление</b> — автоматически, регулярно: развернуть копию на отдельном сервере, проиграть WAL, выполнить проверочные запросы, замерить время. <b>3-2-1</b>: три копии, два типа носителей, одна — вне площадки (другой регион/аккаунт, с защитой от удаления — object lock). <b>Мониторинг архива</b>: упавший <code>archive_command</code> молча копит WAL на диске primary и обнуляет PITR. <b>Роли и настройки</b> тоже нужно сохранять. <b>Шифрование</b> копий и раздельные права: тот, кто может удалить базу, не должен мочь удалить копии.
+</div>
+<div class="callout info"><span class="c-title">Управляемые базы (RDS, Cloud SQL, Azure)</span>
+Автоматические снимки и PITR включены, но окно хранения ограничено (обычно 7–35 дней), снимки живут в том же аккаунте и удаляются вместе с инстансом при неосторожной настройке. Копируйте снимки в другой аккаунт/регион и тоже проверяйте восстановление.
+</div>
+
+<h2 id="quiz"><span class="h-num">19.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Защищает ли синхронная реплика от случайного <code>DELETE FROM orders</code> без WHERE?</p><ul><li>Да, полностью</li><li>Нет: удаление мгновенно применится и на реплике</li><li>Да, если она в другом регионе</li><li>Только при remote_apply</li></ul><div class="why">Реплика — это отказоустойчивость, не резервная копия. Отложенная реплика даёт окно, но не замену PITR.</div></div>
+<div class="mcq" data-ok="3"><p>Что нужно для восстановления базы на состояние в 14:31:59?</p><ul><li>Только ночной pg_dump</li><li>Только текущий WAL на primary</li><li>Снимок диска реплики</li><li>Базовая физическая копия до этого момента + непрерывный архив WAL от неё до 14:31:59</li></ul><div class="why">PITR = базовая копия + проигрывание WAL до цели.</div></div>
+<div class="mcq" data-ok="0"><p>Почему упавший archive_command опасен вдвойне?</p><ul><li>WAL копится на диске primary (риск переполнения), а PITR после последнего успешного сегмента невозможен</li><li>Primary перестаёт принимать запросы сразу</li><li>Реплики отключаются</li><li>Он удаляет базовые копии</li></ul><div class="why">Мониторьте pg_stat_archiver.failed_count и возраст последнего заархивированного сегмента.</div></div>
+<div class="mcq" data-ok="2"><p>Чего не содержит дамп <code>pg_dump</code> одной базы?</p><ul><li>Индексов</li><li>Внешних ключей</li><li>Ролей и их паролей (глобальных объектов кластера)</li><li>Последовательностей</li></ul><div class="why">Роли и табличные пространства — pg_dumpall --globals-only.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как убедиться, что резервные копии рабочие?</summary><div class="a"><p>Автоматическое регулярное восстановление (например, еженедельно) на изолированный сервер: последняя копия + WAL до заданного момента, проверка pgbackrest verify / контрольных сумм, проверочные запросы (количество строк в ключевых таблицах, свежесть данных), замер времени — оно и есть реальный RTO. Алерты на неудачу. Периодические учения с участием людей по документированной инструкции.</p></div></details>
+<details class="q"><summary>Обсудите RPO/RTO с бизнесом: что спросить и что предложить?</summary><div class="a"><p>Спросить: сколько минут данных допустимо потерять при каждой аварии (сервер, зона, регион, ошибка человека) и сколько времени сервис может быть недоступен; сколько стоит час простоя. Предложить уровни: асинхронная реплика + PITR (RPO секунды–минута, RTO минуты для отказа сервера и часы для логической ошибки); синхронная репликация в другую зону (RPO 0 для отказа); отложенная реплика (быстрое восстановление после ошибки); межрегиональные копии. Каждый уровень — с ценой в деньгах и задержке записи.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

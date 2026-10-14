@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Реляционная модель и SQL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · ОСНОВЫ И МОДЕЛИРОВАНИЕ</div>
+  <h1>Реляционная модель и SQL</h1>
+  <p class="lead">Реляционная база хранит данные как множество таблиц и отвечает на вопросы, сформулированные декларативно: вы описываете, <b>что</b> нужно получить, а СУБД сама решает, <b>как</b>. Чтобы писать правильные запросы, нужно понимать три вещи, на которых спотыкаются чаще всего: ключи, NULL с его трёхзначной логикой и логический порядок выполнения SELECT. Внизу страницы — настоящая SQL-песочница, в которой всё можно проверить.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">ключи</span><span class="tag">NULL</span><span class="tag">порядок SELECT</span><span class="tag">SQL-песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">1.1</span>Идея реляционной модели</h2>
+<p>Эдгар Кодд в 1970 году предложил хранить данные как <b>отношения</b> — множества кортежей с одинаковым набором атрибутов — и работать с ними операциями алгебры: выборка, проекция, соединение, объединение. Из этого следуют свойства, которые до сих пор делают реляционные базы выбором по умолчанию:</p>
+<div class="grid-3">
+  <div class="card"><h4>Независимость от хранения</h4><p>Запрос не говорит, где лежат данные и какими индексами их искать. Можно добавить индекс или поменять физическое устройство — запросы не меняются.</p></div>
+  <div class="card"><h4>Произвольные вопросы</h4><p>Данные нормализованы и связаны ключами — значит, можно задать вопрос, о котором не думали при проектировании, соединив нужные таблицы.</p></div>
+  <div class="card"><h4>Целостность</h4><p>Типы, ключи, внешние ключи и CHECK-ограничения проверяет сама база — для любого приложения, которое к ней подключится.</p></div>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Теория</th><th>SQL</th><th>Отличие SQL от теории</th></tr>
+<tr><td>отношение</td><td>таблица</td><td>в таблице могут быть строки-дубликаты, если нет ключа</td></tr>
+<tr><td>кортеж</td><td>строка</td><td>у строк нет порядка — без ORDER BY порядок результата не гарантирован</td></tr>
+<tr><td>атрибут, домен</td><td>столбец, тип</td><td>в SQL есть NULL — отсутствующее значение, которого в чистой теории нет</td></tr>
+</table></div>
+
+<h2 id="keys"><span class="h-num">1.2</span>Ключи и ограничения</h2>
+<pre data-title="Таблицы учебного магазина (используются во всём курсе)"><code class="sql">CREATE TABLE customers (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,   -- первичный ключ: уникален и не NULL
+    name        text NOT NULL,
+    city        text,                                              -- NULL допустим: город может быть неизвестен
+    email       text UNIQUE,                                       -- уникальность, но NULL-ов может быть много
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    customer_id  bigint NOT NULL REFERENCES customers(id),         -- внешний ключ: заказ без клиента невозможен
+    status       text NOT NULL CHECK (status IN ('new', 'paid', 'shipped', 'cancelled')),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE order_items (
+    order_id    bigint NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    product_id  bigint NOT NULL REFERENCES products(id),
+    qty         integer NOT NULL CHECK (qty &gt; 0),
+    price       numeric(12, 2) NOT NULL,                           -- цена на момент покупки, а не текущая
+    PRIMARY KEY (order_id, product_id)                             -- составной ключ
+);</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Ограничение</th><th>Гарантия</th><th>Замечание</th></tr>
+<tr><td><code>PRIMARY KEY</code></td><td>значение уникально и не NULL; по нему строка однозначно находится</td><td>автоматически создаёт уникальный индекс</td></tr>
+<tr><td><code>UNIQUE</code></td><td>нет двух одинаковых не-NULL значений</td><td>индекс; NULL не равен NULL, поэтому строк с NULL может быть много (в PostgreSQL 15+ можно <code>NULLS NOT DISTINCT</code>)</td></tr>
+<tr><td><code>FOREIGN KEY</code></td><td>значение существует в другой таблице</td><td>индекс на ссылающийся столбец НЕ создаётся автоматически — его почти всегда нужно добавить вручную</td></tr>
+<tr><td><code>NOT NULL</code>, <code>CHECK</code></td><td>значение есть / удовлетворяет условию</td><td>самые дешёвые и самые полезные ограничения</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Ограничения — последняя линия обороны</span>
+Проверка «email уникален» в коде приложения не работает при параллельных запросах (тема 13). Ограничение в базе работает всегда, для любого клиента, включая ручной SQL и соседний сервис. Правило: всё, что является инвариантом данных, выражайте ограничениями схемы.</div>
+
+<h2 id="null"><span class="h-num">1.3</span>NULL и трёхзначная логика</h2>
+<p>NULL означает «значение неизвестно или отсутствует». Сравнение с неизвестным даёт не true и не false, а <b>unknown</b>. <code>WHERE</code> пропускает только строки, где условие true — строки с unknown отбрасываются.</p>
+<div class="grid-2">
+<div class="table-wrap"><table>
+<tr><th>Выражение</th><th>Результат</th></tr>
+<tr><td><code>NULL = NULL</code></td><td>unknown</td></tr>
+<tr><td><code>NULL &lt;&gt; 1</code></td><td>unknown</td></tr>
+<tr><td><code>NULL IS NULL</code></td><td>true</td></tr>
+<tr><td><code>true AND unknown</code></td><td>unknown</td></tr>
+<tr><td><code>false AND unknown</code></td><td>false</td></tr>
+<tr><td><code>true OR unknown</code></td><td>true</td></tr>
+<tr><td><code>NOT unknown</code></td><td>unknown</td></tr>
+</table></div>
+<div class="table-wrap"><table>
+<tr><th>Ловушка</th><th>Почему</th></tr>
+<tr><td><code>WHERE city &lt;&gt; 'Минск'</code> не вернёт клиентов без города</td><td>NULL &lt;&gt; 'Минск' → unknown</td></tr>
+<tr><td><code>NOT IN (подзапрос)</code> возвращает пустоту, если в подзапросе есть NULL</td><td><code>x NOT IN (1, NULL)</code> = <code>x&lt;&gt;1 AND x&lt;&gt;NULL</code> → никогда не true</td></tr>
+<tr><td><code>COUNT(city)</code> меньше <code>COUNT(*)</code></td><td>агрегаты пропускают NULL; <code>COUNT(*)</code> считает строки</td></tr>
+<tr><td><code>SUM</code> по пустому множеству — NULL, а не 0</td><td>оборачивайте в <code>COALESCE(SUM(x), 0)</code></td></tr>
+<tr><td>сравнение «равно, включая NULL»</td><td><code>a IS NOT DISTINCT FROM b</code></td></tr>
+</table></div>
+</div>
+
+<h2 id="order"><span class="h-num">1.4</span>Логический порядок выполнения SELECT</h2>
+<p>SELECT пишется в одном порядке, а вычисляется в другом. Этот <b>логический</b> порядок объясняет, почему в <code>WHERE</code> нельзя сослаться на псевдоним из <code>SELECT</code>, почему агрегаты фильтруют в <code>HAVING</code> и почему оконные функции нельзя использовать в <code>WHERE</code>. (Физически планировщик может выполнять шаги иначе, если результат тот же.)</p>
+<pre><code class="sql">SELECT c.city, COUNT(*) AS orders_cnt                -- 6
+FROM customers c JOIN orders o ON o.customer_id = c.id  -- 1
+WHERE o.status IN ('paid', 'shipped')                 -- 2
+GROUP BY c.city                                       -- 3
+HAVING COUNT(*) &gt;= 2                                  -- 4
+ORDER BY orders_cnt DESC                              -- 7   (5 — оконные функции, здесь их нет)
+LIMIT 1;                                              -- 8</code></pre>
+<div class="widget stepper" id="soSim">
+  <div class="widget-title">Симулятор: промежуточный результат на каждом шаге</div>
+  <section class="st-step" data-t="1. FROM / JOIN"><h4>FROM customers JOIN orders</h4><p>Соединение: каждая строка заказа получает поля своего клиента. Клиент Глеб без заказов в результат не попал — это внутреннее соединение.</p>
+<div class="out">c.name  c.city   o.id  o.status
+Анна    Минск    101   paid
+Анна    Минск    102   shipped
+Борис   Москва   103   paid
+Вера    Минск    104   cancelled
+Борис   Москва   105   new
+Дина    Алматы   106   paid
+Анна    Минск    107   paid
+Егор    Москва   108   shipped          — 8 строк</div></section>
+  <section class="st-step" data-t="2. WHERE"><h4>WHERE o.status IN ('paid', 'shipped')</h4><p>Фильтр по отдельным строкам. Агрегатов ещё нет — поэтому <code>WHERE COUNT(*) &gt; 1</code> невозможен. Псевдонимов из SELECT тоже ещё нет.</p>
+<div class="out">Анна    Минск    101   paid
+Анна    Минск    102   shipped
+Борис   Москва   103   paid
+Дина    Алматы   106   paid
+Анна    Минск    107   paid
+Егор    Москва   108   shipped          — 6 строк (отброшены 104 и 105)</div></section>
+  <section class="st-step" data-t="3. GROUP BY"><h4>GROUP BY c.city</h4><p>Строки собираются в группы по городу. После этого в SELECT можно использовать только столбцы группировки и агрегаты — у группы нет «одного» имени клиента.</p>
+<div class="out">Минск   → [101, 102, 107]
+Москва  → [103, 108]
+Алматы  → [106]</div></section>
+  <section class="st-step" data-t="4. HAVING"><h4>HAVING COUNT(*) &gt;= 2</h4><p>Фильтр по группам, уже с агрегатами.</p>
+<div class="out">Минск   → 3
+Москва  → 2              (Алматы отброшен: 1 &lt; 2)</div></section>
+  <section class="st-step" data-t="5–6. SELECT"><h4>Оконные функции, затем SELECT</h4><p>Вычисляются выражения списка выборки и назначаются псевдонимы. Окна (<code>OVER</code>) считаются здесь — после группировки, поэтому их нельзя использовать в WHERE: для фильтрации по оконной функции нужен подзапрос или CTE.</p>
+<div class="out">city    orders_cnt
+Минск   3
+Москва  2</div></section>
+  <section class="st-step" data-t="7. ORDER BY"><h4>ORDER BY orders_cnt DESC</h4><p>Сортировка — уже после SELECT, поэтому здесь псевдоним <code>orders_cnt</code> доступен. Без ORDER BY порядок строк не определён, даже если «всегда выходило по порядку».</p></section>
+  <section class="st-step" data-t="8. LIMIT"><h4>LIMIT 1</h4><p>Последним отсекается нужное число строк. <code>LIMIT</code> без <code>ORDER BY</code> возвращает «какие-то» строки.</p>
+<div class="out">city    orders_cnt
+Минск   3</div></section>
+</div>
+
+<h2 id="sandbox"><span class="h-num">1.5</span>Песочница</h2>
+<p>Ниже — настоящая база SQLite, работающая прямо в браузере, с таблицами учебного магазина. Синтаксис SQLite в рамках этих примеров совпадает с PostgreSQL; различия будут отмечены. Пробуйте свои запросы: база пересоздаётся кнопкой «Сбросить».</p>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: учебный магазин</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT * FROM customers;">все клиенты</button>
+    <button data-sql="SELECT name, city FROM customers WHERE city &lt;&gt; 'Минск';">ловушка: &lt;&gt; и NULL</button>
+    <button data-sql="SELECT name FROM customers WHERE id NOT IN (SELECT customer_id FROM orders);">клиенты без заказов</button>
+    <button data-sql="SELECT name FROM customers WHERE city NOT IN (SELECT city FROM customers WHERE id IN (1, 4));">ловушка: NOT IN с NULL</button>
+    <button data-sql="SELECT COUNT(*) AS rows_cnt, COUNT(city) AS with_city, COUNT(DISTINCT city) AS cities FROM customers;">COUNT(*) и COUNT(col)</button>
+    <button data-sql="SELECT c.city, COUNT(*) AS orders_cnt&#10;FROM customers c JOIN orders o ON o.customer_id = c.id&#10;WHERE o.status IN ('paid', 'shipped')&#10;GROUP BY c.city&#10;HAVING COUNT(*) &gt;= 2&#10;ORDER BY orders_cnt DESC;">запрос из симулятора</button>
+    <button data-sql="SELECT o.id, SUM(i.qty * i.price) AS total&#10;FROM orders o JOIN order_items i ON i.order_id = o.id&#10;GROUP BY o.id ORDER BY total DESC;">сумма заказов</button>
+  </div>
+  <textarea>SELECT name, city, email FROM customers ORDER BY name;</textarea>
+</div>
+<p><b>Задания:</b> (1) найдите клиентов, у которых нет email; (2) выведите клиентов не из Минска, включая тех, у кого город неизвестен (два способа: <code>OR city IS NULL</code> и <code>COALESCE</code>); (3) посчитайте выручку по категориям товаров только по оплаченным и отправленным заказам.</p>
+
+<h2 id="dml"><span class="h-num">1.6</span>Изменение данных</h2>
+<pre><code class="sql">INSERT INTO customers (name, city, email) VALUES ('Жанна', 'Минск', 'zh@ex.com')
+RETURNING id, created_at;                                   -- сразу получить сгенерированные значения
+
+UPDATE orders SET status = 'paid' WHERE id = 105 AND status = 'new'   -- условие на текущее состояние
+RETURNING id;                                               -- пусто — значит, статус уже был другим
+
+DELETE FROM orders WHERE status = 'cancelled' AND created_at &lt; now() - interval '1 year';
+
+INSERT INTO product_stock (product_id, qty) VALUES (7, 5)  -- вставить или увеличить (UPSERT)
+ON CONFLICT (product_id) DO UPDATE SET qty = product_stock.qty + EXCLUDED.qty;</code></pre>
+<div class="callout bad"><span class="c-title">UPDATE и DELETE без WHERE</span>
+изменяют всю таблицу. Привычка для ручной работы: сначала <code>SELECT</code> с тем же условием, потом <code>BEGIN; UPDATE …; проверить; COMMIT;</code> — внутри транзакции ошибку можно откатить.</div>
+
+<h2 id="quiz"><span class="h-num">1.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что вернёт <code>SELECT * FROM t WHERE x NOT IN (1, 2, NULL)</code>?</p><ul><li>Все строки, кроме x = 1 и x = 2</li><li>Ошибку</li><li>Ни одной строки</li><li>Только строки с x = NULL</li></ul><div class="why">Условие эквивалентно <code>x &lt;&gt; 1 AND x &lt;&gt; 2 AND x &lt;&gt; NULL</code>; последнее всегда unknown. Для «нет в подзапросе» используйте <code>NOT EXISTS</code>.</div></div>
+<div class="mcq" data-ok="1"><p>Почему нельзя написать <code>WHERE orders_cnt &gt; 1</code>, если <code>orders_cnt</code> — псевдоним из SELECT?</p><ul><li>Псевдонимы запрещены в PostgreSQL</li><li>WHERE вычисляется раньше SELECT, псевдонима ещё не существует; а для агрегата нужен HAVING</li><li>Нужно взять псевдоним в кавычки</li><li>Можно, это работает</li></ul><div class="why">Логический порядок: FROM → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT.</div></div>
+<div class="mcq" data-ok="0"><p>Создаёт ли PostgreSQL индекс для внешнего ключа автоматически?</p><ul><li>Нет — индекс на ссылающийся столбец нужно создать самому</li><li>Да, всегда</li><li>Только при ON DELETE CASCADE</li><li>Только для составных ключей</li></ul><div class="why">Без индекса медленными станут соединения по этому столбцу и удаление строк родительской таблицы (проверка ссылок — полный просмотр дочерней).</div></div>
+<div class="mcq" data-ok="3"><p>Гарантирован ли порядок строк в <code>SELECT * FROM orders</code>?</p><ul><li>Да, по первичному ключу</li><li>Да, по порядку вставки</li><li>Да, если есть индекс</li><li>Нет — без ORDER BY порядок не определён и может меняться</li></ul><div class="why">Он зависит от плана, физического расположения, параллельного выполнения и даже от того, что другой запрос уже читает таблицу (synchronized scans).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>В чём ценность декларативности SQL?</summary><div class="a"><p>Запрос описывает результат, а способ получения выбирает оптимизатор по статистике и доступным индексам. Добавление индекса или рост данных меняют план без изменения кода. Обратная сторона — нужно уметь читать план (тема 08), когда оптимизатор ошибается.</p></div></details>
+<details class="q"><summary>Как NULL ведёт себя в агрегатах, сравнениях и уникальных индексах?</summary><div class="a"><p>Агрегаты (кроме COUNT(*)) пропускают NULL; SUM/AVG по пустому множеству — NULL. Сравнения с NULL дают unknown, WHERE их отбрасывает; нужен IS NULL / IS DISTINCT FROM. В уникальном индексе NULL-ы не конфликтуют друг с другом (кроме NULLS NOT DISTINCT).</p></div></details>
+<details class="q"><summary>Назовите логический порядок выполнения SELECT.</summary><div class="a"><p>FROM и JOIN → WHERE → GROUP BY → HAVING → оконные функции → SELECT (выражения, псевдонимы) → DISTINCT → ORDER BY → LIMIT/OFFSET.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900), (7,'Монитор','электроника',32000);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'), (104,3,'cancelled','2026-07-02'),
+  (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'), (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500), (104,6,3,900),
+  (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800), (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Свои загрузчики, изоляция, утечки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ЗАГРУЗКА КЛАССОВ</div>
+  <h1>Свои загрузчики, изоляция, утечки</h1>
+  <p class="lead">Свои загрузчики стоят за плагинами, серверами приложений, горячей перезагрузкой, исполняемым jar Spring Boot, изоляцией тестов и генерацией кода. Пишем загрузчик, разбираем, как устроены Spring Boot, Tomcat и ServiceLoader, когда класс выгружается и почему после десятка редеплоев падает <code>OutOfMemoryError: Metaspace</code>. В конце — Java-агенты: как Mockito, APM и профилировщики меняют классы на лету.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">defineClass</span><span class="tag">hot reload</span><span class="tag">Spring Boot jar</span><span class="tag">ServiceLoader</span><span class="tag">выгрузка классов</span><span class="tag">агенты</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="write"><span class="h-num">7.1</span>Пишем загрузчик</h2>
+<pre data-title="загрузчик из каталога: переопределяем findClass, а не loadClass"><code class="java">public class DirClassLoader extends ClassLoader {
+    static { registerAsParallelCapable(); }            // блокировка на имя класса, а не на весь загрузчик
+    private final Path root;
+
+    public DirClassLoader(Path root, ClassLoader parent) { super("dir-loader", parent); this.root = root; }
+
+    @Override
+    protected Class&lt;?&gt; findClass(String name) throws ClassNotFoundException {
+        Path file = root.resolve(name.replace('.', '/') + ".class");
+        try {
+            byte[] bytes = Files.readAllBytes(file);         // сюда можно вставить расшифровку, генерацию, трансформацию
+            return defineClass(name, bytes, 0, bytes.length); // → верификация, создание Class в metaspace
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+
+    @Override
+    protected URL findResource(String name) {               // getResource тоже должен работать
+        Path p = root.resolve(name);
+        try { return Files.exists(p) ? p.toUri().toURL() : null; } catch (MalformedURLException e) { return null; }
+    }
+}</code></pre>
+<ul>
+  <li>Переопределяя <code>findClass</code>, вы сохраняете делегирование родителю. Переопределяйте <code>loadClass</code>, только если нужна child-first модель — и всегда делегируйте <code>java.*</code> родителю.</li>
+  <li>Для jar и URL обычно достаточно <code>URLClassLoader</code>; для сгенерированного в рантайме кода — <code>MethodHandles.Lookup.defineHiddenClass</code> (скрытые классы, выгружаемые независимо).</li>
+  <li>Закрывайте <code>URLClassLoader.close()</code> — иначе на Windows jar-файлы останутся заблокированными.</li>
+</ul>
+
+<h2 id="hot-reload"><span class="h-num">7.2</span>Горячая перезагрузка</h2>
+<p>Переопределить уже загруженный класс нельзя (кроме ограниченной <b>редефиниции</b> тел методов через JVMTI — раздел 7.5). Поэтому перезагрузка = <b>новый загрузчик</b>: загрузить новые версии классов в свежий загрузчик, переключить на них, а старый загрузчик оставить сборщику мусора.</p>
+<div class="table-wrap"><table>
+<tr><th>Инструмент</th><th>Как перезагружает</th></tr>
+<tr><td>Spring Boot DevTools</td><td>два загрузчика: <b>base</b> (библиотеки из jar — не меняются) и <b>restart</b> (ваши классы); при изменении выбрасывается restart-загрузчик и контекст поднимается заново</td></tr>
+<tr><td>Tomcat redeploy</td><td>новый WebappClassLoader на каждый деплой</td></tr>
+<tr><td>JRebel, DCEVM/HotswapAgent</td><td>расширенная редефиниция классов (поля, методы) без смены загрузчика</td></tr>
+<tr><td>Отладчик IDE (HotSwap)</td><td>JVMTI RedefineClasses: только тела методов</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">DevTools и ClassCastException</span>
+Если класс из вашего кода попал в base-загрузчик (например, библиотека держит ссылку на объект, созданный до перезапуска, или класс сериализован в кэше), после рестарта вы получите <code>X cannot be cast to X</code> — тот же класс из двух загрузчиков (тема 05). Решение — <code>META-INF/spring-devtools.properties</code> с <code>restart.include</code>/<code>exclude</code>.
+</div>
+
+<h2 id="real"><span class="h-num">7.3</span>Загрузчики в реальных системах</h2>
+<div class="grid-2">
+  <div class="card"><h4>Spring Boot executable jar</h4><p>Внутри <code>app.jar</code> лежат <code>BOOT-INF/classes</code> и <code>BOOT-INF/lib/*.jar</code> — вложенные jar стандартный загрузчик читать не умеет. <code>Main-Class</code> в манифесте — <code>JarLauncher</code>: он создаёт <code>LaunchedClassLoader</code> с собственным протоколом URL для вложенных jar (<code>jar:nested:…!/BOOT-INF/lib/x.jar</code>) и запускает ваш <code>Start-Class</code>. Распакованный режим (<code>java -Djarmode=tools -jar app.jar extract</code>) быстрее стартует и лучше для слоёв Docker и CDS.</p></div>
+  <div class="card"><h4>Tomcat</h4><p>Bootstrap → System → Common (<code>lib/</code> Tomcat) → <b>WebappClassLoader</b> на каждое приложение. Для webapp порядок <b>child-first</b>: сначала <code>WEB-INF/classes</code> и <code>WEB-INF/lib</code>, кроме <code>java.*</code> и API сервлетов. Поэтому два приложения могут иметь разные версии Jackson, но <code>servlet-api.jar</code> в WEB-INF/lib ломает приложение.</p></div>
+</div>
+<pre data-title="ServiceLoader: плагины без жёстких зависимостей"><code class="java">// API: interface PaymentProvider { String id(); … }
+// реализация в отдельном jar: META-INF/services/com.shop.PaymentProvider  →  строка: com.acme.AcmeProvider
+// или в module-info: provides com.shop.PaymentProvider with com.acme.AcmeProvider;
+ServiceLoader&lt;PaymentProvider&gt; sl = ServiceLoader.load(PaymentProvider.class, pluginLoader);
+sl.stream().map(ServiceLoader.Provider::get).forEach(p -&gt; registry.put(p.id(), p));
+// так находятся JDBC-драйверы (java.sql.Driver), логгеры SLF4J 2, провайдеры JSON-B, Jackson-модули (findAndRegisterModules)</code></pre>
+
+<h2 id="unload"><span class="h-num">7.4</span>Выгрузка классов и утечки загрузчиков</h2>
+<p>Класс выгружается только вместе со своим загрузчиком — когда сборщик мусора докажет, что недостижимы <b>одновременно</b>: сам загрузчик, все загруженные им объекты <code>Class</code> и все экземпляры этих классов. Классы bootstrap, platform и app загрузчиков не выгружаются никогда. Одна «забытая» ссылка удерживает весь загрузчик — тысячи классов в metaspace и все их статические поля.</p>
+<div class="widget" id="lkW">
+  <div class="widget-title">Утечёт ли загрузчик веб-приложения после редеплоя?</div>
+  <div class="checks col" id="lkL"></div>
+  <div class="controls"><label>число редеплоев<input type="number" id="lkN" value="10" min="1" max="100"></label><label>классов в приложении<input type="number" id="lkC" value="15000" min="100" step="1000"></label></div>
+  <div class="bar" id="lkBar"><i></i></div>
+  <div class="verdict" id="lkV"></div>
+</div>
+<script>
+(function () {
+  var R = [
+    ["Поток из пула сервера держит ThreadLocal со значением класса приложения", "ThreadLocal → объект → его Class → загрузчик. Поток живёт дольше приложения. Очищайте ThreadLocal.remove() в finally."],
+    ["Приложение запустило свой поток (Executor, Timer) и не остановило его при undeploy", "Живой поток держит свой контекстный загрузчик и объекты задач. Останавливайте пулы в @PreDestroy/contextDestroyed."],
+    ["JDBC-драйвер из WEB-INF/lib зарегистрирован в DriverManager", "DriverManager (в platform) держит ссылку на драйвер → его загрузчик. Tomcat пытается снять регистрацию сам; лучше класть драйвер в lib сервера."],
+    ["Статический кэш в библиотеке сервера хранит объект приложения", "Например, кэш интроспекции Bean, Jackson TypeFactory, логгер в общем загрузчике. Ссылка из «вечного» загрузчика."],
+    ["Зарегистрирован shutdown hook или MBean и не снят", "Runtime держит hook → класс приложения."],
+    ["Поток с contextClassLoader приложения создан внутри JDK (например, первый вызов, запустивший внутренний демон)", "Классические утечки через sun.awt.AppContext, keep-alive потоки HTTP — Tomcat JreMemoryLeakPreventionListener заранее инициирует их в системном загрузчике."]
+  ];
+  var $ = function (i) { return document.getElementById(i); };
+  $("lkL").innerHTML = R.map(function (r, i) { return '<label><input type="checkbox" data-i="' + i + '"' + (i === 1 ? " checked" : "") + "> " + r[0] + "</label>"; }).join("");
+  function run() {
+    var on = [].map.call($("lkL").querySelectorAll("input:checked"), function (c) { return +c.getAttribute("data-i"); });
+    var n = Math.max(1, +$("lkN").value), c = Math.max(100, +$("lkC").value), perDeploy = c * 6 / 1024;   // ~6 КБ метаданных на класс
+    var meta = on.length ? perDeploy * (n + 1) : perDeploy, pct = Math.min(100, meta / 512 * 100);
+    $("lkBar").className = "bar " + (on.length ? "bad" : "ok"); $("lkBar").firstChild.style.width = pct + "%";
+    var v = $("lkV");
+    if (!on.length) { v.className = "verdict ok"; v.textContent = "Ссылок нет: после редеплоя старый загрузчик и его ~" + Math.round(perDeploy) + " МБ метаданных уйдут при ближайшей сборке. Metaspace держится на уровне одного приложения."; }
+    else { v.className = "verdict bad"; v.textContent = "Утечка! Каждый редеплой оставляет ~" + Math.round(perDeploy) + " МБ metaspace + статические поля. После " + n + " редеплоев ≈ " + Math.round(meta) + " МБ" + (meta > 512 ? " — при MaxMetaspaceSize=512m: java.lang.OutOfMemoryError: Metaspace." : ".") + " Причины: " + on.map(function (i) { return R[i][1]; }).join(" ") + " Диагностика: heap dump → найти экземпляры WebappClassLoader/LaunchedClassLoader → Path to GC Roots (Eclipse MAT)."; }
+  }
+  $("lkL").addEventListener("change", run); $("lkN").addEventListener("input", run); $("lkC").addEventListener("input", run); run();
+})();
+</script>
+<pre data-title="наблюдать загрузку и выгрузку"><code class="txt">java -Xlog:class+load=info,class+unload=info -jar app.jar
+jcmd &lt;pid&gt; VM.classloader_stats      # загрузчики, число классов, размер их метаданных
+jcmd &lt;pid&gt; GC.class_histogram | head # экземпляры по классам
+jcmd &lt;pid&gt; VM.metaspace              # подробности metaspace по загрузчикам</code></pre>
+
+<h2 id="agents"><span class="h-num">7.5</span>Java-агенты и инструментирование</h2>
+<p>Агент — jar с методом <code>premain</code> (при старте, <code>-javaagent:agent.jar</code>) или <code>agentmain</code> (подключение к работающей JVM через Attach API). Он получает <code>Instrumentation</code> и может регистрировать <code>ClassFileTransformer</code> — функцию «байты класса → новые байты», вызываемую <b>при каждой загрузке класса</b>, до defineClass.</p>
+<pre data-title="агент, считающий время методов (идея; на практике — Byte Buddy)"><code class="java">public class TimingAgent {
+    public static void premain(String args, Instrumentation inst) {
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override
+            public byte[] transform(Module module, ClassLoader loader, String className,
+                                    Class&lt;?&gt; redefined, ProtectionDomain pd, byte[] bytes) {
+                if (className == null || !className.startsWith("com/shop/")) return null;   // null = не менять
+                return Weaver.addTiming(bytes);     // ASM / Class-File API / Byte Buddy
+            }
+        }, true);
+    }
+}
+// MANIFEST.MF: Premain-Class: TimingAgent   Can-Retransform-Classes: true</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Кто так работает</th><th>Что делает</th></tr>
+<tr><td>APM: OpenTelemetry Java agent, Datadog, New Relic</td><td>вплетают трассировку в JDBC, HTTP-клиенты, Spring MVC при загрузке</td></tr>
+<tr><td>Mockito (inline mock maker)</td><td>ретрансформирует классы, чтобы мокать final-классы и методы (с JDK 21 — предупреждение о динамической загрузке агента, JEP 451; добавьте <code>-javaagent</code> явно)</td></tr>
+<tr><td>JaCoCo</td><td>вставляет пробы покрытия</td></tr>
+<tr><td>async-profiler, JFR</td><td>нативные агенты JVMTI (не трансформируют байткод)</td></tr>
+</table></div>
+<p><b>Retransformation</b> уже загруженных классов (<code>inst.retransformClasses</code>) разрешает менять только тела методов: нельзя добавлять поля и методы или менять иерархию.</p>
+
+<h2 id="quiz"><span class="h-num">7.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой метод переопределять в своём загрузчике, чтобы сохранить делегирование?</p><ul><li>loadClass</li><li>findClass</li><li>defineClass</li><li>getParent</li></ul><div class="why">loadClass реализует делегирование и вызывает findClass, когда родители не нашли класс.</div></div>
+<div class="mcq" data-ok="3"><p>Когда выгружается класс, загруженный пользовательским загрузчиком?</p><ul><li>Сразу после использования</li><li>Никогда</li><li>При System.gc()</li><li>Когда недостижимы загрузчик, все его Class и все экземпляры этих классов — и прошла сборка мусора</li></ul><div class="why">Выгрузка — это сборка мусора загрузчика целиком.</div></div>
+<div class="mcq" data-ok="0"><p>После 20 редеплоев в Tomcat — OutOfMemoryError: Metaspace. Самая вероятная причина?</p><ul><li>Утечка загрузчика: что-то долгоживущее держит ссылку на класс или объект старого приложения</li><li>Слишком маленькая куча</li><li>Слишком много потоков</li><li>Большие JSP</li></ul><div class="why">Ищите пути к GC Roots от старых WebappClassLoader в heap dump.</div></div>
+<div class="mcq" data-ok="2"><p>Как Spring Boot загружает классы из jar, вложенных в app.jar?</p><ul><li>Распаковывает их во временный каталог при каждом старте</li><li>Стандартный AppClassLoader это умеет</li><li>JarLauncher создаёт собственный загрузчик с поддержкой вложенных jar</li><li>Через ServiceLoader</li></ul><div class="why">Main-Class: JarLauncher, Start-Class: ваш класс.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Спроектируйте систему плагинов на JVM.</summary><div class="a"><p>API плагинов — в отдельном модуле, загружаемом загрузчиком приложения. Каждый плагин — свой URLClassLoader с родителем «загрузчик API» (видит только API и JDK, а не внутренности приложения); при конфликтах библиотек — child-first для всего, кроме java.* и API-пакетов. Обнаружение реализаций — ServiceLoader. Выгрузка — закрыть загрузчик, остановить потоки плагина, снять регистрации; проверять утечки. Готовые решения: PF4J, OSGi, JPMS-слои (тема 08).</p></div></details>
+<details class="q"><summary>Чем агент с ClassFileTransformer отличается от Spring AOP?</summary><div class="a"><p>Агент меняет байткод любых классов (включая чужие библиотеки и JDK, кроме части ядра) при загрузке — работают и self-invocation, и final-методы, и не-бины. Spring AOP создаёт прокси вокруг бинов в рантайме: перехватываются только внешние вызовы через прокси публичных (для CGLIB — не final) методов. Агент сложнее в отладке и влияет на старт; AOP — проще, но ограничен.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

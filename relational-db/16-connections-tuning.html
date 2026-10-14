@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Соединения, пулы, настройка</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ЭКСПЛУАТАЦИЯ И МАСШТАБ</div>
+  <h1>Соединения, пулы, настройка</h1>
+  <p class="lead">Самые частые проблемы «база тормозит» на деле — проблемы соединений: слишком большой пул, утечки, транзакции, ожидающие сеть, или PgBouncer в неподходящем режиме. Считаем правильный размер пула по закону Литтла, настраиваем HikariCP и PgBouncer, разбираем ключевые параметры postgresql.conf и таймауты, которые спасают от каскадных отказов.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">HikariCP</span><span class="tag">PgBouncer</span><span class="tag">размер пула</span><span class="tag">таймауты</span><span class="tag">postgresql.conf</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cost"><span class="h-num">16.1</span>Сколько стоит соединение</h2>
+<ul>
+  <li><b>Установка</b>: TCP + TLS + аутентификация + fork процесса — единицы миллисекунд. Открывать соединение на каждый запрос нельзя — отсюда пулы.</li>
+  <li><b>Память</b>: каждый backend — несколько МБ своей памяти, плюс <code>work_mem</code> на каждую сортировку/хэш в запросе.</li>
+  <li><b>Процессор</b>: активных запросов больше, чем ядер, — значит, они делят ядра; переключения и конкуренция за блокировки в памяти (LWLock) снижают общую пропускную способность.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная идея</span>
+База выполняет одновременно не больше запросов, чем у неё ядер (и каналов диска). Больше активных соединений — не больше работы, а та же работа плюс очередь внутри СУБД. Очередь лучше держать <b>в пуле приложения</b>, где она дешёвая и видимая.
+</div>
+
+<h2 id="size"><span class="h-num">16.2</span>Размер пула: закон Литтла</h2>
+<p>Среднее число занятых соединений = пропускная способность × время удержания соединения: <code>L = λ × W</code>. 2000 запросов/с по 5 мс занимают в среднем 10 соединений. Если транзакции держат соединение 200 мс (из-за HTTP-вызовов внутри), нужно уже 400.</p>
+<div class="widget" id="psW">
+  <div class="widget-title">Калькулятор пула</div>
+  <div class="controls">
+    <label>запросов (транзакций) в секунду<input type="number" id="psR" value="2000" min="1"></label>
+    <label>время удержания соединения, мс<input type="number" id="psW2" value="5" min="0.1" step="0.5"></label>
+    <label>экземпляров приложения<input type="number" id="psI" value="6" min="1"></label>
+    <label>ядер у сервера БД<input type="number" id="psC" value="16" min="1"></label>
+    <label>maximumPoolSize в каждом<input type="number" id="psP" value="50" min="1"></label>
+  </div>
+  <div class="out" id="psOut"></div>
+  <div class="verdict" id="psV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var r = Math.max(1, +$("psR").value), w = Math.max(0.1, +$("psW2").value), n = Math.max(1, +$("psI").value), c = Math.max(1, +$("psC").value), p = Math.max(1, +$("psP").value);
+    var busy = r * w / 1000, perInst = busy / n, total = p * n, rec = Math.max(2, Math.ceil(perInst * 1.5 + 2)), dbOpt = c * 2 + 1;
+    $("psOut").textContent = "занято в среднем: " + busy.toFixed(1) + " соединений на всех (≈ " + perInst.toFixed(1) + " на экземпляр)" +
+      "\nрекомендуемый пул на экземпляр (среднее × 1.5 + запас): " + rec +
+      "\nрекомендуемая активная нагрузка на БД (ядра × 2 + 1): ≈ " + dbOpt +
+      "\nсейчас максимум соединений к БД: " + p + " × " + n + " = " + total + (total > 300 ? "  ← больше, чем разумно для PostgreSQL" : "");
+    var v = $("psV");
+    if (busy > dbOpt * 1.5) { v.className = "verdict bad"; v.textContent = "Нагрузка " + busy.toFixed(0) + " одновременных запросов превышает возможности " + c + " ядер. Увеличение пула не поможет — ускоряйте запросы, сокращайте время удержания (никаких внешних вызовов в транзакции), читайте с реплик, кэшируйте."; }
+    else if (total > dbOpt * 4) { v.className = "verdict warn"; v.textContent = "Пул завышен: при всплеске до " + total + " соединений одновременно начнут работать, база захлебнётся, и все запросы станут медленнее. Уменьшите maximumPoolSize до ~" + Math.max(rec, Math.ceil(dbOpt / n)) + " или поставьте PgBouncer в режиме transaction."; }
+    else { v.className = "verdict ok"; v.textContent = "Конфигурация разумна: пул покрывает среднюю нагрузку с запасом и не перегружает БД при всплесках."; }
+  }
+  ["psR", "psW2", "psI", "psC", "psP"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+
+<h2 id="hikari"><span class="h-num">16.3</span>HikariCP: настройки, которые важны</h2>
+<pre data-title="application.yml"><code class="yaml">spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 10           # меньше, чем кажется нужным; фиксированный размер
+      minimum-idle: 10                # = maximum: не тратить время на открытие под нагрузкой
+      connection-timeout: 3000        # ждать соединения из пула не дольше 3 с → быстрый отказ, а не зависание
+      max-lifetime: 1800000           # меньше таймаутов на сетевых устройствах/PgBouncer
+      idle-timeout: 600000
+      leak-detection-threshold: 20000 # предупреждение в лог, если соединение держат > 20 с — ищет утечки и долгие транзакции
+      data-source-properties:
+        reWriteBatchedInserts: true
+        ApplicationName: order-service   # видно в pg_stat_activity
+  jpa:
+    open-in-view: false               # не держать соединение на всё время рендеринга HTTP-ответа</code></pre>
+<div class="callout warn"><span class="c-title">spring.jpa.open-in-view</span>
+По умолчанию в Spring Boot включён: EntityManager (и соединение после первого обращения к базе) живёт до конца HTTP-запроса, включая сериализацию JSON и вызовы других сервисов. Это незаметно удлиняет время удержания соединения в разы. Выключайте и загружайте нужные данные явно.
+</div>
+
+<h2 id="pgbouncer"><span class="h-num">16.4</span>PgBouncer: пул перед базой</h2>
+<p>Когда экземпляров приложения много (десятки подов, serverless), даже маленькие пулы складываются в тысячи соединений. PgBouncer принимает тысячи клиентских соединений и мультиплексирует их на десятки серверных.</p>
+<div class="table-wrap"><table>
+<tr><th>Режим</th><th>Серверное соединение выдаётся на</th><th>Ограничения</th></tr>
+<tr><td><code>session</code></td><td>всё клиентское соединение</td><td>нет, но и выигрыша почти нет — только лимит</td></tr>
+<tr><td><code>transaction</code></td><td>одну транзакцию</td><td>нельзя полагаться на состояние сессии между транзакциями: <code>SET</code> (используйте <code>SET LOCAL</code>), временные таблицы, сессионные advisory-блокировки, <code>LISTEN</code>; подготовленные выражения — с PgBouncer 1.21+ (<code>max_prepared_statements</code>), иначе <code>prepareThreshold=0</code> в JDBC</td></tr>
+<tr><td><code>statement</code></td><td>одну команду</td><td>многооператорные транзакции запрещены</td></tr>
+</table></div>
+<pre data-title="pgbouncer.ini — основное"><code class="txt">[databases]
+app = host=10.0.0.5 port=5432 dbname=app
+
+[pgbouncer]
+listen_port = 6432
+pool_mode = transaction
+max_client_conn = 5000        ; клиентов
+default_pool_size = 40        ; серверных соединений на пару (база, пользователь)
+reserve_pool_size = 10
+max_prepared_statements = 200 ; 1.21+: поддержка подготовленных выражений в transaction mode
+server_idle_timeout = 600</code></pre>
+
+<h2 id="timeouts"><span class="h-num">16.5</span>Таймауты: защита от каскадов</h2>
+<div class="table-wrap"><table>
+<tr><th>Параметр</th><th>Защищает от</th><th>Типичное значение</th></tr>
+<tr><td><code>statement_timeout</code></td><td>бесконечных запросов, занимающих соединения</td><td>OLTP-роль: 5–30 с; отчёты — отдельная роль</td></tr>
+<tr><td><code>lock_timeout</code></td><td>очередей блокировок (тема 13)</td><td>миграции: 2–5 с</td></tr>
+<tr><td><code>idle_in_transaction_session_timeout</code></td><td>забытых транзакций (горизонт, блокировки)</td><td>30–120 с</td></tr>
+<tr><td><code>transaction_timeout</code> (PG 17+)</td><td>слишком долгих транзакций целиком</td><td>по ситуации</td></tr>
+<tr><td>HikariCP <code>connection-timeout</code></td><td>бесконечного ожидания пула</td><td>1–5 с</td></tr>
+<tr><td>JDBC <code>socketTimeout</code></td><td>зависания на мёртвом сервере после failover</td><td>больше statement_timeout</td></tr>
+</table></div>
+<pre data-title="таймауты на роль — не зависят от кода"><code class="sql">ALTER ROLE app_rw SET statement_timeout = '15s';
+ALTER ROLE app_rw SET idle_in_transaction_session_timeout = '60s';
+ALTER ROLE reporting SET statement_timeout = '10min';</code></pre>
+
+<h2 id="config"><span class="h-num">16.6</span>postgresql.conf: с чего начать</h2>
+<div class="widget" id="cfW">
+  <div class="widget-title">Стартовые значения для выделенного сервера</div>
+  <div class="controls">
+    <label>ОЗУ, ГБ<input type="number" id="cfM" value="64" min="1"></label>
+    <label>ядер<input type="number" id="cfC" value="16" min="1"></label>
+    <label>диск<select id="cfD"><option value="ssd">SSD/NVMe</option><option value="hdd">HDD</option><option value="net">сетевой (облако)</option></select></label>
+    <label>нагрузка<select id="cfT"><option value="oltp">OLTP</option><option value="dw">аналитика</option></select></label>
+    <label>max_connections<input type="number" id="cfN" value="200" min="10"></label>
+  </div>
+  <pre><code class="txt" id="cfOut"></code></pre>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function mb(x) { return x >= 1024 ? Math.round(x / 1024) + "GB" : Math.max(1, Math.round(x)) + "MB"; }
+  function run() {
+    var m = Math.max(1, +$("cfM").value) * 1024, c = Math.max(1, +$("cfC").value), d = $("cfD").value, t = $("cfT").value, n = Math.max(10, +$("cfN").value);
+    var sb = m * 0.25, ec = m * 0.75, wm = (m - sb) * (t === "oltp" ? 0.25 : 0.5) / (n * (t === "oltp" ? 3 : 1)), mw = Math.min(2048, m * 0.05);
+    $("cfOut").textContent = [
+      "max_connections = " + n + "                # за ним — пул; не тысячи",
+      "shared_buffers = " + mb(sb) + "             # ~25% ОЗУ",
+      "effective_cache_size = " + mb(ec) + "       # ~75%: подсказка планировщику, память не выделяет",
+      "work_mem = " + mb(wm) + "                   # на КАЖДУЮ сортировку/хэш в каждом запросе",
+      "maintenance_work_mem = " + mb(mw) + "       # VACUUM, CREATE INDEX",
+      "random_page_cost = " + (d === "hdd" ? "4.0" : d === "net" ? "1.5" : "1.1"),
+      "effective_io_concurrency = " + (d === "hdd" ? 2 : 200),
+      "max_wal_size = " + (t === "oltp" ? "8GB" : "16GB") + "\ncheckpoint_timeout = 15min\ncheckpoint_completion_target = 0.9",
+      "max_worker_processes = " + c + "\nmax_parallel_workers = " + c + "\nmax_parallel_workers_per_gather = " + (t === "oltp" ? Math.min(2, c) : Math.max(2, Math.floor(c / 2))),
+      "wal_compression = lz4\nhuge_pages = try",
+      "shared_preload_libraries = 'pg_stat_statements,auto_explain'\nauto_explain.log_min_duration = '1s'\nlog_min_duration_statement = '500ms'\nlog_lock_waits = on\nlog_temp_files = 0\nlog_autovacuum_min_duration = '10s'"
+    ].join("\n");
+  }
+  ["cfM", "cfC", "cfD", "cfT", "cfN"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">work_mem умножается</span>
+Один сложный запрос может использовать несколько work_mem (по одному на каждую сортировку и хэш, на каждого параллельного воркера). 200 соединений × 3 узла × 64 МБ = 38 ГБ в худшем случае. Ставьте умеренное значение глобально и повышайте точечно: <code>SET LOCAL work_mem = '256MB'</code> в транзакции отчёта.
+</div>
+
+<h2 id="quiz"><span class="h-num">16.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>При росте нагрузки запросы стали медленными, и разработчик увеличил пул со 20 до 200 на каждом из 10 экземпляров. Что вероятнее всего произойдёт?</p><ul><li>Пропускная способность вырастет в 10 раз</li><li>Ничего не изменится</li><li>База получит до 2000 одновременных запросов на десятки ядер: конкуренция, рост задержек и, возможно, нехватка памяти</li><li>Запросы станут быстрее за счёт кэша</li></ul><div class="why">Очередь должна быть в пуле, а не внутри СУБД.</div></div>
+<div class="mcq" data-ok="0"><p>Что сломается при PgBouncer в режиме transaction?</p><ul><li><code>SET search_path</code> в начале сессии и сессионные advisory-блокировки</li><li>Обычные транзакции</li><li>Внешние ключи</li><li>Индексы</li></ul><div class="why">Каждая транзакция может попасть на другое серверное соединение.</div></div>
+<div class="mcq" data-ok="3"><p>Сервис выполняет 1000 транзакций/с, каждая держит соединение 20 мс. Сколько соединений занято в среднем?</p><ul><li>1000</li><li>50</li><li>2</li><li>20</li></ul><div class="why">L = λW = 1000 × 0.02 = 20.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем выключать <code>spring.jpa.open-in-view</code>?</p><ul><li>Он запрещает транзакции</li><li>Соединение и EntityManager живут до конца HTTP-запроса, удлиняя время удержания соединения и скрывая ленивые загрузки</li><li>Он отключает кэш</li><li>Он мешает миграциям</li></ul><div class="why">Spring Boot даже пишет предупреждение при старте, если настройка не задана явно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>В приложении ошибки «Connection is not available, request timed out after 30000ms». Ваши действия?</summary><div class="a"><p>Это исчерпание пула. Смотреть: сколько соединений активно и что они делают (pg_stat_activity по ApplicationName: idle in transaction? ожидание блокировок? долгие запросы?); включить leakDetectionThreshold для поиска мест, где соединение держат долго или не возвращают; проверить внешние вызовы внутри @Transactional и open-in-view; затем уже оптимизировать запросы. Увеличение пула — последнее средство и только если база недогружена.</p></div></details>
+<details class="q"><summary>Когда нужен PgBouncer, если в приложении уже есть HikariCP?</summary><div class="a"><p>Когда суммарное число соединений от всех экземпляров слишком велико для базы: много подов, автоскейлинг, serverless-функции, много микросервисов на одну базу. PgBouncer в transaction mode сводит тысячи клиентских соединений к десяткам серверных. Также полезен при частых переподключениях и для мягкого переключения (PAUSE/RESUME) при обслуживании.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

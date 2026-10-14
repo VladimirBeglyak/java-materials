@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · WAL и долговечность</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ТРАНЗАКЦИИ И КОНКУРЕНТНОСТЬ</div>
+  <h1>WAL и долговечность</h1>
+  <p class="lead">Буква D в ACID: после «COMMIT OK» данные переживут выключение питания. Как это достигается одним последовательным журналом, что происходит при восстановлении после сбоя, зачем контрольные точки и как настройки <code>synchronous_commit</code> и <code>fsync</code> меняют гарантии на скорость.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">WAL</span><span class="tag">fsync</span><span class="tag">checkpoint</span><span class="tag">crash recovery</span><span class="tag">full page writes</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="problem"><span class="h-num">10.1</span>Задача: быстро и надёжно</h2>
+<p>Транзакция может изменить десятки страниц в разных местах файлов. Записывать их все на диск при каждом COMMIT — десятки случайных записей и <code>fsync</code>: медленно. Не записывать — потеря данных при сбое. Решение — <b>журнал предзаписи (Write-Ahead Log)</b>:</p>
+<ol>
+  <li>Любое изменение страницы сначала описывается записью в журнале (последовательный файл).</li>
+  <li>При COMMIT на диск принудительно сбрасывается <b>только журнал</b> до записи о коммите — одна последовательная запись.</li>
+  <li>Изменённые страницы данных пишутся позже, в фоне, пачками.</li>
+  <li>Правило WAL: страница данных не может попасть на диск раньше, чем журнал с её изменениями (каждая страница хранит LSN последней записи журнала, менеджер буферов это проверяет).</li>
+</ol>
+<p>LSN (Log Sequence Number) — позиция в журнале, растущее 64-битное число вида <code>0/3A2F1A0</code>. Им измеряется всё: отставание реплик, положение контрольной точки, объём сгенерированного WAL.</p>
+
+<h2 id="recovery"><span class="h-num">10.2</span>Сбой и восстановление</h2>
+<div class="widget stepper" id="crSim">
+  <div class="widget-title">Симулятор: выключили питание — что с данными?</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Память (shared buffers)</h5><div class="items"><span class="chip" id="crP1">стр. 7: баланс A = 100</span><span class="chip" id="crP2">стр. 31: баланс B = 50</span></div></div>
+    <div class="lane"><h5>WAL на диске</h5><div class="items"><span class="chip" id="crCk">CHECKPOINT @0/100</span><span class="chip off" id="crW1">T1: стр.7 A=70</span><span class="chip off" id="crW2">T1: стр.31 B=80</span><span class="chip off" id="crW3">T1 COMMIT</span><span class="chip off" id="crW4">T2: стр.7 A=0</span></div></div>
+    <div class="lane"><h5>Файлы данных</h5><div class="items"><span class="chip" id="crD1">стр. 7: A = 100</span><span class="chip" id="crD2">стр. 31: B = 50</span></div></div>
+  </div>
+  <section class="st-step" data-t="Исходное состояние" data-hl="crCk crD1 crD2" data-log="checkpoint на LSN 0/100: всё, что было до него, уже в файлах данных"><p>Последняя контрольная точка на LSN 0/100: все изменения до неё записаны в файлы данных. Счета: A = 100, B = 50.</p></section>
+  <section class="st-step" data-t="T1: перевод 30" data-hl="crP1 crP2 crW1 crW2" data-log="T1: UPDATE A, UPDATE B → страницы 7 и 31 грязные в памяти; записи WAL в буфере"><p>T1 переводит 30 с A на B. Страницы в памяти изменены (A = 70, B = 80) и помечены грязными. Записи журнала добавлены в буфер WAL — возможно, уже на диске, возможно, нет: до COMMIT это неважно.</p></section>
+  <section class="st-step" data-t="T1 COMMIT" data-hl="crW3" data-log="T1 COMMIT: WAL сброшен (fsync) до записи commit → клиенту «OK». Файлы данных НЕ менялись"><p>При COMMIT журнал сбрасывается на диск вместе с записью о фиксации, и только потом клиент получает OK. Файлы данных по-прежнему содержат A = 100, B = 50.</p></section>
+  <section class="st-step" data-t="T2 начата, не завершена" data-hl="crW4" data-log="T2: UPDATE A = 0 — запись WAL попала на диск (фоновый сброс), COMMIT не было"><p>T2 начала обнулять A, её запись журнала даже успела попасть на диск (walwriter сбрасывает буфер в фоне), но COMMIT не было.</p></section>
+  <section class="st-step" data-t="Сбой питания" data-hl="crD1 crD2" data-log="💥 power loss: память потеряна. Диск: файлы данных (A=100, B=50) + WAL до T2 включительно"><p>Память потеряна полностью. На диске — устаревшие страницы данных и журнал. Без журнала перевод T1 был бы потерян, хотя клиенту сказали OK.</p></section>
+  <section class="st-step" data-t="Redo: повтор журнала" data-hl="crCk crW1 crW2 crW3 crW4" data-log="recovery: redo с LSN 0/100 → применены все записи WAL (T1 и T2), сравнивая LSN страниц"><p>При старте PostgreSQL видит, что остановка была аварийной, и проигрывает журнал от последней контрольной точки: каждая запись применяется к странице, если LSN страницы меньше LSN записи. Повторяются <b>все</b> записи, включая незавершённую T2.</p></section>
+  <section class="st-step" data-t="Результат" data-hl="crP1 crP2" data-log="результат: A=70, B=80 (T1 есть); T2 не зафиксирована → её версии невидимы (MVCC), undo не нужен"><p>T1 восстановлена: A = 70, B = 80. Изменения T2 физически применены, но T2 не зафиксирована — по правилам видимости MVCC (тема 11) её версии строк никто не увидит, их уберёт VACUUM. Поэтому PostgreSQL не нужна фаза отката (undo), в отличие от InnoDB и классического алгоритма ARIES.</p></section>
+</div>
+
+<h2 id="checkpoint"><span class="h-num">10.3</span>Контрольные точки и full page writes</h2>
+<p>Контрольная точка ограничивает, сколько журнала проигрывать при восстановлении: она сбрасывает все грязные страницы и отмечает в журнале «до этой точки всё на диске». Запускается по времени <code>checkpoint_timeout</code> (по умолчанию 5 мин) или по объёму WAL <code>max_wal_size</code> (1 ГБ).</p>
+<div class="callout warn"><span class="c-title">Full page writes</span>
+Страница 8 КБ, а диск гарантирует атомарность записи блоками 4 КБ или 512 байт. Сбой в середине записи оставит «разорванную» страницу, которую журналом не починить. Поэтому при <b>первом</b> изменении страницы после каждой контрольной точки в WAL пишется её полный образ. Следствие: сразу после checkpoint объём WAL резко растёт, особенно при случайных обновлениях по большой таблице (снова случайные UUID).
+</div>
+<div class="widget" id="ckpW">
+  <div class="widget-title">Частота контрольных точек: компромисс</div>
+  <div class="controls">
+    <label>checkpoint_timeout, мин<select id="ckT"><option>1</option><option selected>5</option><option>15</option><option>30</option><option>60</option></select></label>
+    <label>изменяемых страниц/с<input type="number" id="ckR" value="2000" min="1"></label>
+    <label>«горячих» страниц, тыс.<input type="number" id="ckH" value="200" min="1"></label>
+  </div>
+  <div class="out" id="ckOut"></div>
+  <div class="verdict" id="ckV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var t = +$("ckT").value * 60, r = Math.max(1, +$("ckR").value), h = Math.max(1, +$("ckH").value) * 1000;
+    var changes = r * t, distinct = h * (1 - Math.exp(-changes / h)), fpw = distinct * 8 / 1024, rec = changes * 0.2 / 1024 + fpw;
+    var recTime = rec / 200;
+    $("ckOut").textContent = "изменений страниц за интервал: " + changes.toLocaleString("ru") + "\nиз них первых изменений (полные образы в WAL): " + Math.round(distinct).toLocaleString("ru") +
+      "\nWAL за интервал ≈ " + Math.round(rec).toLocaleString("ru") + " МБ, из них полные образы ≈ " + Math.round(fpw).toLocaleString("ru") + " МБ (" + Math.round(fpw / rec * 100) + "%)" +
+      "\nWAL в час ≈ " + Math.round(rec * 3600 / t / 1024).toLocaleString("ru") + " ГБ" +
+      "\nвосстановление после сбоя ≈ до " + Math.max(1, Math.round(recTime)) + " с (проиграть WAL одного интервала при ~200 МБ/с)";
+    var v = $("ckV");
+    if (t <= 60) { v.className = "verdict bad"; v.textContent = "Слишком частые контрольные точки: много полных образов страниц, постоянная фоновая запись. Восстановление быстрое, но цена — объём WAL и нагрузка на диск."; }
+    else if (t >= 1800) { v.className = "verdict warn"; v.textContent = "Редкие контрольные точки экономят WAL, но восстановление после сбоя дольше, а для pg_wal нужно больше места (max_wal_size)."; }
+    else { v.className = "verdict ok"; v.textContent = "Разумный баланс. Типичная настройка нагруженных систем: checkpoint_timeout 15 мин, max_wal_size, достаточный, чтобы точки шли по времени, checkpoint_completion_target 0.9 (размазать запись)."; }
+  }
+  ["ckT", "ckR", "ckH"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<pre data-title="частые контрольные точки по объёму — признак маленького max_wal_size"><code class="sql">SELECT num_timed, num_requested, write_time, sync_time, buffers_written
+FROM pg_stat_checkpointer;   -- PostgreSQL 17+; раньше — pg_stat_bgwriter
+-- num_requested &gt;&gt; num_timed → увеличьте max_wal_size
+-- в журнале: "checkpoints are occurring too frequently"</code></pre>
+
+<h2 id="sync"><span class="h-num">10.4</span>Ручки долговечности</h2>
+<div class="widget" id="scW2">
+  <div class="widget-title">synchronous_commit и fsync: что вы теряете при сбое</div>
+  <div class="controls"><label>настройка<select id="sc2" class="wide">
+    <option value="on">synchronous_commit = on (по умолчанию)</option>
+    <option value="off">synchronous_commit = off</option>
+    <option value="remote_apply">synchronous_commit = remote_apply + синхронная реплика</option>
+    <option value="fsyncoff">fsync = off</option>
+    <option value="unlogged">UNLOGGED TABLE</option>
+  </select></label></div>
+  <div class="verdict" id="sc2V"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    on: ["ok", "COMMIT ждёт сброса WAL на локальный диск. Сбой ОС/питания — ничего зафиксированного не теряется. Задержка коммита = время fsync (0.1–2 мс на SSD с защитой от потери питания, больше на сетевых дисках)."],
+    off: ["warn", "COMMIT возвращается сразу, WAL сбрасывается в фоне (до 3 × wal_writer_delay ≈ 600 мс). При сбое теряются последние доли секунды подтверждённых транзакций, но база остаётся целостной. Можно включать на уровне транзакции: SET LOCAL synchronous_commit = off — для логов, метрик, некритичных событий."],
+    remote_apply: ["ok", "COMMIT ждёт, пока синхронная реплика получит, запишет и применит WAL: данные переживут потерю всего сервера, и чтение с реплики сразу увидит коммит. Цена — сетевая задержка в каждом коммите и остановка записи, если реплика недоступна (нужно 2+ кандидата)."],
+    fsyncoff: ["bad", "Никогда в продакшене. База не ждёт записи на диск вообще — после сбоя ОС или питания файлы могут оказаться в несогласованном состоянии, и база не восстановится. Допустимо только для одноразовых тестовых окружений и начальной загрузки, которую можно повторить."],
+    unlogged: ["warn", "Таблица не пишется в WAL: запись в разы быстрее, но после аварийного перезапуска таблица очищается, и она не реплицируется. Подходит для промежуточных данных ETL, кэшей, которые можно пересоздать."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("sc2").value]; $("sc2V").className = "verdict " + d[0]; $("sc2V").textContent = d[1]; }
+  $("sc2").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout bad"><span class="c-title">Диск, который врёт</span>
+Гарантия держится на том, что <code>fsync</code> действительно доводит данные до энергонезависимого носителя. Потребительские SSD с кэшем записи без конденсаторов и некоторые виртуальные диски подтверждают запись раньше — тогда потеря данных возможна при любых настройках. Проверка: <code>pg_test_fsync</code> (нереально быстрый fsync — подозрительно).
+</div>
+
+<h2 id="wal-uses"><span class="h-num">10.5</span>Журнал — основа всего остального</h2>
+<div class="grid-3">
+  <div class="card"><h4>Репликация</h4><p>Реплики получают тот же поток WAL и проигрывают его — физическая репликация (тема 15).</p></div>
+  <div class="card"><h4>PITR</h4><p>Базовая копия + архив WAL = восстановление на любую секунду (тема 19).</p></div>
+  <div class="card"><h4>Логическое декодирование</h4><p>WAL раскладывается в события INSERT/UPDATE/DELETE — основа CDC (Debezium) и логической репликации.</p></div>
+</div>
+<pre data-title="сколько WAL пишет запрос и база"><code class="sql">EXPLAIN (ANALYZE, WAL) UPDATE orders SET status = 'paid' WHERE id = 105;
+--   WAL: records=3 fpi=1 bytes=8410        ← fpi: полный образ страницы
+
+SELECT pg_current_wal_lsn(),
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')) AS total_wal;
+SELECT * FROM pg_stat_wal;   -- wal_records, wal_fpi, wal_bytes, wal_buffers_full</code></pre>
+
+<h2 id="quiz"><span class="h-num">10.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что гарантированно оказывается на диске к моменту ответа «COMMIT» при настройках по умолчанию?</p><ul><li>Все изменённые страницы таблиц и индексов</li><li>Записи WAL транзакции, включая запись о фиксации</li><li>Ничего, всё в памяти</li><li>Только страницы индексов</li></ul><div class="why">Страницы данных можно восстановить по журналу, поэтому их запись откладывается.</div></div>
+<div class="mcq" data-ok="3"><p>Зачем в WAL пишутся полные образы страниц после контрольной точки?</p><ul><li>Для сжатия</li><li>Для логической репликации</li><li>Чтобы ускорить чтение</li><li>Чтобы восстановить страницу, разорванную частичной записью при сбое</li></ul><div class="why">Журнальная запись описывает изменение, а не страницу целиком — к испорченной странице её не применить.</div></div>
+<div class="mcq" data-ok="0"><p>Что потеряется при сбое сервера с <code>synchronous_commit = off</code>?</p><ul><li>Последние доли секунды подтверждённых транзакций; целостность базы сохранится</li><li>Вся база станет повреждённой</li><li>Ничего</li><li>Только незафиксированные транзакции</li></ul><div class="why">В отличие от fsync = off, это безопасная для целостности настройка с ограниченным окном потерь.</div></div>
+<div class="mcq" data-ok="2"><p>Почему PostgreSQL не нужна фаза undo при восстановлении?</p><ul><li>Он не пишет незавершённые транзакции в WAL</li><li>Он откатывает транзакции при каждой контрольной точке</li><li>Версии строк незафиксированных транзакций невидимы по правилам MVCC, а мусор потом убирает VACUUM</li><li>Он хранит undo в отдельном файле</li></ul><div class="why">Статус транзакции хранится отдельно (pg_xact); незафиксированная после сбоя считается прерванной.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните, как СУБД обеспечивает долговечность коммита, не записывая все изменённые страницы при каждом COMMIT.</summary><div class="a"><p>Журнал предзаписи: изменения описываются в последовательном журнале; при COMMIT журнал сбрасывается на диск (fsync), что дёшево — последовательная запись, объединяемая для параллельных коммитов (group commit). Страницы данных пишутся позже фоновыми процессами. Правило WAL гарантирует, что страница не попадёт на диск раньше своего журнала. После сбоя журнал проигрывается от последней контрольной точки.</p></div></details>
+<details class="q"><summary>Как снизить задержку коммита, если часть данных некритична?</summary><div class="a"><p>Для некритичных транзакций — <code>SET LOCAL synchronous_commit = off</code>: окно потери ограничено долями секунды, целостность сохраняется. Объединять мелкие транзакции в более крупные (батчи). Для пересоздаваемых данных — UNLOGGED-таблицы. Для критичных — быстрые диски с защитой от потери питания и отдельный том под pg_wal.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

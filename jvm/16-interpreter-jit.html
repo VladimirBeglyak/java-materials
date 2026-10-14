@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Интерпретатор и JIT: tiered compilation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ИСПОЛНЕНИЕ</div>
+  <h1>Интерпретатор и JIT: tiered compilation</h1>
+  <p class="lead">HotSpot начинает с интерпретации, считает вызовы и итерации циклов и компилирует горячие методы дважды: быстро и без особых оптимизаций (C1), а затем, собрав профиль, — агрессивно (C2). Отсюда «прогрев»: первые запросы после старта в разы медленнее. Разбираем пять уровней компиляции, пороги, OSR, очередь компиляции, вывод <code>-XX:+PrintCompilation</code> и что делать с прогревом.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">уровни 0–4</span><span class="tag">C1 и C2</span><span class="tag">профилирование</span><span class="tag">OSR</span><span class="tag">PrintCompilation</span><span class="tag">прогрев</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">16.1</span>Зачем компилировать во время работы</h2>
+<div class="grid-2">
+  <div class="card"><h4>Против AOT</h4><p>JIT видит <b>реальный профиль</b>: какие ветки выполняются, какие классы приходят в виртуальный вызов, какие методы горячие. Он может делать спекулятивные оптимизации («здесь всегда ArrayList») и откатывать их, если предположение нарушится (деоптимизация, тема 17).</p></div>
+  <div class="card"><h4>Цена</h4><p>Время старта и прогрева, CPU на компиляцию (потоки C1/C2), память под code cache и профили, непредсказуемость производительности первых минут.</p></div>
+</div>
+
+<h2 id="tiers"><span class="h-num">16.2</span>Пять уровней</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Что</th><th>Скорость кода</th></tr>
+<tr><td><b>0</b></td><td>интерпретатор (с базовым профилированием)</td><td>1× (очень медленно)</td></tr>
+<tr><td><b>1</b></td><td>C1 без профилирования — для тривиальных методов (геттеры), которым C2 ничего не добавит</td><td>~ максимум для таких методов</td></tr>
+<tr><td><b>2</b></td><td>C1 с ограниченным профилированием (счётчики вызовов и циклов) — когда очередь C2 перегружена</td><td>быстро</td></tr>
+<tr><td><b>3</b></td><td>C1 с полным профилированием (типы получателей, ветки, null) — основная ступень</td><td>быстро, но ~30% накладных на профиль</td></tr>
+<tr><td><b>4</b></td><td>C2: агрессивные оптимизации по профилю</td><td>максимум (в 10–50 раз быстрее интерпретатора)</td></tr>
+</table></div>
+<p>Типичный путь: <b>0 → 3 → 4</b>. Метод интерпретируется, после ~200 вызовов (или ~2000 вызовов+итераций) компилируется C1 с профилированием, после ~5000 вызовов (~15000 с итерациями) — C2. Пороги масштабируются при загруженности очереди компиляции.</p>
+
+<div class="widget" id="tiW">
+  <div class="widget-title">Симулятор многоуровневой компиляции</div>
+  <div class="controls">
+    <label>вызовов метода в секунду<input type="number" id="tiR" value="300" min="1"></label>
+    <label>итераций цикла внутри метода<input type="number" id="tiL" value="10" min="0"></label>
+    <label>очередь C2<select id="tiQ"><option value="0">свободна</option><option value="1">загружена (старт Spring)</option></select></label>
+    <button class="btn primary" type="button" id="tiS">▶ 1 секунда</button>
+    <button class="btn" type="button" id="tiX">↺</button>
+  </div>
+  <div class="rows" id="tiRows"></div>
+  <div class="log" id="tiLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, t, inv, back, tier, log, pending;
+  var SPEED = { 0: 1, 2: 12, 3: 9, 4: 30 };
+  function reset() { t = 0; inv = 0; back = 0; tier = 0; pending = null; log = ["t=0: метод исполняется интерпретатором (уровень 0)"]; draw(); }
+  function sec() {
+    t++; var r = Math.max(1, +$("tiR").value), l = Math.max(0, +$("tiL").value), busy = $("tiQ").value === "1";
+    inv += r; back += r * l;
+    if (pending && t >= pending[1]) { tier = pending[0]; log.push("t=" + t + "с: компиляция завершена → код уровня " + tier + " установлен; новые вызовы идут в него"); pending = null; }
+    if (!pending) {
+      if (tier === 0 && (inv > 200 && inv + back > 2000 || back > 60000)) {
+        if (back > 60000 && inv < 200) log.push("t=" + t + "с: счётчик итераций цикла перешёл порог → OSR-компиляция C1: замена кадра прямо посреди цикла");
+        var lvl = busy ? 2 : 3; pending = [lvl, t + 1]; log.push("t=" + t + "с: вызовов " + inv + ", итераций " + back + " → в очередь C1 на уровень " + lvl + (busy ? " (C2 перегружен — профилируем меньше)" : ""));
+      } else if ((tier === 3 || tier === 2) && (inv > 5000 && inv + back > 15000)) {
+        if (tier === 2) { pending = [3, t + 1]; log.push("t=" + t + "с: очередь C2 разгрузилась → перекомпиляция на уровень 3 для сбора полного профиля"); }
+        else { pending = [4, t + (busy ? 4 : 2)]; log.push("t=" + t + "с: профиль собран (вызовов " + inv + ") → в очередь C2 (уровень 4)" + (busy ? ", очередь длинная — ждём" : "")); }
+      }
+    }
+    draw();
+  }
+  function draw() {
+    var lv = [[0, "интерпретатор"], [2, "C1 ограниченный профиль"], [3, "C1 + полный профиль"], [4, "C2"]];
+    $("tiRows").innerHTML = lv.map(function (x) { var on = tier === x[0]; return '<div class="row' + (on ? " win" : "") + '"><span>' + x[0] + "</span><span>" + x[1] + (pending && pending[0] === x[0] ? " <small>(компилируется…)</small>" : "") + '</span><span style="font-family:var(--font-mono);text-align:right">×' + SPEED[x[0]] + "</span></div>"; }).join("") +
+      '<div class="hint">t = ' + t + " с · счётчик вызовов " + inv.toLocaleString("ru") + " · счётчик обратных переходов " + back.toLocaleString("ru") + "</div>";
+    $("tiLog").textContent = log.slice(-8).join("\n"); $("tiLog").scrollTop = 1e6;
+  }
+  $("tiS").addEventListener("click", sec); $("tiX").addEventListener("click", reset);
+  ["tiR", "tiL", "tiQ"].forEach(function (i) { $(i).addEventListener("change", reset); });
+  reset();
+})();
+</script>
+
+<h2 id="osr"><span class="h-num">16.3</span>OSR: компиляция посреди цикла</h2>
+<p>Метод <code>main</code> с циклом на миллиард итераций вызывается один раз — счётчик вызовов не поможет. Поэтому есть счётчик <b>обратных переходов</b> (backedge): когда он превышает порог, метод компилируется в специальной версии с точкой входа на заголовке цикла, и JVM <b>заменяет кадр интерпретатора</b> на кадр скомпилированного кода прямо в процессе выполнения (On-Stack Replacement). В <code>PrintCompilation</code> такие компиляции отмечены <code>%</code> и номером байткода цикла. Вывод для микробенчмарков: код, измеряемый в одном длинном цикле <code>main</code>, работает не так, как тот же код, вызываемый многократно, — используйте JMH.</p>
+
+<h2 id="print"><span class="h-num">16.4</span>Читаем -XX:+PrintCompilation</h2>
+<div class="widget" id="pcW">
+  <div class="widget-title">Расшифровка строки</div>
+  <div class="controls"><label>строка<select id="pcS" class="wide">
+    <option value="0">обычная компиляция C1</option><option value="1">C2</option><option value="2">OSR</option><option value="3">made not entrant</option><option value="4">нативный метод</option><option value="5">intrinsic / синхронизированный</option>
+  </select></label></div>
+  <pre style="margin:0"><code class="txt" id="pcL"></code></pre>
+  <div class="verdict" id="pcV"></div>
+</div>
+<script>
+(function () {
+  var D = [
+    ["   1843  412       3       com.shop.OrderService::total (41 bytes)", "Время от старта 1843 мс, id компиляции 412, уровень 3 (C1 с профилем), метод и размер байткода 41 байт."],
+    ["   5210  988       4       com.shop.OrderService::total (41 bytes)", "Тот же метод через 5,2 с перекомпилирован C2 (уровень 4). Версия уровня 3 скоро будет помечена «made not entrant»."],
+    ["   2950  601 %     3       com.shop.Batch::run @ 17 (120 bytes)", "% — OSR-компиляция; @ 17 — индекс байткода заголовка цикла, с которого произойдёт вход в скомпилированный код."],
+    ["   5214  412       3       com.shop.OrderService::total (41 bytes)   made not entrant", "Старая версия больше не используется для новых вызовов (появилась лучшая или нарушилось предположение — деоптимизация). Вызовы, уже выполняющиеся в ней, доработают; позже код будет удалён из code cache (made zombie / освобождён)."],
+    ["   1200  305     n 0       java.lang.Object::hashCode (native)", "n — обёртка для нативного метода."],
+    ["   3100  702  s    4       java.lang.StringBuffer::append (13 bytes)\n   3102  703   !   3       com.shop.Parser::parse (380 bytes)", "s — synchronized-метод; ! — метод с обработчиками исключений. Ещё бывает b — блокирующая компиляция (-Xbatch), % — OSR."]
+  ];
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[+$("pcS").value]; $("pcL").textContent = d[0]; $("pcV").textContent = d[1]; }
+  $("pcS").addEventListener("change", run); run();
+})();
+</script>
+<pre data-title="полезные флаги"><code class="txt">-XX:+PrintCompilation                                   # каждая компиляция
+-XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining       # решения о встраивании (тема 17)
+-XX:+UnlockDiagnosticVMOptions -XX:+LogCompilation      # подробный XML → JITWatch
+jcmd &lt;pid&gt; Compiler.queue                               # что ждёт компиляции
+jcmd &lt;pid&gt; Compiler.codecache                           # заполненность code cache
+-XX:TieredStopAtLevel=1                                 # только C1: быстрее старт, медленнее пик (CLI-утилиты, тесты)</code></pre>
+
+<h2 id="warmup"><span class="h-num">16.5</span>Прогрев и что с ним делать</h2>
+<div class="table-wrap"><table>
+<tr><th>Подход</th><th>Эффект</th></tr>
+<tr><td>Прогревающий трафик перед вводом в балансировщик (readiness после прогрева)</td><td>первые реальные запросы уже на C2-коде</td></tr>
+<tr><td>Плавное увеличение веса нового пода (slow start в балансировщике/Envoy)</td><td>JIT успевает без всплеска задержек</td></tr>
+<tr><td>CDS / AOT cache (Java 24+: JEP 483, 515 — профили и загруженные классы с тренировочного запуска)</td><td>быстрее старт и прогрев (тема 20)</td></tr>
+<tr><td>CRaC — снимок прогретого процесса</td><td>мгновенный старт уже прогретого приложения (тема 20)</td></tr>
+<tr><td>GraalVM Native Image</td><td>нет прогрева совсем, но и пикового JIT-профиля нет (PGO частично компенсирует)</td></tr>
+<tr><td>Больше CPU на старте (не урезать лимит CPU пода до 0,5 на прогреве)</td><td>потоки C1/C2 успевают</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Graal JIT</span>
+Компилятор Graal (на Java) может заменить C2 (<code>-XX:+UseGraalJIT</code> в GraalVM / Oracle GraalVM). Сильнее в частичном escape analysis и оптимизациях потоков данных (стримы, лямбды); проект интеграции Graal в OpenJDK развивается в рамках проекта Galahad.
+</div>
+
+<h2 id="quiz"><span class="h-num">16.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему метод сначала компилируется C1 с профилированием, а не сразу C2?</p><ul><li>C2 не умеет компилировать холодный код</li><li>C1 быстрее C2 на любом коде</li><li>C2 нужен профиль (типы, ветки) для спекулятивных оптимизаций, а C1-код с профилем быстро даёт и скорость, и данные</li><li>Так требует спецификация</li></ul><div class="why">Уровень 3 — компромисс скорости и сбора профиля.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое OSR?</p><ul><li>Замена кадра интерпретатора на кадр скомпилированного кода посреди долгого цикла</li><li>Оптимизация строк</li><li>Сборка мусора в старом поколении</li><li>Удаление скомпилированного кода</li></ul><div class="why">Метка % в PrintCompilation.</div></div>
+<div class="mcq" data-ok="3"><p>Почему первые запросы после деплоя медленные, хотя приложение «запустилось»?</p><ul><li>Медленная сеть</li><li>Пустой пул соединений — единственная причина</li><li>GC</li><li>Код ещё интерпретируется или работает на C1; плюс ленивая загрузка и инициализация классов, первые indy-связывания</li></ul><div class="why">Прогрев — сумма ленивых механизмов JVM.</div></div>
+<div class="mcq" data-ok="1"><p>Что значит «made not entrant» в выводе компиляции?</p><ul><li>Ошибка компиляции</li><li>Версия кода больше не используется для новых вызовов — заменена или деоптимизирована</li><li>Метод удалён из класса</li><li>Метод стал нативным</li></ul><div class="why">Код удалится из code cache, когда его перестанут исполнять.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как правильно измерять производительность Java-кода с учётом JIT?</summary><div class="a"><p>JMH: отдельный процесс (fork), итерации прогрева до стабильности, Blackhole против удаления мёртвого кода, защита от свёртки констант, несколько форков для разброса, профилировщики (-prof gc, -prof perfasm). Самописный цикл в main измеряет смесь интерпретатора, OSR и компиляции, а JIT может выбросить «бесполезный» код целиком.</p></div></details>
+<details class="q"><summary>Зачем ограничивать JIT уровнем C1 (TieredStopAtLevel=1)?</summary><div class="a"><p>Для короткоживущих процессов (CLI, сборка, тесты в CI): C2 не успеет окупиться, а его компиляции тратят CPU и память. C1 даёт быстрый старт и разумную скорость. Для долгоживущих серверов — нет: потеря пиковой производительности в разы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

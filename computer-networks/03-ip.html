@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · IP и маршрутизация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .calc-in { font: 15px var(--font-mono); padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 200px; }
+  .bits { font: 13px var(--font-mono); word-break: break-all; margin: 8px 0; }
+  .bits .n { color: var(--accent); font-weight: 600; } .bits .h { color: var(--info); }
+</style>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ФУНДАМЕНТ · РОАДМАП j6, m2, m3</div>
+  <h1>IP, подсети, маршрутизация</h1>
+  <p class="lead">IP доставляет пакет между хостами в разных сетях: адрес говорит «куда», таблица маршрутизации на каждом узле — «в какую сторону». Разберём адресацию с CIDR, как хост решает, отправить ли пакет напрямую или через шлюз, и как устроены traceroute и IPv6.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">калькулятор подсетей</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="header"><span class="h-num">3.1</span>Заголовок IPv4</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 250" role="img" aria-label="Заголовок IPv4">
+  <g font-size="12">
+    <text x="20" y="20" class="mono muted" font-size="11">0</text><text x="200" y="20" class="mono muted" font-size="11">8</text><text x="390" y="20" class="mono muted" font-size="11">16</text><text x="770" y="20" class="mono muted" font-size="11">31</text>
+    <rect x="20" y="28" width="90" height="34" class="box"/><text x="65" y="50" text-anchor="middle">Version=4</text>
+    <rect x="110" y="28" width="90" height="34" class="box"/><text x="155" y="50" text-anchor="middle">IHL</text>
+    <rect x="200" y="28" width="190" height="34" class="box"/><text x="295" y="50" text-anchor="middle">DSCP / ECN (QoS)</text>
+    <rect x="390" y="28" width="390" height="34" class="box"/><text x="585" y="50" text-anchor="middle">Total Length</text>
+    <rect x="20" y="62" width="370" height="34" class="box"/><text x="205" y="84" text-anchor="middle">Identification</text>
+    <rect x="390" y="62" width="110" height="34" class="box-warn"/><text x="445" y="84" text-anchor="middle">Flags (DF, MF)</text>
+    <rect x="500" y="62" width="280" height="34" class="box"/><text x="640" y="84" text-anchor="middle">Fragment Offset</text>
+    <rect x="20" y="96" width="180" height="34" class="box-acc"/><text x="110" y="118" text-anchor="middle">TTL</text>
+    <rect x="200" y="96" width="190" height="34" class="box-acc"/><text x="295" y="118" text-anchor="middle">Protocol (6/17/1)</text>
+    <rect x="390" y="96" width="390" height="34" class="box"/><text x="585" y="118" text-anchor="middle">Header Checksum</text>
+    <rect x="20" y="130" width="760" height="34" class="box-ok"/><text x="400" y="152" text-anchor="middle">Source Address (32 бита)</text>
+    <rect x="20" y="164" width="760" height="34" class="box-ok"/><text x="400" y="186" text-anchor="middle">Destination Address (32 бита)</text>
+  </g>
+  <text x="20" y="220" font-size="12.5" class="muted">Минимум 20 байт. Protocol: 6 — TCP, 17 — UDP, 1 — ICMP.</text><text x="20" y="240" font-size="12.5" class="muted">TTL уменьшается на каждом маршрутизаторе; на нуле пакет уничтожается.</text>
+</svg>
+</figure>
+
+<h2 id="cidr"><span class="h-num">3.2</span>Адресация и CIDR</h2>
+<p>IPv4-адрес — 32 бита, записанные четырьмя десятичными октетами: <code>192.168.1.37</code>. Адрес делится на <b>префикс сети</b> и <b>номер хоста</b>. Граница задаётся длиной префикса в нотации <b>CIDR</b>: <code>192.168.1.0/24</code> — первые 24 бита общие для сети, оставшиеся 8 нумеруют хосты (маска <code>255.255.255.0</code>).</p>
+<ul>
+  <li>Первый адрес подсети — <b>адрес сети</b>, последний — <b>широковещательный</b>; хостам доступно 2<sup>(32−префикс)</sup> − 2. В /31 (точка-точка) и /32 (один хост) правило не действует.</li>
+  <li>Классы A/B/C (до 1993) — историческое наследие: деление по фиксированным границам /8, /16, /24 расходовало адреса. CIDR и <b>VLSM</b> (подсети разной длины внутри одного блока) позволяют резать адресное пространство точно по потребности.</li>
+</ul>
+
+<div class="widget" id="cidrw">
+  <div class="widget-title">Калькулятор подсети</div>
+  <div class="controls">
+    <label>адрес/префикс <input class="calc-in" id="cIn" value="10.20.130.77/20"></label>
+    <label>проверить IP <input class="calc-in" id="cTest" value="10.20.143.5" style="width:150px"></label>
+  </div>
+  <div class="bits" id="cBits"></div>
+  <dl class="kv" id="cOut"></dl>
+</div>
+<script>
+(function(){
+  function toInt(s){var p=s.trim().split(".");if(p.length!==4)return null;var v=0;for(var i=0;i<4;i++){var n=+p[i];if(!/^\d+$/.test(p[i])||n>255)return null;v=v*256+n;}return v>>>0;}
+  function toIp(v){return [v>>>24,(v>>>16)&255,(v>>>8)&255,v&255].join(".");}
+  function bin(v){var s=(v>>>0).toString(2);return ("0".repeat(32)+s).slice(-32);}
+  function calc(){
+    var m=document.getElementById("cIn").value.match(/^\s*([\d.]+)\s*\/\s*(\d+)\s*$/), out=document.getElementById("cOut");
+    if(!m||toInt(m[1])===null||+m[2]>32){out.innerHTML="<dt>ошибка</dt><dd>формат: 192.168.1.10/24</dd>";document.getElementById("cBits").innerHTML="";return;}
+    var ip=toInt(m[1]),pre=+m[2],mask=pre===0?0:(0xFFFFFFFF<<(32-pre))>>>0,net=(ip&mask)>>>0,bc=(net|(~mask>>>0))>>>0;
+    var total=Math.pow(2,32-pre),hosts=pre>=31?total:total-2;
+    var b=bin(ip),bits="";for(var i=0;i<32;i++){bits+='<span class="'+(i<pre?"n":"h")+'">'+b[i]+"</span>";if(i%8===7&&i<31)bits+=".";}
+    document.getElementById("cBits").innerHTML=bits+'  <span style="color:var(--fg-muted)">— <span class="n">сеть</span> / <span class="h">хост</span></span>';
+    var t=toInt(document.getElementById("cTest").value),inNet=t!==null&&((t&mask)>>>0)===net;
+    out.innerHTML="<dt>Маска</dt><dd>"+toIp(mask)+"</dd><dt>Адрес сети</dt><dd>"+toIp(net)+"/"+pre+"</dd><dt>Broadcast</dt><dd>"+toIp(bc)+"</dd>"+
+      "<dt>Диапазон хостов</dt><dd>"+(pre>=31?toIp(net)+" – "+toIp(bc):toIp(net+1)+" – "+toIp(bc-1))+"</dd><dt>Адресов / хостов</dt><dd>"+total.toLocaleString("ru")+" / "+hosts.toLocaleString("ru")+"</dd>"+
+      "<dt>Wildcard (ACL)</dt><dd>"+toIp((~mask)>>>0)+"</dd><dt>Проверяемый IP</dt><dd>"+(t===null?"—":(inNet?"✔ в этой подсети → доставка напрямую через ARP":"✘ вне подсети → пакет уйдёт на шлюз"))+"</dd>";
+  }
+  document.addEventListener("DOMContentLoaded",function(){["cIn","cTest"].forEach(function(id){document.getElementById(id).addEventListener("input",calc);});calc();});
+})();
+</script>
+
+<div class="callout info"><span class="c-title">Практика: проектируем адреса VPC</span>
+Блок <code>10.0.0.0/16</code> (65 536 адресов) на три зоны доступности: публичные подсети <code>10.0.0.0/24</code>, <code>10.0.1.0/24</code>, <code>10.0.2.0/24</code>; приватные для приложений <code>10.0.16.0/20</code>, <code>10.0.32.0/20</code>, <code>10.0.48.0/20</code> (по 4 096 — Kubernetes съедает адреса под поды); для БД <code>10.0.100.0/24</code>… Типичная ошибка — пересечение диапазонов с офисной сетью или другим VPC: тогда VPN и peering невозможны без NAT.
+</div>
+
+<h2 id="special"><span class="h-num">3.3</span>Специальные адреса</h2>
+<div class="table-wrap"><table>
+<tr><th>Диапазон</th><th>Назначение</th></tr>
+<tr><td><code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code></td><td>частные (RFC 1918), не маршрутизируются в Интернете — тема 04</td></tr>
+<tr><td><code>100.64.0.0/10</code></td><td>CGNAT у провайдеров</td></tr>
+<tr><td><code>127.0.0.0/8</code></td><td>loopback; <code>localhost</code></td></tr>
+<tr><td><code>169.254.0.0/16</code></td><td>link-local: адрес, если DHCP не ответил; в облаках <code>169.254.169.254</code> — сервис метаданных (цель SSRF-атак!)</td></tr>
+<tr><td><code>0.0.0.0</code></td><td>«любой адрес»: сервер, слушающий <code>0.0.0.0:8080</code>, принимает на всех интерфейсах; <code>127.0.0.1:8080</code> — только локально</td></tr>
+<tr><td><code>224.0.0.0/4</code></td><td>multicast</td></tr>
+</table></div>
+
+<h2 id="local"><span class="h-num">3.4</span>Напрямую или через шлюз: ARP</h2>
+<p>Перед отправкой хост сравнивает адрес назначения со своей подсетью (адрес &amp; маска):</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 220" role="img" aria-label="Решение о доставке и ARP">
+  <defs><marker id="c1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="20" y="80" width="190" height="56" rx="9" class="box-info"/><text x="115" y="104" text-anchor="middle" font-weight="700">dst &amp; mask</text><text x="115" y="124" text-anchor="middle" font-size="12">== моя сеть?</text>
+  <rect x="290" y="20" width="230" height="56" rx="9" class="box-ok"/><text x="405" y="44" text-anchor="middle" font-weight="700">Да: напрямую</text><text x="405" y="64" text-anchor="middle" font-size="12">ARP: чей MAC у dst?</text>
+  <rect x="290" y="140" width="230" height="56" rx="9" class="box-warn"/><text x="405" y="164" text-anchor="middle" font-weight="700">Нет: на шлюз</text><text x="405" y="184" text-anchor="middle" font-size="12">ARP: чей MAC у 192.168.1.1?</text>
+  <path d="M210 100 L286 56" class="ln" marker-end="url(#c1)"/><path d="M210 118 L286 160" class="ln" marker-end="url(#c1)"/>
+  <rect x="580" y="80" width="200" height="56" rx="9" class="box"/><text x="680" y="104" text-anchor="middle" font-size="12.5">кадр: MAC получателя</text><text x="680" y="122" text-anchor="middle" font-size="12.5">пакет: IP конечной цели</text>
+  <path d="M520 48 L576 96" class="ln" marker-end="url(#c1)"/><path d="M520 168 L576 120" class="ln" marker-end="url(#c1)"/>
+</svg>
+</figure>
+<p><b>ARP</b>: хост рассылает broadcast «У кого 192.168.1.1? Скажите 192.168.1.37», владелец адреса отвечает своим MAC, ответ кэшируется на минуты. В IPv6 ту же роль играет NDP через multicast. ARP не проверяет подлинность — на этом основан ARP-spoofing (тема 14).</p>
+
+<h2 id="routing"><span class="h-num">3.5</span>Маршрутизация</h2>
+<p>Каждый маршрутизатор (и ваш ноутбук тоже) хранит <b>таблицу маршрутизации</b>: префикс → следующий прыжок и интерфейс. Решение принимается <b>по наиболее длинному совпадающему префиксу</b> (longest prefix match):</p>
+<pre data-title="ip route (Linux)"><code class="sh">$ ip route
+default via 192.168.1.1 dev wlan0            # 0.0.0.0/0 — всё остальное
+10.8.0.0/16 via 10.8.0.1 dev tun0            # корпоративный VPN
+10.8.5.0/24 via 192.168.1.1 dev wlan0        # исключение из VPN
+192.168.1.0/24 dev wlan0 scope link          # своя подсеть — напрямую
+# Пакет на 10.8.5.20 совпадает с /0, /16 и /24 — выигрывает самый длинный /24.</code></pre>
+
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Как узнаёт маршруты</th><th>Где</th></tr>
+<tr><td>Статические маршруты</td><td>вручную</td><td>домашние роутеры, простые сети, облачные route tables</td></tr>
+<tr><td>Дистанционно-векторные (RIP)</td><td>соседи обмениваются «расстояниями» (числом прыжков); медленная сходимость, «счёт до бесконечности»; макс. 15 прыжков</td><td>устарел, учебный пример</td></tr>
+<tr><td>Состояния каналов (OSPF, IS-IS)</td><td>каждый маршрутизатор знает топологию всей области и считает кратчайшие пути алгоритмом Дейкстры; быстрая сходимость</td><td>внутри организации / провайдера</td></tr>
+<tr><td>Path vector (BGP)</td><td>маршруты между автономными системами с учётом политик</td><td>между провайдерами — тема 05</td></tr>
+</table></div>
+
+<h2 id="icmp"><span class="h-num">3.6</span>ICMP, TTL и traceroute</h2>
+<p>ICMP — служебные сообщения IP: <i>Echo Request/Reply</i> (ping), <i>Destination Unreachable</i> (в т.ч. «нужна фрагментация»), <i>Time Exceeded</i> (TTL истёк). <b>traceroute</b> использует последнее: отправляет пакеты с TTL = 1, 2, 3…; каждый маршрутизатор, на котором TTL обнулился, отвечает «Time Exceeded» со своим адресом — так строится путь.</p>
+<pre><code class="sh">$ traceroute -n 1.1.1.1        # Windows: tracert -d 1.1.1.1
+ 1  192.168.1.1    0.8 ms      # домашний роутер
+ 2  10.x.x.x       3.1 ms      # сеть провайдера (частный адрес: возможно, CGNAT)
+ 3  * * *                      # узел не отвечает на ICMP — это нормально, не авария
+ ...
+ 8  1.1.1.1        14.2 ms</code></pre>
+<div class="callout warn">Звёздочки и рост задержки на промежуточном узле, если дальше задержка снова нормальная, — не проблема: маршрутизаторы отвечают на ICMP с низким приоритетом. Смотреть надо на <b>конечный узел</b> и на устойчивые потери, начинающиеся с какого-то прыжка и сохраняющиеся до конца. Удобнее — <code>mtr</code> (тема 14).</div>
+
+<h3>Фрагментация и Path MTU Discovery</h3>
+<p>Если пакет больше MTU следующей линии, IPv4-маршрутизатор может разрезать его на фрагменты (собирает только получатель). Фрагментация дорога и опасна: потеря одного фрагмента губит весь пакет. Поэтому TCP ставит флаг <b>DF</b> (don't fragment) и полагается на <b>PMTUD</b>: маршрутизатор отбрасывает слишком большой пакет и шлёт ICMP «Fragmentation needed, MTU = X», отправитель уменьшает размер. Если ICMP заблокирован — «чёрная дыра» из темы 02.</p>
+
+<h2 id="ipv6"><span class="h-num">3.7</span>IPv6</h2>
+<div class="grid-2">
+  <div class="card"><h4>Что изменилось</h4><ul><li>128 бит: <code>2001:db8:85a3::8a2e:370:7334</code> (<code>::</code> — сжатые нули).</li><li>Адресов хватает всем → NAT не нужен, каждое устройство адресуемо глобально (безопасность — файрвол, а не NAT).</li><li>Подсеть стандартно /64; адрес хост может сгенерировать сам (SLAAC).</li><li>Нет broadcast — только multicast; ARP заменён NDP.</li><li>Маршрутизаторы не фрагментируют; минимальный MTU 1280.</li><li>Заголовок фиксированный 40 байт, нет контрольной суммы.</li></ul></div>
+  <div class="card"><h4>Что важно разработчику</h4><ul><li>Хранить IP в БД строкой до 45 символов или как <code>inet</code>/<code>VARBINARY(16)</code>, а не <code>INT</code>.</li><li>Валидация и логирование адресов — с учётом IPv6 и квадратных скобок в URL: <code>http://[::1]:8080/</code>.</li><li>Dual stack: клиент получает A и AAAA и пробует IPv6 и IPv4 почти параллельно (<b>Happy Eyeballs</b>), чтобы сломанный IPv6 не давал задержку.</li><li>Java: свойство <code>java.net.preferIPv6Addresses</code>, слушать <code>::</code> — обычно принимает и IPv4.</li></ul></div>
+</div>
+
+<h2 id="sim"><span class="h-num">3.8</span>Интерактив: куда уйдёт пакет — таблица маршрутов</h2>
+<div class="widget" id="rtW">
+  <div class="widget-title">Симулятор: longest prefix match</div>
+  <p class="hint">Хост <code>10.0.1.25/24</code> с такой таблицей (<code>ip route</code>). Введите адрес назначения.</p>
+  <div class="out" id="rtTable"></div>
+  <div class="controls"><label>адрес назначения<input type="text" id="rtDst" value="10.0.1.77"></label>
+    <button class="btn" type="button" data-v="10.0.1.77">10.0.1.77</button><button class="btn" type="button" data-v="10.0.2.5">10.0.2.5</button><button class="btn" type="button" data-v="10.8.3.3">10.8.3.3</button><button class="btn" type="button" data-v="172.17.0.4">172.17.0.4</button><button class="btn" type="button" data-v="8.8.8.8">8.8.8.8</button><button class="btn" type="button" data-v="127.0.0.1">127.0.0.1</button><button class="btn" type="button" data-v="169.254.169.254">169.254.169.254</button></div>
+  <div class="log" id="rtLog"></div>
+  <div class="verdict" id="rtOut"></div>
+</div>
+<script>
+(function () {
+  var R = [
+    { net: "127.0.0.0", len: 8, dev: "lo", via: null, note: "loopback" },
+    { net: "10.0.1.0", len: 24, dev: "eth0", via: null, note: "своя подсеть" },
+    { net: "10.0.0.0", len: 8, dev: "eth0", via: "10.0.1.254", note: "корпоративная сеть через внутренний маршрутизатор" },
+    { net: "10.8.0.0", len: 16, dev: "tun0", via: null, note: "VPN" },
+    { net: "172.17.0.0", len: 16, dev: "docker0", via: null, note: "мост Docker" },
+    { net: "169.254.169.254", len: 32, dev: "eth0", via: "10.0.1.1", note: "метаданные облака" },
+    { net: "0.0.0.0", len: 0, dev: "eth0", via: "10.0.1.1", note: "маршрут по умолчанию" }
+  ];
+  function ip2n(s) { var p = s.trim().split("."); if (p.length !== 4) return null; var n = 0; for (var i = 0; i < 4; i++) { var x = +p[i]; if (!(x >= 0 && x <= 255) || p[i] === "") return null; n = n * 256 + x; } return n; }
+  function mask(len) { return len === 0 ? 0 : (0xFFFFFFFF << (32 - len)) >>> 0; }
+  var $ = function (i) { return document.getElementById(i); };
+  $("rtTable").textContent = R.map(function (r) { return (r.len === 0 ? "default" : r.net + "/" + r.len).padEnd(22) + (r.via ? "via " + r.via + " " : "").padEnd(18) + "dev " + r.dev.padEnd(8) + "# " + r.note; }).join("\n");
+  function run() {
+    var d = ip2n($("rtDst").value), o = $("rtOut");
+    if (d === null) { $("rtLog").textContent = ""; o.className = "verdict bad"; o.textContent = "Введите IPv4-адрес вида 10.0.1.77"; return; }
+    var L = [], best = null;
+    R.forEach(function (r) { var m = mask(r.len), hit = ((d & m) >>> 0) === ((ip2n(r.net) & m) >>> 0); L.push((hit ? "✓ " : "  ") + (r.len === 0 ? "default" : r.net + "/" + r.len).padEnd(20) + (hit ? "совпали первые " + r.len + " бит" : "не подходит")); if (hit && (!best || r.len > best.len)) best = r; });
+    $("rtLog").textContent = L.join("\n");
+    var direct = !best.via;
+    o.className = "verdict ok";
+    o.innerHTML = "Выбран маршрут <b>" + (best.len === 0 ? "default" : best.net + "/" + best.len) + "</b> — самый длинный совпавший префикс (" + best.note + "). " +
+      (direct ? "Получатель в непосредственно подключённой сети: хост делает ARP-запрос самого адреса назначения и отправляет кадр на его MAC через " + best.dev + "." : "Получатель не в своей сети: хост делает ARP-запрос <b>шлюза " + best.via + "</b> и отправляет кадр на MAC шлюза. IP-адрес назначения в пакете при этом не меняется — меняется только MAC в кадре на каждом участке.");
+  }
+  $("rtDst").addEventListener("input", run);
+  document.querySelectorAll("#rtW [data-v]").forEach(function (b) { b.addEventListener("click", function () { $("rtDst").value = b.getAttribute("data-v"); run(); }); });
+  run();
+})();
+</script>
+<p>Обратите внимание на <code>10.8.3.3</code>: адрес подходит и под <code>10.0.0.0/8</code>, и под <code>10.8.0.0/16</code>, и под default — побеждает /16. Так VPN «перехватывает» часть адресов, не трогая остальные маршруты, а пересекающиеся подсети VPN и локальной сети порождают загадочные сбои.</p>
+
+<h2 id="quiz"><span class="h-num">3.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько адресов для хостов в подсети /26?</p><ul><li>64</li><li>26</li><li>62</li><li>126</li></ul><div class="why">32 − 26 = 6 бит на хост → 2⁶ = 64 адреса, минус адрес сети и широковещательный.</div></div>
+<div class="mcq" data-ok="1"><p>Хост 192.168.1.10/24 отправляет пакет на 192.168.2.20. Чей MAC он запросит через ARP?</p><ul><li>Хоста 192.168.2.20</li><li>Шлюза по умолчанию</li><li>Широковещательный</li><li>DNS-сервера</li></ul><div class="why">Получатель в другой подсети, значит кадр адресуется маршрутизатору; ARP работает только внутри своего широковещательного домена.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает маршрутизатор, когда TTL пакета становится равным 0?</p><ul><li>Отбрасывает пакет и шлёт отправителю ICMP Time Exceeded</li><li>Пересылает пакет дальше</li><li>Сбрасывает TTL в 64</li><li>Возвращает пакет целиком отправителю</li></ul><div class="why">Это защита от вечных петель — и принцип работы traceroute: пакеты с TTL 1, 2, 3… заставляют каждый узел по пути назвать себя.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сколько хостов в /26, какая маска, и лежат ли 192.168.10.70 и 192.168.10.130 в одной /26?</summary><div class="a"><p>2<sup>6</sup> − 2 = 62 хоста, маска 255.255.255.192. Подсети /26: .0–.63, .64–.127, .128–.191, .192–.255. 70 — во второй, 130 — в третьей: разные подсети, обмен через маршрутизатор.</p></div></details>
+<details class="q"><summary>Что такое longest prefix match? Приведите пример.</summary><div class="a"><p>Из всех маршрутов, префикс которых содержит адрес назначения, выбирается самый специфичный. Для 10.8.5.20 при маршрутах 0.0.0.0/0, 10.8.0.0/16, 10.8.5.0/24 выбран /24. Так задают исключения и «точечные» маршруты поверх общих.</p></div></details>
+<details class="q"><summary>Как работает traceroute?</summary><div class="a"><p>Посылает пакеты (UDP, ICMP или TCP — в зависимости от реализации) с последовательно растущим TTL. Узел, на котором TTL стал нулём, отбрасывает пакет и отвечает ICMP Time Exceeded со своим адресом. Каждый TTL открывает следующий прыжок. Конечный узел отвечает Echo Reply или Port Unreachable.</p></div></details>
+<details class="q"><summary>Сервис в Docker слушает 127.0.0.1:8080, а снаружи контейнера к нему не подключиться. Почему?</summary><div class="a"><p>127.0.0.1 внутри контейнера — loopback самого контейнера (отдельное сетевое пространство имён). Проброс порта доставляет трафик на интерфейс контейнера (eth0), а не на его loopback. Нужно слушать 0.0.0.0 (или ::).</p></div></details>
+<details class="q"><summary>Почему в IPv6 «не нужен NAT» и значит ли это, что устройства открыты всему Интернету?</summary><div class="a"><p>Адресов достаточно, чтобы каждое устройство имело глобальный адрес, поэтому трансляция ради экономии не нужна. Но NAT никогда не был механизмом безопасности: защиту даёт stateful-файрвол, который по умолчанию разрешает только ответный трафик на исходящие соединения — домашние роутеры включают его и для IPv6.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · ООП: классы, наследование, интерфейсы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ОСНОВА ЯЗЫКА</div>
+  <h1>ООП: классы, наследование, интерфейсы</h1>
+  <p class="lead">Объектная модель Java проста по правилам и коварна в деталях: какой из перегруженных методов будет вызван, в каком порядке инициализируются поля родителя и потомка, почему поле «не переопределяется». Глава разбирает механику, на которой держатся эти правила.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">полиморфизм</span><span class="tag">инициализация</span><span class="tag">интерфейсы</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="principles"><span class="h-num">4.1</span>Четыре принципа</h2>
+<div class="grid-2">
+  <div class="card"><h4>Инкапсуляция</h4><p>Состояние скрыто за методами. Класс сам отвечает за корректность своих данных: поле <code>private</code>, изменение — только через метод, проверяющий инварианты. Геттер и сеттер на каждое поле — не инкапсуляция.</p></div>
+  <div class="card"><h4>Наследование</h4><p>Класс получает состояние и поведение родителя и может их дополнить. В Java — один родительский класс и сколько угодно интерфейсов.</p></div>
+  <div class="card"><h4>Полиморфизм</h4><p>Код работает с объектом через общий тип, а вызывается реализация фактического класса. <code>shape.area()</code> не знает, круг это или квадрат.</p></div>
+  <div class="card"><h4>Абстракция</h4><p>Наружу выставляется только существенное — «что делает», а не «как». В языке выражается интерфейсами и абстрактными классами.</p></div>
+</div>
+
+<h2 id="access"><span class="h-num">4.2</span>Модификаторы доступа</h2>
+<div class="table-wrap"><table>
+<tr><th>Модификатор</th><th>Тот же класс</th><th>Тот же пакет</th><th>Наследник в другом пакете</th><th>Все остальные</th></tr>
+<tr><td><code>private</code></td><td>да</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td><i>без модификатора</i> (package-private)</td><td>да</td><td>да</td><td>—</td><td>—</td></tr>
+<tr><td><code>protected</code></td><td>да</td><td>да</td><td>да</td><td>—</td></tr>
+<tr><td><code>public</code></td><td>да</td><td>да</td><td>да</td><td>да</td></tr>
+</table></div>
+<p>Правило: начинать с самого закрытого уровня и открывать по необходимости. Всё, что <code>public</code> или <code>protected</code>, — обязательство перед пользователями класса, которое нельзя изменить без поломки чужого кода. Частая неожиданность: <code>protected</code> открывает доступ ещё и всему пакету, а наследник из другого пакета может обращаться к такому члену только через ссылку собственного типа.</p>
+
+<h2 id="init"><span class="h-num">4.3</span>Конструкторы и порядок инициализации</h2>
+<p>Создание объекта — строго определённая последовательность. Статическая часть выполняется один раз при первом использовании класса, остальное — при каждом <code>new</code>.</p>
+<pre data-title="что будет напечатано?"><code class="java">class Parent {
+    static { System.out.println("1 static Parent"); }
+    { System.out.println("3 поля и блоки Parent"); }
+    Parent() {
+        System.out.println("4 конструктор Parent");
+        init();                                   // вызов переопределяемого метода из конструктора
+    }
+    void init() { }
+}
+
+class Child extends Parent {
+    static { System.out.println("2 static Child"); }
+    private String name = "child";
+    { System.out.println("5 поля и блоки Child"); }
+    Child() { System.out.println("6 конструктор Child, name = " + name); }
+    @Override void init() { System.out.println("  init() видит name = " + name); }
+}
+
+new Child();</code></pre>
+<pre data-title="вывод"><code class="txt">1 static Parent
+2 static Child
+3 поля и блоки Parent
+4 конструктор Parent
+  init() видит name = null
+5 поля и блоки Child
+6 конструктор Child, name = child</code></pre>
+<ol class="steps">
+  <li>Статические поля и блоки — сначала родителя, затем потомка, в порядке записи в коде. Один раз на класс.</li>
+  <li>Память под объект выделена, все поля заполнены значениями по умолчанию (<code>0</code>, <code>false</code>, <code>null</code>).</li>
+  <li>Инициализаторы полей и блоки родителя, затем тело конструктора родителя.</li>
+  <li>Инициализаторы полей и блоки потомка, затем тело его конструктора.</li>
+</ol>
+<div class="callout bad"><span class="c-title">Не вызывайте переопределяемые методы из конструктора</span>
+В примере <code>init()</code> потомка выполнился, когда конструктор родителя ещё не завершён, а поля потомка не инициализированы — метод увидел <code>null</code>. Вызов диспетчеризуется по фактическому классу объекта, а объект уже «потомок», хотя ещё не готов. Из конструктора безопасно вызывать только <code>private</code>, <code>final</code> и <code>static</code> методы.
+</div>
+<ul>
+  <li><b>Первая инструкция конструктора</b> — <code>this(...)</code> или <code>super(...)</code>. Если её нет, компилятор вставит <code>super()</code>; если у родителя нет конструктора без параметров — ошибка компиляции.</li>
+  <li><b>Конструктор по умолчанию</b> создаётся, только если в классе нет ни одного конструктора.</li>
+  <li><b>Java 25: гибкие тела конструкторов.</b> Перед <code>super(...)</code> разрешены инструкции, не обращающиеся к создаваемому объекту, — например, проверка аргументов. Раньше для этого приходилось писать вспомогательные статические методы.</li>
+</ul>
+
+<h2 id="polymorphism"><span class="h-num">4.4</span>Полиморфизм: переопределение и перегрузка</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Переопределение (override)</th><th>Перегрузка (overload)</th></tr>
+<tr><td>Что это</td><td>Потомок заменяет реализацию метода родителя</td><td>Несколько методов с одним именем и разными параметрами</td></tr>
+<tr><td>Сигнатура</td><td>Та же</td><td>Разная</td></tr>
+<tr><td>Когда выбирается метод</td><td><b>При выполнении</b>, по фактическому классу объекта</td><td><b>При компиляции</b>, по объявленным типам аргументов</td></tr>
+<tr><td>Возвращаемый тип</td><td>Тот же или подтип (ковариантный)</td><td>Любой; сам по себе не различает методы</td></tr>
+</table></div>
+<p><b>Правила переопределения</b>: доступ нельзя сузить (<code>public</code> → <code>protected</code> запрещено); нельзя объявить более широкие проверяемые исключения; <code>final</code>-метод переопределить нельзя. Аннотация <code>@Override</code> обязательна по соглашению: с ней опечатка в сигнатуре станет ошибкой компиляции, а не молча созданным новым методом.</p>
+<pre data-title="перегрузка выбирается по типу переменной, а не объекта"><code class="java">void print(Object o) { System.out.println("Object"); }
+void print(String s) { System.out.println("String"); }
+
+Object o = "text";
+print(o);        // Object — компилятор видит тип переменной
+print("text");   // String
+print(null);     // String — выбирается самый специфичный подходящий вариант</code></pre>
+<h3>Что не является полиморфным</h3>
+<pre><code class="java">class A {
+    String name = "A";
+    static String kind() { return "A"; }
+    String who() { return "A"; }
+}
+class B extends A {
+    String name = "B";                       // скрывает поле родителя
+    static String kind() { return "B"; }     // скрывает статический метод
+    @Override String who() { return "B"; }   // переопределяет
+}
+
+A x = new B();
+x.who();     // "B" — виртуальный вызов
+x.name;      // "A" — поле выбирается по типу переменной
+x.kind();    // "A" — статический метод тоже; вызывать его через экземпляр — дурной тон</code></pre>
+<div class="callout info"><span class="c-title">Правило</span>
+Динамически диспетчеризуются только нестатические, не <code>private</code> методы. Поля, статические и приватные методы привязываются при компиляции по объявленному типу — они <b>скрываются</b> (hiding), а не переопределяются. Это следует из байткода: <code>invokevirtual</code> против <code>invokestatic</code>, <code>invokespecial</code> и <code>getfield</code> (<a href="01-platform.html#bytecode">тема 01</a>).
+</div>
+
+<h2 id="abstract-interface"><span class="h-num">4.5</span>Абстрактный класс и интерфейс</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Абстрактный класс</th><th>Интерфейс</th></tr>
+<tr><td>Состояние (поля экземпляра)</td><td>Да</td><td>Нет — только константы <code>public static final</code></td></tr>
+<tr><td>Конструкторы</td><td>Да</td><td>Нет</td></tr>
+<tr><td>Методы с реализацией</td><td>Да, с любым доступом</td><td><code>default</code> и <code>static</code> (Java 8), <code>private</code> (Java 9)</td></tr>
+<tr><td>Сколько можно унаследовать</td><td>Один</td><td>Сколько угодно</td></tr>
+<tr><td>Смысл</td><td>«Является разновидностью» + общий код и состояние</td><td>«Умеет делать» — контракт, роль</td></tr>
+</table></div>
+<p><b>Выбор по умолчанию — интерфейс</b>: он не занимает единственное место родителя и позволяет подменять реализацию (в тестах, через прокси). Абстрактный класс уместен, когда у наследников есть общее состояние или шаблонный алгоритм с изменяемыми шагами.</p>
+<pre data-title="конфликт default-методов"><code class="java">interface Walker  { default String move() { return "walk"; } }
+interface Swimmer { default String move() { return "swim"; } }
+
+class Duck implements Walker, Swimmer {
+    @Override public String move() {          // без переопределения — ошибка компиляции
+        return Walker.super.move() + " and " + Swimmer.super.move();
+    }
+}</code></pre>
+<p>Правила разрешения: реализация из класса-родителя побеждает любой <code>default</code>; более конкретный интерфейс побеждает более общий; если однозначного победителя нет — класс обязан переопределить метод сам. Ромбовидной проблемы <i>состояния</i> в Java нет, потому что у интерфейсов нет полей.</p>
+
+<h2 id="nested"><span class="h-num">4.6</span>Вложенные классы</h2>
+<div class="table-wrap"><table>
+<tr><th>Вид</th><th>Доступ к экземпляру внешнего класса</th><th>Применение</th></tr>
+<tr><td><b>Статический вложенный</b> <code>static class</code></td><td>Нет</td><td>Вспомогательный тип, логически принадлежащий внешнему: <code>Map.Entry</code>, Builder</td></tr>
+<tr><td><b>Внутренний</b> (без <code>static</code>)</td><td>Да — хранит скрытую ссылку <code>Outer.this</code></td><td>Итератор коллекции</td></tr>
+<tr><td><b>Локальный</b> — объявлен в методе</td><td>Да + локальные переменные метода</td><td>Редко</td></tr>
+<tr><td><b>Анонимный</b></td><td>Да + локальные переменные метода</td><td>Одноразовая реализация; вытеснен лямбдами</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Скрытая ссылка — источник утечек памяти</span>
+Экземпляр внутреннего или анонимного класса удерживает внешний объект. Если такой объект передан в долгоживущее место — зарегистрирован слушателем, отдан в пул потоков, положен в статическую коллекцию, — внешний объект не будет собран сборщиком мусора. Правило: вложенный класс объявляйте <code>static</code>, если ему не нужен экземпляр внешнего. Лямбда, в отличие от анонимного класса, захватывает <code>this</code>, только если действительно его использует (<a href="10-lambdas.html#how">тема 10</a>).
+</div>
+
+<h2 id="enum"><span class="h-num">4.7</span>Перечисления</h2>
+<p><code>enum</code> — полноценный класс с фиксированным набором экземпляров, созданных при загрузке. У него могут быть поля, конструктор, методы и даже своя реализация метода в каждой константе.</p>
+<pre><code class="java">enum OrderStatus {
+    NEW(false), PAID(false), SHIPPED(false), DELIVERED(true), CANCELLED(true);
+
+    private final boolean terminal;
+    OrderStatus(boolean terminal) { this.terminal = terminal; }   // конструктор всегда private
+    boolean isTerminal() { return terminal; }
+}
+
+OrderStatus s = OrderStatus.valueOf("PAID");      // IllegalArgumentException, если такой константы нет
+if (s == OrderStatus.PAID) { }                    // == корректно и безопасно при null: экземпляр единственный
+Map&lt;OrderStatus, Integer&gt; counts = new EnumMap&lt;&gt;(OrderStatus.class);   // массив внутри, быстрее HashMap
+Set&lt;OrderStatus&gt; open = EnumSet.of(OrderStatus.NEW, OrderStatus.PAID);  // битовая маска</code></pre>
+<ul>
+  <li><b>Не сохраняйте <code>ordinal()</code></b> в базу и не стройте на нём логику: добавление константы в середину сдвинет все номера. Храните <code>name()</code> или собственный код. В JPA — <code>@Enumerated(EnumType.STRING)</code>.</li>
+  <li><b><code>values()</code> каждый раз создаёт новый массив</b> — в горячем коде сохраните его в константу.</li>
+  <li><b>Singleton через enum</b> — самый надёжный способ: единственность гарантирована JVM, включая сериализацию и рефлексию.</li>
+  <li><b><code>switch</code> по enum</b> в форме выражения компилятор проверяет на полноту — забытая константа станет ошибкой компиляции (<a href="12-modern-java.html#switch">тема 12</a>).</li>
+</ul>
+
+<h2 id="composition"><span class="h-num">4.8</span>Композиция вместо наследования</h2>
+<p>Наследование — самая сильная связь между классами: потомок зависит не только от контракта родителя, но и от деталей его реализации.</p>
+<pre data-title="хрупкий базовый класс" class="bad-code"><code class="java">class CountingSet&lt;E&gt; extends HashSet&lt;E&gt; {
+    int added;
+    @Override public boolean add(E e) { added++; return super.add(e); }
+    @Override public boolean addAll(Collection&lt;? extends E&gt; c) { added += c.size(); return super.addAll(c); }
+}
+var set = new CountingSet&lt;String&gt;();
+set.addAll(List.of("a", "b", "c"));
+set.added;   // 6, а не 3: HashSet.addAll внутри вызывает add() для каждого элемента</code></pre>
+<pre data-title="композиция: обёртка зависит только от контракта" class="good-code"><code class="java">class CountingSet&lt;E&gt; {
+    private final Set&lt;E&gt; delegate = new HashSet&lt;&gt;();
+    private int added;
+    boolean add(E e) { added++; return delegate.add(e); }
+    boolean addAll(Collection&lt;? extends E&gt; c) { added += c.size(); return delegate.addAll(c); }
+}</code></pre>
+<p>Наследование оправдано, когда выполняется <b>принцип подстановки Лисков</b>: объект потомка можно использовать везде, где ожидается родитель, и программа останется корректной. «Квадрат — это прямоугольник» в математике верно, а в коде с методами <code>setWidth</code> и <code>setHeight</code> — нет. Чтобы запретить наследование, не рассчитанное на это, класс объявляют <code>final</code> или <code>sealed</code>.</p>
+
+<h2 id="lab"><span class="h-num">4.9</span>Интерактив: порядок инициализации</h2>
+<pre data-title="Что напечатает new Child()?"><code class="java">// log(s) печатает строку; init(s) печатает её и возвращает
+class Parent {
+    static { log("1 static Parent"); }
+    private String name = init("3 поле Parent");
+    { log("4 блок Parent"); }
+    Parent() { log("5 конструктор Parent"); describe(); }      // вызов переопределяемого метода!
+    void describe() { log("Parent.describe"); }
+}
+class Child extends Parent {
+    static { log("2 static Child"); }
+    private String title = init("7 поле Child");
+    { log("8 блок Child"); }
+    Child() { super(); log("9 конструктор Child"); }
+    @Override void describe() { log("6 Child.describe, title = " + title); }
+}</code></pre>
+<div class="widget stepper" id="ioSim">
+  <div class="widget-title">Симулятор: new Child() по шагам</div>
+  <div class="flow st-stage">
+    <div class="node" id="ioSP"><b>static Parent</b></div><span class="to">→</span>
+    <div class="node" id="ioSC"><b>static Child</b></div><span class="to">→</span>
+    <div class="node" id="ioAlloc"><b>память + нули</b></div><span class="to">→</span>
+    <div class="node" id="ioIP"><b>экземпляр Parent</b></div><span class="to">→</span>
+    <div class="node" id="ioIC"><b>экземпляр Child</b></div>
+  </div>
+  <section class="st-step" data-t="Загрузка классов" data-hl="ioSP" data-log="1 static Parent"><h4>Статическая инициализация Parent</h4><p>Первое использование <code>Child</code> запускает инициализацию класса. Сначала инициализируется суперкласс: его статические поля и блоки выполняются сверху вниз, один раз на загрузчик классов, под блокировкой инициализации (потокобезопасно).</p></section>
+  <section class="st-step" data-t="static Child" data-hl="ioSC" data-log="2 static Child"><h4>Статическая инициализация Child</h4><p>Затем статика самого <code>Child</code>. При втором <code>new Child()</code> эти два шага уже не повторятся.</p></section>
+  <section class="st-step" data-t="Выделение памяти" data-hl="ioAlloc"><h4>new: память и значения по умолчанию</h4><p>Выделяется память под весь объект (поля Parent и Child), все поля получают значения по умолчанию: <code>name = null</code>, <code>title = null</code>. Затем вызывается конструктор <code>Child</code>, первой инструкцией которого идёт <code>super()</code>.</p></section>
+  <section class="st-step" data-t="Поля и блоки Parent" data-hl="ioIP" data-log="3 поле Parent&#10;4 блок Parent"><h4>Инициализаторы экземпляра Parent</h4><p>Компилятор вставляет инициализаторы полей и блоки в начало каждого конструктора (после вызова <code>super</code>), в порядке их записи в классе.</p></section>
+  <section class="st-step" data-t="Конструктор Parent" data-hl="ioIP" data-log="5 конструктор Parent&#10;6 Child.describe, title = null"><h4>Тело конструктора Parent — и ловушка</h4><p>Вызов <code>describe()</code> — виртуальный: объект уже имеет тип <code>Child</code>, поэтому выполняется <code>Child.describe()</code>. Но инициализаторы Child ещё не выполнялись — <code>title == null</code>.</p>
+    <div class="callout bad" style="margin:10px 0 0">Не вызывайте переопределяемые методы из конструктора: подкласс увидит свои поля неинициализированными. Именно поэтому такие методы делают <code>private</code> или <code>final</code>.</div></section>
+  <section class="st-step" data-t="Поля и блоки Child" data-hl="ioIC" data-log="7 поле Child&#10;8 блок Child"><h4>Инициализаторы экземпляра Child</h4><p>Только после возврата из <code>super()</code> выполняются инициализаторы полей и блоки подкласса.</p></section>
+  <section class="st-step" data-t="Конструктор Child" data-hl="ioIC" data-log="9 конструктор Child"><h4>Тело конструктора Child</h4><p>Объект готов. Итоговый порядок: статика родителя → статика потомка → (поля и блоки родителя → конструктор родителя) → (поля и блоки потомка → конструктор потомка).</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">4.10</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Класс A объявляет <code>static void hi()</code>, класс B extends A объявляет свой <code>static void hi()</code>. Что вызовет <code>A ref = new B(); ref.hi();</code>?</p><ul><li>B.hi() — полиморфизм</li><li>Ошибку компиляции</li><li>A.hi() — статические методы не переопределяются, а скрываются; выбор по типу ссылки</li><li>Оба метода</li></ul><div class="why">Динамическая диспетчеризация работает только для методов экземпляра. Статический вызов привязывается на этапе компиляции к типу переменной.</div></div>
+<div class="mcq" data-ok="1"><p>Какой метод будет вызван: <code>void print(Object o)</code> или <code>void print(String s)</code> при <code>Object x = "text"; print(x);</code>?</p><ul><li>print(String) — фактический тип String</li><li>print(Object) — перегрузка выбирается при компиляции по объявленному типу аргумента</li><li>Оба по очереди</li><li>Неоднозначность, ошибка компиляции</li></ul><div class="why">Перегрузка (overload) — статическое связывание по типам выражений; переопределение (override) — динамическое по типу объекта.</div></div>
+<div class="mcq" data-ok="0"><p>Когда выбрать абстрактный класс, а не интерфейс?</p><ul><li>Когда нужно общее состояние (поля) и конструктор для семейства тесно связанных классов</li><li>Всегда — он быстрее</li><li>Когда нужно множественное наследование</li><li>Когда в типе есть default-методы</li></ul><div class="why">Интерфейс — контракт без состояния, можно реализовать несколько. Абстрактный класс — частичная реализация с полями; наследовать можно только один.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>В каком порядке выполняется инициализация при <code>new Child()</code>?</summary><div class="a"><p>Статические инициализаторы родителя, затем потомка (если классы ещё не инициализированы). Затем для объекта: поля и блоки родителя → конструктор родителя → поля и блоки потомка → конструктор потомка. До начала этой цепочки все поля уже имеют значения по умолчанию.</p></div></details>
+<details class="q"><summary>Чем перегрузка отличается от переопределения с точки зрения выбора метода?</summary><div class="a"><p>Перегруженный метод выбирает компилятор по объявленным (статическим) типам аргументов. Переопределённый выбирает JVM во время выполнения по фактическому классу объекта, у которого вызван метод. Поэтому <code>Object o = "s"; print(o)</code> вызовет <code>print(Object)</code>, даже если есть <code>print(String)</code>.</p></div></details>
+<details class="q"><summary>Можно ли переопределить статический метод? А приватный?</summary><div class="a"><p>Нет. Статический метод в потомке с той же сигнатурой скрывает родительский: какой будет вызван, определяется типом ссылки при компиляции. Приватный метод потомку не виден — одноимённый метод в потомке является новым, никак не связанным с родительским.</p></div></details>
+<details class="q"><summary>Когда выбрать абстрактный класс, а когда интерфейс?</summary><div class="a"><p>Интерфейс — когда описывается способность или контракт, который могут реализовать несвязанные классы, и нужна подменяемость. Абстрактный класс — когда у семейства есть общее состояние, конструктор или шаблонный алгоритм. С появлением default-методов интерфейс покрывает большинство случаев; отличие остаётся в состоянии и единственности родителя.</p></div></details>
+<details class="q"><summary>Класс реализует два интерфейса с одинаковым default-методом. Что произойдёт?</summary><div class="a"><p>Ошибка компиляции, пока класс не переопределит метод сам. В реализации можно вызвать нужную версию через <code>Имя.super.метод()</code>. Конфликта нет, если один интерфейс наследует другой (побеждает более конкретный) или если метод реализован в классе-родителе (класс всегда побеждает интерфейс).</p></div></details>
+<details class="q"><summary>Почему внутренний класс может вызвать утечку памяти?</summary><div class="a"><p>Нестатический вложенный и анонимный классы хранят неявную ссылку на экземпляр внешнего класса. Пока жив объект внутреннего класса (например, в статическом списке слушателей или в очереди пула потоков), внешний объект и всё, на что он ссылается, недостижимы для сборщика мусора.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Архитектура WebFlux: путь запроса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · WEBFLUX</div>
+  <h1>Архитектура WebFlux: путь запроса</h1>
+  <p class="lead">WebFlux повторяет знакомую по MVC архитектуру — DispatcherHandler вместо DispatcherServlet, HandlerMapping, HandlerAdapter, — но всё возвращает <code>Mono</code>, а под капотом нет Servlet API. Проходим путь байтов от сокета Netty до вашего контроллера и обратно, разбираем ServerWebExchange и то, как Spring Boot решает, какой стек поднять.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Reactor Netty</span><span class="tag">HttpHandler</span><span class="tag">WebHandler</span><span class="tag">DispatcherHandler</span><span class="tag">ServerWebExchange</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="layers"><span class="h-num">10.1</span>Слои</h2>
+<div class="flow col">
+  <div class="node"><b>Сервер: Reactor Netty (по умолчанию), Tomcat, Jetty</b> (Undertow удалён в Spring Framework 7 / Boot 4)<small>Servlet-контейнеры — через неблокирующий Servlet 3.1+ API (ServletHttpHandlerAdapter)</small></div><span class="to">↓</span>
+  <div class="node info"><b>HttpHandler</b><small>минимальный контракт: Mono&lt;Void&gt; handle(ServerHttpRequest, ServerHttpResponse) — адаптер ReactorHttpHandlerAdapter</small></div><span class="to">↓</span>
+  <div class="node info"><b>HttpWebHandlerAdapter</b><small>создаёт ServerWebExchange: атрибуты, сессия (WebSessionManager), кодеки, LocaleContext, form data</small></div><span class="to">↓</span>
+  <div class="node acc"><b>WebHandler-цепочка: ExceptionHandlingWebHandler → FilteringWebHandler (WebFilter*)</b><small>WebExceptionHandler-ы, фильтры безопасности, CORS, ваши фильтры</small></div><span class="to">↓</span>
+  <div class="node ok"><b>DispatcherHandler</b><small>HandlerMapping → HandlerAdapter → HandlerResultHandler</small></div>
+</div>
+
+<h2 id="path"><span class="h-num">10.2</span>Путь запроса по шагам</h2>
+<div class="widget stepper" id="paSim">
+  <div class="widget-title">GET /api/users/42, Accept: application/json → @GetMapping возвращает Mono&lt;User&gt;</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Netty</h5><div class="items"><span class="chip" id="paA">epoll: данные в сокете</span><span class="chip off" id="paB">HttpServerCodec → HttpRequest</span><span class="chip off" id="paN">write + flush</span></div></div>
+    <div class="lane"><h5>Spring Web (адаптеры)</h5><div class="items"><span class="chip off" id="paC">ReactorHttpHandlerAdapter</span><span class="chip off" id="paD">HttpWebHandlerAdapter → exchange</span><span class="chip off" id="paE">WebFilter-ы</span></div></div>
+    <div class="lane"><h5>DispatcherHandler</h5><div class="items"><span class="chip off" id="paF">HandlerMapping</span><span class="chip off" id="paG">HandlerAdapter + резолверы аргументов</span><span class="chip off" id="paH">контроллер → Mono&lt;User&gt;</span><span class="chip off" id="paI">HandlerResultHandler</span><span class="chip off" id="paJ">JacksonJsonEncoder</span></div></div>
+  </div>
+  <section class="st-step" data-t="Сокет" data-hl="paA" data-log="поток reactor-http-nio-4: событие READ на канале"><p>Event loop Netty получает событие готовности. Каждое соединение навсегда привязано к одному event loop — все его события обрабатывает один поток.</p></section>
+  <section class="st-step" data-t="Разбор HTTP" data-hl="paB paC" data-log="HttpServerOperations → ReactorServerHttpRequest (тело — Flux<DataBuffer>, ещё не прочитано)"><p>Netty разбирает стартовую строку и заголовки. Тело не читается: оно станет доступно как <code>Flux&lt;DataBuffer&gt;</code> и будет прочитано, только когда кто-то подпишется.</p></section>
+  <section class="st-step" data-t="Exchange" data-hl="paD" data-log="DefaultServerWebExchange(request, response, sessionManager, codecConfigurer, localeResolver)"><p>Создаётся <code>ServerWebExchange</code> — аналог пары HttpServletRequest/Response плюс атрибуты, сессия (лениво, Mono&lt;WebSession&gt;) и principal (Mono).</p></section>
+  <section class="st-step" data-t="Фильтры" data-hl="paE" data-log="HttpWebHandlerAdapter (наблюдаемость http.server.requests) → WebFilterChainProxy (Spring Security, −100) → ваши WebFilter-ы → DispatcherHandler"><p>Каждый WebFilter возвращает Mono&lt;Void&gt; и решает, вызывать ли <code>chain.filter(exchange)</code>. Здесь работают безопасность, CORS, метрики, ваши фильтры (тема 13).</p></section>
+  <section class="st-step" data-t="Маршрутизация" data-hl="paF" data-log="RouterFunctionMapping (order -1) → RequestMappingHandlerMapping (0) → SimpleUrlHandlerMapping: найден UserController#get"><p>DispatcherHandler опрашивает HandlerMapping-и по порядку: <code>Flux.fromIterable(mappings).concatMap(m -&gt; m.getHandler(exchange)).next()</code>. Ничего не нашлось — 404 (ResponseStatusException).</p></section>
+  <section class="st-step" data-t="Вызов" data-hl="paG paH" data-log="@PathVariable id=42 → UserController.get(42) → вернул Mono<User> (ещё не выполнен!)"><p><code>RequestMappingHandlerAdapter</code> разрешает аргументы (часть резолверов асинхронны — @RequestBody читает тело как Mono) и вызывает метод. Метод возвращает <b>описание</b> работы: запрос в БД ещё не отправлен.</p></section>
+  <section class="st-step" data-t="Результат" data-hl="paI paJ" data-log="ResponseBodyResultHandler: Accept json → JacksonJsonEncoder (Jackson 3); подписка на Mono<User> → R2DBC-запрос → User"><p>HandlerResultHandler выбирается по типу результата (ResponseEntity, @ResponseBody, ServerResponse, имя View). Он <b>подписывается</b> на Mono — именно в этот момент выполняется ваша цепочка — и кодирует результат в DataBuffer.</p></section>
+  <section class="st-step" data-t="Ответ" data-hl="paN" data-log="response.writeWith(Mono<DataBuffer>) → Netty: write + flush → соединение возвращается в keep-alive"><p>Mono&lt;Void&gt; всей цепочки завершается, когда ответ записан. Отмена (клиент закрыл соединение) распространяется вверх и отменяет всё, включая запрос к БД.</p></section>
+</div>
+
+<h2 id="dispatcher"><span class="h-num">10.3</span>DispatcherHandler в сокращении</h2>
+<pre data-title="DispatcherHandler.handle (упрощённо, Spring 6)"><code class="java">public Mono&lt;Void&gt; handle(ServerWebExchange exchange) {
+    if (this.handlerMappings == null) return createNotFoundError();
+    if (CorsUtils.isPreFlightRequest(exchange.getRequest())) return handlePreFlight(exchange);
+    return Flux.fromIterable(this.handlerMappings)
+            .concatMap(mapping -&gt; mapping.getHandler(exchange))   // первый нашедший
+            .next()
+            .switchIfEmpty(createNotFoundError())
+            .onErrorResume(ex -&gt; handleResultMono(exchange, Mono.error(ex)))
+            .flatMap(handler -&gt; handleRequestWith(exchange, handler));
+}
+private Mono&lt;Void&gt; handleRequestWith(ServerWebExchange ex, Object handler) {
+    for (HandlerAdapter adapter : this.handlerAdapters)
+        if (adapter.supports(handler))
+            return adapter.handle(ex, handler)                  // Mono&lt;HandlerResult&gt;
+                          .flatMap(result -&gt; handleResult(ex, result));
+    return Mono.error(new IllegalStateException("No HandlerAdapter: " + handler));
+}</code></pre>
+
+<h2 id="router"><span class="h-num">10.4</span>Куда попадёт запрос</h2>
+<div class="widget" id="rqW">
+  <div class="widget-title">Выберите запрос — увидите, кто его обработает</div>
+  <div class="controls"><label>Запрос<select id="rqSel">
+    <option value="json">GET /api/users/42 (Accept: application/json)</option>
+    <option value="fn">GET /fn/orders (RouterFunction)</option>
+    <option value="sse">GET /api/events (Accept: text/event-stream)</option>
+    <option value="static">GET /index.html (static/)</option>
+    <option value="bad">POST /api/users, невалидное тело</option>
+    <option value="404">GET /nothing</option>
+    <option value="err">GET /api/users/0 — сервис бросает исключение</option>
+  </select></label></div>
+  <div class="flow" id="rqFlow"></div>
+  <div class="verdict" id="rqV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var M = {
+    json: [[["RequestMappingHandlerMapping", "UserController#get"], ["RequestMappingHandlerAdapter", "@PathVariable"], ["ResponseBodyResultHandler", "JacksonJsonEncoder"]], "ok", "200 application/json. Mono из одного User кодируется целиком как JSON-объект."],
+    fn: [[["RouterFunctionMapping", "order -1 — раньше аннотаций"], ["HandlerFunctionAdapter", "HandlerFunction.handle(request)"], ["ServerResponseResultHandler", "ServerResponse.writeTo"]], "ok", "Функциональные маршруты проверяются первыми. Ответ строит сам ServerResponse (тема 12)."],
+    sse: [[["RequestMappingHandlerMapping", "EventController#stream"], ["RequestMappingHandlerAdapter", "—"], ["ResponseBodyResultHandler", "ServerSentEventHttpMessageWriter"]], "ok", "Flux<Event> + text/event-stream: каждый элемент пишется и сбрасывается сразу, соединение открыто, пока Flux не завершится или клиент не уйдёт."],
+    static: [[["SimpleUrlHandlerMapping", "/** → ResourceWebHandler"], ["SimpleHandlerAdapter", "WebHandler"], ["—", "ResourceWebHandler пишет файл (zero-copy)"]], "ok", "Статика из classpath:/static/ обслуживается ResourceWebHandler; последним в порядке."],
+    bad: [[["RequestMappingHandlerMapping", "UserController#create"], ["RequestMappingHandlerAdapter", "@Valid @RequestBody → Decoder"], ["ошибка", "WebExchangeBindException / ServerWebInputException"]], "warn", "Ошибка декодирования или валидации — 400. Тело читается асинхронно, поэтому ошибка возникает не при вызове метода, а при подписке на аргумент. Обработать — @ExceptionHandler или ResponseEntityExceptionHandler (ProblemDetail)."],
+    "404": [[["SimpleUrlHandlerMapping", "/** → ResourceWebHandler"], ["ResourceWebHandler", "файла нет"], ["WebExceptionHandler", "NoResourceFoundException (404)"]], "warn", "В Boot GET /nothing ловит статический маппинг /**: ResourceWebHandler не находит файл и бросает NoResourceFoundException (подкласс ResponseStatusException, с 6.1). createNotFoundError() DispatcherHandler-а срабатывает, только если ни один mapping не подошёл (например, POST). В Boot ответ формирует DefaultErrorWebExceptionHandler (JSON или whitelabel HTML)."],
+    err: [[["RequestMappingHandlerMapping", "UserController#get"], ["RequestMappingHandlerAdapter", "Mono.error(...)"], ["@ExceptionHandler / WebExceptionHandler", "500 или ваш статус"]], "bad", "onError доходит до DispatcherHandler: сначала ищется @ExceptionHandler в контроллере и @ControllerAdvice; если нет — исключение уходит к WebExceptionHandler-ам (в Boot — ErrorWebExceptionHandler с order -1)."]
+  };
+  function run() { var m = M[$("rqSel").value]; $("rqFlow").innerHTML = m[0].map(function (s, i) { return (i ? '<span class="to">→</span>' : "") + '<div class="node ' + (s[0] === "ошибка" || /WebExceptionHandler|ExceptionHandler/.test(s[0]) ? "bad" : "info") + '"><b>' + s[0] + "</b><small>" + s[1] + "</small></div>"; }).join(""); $("rqV").className = "verdict " + m[1]; $("rqV").textContent = m[2]; }
+  $("rqSel").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="mvc"><span class="h-num">10.5</span>Соответствие компонентов MVC</h2>
+<div class="table-wrap"><table>
+<tr><th>Spring MVC</th><th>Spring WebFlux</th></tr>
+<tr><td>DispatcherServlet</td><td>DispatcherHandler</td></tr>
+<tr><td>HttpServletRequest / Response</td><td>ServerHttpRequest / Response, ServerWebExchange</td></tr>
+<tr><td>Filter (Servlet), HandlerInterceptor</td><td>WebFilter (интерсепторов нет)</td></tr>
+<tr><td>HandlerExceptionResolver</td><td>@ExceptionHandler + WebExceptionHandler</td></tr>
+<tr><td>HttpMessageConverter</td><td>HttpMessageReader/Writer, Encoder/Decoder</td></tr>
+<tr><td>RestTemplate / RestClient</td><td>WebClient</td></tr>
+<tr><td>HttpSession</td><td>WebSession (Mono)</td></tr>
+<tr><td>RequestContextHolder (ThreadLocal)</td><td>Reactor Context, exchange.getAttributes()</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Какой стек поднимет Spring Boot</span>
+WebApplicationType определяется по classpath: есть <code>spring-webmvc</code> (DispatcherServlet) — SERVLET, даже если рядом webflux (часто ради WebClient). Только webflux — REACTIVE. Принудительно: <code>spring.main.web-application-type=reactive</code>. Сервер — Reactor Netty из <code>spring-boot-starter-reactor-netty</code>; заменить можно, исключив его и добавив starter-tomcat или starter-jetty. В Boot 4 стартер MVC называется <code>spring-boot-starter-webmvc</code>, а только ради WebClient есть <code>spring-boot-starter-webclient</code> — он не переключает приложение в REACTIVE.
+</div>
+
+<h2 id="quiz"><span class="h-num">10.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В какой момент выполняется запрос к БД из контроллера, вернувшего Mono&lt;User&gt;?</p><ul><li>При вызове метода контроллера</li><li>Когда HandlerResultHandler подписывается на возвращённый Mono</li><li>После записи ответа</li><li>При старте приложения</li></ul><div class="why">Контроллер возвращает описание; работа начинается при подписке фреймворком.</div></div>
+<div class="mcq" data-ok="3"><p>В приложении есть spring-boot-starter-webmvc (в Boot 3 — starter-web) и spring-boot-starter-webflux. Какой стек запустится?</p><ul><li>WebFlux</li><li>Оба</li><li>Ошибка запуска</li><li>MVC (Servlet), WebFlux используется лишь ради WebClient</li></ul><div class="why">SERVLET имеет приоритет; переопределяется spring.main.web-application-type.</div></div>
+<div class="mcq" data-ok="0"><p>Что заменяет HandlerInterceptor в WebFlux?</p><ul><li>WebFilter</li><li>HandlerMapping</li><li>Encoder</li><li>Ничего, они есть</li></ul><div class="why">В WebFlux нет интерсепторов; сквозная логика — в WebFilter.</div></div>
+<div class="mcq" data-ok="2"><p>Какой HandlerMapping проверяется первым по умолчанию?</p><ul><li>RequestMappingHandlerMapping</li><li>SimpleUrlHandlerMapping</li><li>RouterFunctionMapping</li><li>Случайный</li></ul><div class="why">У RouterFunctionMapping order −1.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что происходит, когда клиент закрывает соединение посреди обработки?</summary><div class="a"><p>Netty обнаруживает закрытие канала, Reactor Netty отменяет подписку на Mono&lt;Void&gt; ответа. Отмена распространяется вверх по всей цепочке: WebClient закроет исходящие запросы, R2DBC отменит запрос, Flux SSE остановится. Сработают doOnCancel/doFinally. В логах это видно как «cancel», без исключения. В MVC аналогичная ситуация обнаруживается только при попытке записи (ClientAbortException).</p></div></details>
+<details class="q"><summary>Почему тело запроса — Flux&lt;DataBuffer&gt;, а не byte[]?</summary><div class="a"><p>Тело приходит кусками по мере чтения из сокета; Flux позволяет обрабатывать его потоково (загрузка файлов, NDJSON) и уважать противодавление: пока никто не подписался, Netty не читает дальше. Декодеры собирают куски, когда нужен целый объект (с лимитом spring.http.codecs.max-in-memory-size, по умолчанию 256 КБ). DataBuffer — пулированные буферы Netty, их нужно освобождать (DataBufferUtils.release), если вы работаете с ними вручную.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

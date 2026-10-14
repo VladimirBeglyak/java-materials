@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Разбор: платёжная система</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ПРОЕКТИРОВАНИЕ НА ПРАКТИКЕ</div>
+  <h1>Разбор: платёжная система</h1>
+  <p class="lead">В ленте и чате можно потерять лайк или показать пост с опозданием. С деньгами нельзя ничего: ни потерять платёж, ни провести его дважды, ни разойтись с банком на копейку. Поэтому здесь главные требования — корректность и проверяемость, а не скорость. Это лучшая задача, чтобы показать, что вы понимаете идемпотентность, конечные автоматы, двойную запись и сверку.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">идемпотентность</span><span class="tag">конечный автомат</span><span class="tag">двойная запись</span><span class="tag">сверка</span><span class="tag">2 симулятора</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="req"><span class="h-num">21.1</span>Требования</h2>
+<div class="grid-2">
+  <div class="card"><h4>Функциональные</h4><p>Принять оплату заказа картой через внешнего провайдера (PSP); вернуть деньги (полностью и частично); вести балансы продавцов; выплачивать продавцам; показывать историю операций.</p></div>
+  <div class="card"><h4>Нефункциональные</h4><p><b>Корректность</b>: ни один платёж не проводится дважды и не теряется. <b>Проверяемость</b>: любую сумму можно объяснить цепочкой записей. <b>Согласованность</b> важнее доступности: при сомнении — отказать или отложить, а не угадывать. Нагрузка умеренная: десятки–сотни операций в секунду.</p></div>
+</div>
+<div class="callout info">Собственно движение денег выполняют банки и карточные сети. Ваша система — учёт намерений и фактов и согласование с внешним миром, который отвечает медленно, с ошибками и иногда не отвечает вовсе.</div>
+
+<h2 id="flow"><span class="h-num">21.2</span>Общая схема</h2>
+<div class="flow">
+  <div class="node info"><b>Магазин</b><small>POST /payments + Idempotency-Key</small></div><span class="to">→</span>
+  <div class="node acc"><b>Сервис платежей</b><small>автомат состояний, идемпотентность</small></div><span class="to">→</span>
+  <div class="node"><b>Шлюз к PSP</b><small>таймауты, повторы, подписи</small></div><span class="to">⇄</span>
+  <div class="node warn"><b>PSP / банк</b><small>синхронный ответ + webhook</small></div>
+</div>
+<div class="flow">
+  <div class="node acc"><b>Сервис платежей</b></div><span class="to">→ в одной транзакции →</span>
+  <div class="node"><b>payments</b><small>состояние</small></div><span class="to">+</span>
+  <div class="node"><b>ledger</b><small>проводки</small></div><span class="to">+</span>
+  <div class="node"><b>outbox</b><small>события</small></div><span class="to">→</span>
+  <div class="node ok"><b>Kafka → заказы, уведомления, аналитика</b></div>
+</div>
+<p>Хранилище — реляционная база с ACID-транзакциями: состояние платежа, проводки и исходящее событие обязаны измениться атомарно.</p>
+
+<h2 id="idem"><span class="h-num">21.3</span>Идемпотентность и конечный автомат</h2>
+<pre data-title="Создание платежа"><code class="txt">POST /payments
+Idempotency-Key: 7c9e6679-7425-40de-944b-e07fc1f90ae7        ← генерирует КЛИЕНТ, один на намерение «оплатить заказ 4411»
+{ "orderId": 4411, "amount": "1500.00", "currency": "RUB", "method": { … } }
+
+1. INSERT INTO idempotency(key, request_hash, status='IN_PROGRESS')   -- уникальный индекс по key
+   конфликт → запись есть:
+       тот же request_hash, статус DONE         → вернуть сохранённый ответ
+       тот же request_hash, статус IN_PROGRESS  → 409 «обрабатывается, повторите позже»
+       другой request_hash                      → 422 «ключ уже использован для другого запроса»
+2. выполнить операцию
+3. сохранить ответ в idempotency, status='DONE'</code></pre>
+<div class="widget" id="pmW">
+  <div class="widget-title">Симулятор автомата состояний платежа</div>
+  <p class="hint">Нажимайте события в любом порядке — в том числе повторные и запоздавшие. Автомат решает, что с ними делать.</p>
+  <div class="flow" id="pmFlow"></div>
+  <div class="controls" id="pmBtns"></div>
+  <div class="log" id="pmLog"></div>
+</div>
+<script>
+(function () {
+  var ST = ["CREATED", "PENDING", "AUTHORIZED", "CAPTURED", "FAILED", "UNKNOWN", "REFUNDED"], st, log, seen;
+  var T = {
+    CREATED: { send: ["PENDING", "Запрос ушёл в PSP. Состояние PENDING записано ДО вызова: если сервис упадёт, при восстановлении мы знаем, что запрос мог быть отправлен."] },
+    PENDING: { auth_ok: ["AUTHORIZED", "PSP подтвердил: деньги заблокированы на карте."], auth_fail: ["FAILED", "PSP отклонил платёж (недостаточно средств, 3-D Secure не пройден). Конечное состояние."], timeout: ["UNKNOWN", "PSP не ответил за отведённое время. Мы НЕ знаем результата: запрос мог не дойти, а мог быть выполнен. Считать это отказом нельзя — деньги могли списаться."] },
+    UNKNOWN: { auth_ok: ["AUTHORIZED", "Запоздавший webhook или результат запроса статуса: платёж прошёл."], auth_fail: ["FAILED", "Запрос статуса показал: платёж не прошёл."], query: ["AUTHORIZED", "Фоновый процесс запросил статус у PSP по нашему идентификатору операции: платёж найден и успешен."] },
+    AUTHORIZED: { capture: ["CAPTURED", "Списание (capture): деньги переведены. В той же транзакции — проводки в журнале и событие PaymentCaptured в outbox."], void_: ["FAILED", "Блокировка снята (void) — например, товара не оказалось."] },
+    CAPTURED: { refund: ["REFUNDED", "Возврат: новая операция с собственным ключом идемпотентности и обратными проводками. Запись о платеже не удаляется и не меняется."] },
+    FAILED: {}, REFUNDED: {}
+  };
+  var EV = [["send", "отправить в PSP"], ["auth_ok", "webhook: авторизация успешна"], ["auth_fail", "webhook: отклонено"], ["timeout", "таймаут ответа PSP"], ["query", "фоновый запрос статуса"], ["capture", "списать (capture)"], ["void_", "отменить авторизацию"], ["refund", "возврат"]];
+  var $ = function (i) { return document.getElementById(i); };
+  function fire(e, label) {
+    var id = e + "@" + st, t = T[st][e];
+    if (t) { log.unshift(st + " —[" + label + "]→ " + t[0] + ": " + t[1]); st = t[0]; seen[e] = 1; }
+    else if (seen[e]) log.unshift("⟳ «" + label + "» в состоянии " + st + ": событие уже обработано ранее → ПРОИГНОРИРОВАНО, ответ 200. Webhook-и приходят повторно и не по порядку — обработчик обязан быть идемпотентным.");
+    else log.unshift("✘ «" + label + "» в состоянии " + st + ": переход запрещён → отклонено и записано в журнал аномалий. Автомат не даёт, например, списать неавторизованный платёж или вернуть несписанный.");
+    render();
+  }
+  function render() {
+    $("pmFlow").innerHTML = ST.map(function (s, i) { return (i ? '<span class="to">·</span>' : "") + '<div class="node ' + (s === st ? (s === "FAILED" ? "stop" : (s === "UNKNOWN" ? "warn" : "hl")) : "off") + '"><b>' + s + "</b></div>"; }).join("");
+    $("pmLog").textContent = log.slice(0, 8).join("\n");
+  }
+  var box = $("pmBtns");
+  EV.forEach(function (e) { var b = document.createElement("button"); b.type = "button"; b.className = "btn"; b.textContent = e[1]; b.addEventListener("click", function () { fire(e[0], e[1]); }); box.appendChild(b); });
+  var r = document.createElement("button"); r.type = "button"; r.className = "btn primary"; r.textContent = "↺ новый платёж"; r.addEventListener("click", function () { st = "CREATED"; log = ["Платёж создан: CREATED."]; seen = {}; render(); }); box.appendChild(r);
+  st = "CREATED"; log = ["Платёж создан: CREATED."]; seen = {}; render();
+})();
+</script>
+<p><b>Попробуйте:</b> отправить → таймаут → «webhook: авторизация успешна» (запоздал, но принят) → тот же webhook ещё раз (проигнорирован) → «возврат» до списания (запрещён).</p>
+<div class="callout bad"><span class="c-title">Таймаут — не отказ</span>
+Самая дорогая ошибка в платежах — трактовать «не дождался ответа» как «не прошло» и предложить клиенту оплатить ещё раз. Правильно: состояние UNKNOWN, повтор запроса к PSP <b>с тем же идентификатором операции</b> (PSP тоже идемпотентен по нему) или запрос статуса; клиенту — «платёж обрабатывается».
+</div>
+
+<h2 id="ledger"><span class="h-num">21.4</span>Журнал проводок: двойная запись</h2>
+<p>Баланс не хранят как изменяемое число «на счёте» — его <b>выводят</b> из неизменяемого журнала проводок. Каждая операция записывается минимум двумя строками: дебет одного счёта и кредит другого на одну сумму. Сумма всех проводок в системе всегда равна нулю — это инвариант, который можно проверять непрерывно.</p>
+<div class="widget" id="ldW">
+  <div class="widget-title">Симулятор журнала</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="pay">оплата заказа 1500 ₽ (комиссия площадки 10%)</button>
+    <button class="btn" type="button" data-a="refund">возврат 500 ₽</button>
+    <button class="btn" type="button" data-a="settle">PSP перечислил собранное на наш счёт</button>
+    <button class="btn" type="button" data-a="payout">выплата продавцу всего баланса</button>
+    <button class="btn" type="button" data-a="bug">ошибка: записана только одна сторона</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="table-wrap"><table id="ldTable"></table></div>
+  <div class="lanes" id="ldBal"></div>
+  <div class="verdict" id="ldOut"></div>
+</div>
+<script>
+(function () {
+  var rows, n, $ = function (i) { return document.getElementById(i); };
+  var ACC = { psp: "Расчёты с PSP (нам должны)", seller: "Продавец (мы должны)", fee: "Доход площадки", bank: "Банковский счёт" };
+  function add(tx, acc, amt, note) { rows.push({ tx: tx, acc: acc, amt: amt, note: note }); }
+  function bal(a) { return rows.filter(function (r) { return r.acc === a; }).reduce(function (s, r) { return s + r.amt; }, 0); }
+  function act(a) {
+    if (a === "reset") { rows = []; n = 0; }
+    else if (a === "pay") { n++; add(n, "psp", 1500, "оплата заказа"); add(n, "seller", -1350, "причитается продавцу"); add(n, "fee", -150, "комиссия 10%"); }
+    else if (a === "refund") { n++; add(n, "psp", -500, "возврат покупателю"); add(n, "seller", 450, "уменьшение долга продавцу"); add(n, "fee", 50, "возврат комиссии"); }
+    else if (a === "settle") { var s = bal("psp"); if (s <= 0) { $("ldOut").className = "verdict warn"; $("ldOut").textContent = "PSP нам ничего не должен."; return; } n++; add(n, "bank", s, "поступление от PSP"); add(n, "psp", -s, "погашение расчётов с PSP"); }
+    else if (a === "payout") { var b = -bal("seller"); if (b <= 0) { $("ldOut").className = "verdict warn"; $("ldOut").textContent = "Выплачивать нечего: баланс продавца " + b + " ₽."; return; } n++; add(n, "seller", b, "выплата продавцу"); add(n, "bank", -b, "списание с банковского счёта"); }
+    else if (a === "bug") { n++; add(n, "seller", -700, "начисление без второй стороны"); }
+    render();
+  }
+  function render() {
+    $("ldTable").innerHTML = "<tr><th>Операция</th><th>Счёт</th><th>Дебет</th><th>Кредит</th><th>Описание</th></tr>" + (rows.map(function (r) { return "<tr><td>#" + r.tx + "</td><td>" + ACC[r.acc] + "</td><td>" + (r.amt > 0 ? r.amt.toFixed(2) : "") + "</td><td>" + (r.amt < 0 ? (-r.amt).toFixed(2) : "") + "</td><td>" + r.note + "</td></tr>"; }).join("") || '<tr><td colspan="5">журнал пуст</td></tr>');
+    $("ldBal").innerHTML = Object.keys(ACC).map(function (a) { var b = bal(a); return '<div class="lane"><h5>' + ACC[a] + '</h5><div class="items"><span class="chip ' + (b === 0 ? "" : "info") + '">' + b.toFixed(2) + " ₽</span></div></div>"; }).join("");
+    var total = rows.reduce(function (s, r) { return s + r.amt; }, 0), o = $("ldOut");
+    var byTx = {}; rows.forEach(function (r) { byTx[r.tx] = (byTx[r.tx] || 0) + r.amt; });
+    var broken = Object.keys(byTx).filter(function (t) { return Math.abs(byTx[t]) > 0.001; });
+    if (broken.length) { o.className = "verdict bad"; o.textContent = "ИНВАРИАНТ НАРУШЕН: сумма проводок = " + total.toFixed(2) + " ₽, операция #" + broken.join(", #") + " не сбалансирована. Деньги «появились из ниоткуда». Такая запись должна быть невозможна: проверка «сумма проводок операции = 0» выполняется в той же транзакции, а общий контроль — регулярной сверкой."; }
+    else { o.className = "verdict ok"; o.textContent = "Сумма всех проводок = " + total.toFixed(2) + " ₽ — инвариант соблюдён. Баланс любого счёта — сумма его проводок; история не переписывается: ошибку исправляют новой обратной проводкой, а не UPDATE."; }
+  }
+  document.querySelectorAll("#ldW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  rows = []; n = 0; render();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Правило</th><th>Зачем</th></tr>
+<tr><td>Журнал только дополняется (append-only)</td><td>аудит: любое состояние в прошлом восстановимо; нечего «тихо исправить»</td></tr>
+<tr><td>Суммы — целые в минимальных единицах или <code>DECIMAL</code>, валюта рядом</td><td>никаких <code>double</code>: 0,1 + 0,2 ≠ 0,3</td></tr>
+<tr><td>Баланс — производная величина</td><td>кэш баланса можно хранить для скорости, но источник истины — сумма проводок; расхождение сразу видно</td></tr>
+<tr><td>Проводки и смена состояния — в одной транзакции</td><td>не бывает «платёж CAPTURED, а денег на счету продавца нет»</td></tr>
+</table></div>
+
+<h2 id="recon"><span class="h-num">21.5</span>Сверка</h2>
+<p>Даже безупречный код расходится с внешним миром: webhook не дошёл, PSP провёл операцию после нашего таймаута, комиссия оказалась другой, возврат оформили в кабинете PSP вручную. <b>Сверка</b> (reconciliation) — регулярное сравнение своего журнала с отчётами PSP и банковской выпиской.</p>
+<ol class="steps">
+  <li>Загрузить отчёт PSP за день (файл или API): идентификатор операции, сумма, комиссия, статус.</li>
+  <li>Сопоставить по идентификатору со своими записями.</li>
+  <li>Разобрать расхождения: есть у нас, нет у них; есть у них, нет у нас; не совпали сумма или статус.</li>
+  <li>Автоматически исправить типовые (доставить потерянное событие, перевести UNKNOWN в конечное состояние), остальные — в очередь ручного разбора.</li>
+  <li>Следить за метриками: число и сумма несверенных операций, возраст старейшей.</li>
+</ol>
+<p>Сверка — не «подстраховка», а обязательная половина системы: она превращает «мы надеемся, что всё сошлось» в «мы знаем».</p>
+
+<h2 id="more"><span class="h-num">21.6</span>Вопросы на углубление</h2>
+<div class="quiz">
+<details class="q"><summary>Как надёжно сообщить сервису заказов, что платёж прошёл?</summary><div class="a"><p>Outbox: событие PaymentCaptured записывается в таблицу в той же транзакции, что и смена состояния и проводки; отдельный процесс доставляет его в брокер с повторами. Потребитель идемпотентен по идентификатору платежа. Прямой вызов из транзакции или отправка в брокер «после коммита» теряют события при сбоях.</p></div></details>
+<details class="q"><summary>Как принимать webhook-и от PSP?</summary><div class="a"><p>Проверить подпись (HMAC общим секретом или подпись открытым ключом) и свежесть метки времени; быстро записать сырое событие и ответить 200; обрабатывать асинхронно; быть идемпотентным по идентификатору события; не полагаться на порядок; при сомнении запросить актуальный статус у PSP. Плюс фоновый опрос статусов зависших платежей — webhook может не прийти никогда.</p></div></details>
+<details class="q"><summary>Нужно ли хранить данные карт?</summary><div class="a"><p>Нет, если можно этого избежать: требования PCI DSS к хранению номеров карт очень тяжёлые. Данные карты вводятся на форме PSP (или шифруются в браузере его библиотекой), а система получает токен, который бесполезен вне этого PSP.</p></div></details>
+<details class="q"><summary>Как выдержать распродажу с десятикратным пиком?</summary><div class="a"><p>Узкое место — PSP и его лимиты, а не база. Очередь перед шлюзом к PSP с ограничением скорости, честное «платёж обрабатывается» клиенту, несколько PSP с маршрутизацией и переключением при отказе, заранее согласованные лимиты.</p></div></details>
+</div>
+
+<h2 id="quiz"><span class="h-num">21.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>PSP не ответил на запрос списания за 10 секунд. Что должна сделать система?</p><ul><li>Считать платёж неуспешным и предложить оплатить снова</li><li>Считать платёж успешным</li><li>Перевести в состояние «неизвестно», повторить с тем же идентификатором операции или запросить статус</li><li>Удалить платёж</li></ul><div class="why">Запрос мог быть выполнен. Повтор с новым идентификатором рискует двойным списанием.</div></div>
+<div class="mcq" data-ok="1"><p>Кто генерирует ключ идемпотентности и когда он должен совпадать?</p><ul><li>Сервер, новый на каждый запрос</li><li>Клиент: один ключ на одно намерение, одинаковый во всех повторах этого запроса</li><li>База данных</li><li>PSP</li></ul><div class="why">Только клиент знает, что два запроса — это повтор, а не два разных платежа.</div></div>
+<div class="mcq" data-ok="0"><p>Почему баланс вычисляют из журнала проводок, а не хранят одним изменяемым полем?</p><ul><li>Проверяемость и аудит: каждое значение объясняется цепочкой неизменяемых записей, а инвариант «сумма проводок = 0» ловит ошибки</li><li>Так быстрее</li><li>Реляционные базы не поддерживают UPDATE</li><li>Чтобы сэкономить место</li></ul><div class="why">Изменяемое поле не хранит ответа на вопрос «почему там такая сумма».</div></div>
+<div class="mcq" data-ok="3"><p>Зачем нужна сверка с отчётами PSP, если код написан правильно?</p><ul><li>Она не нужна</li><li>Для ускорения платежей</li><li>Для расчёта налогов</li><li>Внешний мир расходится с нашими записями по причинам, не зависящим от кода: потерянные webhook-и, операции после таймаута, ручные действия — расхождения нужно находить и закрывать</li></ul><div class="why">Сверка — механизм обнаружения ошибок последней инстанции.</div></div>
+
+</div></main>
+</div>
+</body>
+</html>

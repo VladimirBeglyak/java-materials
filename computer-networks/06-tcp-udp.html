@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · UDP и TCP</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ТРАНСПОРТ · РОАДМАП j7</div>
+  <h1>UDP и TCP: соединение и надёжность</h1>
+  <p class="lead">IP доставляет пакеты между хостами «как получится». Транспортный уровень доставляет данные между <b>процессами</b>: UDP — просто и без гарантий, TCP — надёжным упорядоченным потоком байтов поверх ненадёжной сети. Половина сетевых ошибок в логах Java-сервиса — это состояния TCP, которые здесь и разберём.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">RFC 9293</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="ports"><span class="h-num">6.1</span>Порты и сокеты</h2>
+<p>Порт — 16-битный номер процесса на хосте. Соединение TCP однозначно определяется <b>пятёркой</b>: (протокол, IP клиента, порт клиента, IP сервера, порт сервера). Поэтому сервер на одном порту 443 держит сотни тысяч соединений — у них разные адреса и порты клиентов.</p>
+<div class="table-wrap"><table>
+<tr><th>Диапазон</th><th>Назначение</th><th>Примеры</th></tr>
+<tr><td>0–1023</td><td>well-known, на Linux для прослушивания нужны права</td><td>22 SSH, 53 DNS, 80 HTTP, 443 HTTPS</td></tr>
+<tr><td>1024–49151</td><td>registered</td><td>3306 MySQL, 5432 PostgreSQL, 6379 Redis, 9092 Kafka, 8080</td></tr>
+<tr><td>эфемерные</td><td>ОС выдаёт клиенту для исходящего соединения</td><td>Linux по умолчанию 32768–60999 (≈ 28 000 портов) — тема 12</td></tr>
+</table></div>
+<figure class="diagram">
+<svg viewBox="0 0 800 190" role="img" aria-label="Слушающий и подключённые сокеты">
+  <defs><marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="470" y="20" width="310" height="44" rx="8" class="box-acc"/><text x="625" y="47" text-anchor="middle" class="mono" font-size="12.5">LISTEN  *:443        (ServerSocket)</text>
+  <rect x="470" y="80" width="310" height="40" rx="8" class="box-ok"/><text x="625" y="105" text-anchor="middle" class="mono" font-size="12">ESTAB 10.0.0.5:443 ↔ 85.1.2.3:51544</text>
+  <rect x="470" y="132" width="310" height="40" rx="8" class="box-ok"/><text x="625" y="157" text-anchor="middle" class="mono" font-size="12">ESTAB 10.0.0.5:443 ↔ 85.1.2.3:51545</text>
+  <rect x="20" y="96" width="250" height="60" rx="8" class="box"/><text x="145" y="120" text-anchor="middle" font-size="13">Клиент 85.1.2.3</text><text x="145" y="140" text-anchor="middle" class="mono" font-size="11">два соединения — два порта</text>
+  <path d="M270 115 L466 100" class="ln" marker-end="url(#f1)"/><path d="M270 138 L466 152" class="ln" marker-end="url(#f1)"/>
+  <text x="20" y="40" font-size="12.5" class="muted">accept() возвращает новый сокет</text><text x="20" y="58" font-size="12.5" class="muted">на каждое соединение</text>
+</svg>
+</figure>
+
+<h2 id="udp"><span class="h-num">6.2</span>UDP</h2>
+<p>Заголовок 8 байт: порты, длина, контрольная сумма. Ни соединения, ни подтверждений, ни порядка, ни управления перегрузкой. Каждая датаграмма — независимое сообщение (в отличие от потока TCP — границы сообщений сохраняются).</p>
+<div class="grid-2">
+  <div class="card"><h4>Когда UDP</h4><ul><li>Короткий запрос–ответ, где проще повторить: DNS.</li><li>Реальное время, где опоздавший пакет бесполезен: голос, видео, игры.</li><li>Свой транспорт поверх UDP: <b>QUIC/HTTP/3</b>, WireGuard.</li><li>Метрики «отправил и забыл»: StatsD, syslog.</li></ul></div>
+  <div class="card"><h4>Что придётся делать самому</h4><ul><li>Повторы и таймауты.</li><li>Ограничение скорости — иначе можно забить сеть.</li><li>Размер датаграммы ≤ MTU пути, иначе фрагментация (DNS-ответы &gt; 1232 байт переключают на TCP).</li></ul></div>
+</div>
+
+<h2 id="tcpheader"><span class="h-num">6.3</span>Заголовок TCP</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 210" role="img" aria-label="Заголовок TCP">
+  <g font-size="12">
+    <rect x="20" y="20" width="380" height="34" class="box"/><text x="210" y="42" text-anchor="middle">Source Port</text>
+    <rect x="400" y="20" width="380" height="34" class="box"/><text x="590" y="42" text-anchor="middle">Destination Port</text>
+    <rect x="20" y="54" width="760" height="34" class="box-acc"/><text x="400" y="76" text-anchor="middle">Sequence Number — номер первого байта данных в сегменте</text>
+    <rect x="20" y="88" width="760" height="34" class="box-acc"/><text x="400" y="110" text-anchor="middle">Acknowledgment Number — «жду байт номер N» (всё до N получено)</text>
+    <rect x="20" y="122" width="100" height="34" class="box"/><text x="70" y="144" text-anchor="middle">Offset</text>
+    <rect x="120" y="122" width="280" height="34" class="box-warn"/><text x="260" y="144" text-anchor="middle" class="mono">SYN ACK FIN RST PSH URG ECE CWR</text>
+    <rect x="400" y="122" width="380" height="34" class="box-info"/><text x="590" y="144" text-anchor="middle">Window — сколько ещё байт готов принять</text>
+    <rect x="20" y="156" width="380" height="34" class="box"/><text x="210" y="178" text-anchor="middle">Checksum</text>
+    <rect x="400" y="156" width="380" height="34" class="box"/><text x="590" y="178" text-anchor="middle">Options: MSS, SACK, Window Scale, Timestamps</text>
+  </g>
+</svg>
+</figure>
+
+<h2 id="handshake"><span class="h-num">6.4</span>Установление соединения</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="Трёхстороннее рукопожатие">
+  <defs><marker id="f2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker>
+  <marker id="f3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="140" y="22" text-anchor="middle" font-weight="700">Клиент</text><text x="660" y="22" text-anchor="middle" font-weight="700">Сервер</text>
+  <path d="M140 30 V290" class="ln"/><path d="M660 30 V290" class="ln"/>
+  <text x="20" y="54" class="mono" font-size="11.5">SYN_SENT</text><text x="680" y="54" class="mono" font-size="11.5">LISTEN</text>
+  <path d="M140 50 L656 90" class="ln-acc" marker-end="url(#f2)"/><text x="400" y="62" text-anchor="middle" class="mono" font-size="12">SYN seq=1000, MSS=1460, SACK, WScale</text>
+  <text x="680" y="100" class="mono" font-size="11.5">SYN_RCVD</text><text x="680" y="116" class="mono muted" font-size="11">SYN queue</text>
+  <path d="M660 110 L144 150" class="ln-acc" marker-end="url(#f2)"/><text x="400" y="122" text-anchor="middle" class="mono" font-size="12">SYN-ACK seq=5000 ack=1001</text>
+  <text x="20" y="160" class="mono" font-size="11.5">ESTABLISHED</text>
+  <path d="M140 170 L656 210" class="ln-acc" marker-end="url(#f2)"/><text x="400" y="182" text-anchor="middle" class="mono" font-size="12">ACK ack=5001  (+ можно сразу данные)</text>
+  <text x="680" y="220" class="mono" font-size="11.5">ESTABLISHED</text><text x="668" y="236" class="mono muted" font-size="11">accept queue</text>
+  <path d="M140 250 L656 280" class="ln" marker-end="url(#f3)"/><text x="400" y="258" text-anchor="middle" class="mono" font-size="12">GET / HTTP/1.1 …</text>
+  <text x="20" y="284" font-size="12" fill="var(--accent)">1 RTT до первого байта запроса</text>
+</svg>
+</figure>
+<ul>
+  <li><b>Зачем три сообщения</b>: обе стороны должны выбрать случайный начальный номер последовательности (ISN) и убедиться, что другая сторона его получила. Случайный ISN защищает от путаницы со старыми пакетами и подделки соединений.</li>
+  <li><b>Две очереди на сервере</b>: SYN queue (полуоткрытые соединения) и accept queue (готовые, ждут <code>accept()</code>). Размер второй задаёт <code>backlog</code> в <code>ServerSocket</code> и <code>net.core.somaxconn</code>. Если приложение не успевает принимать — новые соединения отбрасываются, клиенты видят таймауты подключения.</li>
+  <li><b>SYN flood</b>: атакующий шлёт SYN с поддельных адресов и забивает SYN queue. Защита — SYN cookies: состояние кодируется в ISN, очередь не нужна (тема 14).</li>
+  <li><b>TCP Fast Open</b> позволяет отправить данные уже в SYN при повторных подключениях, но широко не используется из-за проблем с middlebox'ами — эту задачу решил QUIC.</li>
+</ul>
+
+<h2 id="reliability"><span class="h-num">6.5</span>Надёжность: номера, подтверждения, повторы</h2>
+<p>TCP нумерует <b>байты</b>, а не сегменты. ACK кумулятивный: <code>ack=7001</code> значит «всё до 7000 включительно получено». Если подтверждение не пришло за <b>RTO</b> (retransmission timeout, вычисляется из сглаженного RTT и его разброса, минимум ~200 мс в Linux), сегмент отправляется повторно, а RTO удваивается.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 330" role="img" aria-label="Fast retransmit">
+  <defs><marker id="f4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
+  <marker id="f5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="120" y="20" text-anchor="middle" font-weight="700">Отправитель</text><text x="680" y="20" text-anchor="middle" font-weight="700">Получатель</text>
+  <path d="M120 28 V320" class="ln"/><path d="M680 28 V320" class="ln"/>
+  <path d="M120 40 L676 52" class="ln" marker-end="url(#f4)"/><text x="20" y="44" class="mono" font-size="11.5">seq 1</text>
+  <path d="M120 66 L400 72" stroke="var(--bad)" stroke-width="1.6"/><text x="410" y="76" font-size="12.5" fill="var(--bad)">✘ потерян</text><text x="20" y="70" class="mono" font-size="11.5">seq 1461</text>
+  <path d="M120 92 L676 104" class="ln" marker-end="url(#f4)"/><text x="20" y="96" class="mono" font-size="11.5">seq 2921</text>
+  <path d="M120 118 L676 130" class="ln" marker-end="url(#f4)"/><text x="20" y="122" class="mono" font-size="11.5">seq 4381</text>
+  <path d="M120 144 L676 156" class="ln" marker-end="url(#f4)"/><text x="20" y="148" class="mono" font-size="11.5">seq 5841</text>
+  <path d="M680 176 L124 188" class="ln-dash" marker-end="url(#f4)"/><text x="690" y="180" class="mono" font-size="11">ack 1461 ①</text>
+  <path d="M680 202 L124 214" class="ln-dash" marker-end="url(#f4)"/><text x="690" y="206" class="mono" font-size="11">ack 1461 ②</text>
+  <path d="M680 228 L124 240" class="ln-dash" marker-end="url(#f4)"/><text x="690" y="232" class="mono" font-size="11">ack 1461 ③</text><text x="400" y="226" text-anchor="middle" class="mono" font-size="11">+ SACK 2921–7300</text>
+  <path d="M120 262 L676 276" class="ln-acc" marker-end="url(#f5)"/><text x="20" y="266" class="mono" font-size="11.5" fill="var(--accent)">повтор 1461</text>
+  <path d="M680 296 L124 310" class="ln" marker-end="url(#f4)"/><text x="690" y="300" class="mono" font-size="11">ack 7301</text>
+  <text x="400" y="296" text-anchor="middle" font-size="12" class="muted">3 дубля ACK → повтор без ожидания RTO</text>
+</svg>
+<figcaption><b>Fast retransmit</b>: три дублирующих ACK означают «один сегмент пропал, следующие дошли» — повтор без ожидания RTO. <b>SACK</b> сообщает, какие именно диапазоны получены, чтобы повторять только потерянное.</figcaption>
+</figure>
+<div class="callout warn"><span class="c-title">Head-of-line blocking</span>
+Пока потерянный сегмент не пришёл повторно, получатель не может отдать приложению следующие байты, даже если они уже в буфере: TCP гарантирует порядок. Для HTTP/2, где много запросов идут в одном соединении, одна потеря тормозит все запросы — главная причина появления QUIC (тема 11).
+</div>
+
+<h2 id="flow"><span class="h-num">6.6</span>Управление потоком</h2>
+<p>Поле <b>Window</b> — сколько байт получатель готов принять сверх подтверждённых (свободное место в его буфере). Если приложение-получатель медленно читает из сокета, окно уменьшается до нуля, и отправитель останавливается (zero window), периодически опрашивая получателя. Это <b>backpressure</b> на уровне TCP: медленный потребитель автоматически тормозит быстрого производителя. Окно в заголовке — 16 бит (64 КБ), поэтому опция <b>Window Scale</b> умножает его до гигабайта — без неё на длинных быстрых каналах скорость упирается в окно (BDP, тема 07).</p>
+<p>Не путайте: <b>flow control</b> защищает получателя (окно получателя), <b>congestion control</b> защищает сеть (окно перегрузки, тема 07). Отправитель берёт минимум из двух.</p>
+
+<h2 id="close"><span class="h-num">6.7</span>Закрытие, TIME_WAIT и CLOSE_WAIT</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 280" role="img" aria-label="Закрытие соединения">
+  <defs><marker id="f6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="140" y="20" text-anchor="middle" font-weight="700">Закрывает первым</text><text x="660" y="20" text-anchor="middle" font-weight="700">Другая сторона</text>
+  <path d="M140 28 V270" class="ln"/><path d="M660 28 V270" class="ln"/>
+  <path d="M140 46 L656 76" class="ln" marker-end="url(#f6)"/><text x="400" y="52" text-anchor="middle" class="mono" font-size="12">FIN</text>
+  <text x="20" y="50" class="mono" font-size="11">FIN_WAIT_1</text>
+  <path d="M660 86 L144 116" class="ln" marker-end="url(#f6)"/><text x="400" y="92" text-anchor="middle" class="mono" font-size="12">ACK</text>
+  <text x="20" y="120" class="mono" font-size="11">FIN_WAIT_2</text><text x="676" y="90" class="mono" font-size="11" fill="var(--bad)">CLOSE_WAIT</text>
+  <text x="676" y="108" font-size="11" class="muted">ждёт close()</text><text x="676" y="122" font-size="11" class="muted">в приложении</text>
+  <path d="M660 150 L144 180" class="ln" marker-end="url(#f6)"/><text x="400" y="156" text-anchor="middle" class="mono" font-size="12">FIN</text>
+  <text x="676" y="154" class="mono" font-size="11">LAST_ACK</text>
+  <path d="M140 190 L656 220" class="ln" marker-end="url(#f6)"/><text x="400" y="196" text-anchor="middle" class="mono" font-size="12">ACK</text>
+  <text x="20" y="212" class="mono" font-size="11" fill="var(--accent)">TIME_WAIT</text><text x="20" y="228" font-size="11" class="muted">2×MSL (Linux 60 с)</text>
+  <text x="676" y="226" class="mono" font-size="11">CLOSED</text>
+  <text x="20" y="262" class="mono" font-size="11">CLOSED</text>
+</svg>
+</figure>
+<div class="grid-2">
+  <div class="card"><h4>TIME_WAIT — норма</h4><p>Остаётся у стороны, закрывшей первой, на 2×MSL (в Linux 60 с). Нужен, чтобы последний ACK можно было повторить и чтобы опоздавшие пакеты старого соединения не попали в новое с той же пятёркой. Проблемой становится, когда клиент открывает тысячи коротких соединений к одному адресу: эфемерные порты заняты TIME_WAIT. Лечение — переиспользование соединений (keep-alive, пулы), а не «тюнинг» ядра.</p></div>
+  <div class="card"><h4>CLOSE_WAIT — баг в вашем коде</h4><p>Удалённая сторона закрыла соединение, а приложение не вызвало <code>close()</code>. Тысячи CLOSE_WAIT в <code>ss</code> = утечка: не закрыт <code>InputStream</code> ответа HTTP-клиента, соединение не возвращено в пул, нет try-with-resources. Дескрипторы кончаются — «Too many open files».</p></div>
+</div>
+<p><b>RST</b> — аварийный сброс: порт закрыт («Connection refused»), пакет для несуществующего соединения, закрытие с непрочитанными данными, или балансировщик/файрвол разорвал соединение («Connection reset by peer»).</p>
+
+<h2 id="java"><span class="h-num">6.8</span>Как это выглядит в Java</h2>
+<div class="table-wrap"><table>
+<tr><th>Исключение</th><th>Что произошло в сети</th><th>Типичная причина</th></tr>
+<tr><td><code>ConnectException: Connection refused</code></td><td>на SYN пришёл RST</td><td>на порту никто не слушает, сервис упал/не поднялся</td></tr>
+<tr><td><code>SocketTimeoutException: Connect timed out</code></td><td>на SYN нет ответа</td><td>файрвол молча отбрасывает, хост недоступен, переполнена accept queue</td></tr>
+<tr><td><code>SocketTimeoutException: Read timed out</code></td><td>соединение есть, данных нет дольше readTimeout</td><td>медленный сервер, долгий запрос в БД, зависание</td></tr>
+<tr><td><code>SocketException: Connection reset</code></td><td>пришёл RST посреди соединения</td><td>сервер или прокси закрыл соединение (idle timeout), процесс упал</td></tr>
+<tr><td><code>IOException: Broken pipe</code></td><td>запись в соединение, уже закрытое другой стороной</td><td>клиент ушёл, не дождавшись ответа; переиспользование «протухшего» соединения из пула</td></tr>
+<tr><td><code>UnknownHostException</code></td><td>до TCP не дошло: DNS</td><td>тема 08</td></tr>
+</table></div>
+
+<h2 id="lab"><span class="h-num">6.9</span>Лабораторная</h2>
+<pre><code class="sh">$ ss -tan | awk '{print $1}' | sort | uniq -c     # сколько соединений в каждом состоянии
+$ ss -tlnp                                        # кто что слушает (Windows: netstat -ano)
+$ sudo tcpdump -i any -nn 'tcp port 443 and host example.com' -c 20
+$ curl -sI https://example.com                    # в другом окне — увидите SYN, SYN-ACK, ACK, FIN
+$ nc -vz localhost 9999                           # закрытый порт → Connection refused (RST)</code></pre>
+
+<h2 id="sim"><span class="h-num">6.10</span>Интерактив: жизнь TCP-соединения по сегментам</h2>
+<div class="widget stepper" id="tcpSim">
+  <div class="widget-title">Симулятор: рукопожатие, данные, потеря, закрытие</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="tcC"><h5>Клиент 10.0.0.5:51000</h5><div class="items">
+      <span class="chip" data-to="1">CLOSED</span><span class="chip warn" data-from="1" data-to="3">SYN_SENT</span><span class="chip ok" data-from="3" data-to="9">ESTABLISHED</span><span class="chip warn" data-from="9" data-to="10">FIN_WAIT_1</span><span class="chip warn" data-from="10" data-to="11">FIN_WAIT_2</span><span class="chip info" data-from="11">TIME_WAIT (2×MSL)</span></div></div>
+    <div class="lane node" id="tcS"><h5>Сервер 10.0.0.9:443</h5><div class="items">
+      <span class="chip" data-to="2">LISTEN</span><span class="chip warn" data-from="2" data-to="3">SYN_RCVD (очередь SYN)</span><span class="chip ok" data-from="3" data-to="10">ESTABLISHED</span><span class="chip warn" data-from="10" data-to="11">CLOSE_WAIT</span><span class="chip warn" data-from="11" data-to="12">LAST_ACK</span><span class="chip" data-from="12">CLOSED</span></div></div>
+  </div>
+  <section class="st-step" data-t="SYN" data-hl="tcC" data-log="C → S   SYN        seq=1000                    win=64240 mss=1460"><h4>connect(): клиент шлёт SYN</h4><p>Начальный номер (ISN) случаен — защита от подделки сегментов. В опциях: MSS, масштаб окна, поддержка SACK. Если ответа нет, SYN повторяется через 1, 2, 4… секунд — отсюда долгое «зависание» connect без таймаута.</p></section>
+  <section class="st-step" data-t="SYN-ACK" data-hl="tcS" data-log="S → C   SYN,ACK    seq=5000 ack=1001           win=65160 mss=1460"><h4>Сервер отвечает SYN-ACK</h4><p>Ядро сервера кладёт полуоткрытое соединение в очередь SYN. <code>ack=1001</code>: «жду от тебя байт №1001» (SYN занимает один номер). Приложение сервера пока ничего не знает.</p></section>
+  <section class="st-step" data-t="ACK" data-hl="tcC tcS" data-log="C → S   ACK        seq=1001 ack=5001"><h4>Клиент подтверждает — соединение установлено</h4><p>Одна поездка туда-обратно (1 RTT). На сервере соединение переходит в accept-очередь и ждёт вызова <code>accept()</code>. Очередь переполнена (приложение не успевает) — новые соединения отбрасываются.</p></section>
+  <section class="st-step" data-t="Данные 200 байт" data-hl="tcC" data-log="C → S   PSH,ACK    seq=1001 ack=5001 len=200"><h4>Клиент отправляет запрос</h4><p>Номер последовательности — номер первого байта сегмента в потоке. TCP — поток байтов, а не сообщений: границы <code>write()</code> не сохраняются.</p></section>
+  <section class="st-step" data-t="ACK данных" data-hl="tcS" data-log="S → C   ACK        seq=5001 ack=1201"><h4>Сервер подтверждает</h4><p><code>ack=1201</code> — кумулятивное подтверждение: «всё до байта 1200 получено». Клиент удаляет эти байты из буфера отправки.</p></section>
+  <section class="st-step" data-t="Ответ: сегмент потерян" data-hl="tcS" data-log="S → C   PSH,ACK    seq=5001 ack=1201 len=1460   ✘ ПОТЕРЯН&#10;S → C   PSH,ACK    seq=6461 ack=1201 len=1460"><h4>Сервер шлёт два сегмента, первый теряется</h4><p>Клиент получает байты с 6461, но ждёт 5001. Он сохраняет полученное в буфере (вне очереди) и не может отдать приложению: порядок байтов должен сохраняться.</p></section>
+  <section class="st-step" data-t="Дубли ACK" data-hl="tcC" data-log="C → S   ACK        ack=5001 SACK=6461-7921     (дубль)"><h4>Клиент повторяет ack=5001</h4><p>Дублирующее подтверждение с опцией SACK: «жду 5001, но 6461–7921 уже есть». Три дубля подряд — сигнал потери без ожидания таймера.</p></section>
+  <section class="st-step" data-t="Повторная передача" data-hl="tcS tcC" data-log="S → C   PSH,ACK    seq=5001 len=1460            (fast retransmit)&#10;C → S   ACK        ack=7921"><h4>Быстрая ретрансляция</h4><p>Сервер пересылает только потерянный сегмент. Клиент подтверждает сразу всё до 7921 и отдаёт данные приложению. Если бы дублей не хватило (потерян последний сегмент), сработал бы таймер RTO — минимум 200 мс.</p></section>
+  <section class="st-step" data-t="FIN клиента" data-hl="tcC" data-log="C → S   FIN,ACK    seq=1201 ack=7921"><h4>close() на клиенте</h4><p>FIN означает «я закончил отправку». Соединение закрывается по одному направлению за раз.</p></section>
+  <section class="st-step" data-t="ACK → CLOSE_WAIT" data-hl="tcS" data-log="S → C   ACK        ack=1202"><h4>Сервер подтверждает FIN</h4><p>Сервер в состоянии CLOSE_WAIT: ядро ждёт, пока <b>приложение</b> вызовет <code>close()</code>. Тысячи сокетов в CLOSE_WAIT — признак утечки: код не закрывает соединения.</p></section>
+  <section class="st-step" data-t="FIN сервера" data-hl="tcS tcC" data-log="S → C   FIN,ACK    seq=7921 ack=1202"><h4>Сервер закрывает свою сторону</h4><p>Клиент переходит в TIME_WAIT.</p></section>
+  <section class="st-step" data-t="Последний ACK" data-hl="tcC tcS" data-log="C → S   ACK        ack=7922"><h4>TIME_WAIT на стороне, закрывшей первой</h4><p>Клиент ждёт 2×MSL (в Linux 60 с): вдруг последний ACK потерялся и FIN придёт повторно, и чтобы запоздавшие сегменты старого соединения не попали в новое с той же четвёркой адресов и портов. Пара «адрес:порт» клиента занята всё это время — при тысячах коротких соединений в секунду так заканчиваются порты.</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">6.11</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Приложение отправило два сообщения двумя вызовами write() по 100 байт. Как их получит другая сторона?</p><ul><li>Гарантированно двумя чтениями по 100 байт</li><li>Как угодно: одним чтением на 200, двумя, или 150 + 50 — TCP не сохраняет границы сообщений</li><li>В обратном порядке</li><li>Только после закрытия соединения</li></ul><div class="why">Границы сообщений — задача прикладного протокола: длина в заголовке, разделитель или фреймы.</div></div>
+<div class="mcq" data-ok="2"><p>На сервере тысячи сокетов в состоянии CLOSE_WAIT. Что это значит?</p><ul><li>Сеть теряет пакеты</li><li>Клиенты не закрывают соединения</li><li>Клиенты закрыли соединения, а приложение сервера не вызвало close() — утечка сокетов</li><li>Это нормальное состояние простаивающих соединений</li></ul><div class="why">CLOSE_WAIT не имеет таймаута: сокет живёт, пока процесс его не закроет. Ищите незакрытые ресурсы.</div></div>
+<div class="mcq" data-ok="0"><p>Когда UDP лучше TCP?</p><ul><li>Когда запоздавшие данные бесполезны (голос, видео, игры), для коротких запросов (DNS) и как основа своих протоколов (QUIC)</li><li>Когда нужна гарантия доставки</li><li>Для передачи файлов</li><li>Никогда</li></ul><div class="why">UDP не ждёт повторной передачи потерянного пакета и не блокирует следующие за ним данные.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Нарисуйте трёхстороннее рукопожатие с номерами seq/ack. Почему не два сообщения?</summary><div class="a"><p>SYN(seq=x) → SYN-ACK(seq=y, ack=x+1) → ACK(ack=y+1). Каждая сторона должна передать свой случайный ISN и получить подтверждение, что его приняли; при двух сообщениях сервер не знает, дошёл ли его ISN, и старый дублированный SYN мог бы открыть ложное соединение.</p></div></details>
+<details class="q"><summary>На сервере 20 000 соединений в CLOSE_WAIT. Что это значит и где искать?</summary><div class="a"><p>Удалённые стороны закрыли соединения, а наше приложение не закрыло сокеты. Ищем незакрытые ресурсы: HTTP-ответы без закрытия тела, соединения JDBC вне try-with-resources, клиенты, создаваемые на каждый запрос. Thread dump и heap dump покажут, где держатся сокеты.</p></div></details>
+<details class="q"><summary>Чем отличаются Connection refused и Connect timed out?</summary><div class="a"><p>Refused — хост ответил RST: он доступен, но порт закрыт. Timed out — ответа на SYN нет вообще: пакеты отбрасываются по пути (файрвол, security group), хост выключен или сервер перегружен. Это разные зоны поиска: приложение против сети.</p></div></details>
+<details class="q"><summary>Почему TCP-окно получателя называют backpressure?</summary><div class="a"><p>Если приложение читает из сокета медленнее, чем приходят данные, буфер заполняется, объявленное окно уменьшается до нуля, и отправитель вынужден остановиться. Скорость производителя автоматически подстраивается под потребителя — тот же принцип, что request(n) в Reactive Streams.</p></div></details>
+<details class="q"><summary>Когда UDP лучше TCP?</summary><div class="a"><p>Когда опоздавшие данные бесполезны (голос, видео, игры), когда обмен — одно короткое сообщение, которое проще повторить (DNS), когда нужен свой транспорт с другими компромиссами (QUIC избавляется от HOL-блокировки и объединяет рукопожатия транспорта и TLS).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

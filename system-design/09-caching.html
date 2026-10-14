@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Кэширование и Redis</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · КЭШ И REDIS</div>
+  <h1>Кэширование и Redis</h1>
+  <p class="lead">Кэш — самый дешёвый способ ускорить систему и самый надёжный способ получить трудноуловимые ошибки. Глава о том, где и что кэшировать, как читать и писать через кэш, что такое Redis — и двенадцать способов, которыми кэш выходит из строя.</p>
+  <div class="meta"><span class="tag">3 конспекта</span><span class="tag">~3 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="strategy"><span class="h-num">9.1</span>Стратегии кэширования<span class="sk-num">#15</span></h2>
+<p>Кэш хранит часто запрашиваемые данные в быстром слое, чтобы не обращаться каждый раз к медленному. Результат — меньше задержка, меньше нагрузка на базу, выше пропускная способность. Плата — данные в кэше могут устареть.</p>
+<figure class="sketch"><a href="img/15-caching-strategy.jpg"><img src="img/15-caching-strategy.jpg" width="1024" height="1536" loading="lazy" alt="Стратегии кэширования: уровни, шаблоны, инвалидация, вытеснение, ключи"></a><figcaption><b>Конспект #15.</b> Caching Strategy <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<h3>Где кэшировать</h3>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Что</th><th>Особенность</th></tr>
+<tr><td>0 · Браузер и CDN</td><td>Статика: изображения, JS, CSS</td><td>Управляется заголовками <code>Cache-Control</code>, <code>ETag</code>; запрос вообще не доходит до сервера</td></tr>
+<tr><td>1 · В памяти приложения</td><td>Справочники, конфигурация</td><td>Быстрее всего (нет сети), но у каждого экземпляра своя копия — Caffeine в Java</td></tr>
+<tr><td>2 · Распределённый кэш</td><td>Сессии, результаты запросов, объекты</td><td>Общий для всех экземпляров — Redis, Memcached</td></tr>
+<tr><td>3 · Кэш базы данных</td><td>Страницы данных и индексов</td><td>Работает сам; настраивается объёмом памяти</td></tr>
+</table></div>
+<h3>Шаблоны чтения и записи</h3>
+<div class="table-wrap"><table>
+<tr><th>Шаблон</th><th>Как работает</th><th>Плюсы</th><th>Риски</th></tr>
+<tr><td><b>Cache-aside</b> (lazy loading)</td><td>Приложение: проверить кэш → промах → прочитать из БД → положить в кэш</td><td>Самый распространённый; кэшируется только востребованное; отказ кэша не роняет систему</td><td>Первый запрос медленный; окно устаревания</td></tr>
+<tr><td><b>Read-through</b></td><td>То же, но в БД ходит сам кэш (библиотека)</td><td>Приложение не знает о БД</td><td>Нужна поддержка в кэше</td></tr>
+<tr><td><b>Write-through</b></td><td>Запись идёт в кэш и синхронно в БД</td><td>Кэш всегда свежий</td><td>Запись медленнее; кэшируется и невостребованное</td></tr>
+<tr><td><b>Write-behind</b> (write-back)</td><td>Запись в кэш, в БД — асинхронно пакетами</td><td>Очень быстрая запись</td><td><b>Потеря данных</b>, если кэш упал до сброса</td></tr>
+<tr><td><i>Refresh-ahead</i></td><td>Кэш обновляет запись заранее, до истечения TTL</td><td>Нет промахов на горячих ключах</td><td>Лишняя работа для невостребованных</td></tr>
+</table></div>
+<p><b>Инвалидация</b> — как старое значение покидает кэш: по времени (TTL), явным удалением при изменении, сменой версии в ключе, по событию из очереди, по тегам. <b>Вытеснение</b> — что удаляется, когда память кончилась: LRU (давно не использованные), LFU (редко используемые), FIFO, случайно.</p>
+<div class="callout warn"><span class="c-title">Чего нет на схеме: порядок действий при записи</span>
+В cache-aside при изменении данных нужно обновить базу и <b>удалить</b> ключ из кэша — не записывать в него новое значение.
+<ul>
+  <li><b>Почему удалять, а не обновлять.</b> Два параллельных обновления могут записать в кэш значения в порядке, обратном записи в БД, и в кэше навсегда останется старое. Удаление идемпотентно.</li>
+  <li><b>Почему сначала БД, потом кэш.</b> Если сначала удалить ключ, параллельное чтение успеет положить в кэш старое значение до того, как БД обновится.</li>
+  <li><b>Гонка всё равно возможна</b> (чтение прочитало старое из БД, запись обновила БД и удалила ключ, чтение положило старое). Поэтому TTL ставят всегда — как страховку, ограничивающую время жизни ошибки.</li>
+</ul>
+</div>
+<div class="callout ok"><span class="c-title">Когда кэш не нужен</span>
+Данные меняются чаще, чем читаются; требуется строгая согласованность (баланс перед списанием); данные дёшево получить и так; данные чувствительны. «Cache smart, not everything»: кэш — это ещё одно хранилище, которое нужно синхронизировать, мониторить и переживать его отказы.
+</div>
+
+<h2 id="redis"><span class="h-num">9.2</span>Redis<span class="sk-num">#39</span></h2>
+<p>Redis — хранилище «ключ–значение» в оперативной памяти. Он быстр, потому что не обращается к диску при чтении и выполняет команды в одном потоке без блокировок. От простого кэша его отличает набор структур данных: значением может быть не только строка, но и список, множество, хэш-таблица, отсортированное множество.</p>
+<figure class="sketch"><a href="img/39-redis.jpg"><img src="img/39-redis.jpg" width="1024" height="1536" loading="lazy" alt="Redis: как работает, шаблоны кэша, структуры данных, возможности, применение"></a><figcaption><b>Конспект #39.</b> Redis — In-Memory Data Store <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>Структура</th><th>Команды</th><th>Типичное применение</th></tr>
+<tr><td>String</td><td><code>SET</code>, <code>GET</code>, <code>INCR</code></td><td>Кэш объектов, счётчики, флаги, блокировки</td></tr>
+<tr><td>Hash</td><td><code>HSET</code>, <code>HGET</code></td><td>Объект с полями: профиль, корзина</td></tr>
+<tr><td>List</td><td><code>LPUSH</code>, <code>RPOP</code></td><td>Простая очередь, последние N событий</td></tr>
+<tr><td>Set</td><td><code>SADD</code>, <code>SISMEMBER</code></td><td>Уникальные элементы, теги, пересечения</td></tr>
+<tr><td>Sorted Set</td><td><code>ZADD</code>, <code>ZRANGE</code></td><td>Рейтинги, очереди с приоритетом, скользящее окно лимитера</td></tr>
+<tr><td>Bitmap</td><td><code>SETBIT</code>, <code>BITCOUNT</code></td><td>Флаги на миллионы пользователей (активность по дням)</td></tr>
+<tr><td>HyperLogLog</td><td><code>PFADD</code>, <code>PFCOUNT</code></td><td>Приблизительный подсчёт уникальных — 12 КБ на счётчик при любом объёме</td></tr>
+<tr><td>Geo</td><td><code>GEOADD</code>, <code>GEOSEARCH</code></td><td>Поиск «рядом со мной»</td></tr>
+<tr><td>Stream</td><td><code>XADD</code>, <code>XREADGROUP</code></td><td>Журнал событий с группами потребителей (<a href="11-redis-toolkit.html#streams">тема 11</a>)</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Однопоточность — ключ к пониманию Redis</span>
+Команды выполняются строго по одной. Отсюда три следствия:
+<ul>
+  <li><b>Каждая команда атомарна</b> — <code>INCR</code> не нужно защищать блокировкой. На этом строятся счётчики, лимитеры и блокировки.</li>
+  <li><b>Медленная команда останавливает всех.</b> <code>KEYS *</code> на миллионе ключей «замораживает» сервер на секунды. В рабочей системе — только <code>SCAN</code>.</li>
+  <li><b>Один экземпляр использует одно ядро</b> для команд. Масштабирование — репликами (чтение) и кластером (запись), <a href="10-redis-ha.html">тема 10</a>.</li>
+</ul>
+</div>
+<p><b>Память конечна.</b> Параметр <code>maxmemory</code> задаёт предел, <code>maxmemory-policy</code> — что делать при его достижении: <code>allkeys-lru</code> / <code>allkeys-lfu</code> для кэша (вытеснять любые ключи), <code>volatile-*</code> — только ключи с TTL, <code>noeviction</code> — отвечать ошибкой на запись (значение по умолчанию; подходит, когда Redis используется как основное хранилище).</p>
+<p><b>В Java</b>: клиент Lettuce (по умолчанию в Spring Data Redis, неблокирующий) или Jedis; абстракция <code>@Cacheable</code> / <code>@CacheEvict</code>; Redisson — для блокировок и распределённых коллекций.</p>
+
+<h2 id="failures"><span class="h-num">9.3</span>Узкие места и отказы кэша<span class="sk-num">#49</span></h2>
+<p>Двенадцать типичных проблем кэша на Redis. Первые пять — про данные и ключи, остальные — про сам сервер и сеть. Три «классические» проблемы с похожими названиями (penetration, stampede, avalanche) спрашивают на собеседованиях чаще всего.</p>
+<figure class="sketch"><a href="img/49-redis-cache-bottlenecks.jpg"><img src="img/49-redis-cache-bottlenecks.jpg" width="1024" height="1536" loading="lazy" alt="Redis Cache: 12 узких мест и отказов с решениями"></a><figcaption><b>Конспект #49.</b> Redis Cache — Bottlenecks and Failures <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th>#</th><th>Проблема</th><th>Что происходит</th><th>Решения</th></tr>
+<tr><td>1</td><td><b>Hot key</b></td><td>Один ключ получает огромную долю запросов; перегружен один узел</td><td>Локальный кэш перед Redis, чтение с реплик, размножение ключа на копии</td></tr>
+<tr><td>2</td><td><b>Big key</b></td><td>Значение на мегабайты: медленные операции, блокировка потока, проблемы репликации</td><td>Разбить на части, сжать, хранить большое в S3, а в Redis — ссылку</td></tr>
+<tr><td>3</td><td><b>Cache penetration</b></td><td>Запросы к <i>несуществующим</i> ключам всегда промахиваются и бьют в БД</td><td>Кэшировать «пусто» с коротким TTL, <a href="11-redis-toolkit.html#bloom">фильтр Блума</a>, валидация входа</td></tr>
+<tr><td>4</td><td><b>Cache stampede</b></td><td>Популярный ключ истёк — сотни запросов одновременно идут пересчитывать его</td><td>Блокировка на пересчёт (один считает, остальные ждут), stale-while-revalidate, обновление заранее</td></tr>
+<tr><td>5</td><td><b>Cache avalanche</b></td><td>Массово истекло много ключей или упал сам Redis — вся нагрузка на БД</td><td>Случайная добавка к TTL (jitter), многоуровневый кэш, прогрев, ограничение запросов к БД</td></tr>
+<tr><td>6</td><td>Исчерпание памяти</td><td>Ошибки записи (OOM) или массовое вытеснение</td><td><code>maxmemory</code> + политика вытеснения, TTL на всё, мониторинг</td></tr>
+<tr><td>7</td><td>Медленные команды</td><td><code>KEYS *</code>, <code>HGETALL</code> большого хэша блокируют сервер</td><td><code>SCAN</code>, постраничное чтение, небольшие структуры, <code>SLOWLOG</code></td></tr>
+<tr><td>8</td><td>Исчерпание соединений</td><td>Слишком много клиентов, новые подключения отклоняются</td><td>Пул соединений, <code>maxclients</code>, закрытие простаивающих</td></tr>
+<tr><td>9</td><td>Отставание реплик</td><td>Чтение с реплики возвращает старое</td><td>Критичное читать с мастера, следить за отставанием</td></tr>
+<tr><td>10</td><td>Отказ узла</td><td>Недоступность, потеря данных без реплики</td><td>Sentinel или Cluster, реплики в разных зонах, ретраи с паузой</td></tr>
+<tr><td>11</td><td>Разделение сети</td><td>Таймауты, split-brain</td><td>Несколько зон, разумные таймауты, кворум</td></tr>
+<tr><td>12</td><td>Несогласованность с БД</td><td>В кэше устаревшие данные</td><td>Удаление при записи + TTL, инвалидация по событиям</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Как отличить три похожие проблемы</span>
+<b>Penetration</b> — данных нет нигде, кэш не может помочь в принципе (часто атака перебором идентификаторов). <b>Stampede</b> (он же thundering herd, dog-pile) — данные есть, но истёк <i>один горячий</i> ключ. <b>Avalanche</b> — одновременно пропало <i>много</i> ключей или весь кэш. Общий итог один: нагрузка, которую обычно держит кэш, обрушивается на базу, не рассчитанную на неё.
+</div>
+<div class="callout interview"><span class="c-title">Вопрос, который стоит задать себе о каждом кэше</span>
+«Что произойдёт, если кэш сейчас окажется пустым?» Если ответ — «база ляжет», значит, кэш уже не оптимизация, а критическая зависимость: ему нужны отказоустойчивость, прогрев после перезапуска и защита базы (ограничение параллельных запросов, circuit breaker). Таймаут на обращение к Redis должен быть коротким — десятки миллисекунд, — а недоступность кэша обрабатываться как промах, а не как ошибка запроса.
+</div>
+
+<h2 id="sim"><span class="h-num">9.4</span>Интерактив: что кэш даёт и что будет, когда он упадёт</h2>
+<div class="widget" id="chrW">
+  <div class="widget-title">Калькулятор кэша перед базой данных</div>
+  <div class="controls">
+    <label>нагрузка, RPS<input type="number" id="chrRps" value="10000" min="1" style="width:100px"></label>
+    <label>доля попаданий, %<input type="number" id="chrHit" value="95" min="0" max="100" step="any"></label>
+    <label>ответ кэша, мс<input type="number" id="chrC" value="1" min="0.1" step="any"></label>
+    <label>ответ БД, мс<input type="number" id="chrD" value="20" min="0.1" step="any"></label>
+    <label>БД выдерживает, RPS<input type="number" id="chrCap" value="2000" min="1" style="width:100px"></label>
+  </div>
+  <div id="chrBars"></div>
+  <div class="verdict" id="chrOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var rps = Math.max(1, +$("chrRps").value), hit = Math.min(100, Math.max(0, +$("chrHit").value)) / 100, c = Math.max(0.1, +$("chrC").value), d = Math.max(0.1, +$("chrD").value), cap = Math.max(1, +$("chrCap").value);
+    var avg = hit * c + (1 - hit) * (c + d), dbLoad = rps * (1 - hit), mx = Math.max(rps, cap);
+    function bar(l, v, cls, unit) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px;flex-wrap:wrap"><span><b>' + l + '</b></span><span style="font-family:var(--font-mono)">' + Math.round(v).toLocaleString("ru-RU") + " " + unit + '</span></div><div class="bar ' + cls + '"><i style="width:' + Math.max(1, Math.min(100, v / mx * 100)) + '%"></i></div>'; }
+    $("chrBars").innerHTML = bar("Нагрузка на БД с кэшем", dbLoad, dbLoad > cap ? "bad" : "ok", "RPS") + bar("Предел БД", cap, "", "RPS") + bar("Нагрузка на БД, если кэш недоступен или пуст", rps, rps > cap ? "bad" : "ok", "RPS") +
+      '<div class="out">среднее время ответа: ' + avg.toFixed(2) + " мс  (без кэша " + d.toFixed(1) + " мс)\nкаждый процент попаданий сейчас стоит " + Math.round(rps / 100).toLocaleString("ru-RU") + " RPS нагрузки на БД\nпадение доли попаданий с " + (hit * 100).toFixed(0) + "% до " + Math.max(0, hit * 100 - 5).toFixed(0) + "% увеличит нагрузку на БД в " + ((1 - Math.max(0, hit - 0.05)) / Math.max(0.0001, 1 - hit)).toFixed(1) + " раза</div>";
+    var o = $("chrOut");
+    if (dbLoad > cap) { o.className = "verdict bad"; o.textContent = "Даже с кэшем база перегружена: промахи дают " + Math.round(dbLoad) + " RPS при пределе " + cap + ". Нужна бо́льшая доля попаданий (дольше TTL, прогрев, кэширование большего числа запросов) или масштабирование базы."; }
+    else if (rps > cap) { o.className = "verdict warn"; o.textContent = "Система работает только пока жив кэш. Его перезапуск, сбой или массовое истечение ключей направит в базу " + rps.toLocaleString("ru-RU") + " RPS при пределе " + cap + " — база ляжет, и кэш не сможет заполниться, потому что запросы к базе не проходят. Кэш стал обязательным компонентом: ему нужны реплики, постепенный прогрев, ограничение потока промахов (single-flight, rate limit к БД) и разброс TTL."; }
+    else { o.className = "verdict ok"; o.textContent = "База выдержит полную нагрузку и без кэша: кэш здесь — оптимизация, а не костыль. Это самая здоровая конфигурация."; }
+  }
+  document.querySelectorAll("#chrW input").forEach(function (e) { e.addEventListener("input", run); }); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Отказ</th><th>Что происходит</th><th>Защита</th></tr>
+<tr><td>Stampede (dogpile)</td><td>истёк популярный ключ — сотни запросов одновременно идут в БД за одним значением</td><td>single-flight / блокировка на ключ, обновление до истечения, stale-while-revalidate</td></tr>
+<tr><td>Avalanche</td><td>одновременно истекло много ключей или упал кэш</td><td>случайный разброс TTL, реплики кэша, ограничение запросов к БД</td></tr>
+<tr><td>Penetration</td><td>запросы несуществующих ключей всегда проходят в БД (в том числе атака)</td><td>кэшировать «нет такого» с коротким TTL, фильтр Блума</td></tr>
+<tr><td>Hot key</td><td>один ключ получает непропорционально много запросов и перегружает узел</td><td>локальный кэш первого уровня, реплики для чтения, дробление ключа</td></tr>
+<tr><td>Несогласованность</td><td>в кэше старое значение после обновления БД</td><td>удалять ключ после коммита, TTL как страховка, события изменений (CDC)</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">9.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В cache-aside при обновлении данных правильнее…</p><ul><li>Сначала обновить кэш, потом БД</li><li>Обновить БД и удалить ключ из кэша — следующий читатель загрузит свежее значение</li><li>Обновлять только кэш</li><li>Ничего не делать, TTL всё исправит</li></ul><div class="why">Запись нового значения в кэш создаёт гонку двух писателей. Удаление проще и безопаснее; короткий TTL страхует от редких гонок.</div></div>
+<div class="mcq" data-ok="2"><p>Какая политика вытеснения подходит кэшу общего назначения в Redis?</p><ul><li>noeviction</li><li>volatile-ttl</li><li>allkeys-lru или allkeys-lfu</li><li>random</li></ul><div class="why">noeviction при заполнении памяти начнёт отклонять записи. LRU/LFU вытесняют давно или редко используемое.</div></div>
+<div class="mcq" data-ok="0"><p>Почему доля попаданий 99% против 95% — огромная разница?</p><ul><li>Нагрузка на базу определяется промахами: 1% против 5% — в пять раз меньше запросов</li><li>Разницы почти нет</li><li>Кэш становится быстрее</li><li>Уменьшается память</li></ul><div class="why">Смотреть нужно на долю промахов, а не попаданий.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему при изменении данных ключ в кэше удаляют, а не перезаписывают?</summary><div class="a"><p>При параллельных изменениях порядок записи в кэш может не совпасть с порядком записи в базу: в базе останется новое значение, в кэше — старое, и надолго. Удаление не зависит от порядка: следующий читатель загрузит актуальное значение из базы. Плюс не тратятся ресурсы на значения, которые никто не прочитает.</p></div></details>
+<details class="q"><summary>Чем write-behind опасен и где он всё-таки уместен?</summary><div class="a"><p>Подтверждённая клиенту запись существует только в памяти кэша до асинхронного сброса; отказ кэша в этот момент — потеря данных. Уместен там, где потеря небольшой части допустима, а поток записи велик: счётчики просмотров, лайки, метрики, позиция воспроизведения.</p></div></details>
+<details class="q"><summary>В полночь истекает TTL у миллиона ключей, загруженных одновременно. Что случится и как предотвратить?</summary><div class="a"><p>Cache avalanche: все запросы промахнутся и пойдут в базу одновременно. Предотвращение — случайная добавка к TTL (например, 60 минут ± 10), чтобы истечение было размазано по времени; прогрев кэша заранее; ограничение параллельных запросов к базе.</p></div></details>
+<details class="q"><summary>Злоумышленник запрашивает <code>/products/{id}</code> со случайными несуществующими id. Почему кэш не помогает и что делать?</summary><div class="a"><p>Cache penetration: для несуществующего товара в кэше нечего хранить, каждый запрос идёт в базу. Решения: кэшировать отрицательный результат («не найдено») с коротким TTL; фильтр Блума с множеством существующих id — отсекает заведомо отсутствующие без обращения к базе; проверка формата id и rate limiting.</p></div></details>
+<details class="q"><summary>Почему <code>KEYS user:*</code> нельзя выполнять на рабочем Redis?</summary><div class="a"><p>Команда перебирает все ключи за O(N) в единственном потоке выполнения — на время её работы сервер не обслуживает остальных клиентов, возникают таймауты. <code>SCAN</code> делает то же порциями с курсором, уступая поток между вызовами.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

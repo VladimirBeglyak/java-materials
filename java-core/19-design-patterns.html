@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Паттерны проектирования</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Паттерны проектирования на примерах JDK</h1>
+  <p class="lead">Паттерн — это название для повторяющегося решения, а не цель. Знать их нужно по двум причинам: чтобы узнавать в чужом коде (JDK и Spring построены на них) и чтобы одним словом объяснять коллеге идею. Здесь паттерны показаны через классы, которыми вы уже пользуетесь, и в современной записи — с лямбдами, record и sealed-типами.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">GoF</span><span class="tag">примеры из JDK и Spring</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="map"><span class="h-num">19.1</span>Карта: где вы уже встречали паттерны</h2>
+<div class="table-wrap"><table>
+<tr><th>Паттерн</th><th>Идея в одну строку</th><th>В JDK</th><th>В Spring</th></tr>
+<tr><td>Strategy</td><td>алгоритм как подменяемый объект</td><td><code>Comparator</code>, <code>RejectedExecutionHandler</code></td><td><code>PasswordEncoder</code>, <code>HttpMessageConverter</code></td></tr>
+<tr><td>Template Method</td><td>скелет алгоритма в базовом классе, шаги — в наследниках</td><td><code>AbstractList</code>, <code>InputStream.read(byte[])</code></td><td><code>AbstractApplicationContext.refresh</code>, <code>OncePerRequestFilter</code></td></tr>
+<tr><td>Factory Method / Static Factory</td><td>создание скрыто за методом</td><td><code>List.of</code>, <code>Optional.of</code>, <code>Executors.new…</code></td><td><code>@Bean</code>-метод, <code>FactoryBean</code></td></tr>
+<tr><td>Builder</td><td>пошаговая сборка сложного объекта</td><td><code>StringBuilder</code>, <code>HttpRequest.newBuilder</code>, <code>Stream.builder</code></td><td><code>RestClient.builder</code>, <code>UriComponentsBuilder</code></td></tr>
+<tr><td>Singleton</td><td>один экземпляр</td><td><code>Runtime.getRuntime</code>, enum</td><td>scope singleton (один на контейнер)</td></tr>
+<tr><td>Decorator</td><td>обёртка с тем же интерфейсом добавляет поведение</td><td><code>BufferedInputStream</code>, <code>Collections.unmodifiableList</code></td><td><code>HttpServletRequestWrapper</code>, <code>TaskDecorator</code></td></tr>
+<tr><td>Proxy</td><td>заместитель контролирует доступ к объекту</td><td><code>java.lang.reflect.Proxy</code></td><td>AOP: <code>@Transactional</code>, <code>@Cacheable</code>, scoped proxy</td></tr>
+<tr><td>Adapter</td><td>приводит один интерфейс к другому</td><td><code>Arrays.asList</code>, <code>InputStreamReader</code></td><td><code>HandlerAdapter</code></td></tr>
+<tr><td>Facade</td><td>простой вход в сложную подсистему</td><td><code>Files</code>, <code>HttpClient</code></td><td><code>JdbcTemplate</code>, <code>RestClient</code></td></tr>
+<tr><td>Observer</td><td>подписчики узнают о событии</td><td><code>PropertyChangeListener</code>, <code>Flow.Subscriber</code></td><td><code>@EventListener</code>, <code>ApplicationEventPublisher</code></td></tr>
+<tr><td>Chain of Responsibility</td><td>запрос идёт по цепочке обработчиков</td><td><code>java.util.logging</code> handlers</td><td>servlet-фильтры, <code>SecurityFilterChain</code>, интерцепторы AOP</td></tr>
+<tr><td>Iterator</td><td>обход без раскрытия структуры</td><td><code>Iterator</code>, <code>Spliterator</code></td><td>—</td></tr>
+<tr><td>Command</td><td>действие как объект</td><td><code>Runnable</code>, <code>Callable</code></td><td>задачи <code>@Async</code>, <code>TransactionCallback</code></td></tr>
+<tr><td>Composite</td><td>дерево, где лист и узел имеют один интерфейс</td><td><code>java.awt.Container</code></td><td><code>CompositeHealthContributor</code>, <code>HandlerExceptionResolverComposite</code></td></tr>
+<tr><td>Flyweight</td><td>разделяемые неизменяемые экземпляры</td><td><code>Integer.valueOf</code> (кэш), пул строк</td><td>—</td></tr>
+</table></div>
+
+<div class="widget" id="ppW">
+  <div class="widget-title">Подбор паттерна по задаче</div>
+  <div class="controls"><label>задача<select id="ppCase" style="max-width:100%">
+    <option value="strategy">Цена доставки считается по-разному для курьера, почты и самовывоза; способы добавляются</option>
+    <option value="decorator">К любому HTTP-клиенту нужно добавить ретраи, логирование и метрики в произвольных сочетаниях</option>
+    <option value="builder">Объект с 12 полями, из которых 9 необязательны</option>
+    <option value="observer">После оформления заказа нужно отправить письмо, начислить бонусы и обновить аналитику — и список растёт</option>
+    <option value="state">Заказ ведёт себя по-разному в статусах NEW, PAID, SHIPPED; if-ы по статусу размножились по всему классу</option>
+    <option value="adapter">Сторонняя платёжная библиотека имеет свой интерфейс, а ваш код работает с PaymentGateway</option>
+    <option value="template">Импорт из CSV, XML и JSON: шаги «открыть, проверить, сохранить, отчитаться» одинаковы, отличается только разбор</option>
+    <option value="chain">Запрос должен пройти проверки: аутентификация, лимиты, валидация; каждая может остановить обработку</option>
+    <option value="factory">Нужно создавать парсер по расширению файла, не раскидывая new по коду</option>
+    <option value="proxy">Тяжёлый объект нужно создавать лениво и прозрачно для вызывающего кода</option>
+    <option value="none">В классе один способ расчёта и менять его не планируют</option>
+  </select></label></div>
+  <div class="verdict" id="ppOut"></div>
+</div>
+<script>
+(function () {
+  var A = {
+    strategy: ["Strategy", "Интерфейс DeliveryPricing с реализациями; выбор — по Map<DeliveryType, DeliveryPricing>, которую Spring соберёт из всех бинов. Новый способ = новый класс, существующий код не меняется."],
+    decorator: ["Decorator", "Каждое свойство — обёртка, реализующая тот же интерфейс и делегирующая вложенному объекту: new Metrics(new Retry(new Logging(client))). Наследованием пришлось бы плодить классы на каждое сочетание."],
+    builder: ["Builder", "Именованные шаги вместо конструктора с 12 позиционными аргументами; проверка инвариантов в build(). Для простых случаев хватит record со статическими фабриками."],
+    observer: ["Observer (события)", "Сервис публикует OrderPlaced и не знает о подписчиках. Новая реакция = новый слушатель. Цена: поток управления менее очевиден, поэтому события — для побочных реакций, не для основного сценария."],
+    state: ["State", "Поведение выносится в объекты состояний с общим интерфейсом; заказ делегирует текущему состоянию. В современной Java часто достаточно enum с методами или sealed-интерфейса и switch с проверкой полноты."],
+    adapter: ["Adapter", "Класс StripeGatewayAdapter implements PaymentGateway переводит вызовы в API библиотеки. Чужой интерфейс не просачивается в ваш код, библиотеку можно заменить."],
+    template: ["Template Method — или Strategy", "Скелет в абстрактном классе с абстрактным parse(). Современная альтернатива: обычный класс Importer, принимающий функцию-парсер; композиция гибче наследования."],
+    chain: ["Chain of Responsibility", "Список обработчиков с общим интерфейсом; каждый решает, передавать ли дальше. Так устроены servlet-фильтры и цепочка Spring Security."],
+    factory: ["Factory (статическая фабрика или реестр)", "Parsers.forExtension(\"csv\") скрывает выбор класса. Реестр Map<String, Supplier<Parser>> расширяется без switch."],
+    proxy: ["Proxy (virtual proxy)", "Заместитель с тем же интерфейсом создаёт настоящий объект при первом вызове. В Spring это @Lazy на точке внедрения; в чистой Java — Supplier с мемоизацией."],
+    none: ["Никакой", "Паттерн — ответ на конкретную проблему изменения. Интерфейс с единственной реализацией «на будущее» усложняет чтение и не окупается; добавить абстракцию можно в тот момент, когда появится второй вариант."]
+  };
+  var s = document.getElementById("ppCase"), o = document.getElementById("ppOut");
+  function run() { var a = A[s.value]; o.className = "verdict " + (s.value === "none" ? "warn" : "ok"); o.innerHTML = "<b>" + SG.esc(a[0]) + ".</b> " + SG.esc(a[1]); }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="creational"><span class="h-num">19.2</span>Порождающие: создание объектов</h2>
+<h3>Статическая фабрика вместо конструктора</h3>
+<pre><code class="java">public final class Money {
+    private final long minor; private final Currency currency;
+    private Money(long minor, Currency c) { this.minor = minor; this.currency = c; }
+
+    public static Money of(String amount, String code) { /* разбор и проверка */ }   // у фабрики есть ИМЯ
+    public static Money zero(Currency c) { return new Money(0, c); }                 // может вернуть кэш или подтип
+}</code></pre>
+<h3>Builder</h3>
+<pre><code class="java">HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.shop.ru/orders"))
+        .timeout(Duration.ofSeconds(2))
+        .header("Accept", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(json))
+        .build();                                     // неизменяемый результат, проверки — в build()</code></pre>
+<h3>Singleton</h3>
+<pre data-title="Три корректных способа и один правильный вывод"><code class="java">enum Registry { INSTANCE; /* поля и методы */ }           // 1. enum: потокобезопасно, устойчиво к сериализации и рефлексии
+
+final class Config {                                        // 2. holder: лениво и без синхронизации
+    private Config() { }
+    private static class Holder { static final Config INSTANCE = new Config(); }   // класс загрузится при первом обращении
+    static Config get() { return Holder.INSTANCE; }
+}
+
+final class Cache {                                         // 3. double-checked locking — только с volatile
+    private static volatile Cache instance;
+    static Cache get() {
+        Cache c = instance;
+        if (c == null) synchronized (Cache.class) { c = instance; if (c == null) instance = c = new Cache(); }
+        return c;
+    }
+}</code></pre>
+<div class="callout warn">Singleton через статический доступ — глобальное состояние: его трудно подменить в тесте, а порядок инициализации неочевиден. В приложении с DI-контейнером единственность обеспечивает контейнер: класс обычный, а бин один.</div>
+
+<h2 id="structural"><span class="h-num">19.3</span>Структурные: как объекты соединяются</h2>
+<h3>Decorator</h3>
+<pre><code class="java">interface PriceSource { BigDecimal price(String sku); }
+
+record CachingPriceSource(PriceSource delegate, Map&lt;String, BigDecimal&gt; cache) implements PriceSource {
+    public BigDecimal price(String sku) { return cache.computeIfAbsent(sku, delegate::price); }
+}
+record LoggingPriceSource(PriceSource delegate) implements PriceSource {
+    public BigDecimal price(String sku) {
+        BigDecimal p = delegate.price(sku);
+        System.out.println(sku + " -&gt; " + p);
+        return p;
+    }
+}
+PriceSource source = new LoggingPriceSource(new CachingPriceSource(new HttpPriceSource(), new ConcurrentHashMap&lt;&gt;()));
+// Так же собирается: new BufferedReader(new InputStreamReader(new GZIPInputStream(new FileInputStream(f)), UTF_8))</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>Decorator</th><th>Proxy</th><th>Adapter</th></tr>
+<tr><td>Интерфейс обёртки</td><td>тот же</td><td>тот же</td><td>другой — тот, что нужен клиенту</td></tr>
+<tr><td>Цель</td><td>добавить поведение, можно вкладывать слоями</td><td>управлять доступом: лениво, удалённо, с проверкой, с транзакцией</td><td>совместить несовместимое</td></tr>
+<tr><td>Кто создаёт</td><td>клиент собирает цепочку явно</td><td>обычно инфраструктура, клиент не знает о замене</td><td>интеграционный код</td></tr>
+</table></div>
+
+<h2 id="behavioral"><span class="h-num">19.4</span>Поведенческие: как объекты взаимодействуют</h2>
+<h3>Strategy — с лямбдами это одна строка</h3>
+<pre><code class="java">orders.sort(Comparator.comparing(Order::createdAt).reversed().thenComparing(Order::id));   // стратегия сравнения
+
+enum Discount implements UnaryOperator&lt;BigDecimal&gt; {              // набор именованных стратегий
+    NONE(p -&gt; p), STUDENT(p -&gt; p.multiply(new BigDecimal("0.90"))), VIP(p -&gt; p.multiply(new BigDecimal("0.80")));
+    private final UnaryOperator&lt;BigDecimal&gt; f;
+    Discount(UnaryOperator&lt;BigDecimal&gt; f) { this.f = f; }
+    public BigDecimal apply(BigDecimal price) { return f.apply(price); }
+}</code></pre>
+<h3>State и Visitor через sealed-типы</h3>
+<pre><code class="java">sealed interface OrderState permits New, Paid, Shipped, Cancelled { }
+record New() implements OrderState { }
+record Paid(Instant at) implements OrderState { }
+record Shipped(String trackingId) implements OrderState { }
+record Cancelled(String reason) implements OrderState { }
+
+static OrderState onPayment(OrderState s, Instant now) {
+    return switch (s) {
+        case New n       -&gt; new Paid(now);
+        case Paid p      -&gt; p;                                             // идемпотентно
+        case Shipped sh  -&gt; throw new IllegalStateException("already shipped");
+        case Cancelled c -&gt; throw new IllegalStateException("cancelled: " + c.reason());
+    };                                                                      // новый статус → ошибка компиляции здесь
+}</code></pre>
+<p>Классический Visitor нужен, чтобы добавлять операции над иерархией без изменения её классов. Sealed-типы и pattern matching дают то же проще: операция — обычный метод со <code>switch</code>, а компилятор проверяет полноту.</p>
+<h3>Template Method и его замена композицией</h3>
+<pre><code class="java">abstract class Importer {                          // скелет фиксирован
+    public final Report run(Path file) {
+        List&lt;Row&gt; rows = parse(file);              // шаг-«дырка»
+        rows.forEach(this::validate);
+        return save(rows);
+    }
+    protected abstract List&lt;Row&gt; parse(Path file);
+}
+
+final class Importer2 {                            // то же через функцию: наследование не нужно
+    private final Function&lt;Path, List&lt;Row&gt;&gt; parser;
+    Importer2(Function&lt;Path, List&lt;Row&gt;&gt; parser) { this.parser = parser; }
+}</code></pre>
+
+<h2 id="anti"><span class="h-num">19.5</span>Когда паттерн вредит</h2>
+<div class="grid-2">
+  <div class="card"><h4>Преждевременная абстракция</h4><p>Интерфейс <code>UserService</code> и единственный <code>UserServiceImpl</code>, фабрика фабрик, стратегия с одной реализацией. Каждый слой косвенности — это переход по коду при чтении. Абстракция оправдана, когда вариантов уже два или граница модуля требует инверсии зависимости.</p></div>
+  <div class="card"><h4>Паттерн ради названия</h4><p>Класс <code>OrderManagerFactoryBuilder</code> ничего не говорит о задаче. Называйте по предметной области (<code>DeliveryPricing</code>), а паттерн оставляйте в структуре.</p></div>
+  <div class="card"><h4>Singleton как глобальная переменная</h4><p>Скрытые зависимости, невозможность параллельных тестов, порядок инициализации.</p></div>
+  <div class="card"><h4>Глубокое наследование</h4><p>Template Method в четыре уровня: чтобы понять метод, нужно держать в голове всю иерархию. Предпочитайте композицию (тема 04).</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">19.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой паттерн реализует <code>new BufferedInputStream(new FileInputStream(f))</code>?</p><ul><li>Adapter</li><li>Decorator: обёртка с тем же интерфейсом InputStream добавляет буферизацию</li><li>Proxy</li><li>Facade</li></ul><div class="why">Интерфейс не меняется, поведение добавляется слоями. Adapter был бы, если бы интерфейс менялся: InputStreamReader превращает InputStream в Reader.</div></div>
+<div class="mcq" data-ok="2"><p>Почему double-checked locking без volatile некорректен?</p><ul><li>synchronized не работает со статическими полями</li><li>Он создаёт два экземпляра всегда</li><li>Другой поток может увидеть ненулевую ссылку на объект, конструктор которого ещё не завершён</li><li>Он медленнее простой синхронизации</li></ul><div class="why">Запись ссылки и инициализация полей могут быть переупорядочены; volatile даёт happens-before. Подробности — пособие Java Concurrency, тема 02.</div></div>
+<div class="mcq" data-ok="0"><p>Что из перечисленного — пример паттерна Strategy в JDK?</p><ul><li>Comparator, передаваемый в sort</li><li>StringBuilder</li><li>Integer.valueOf</li><li>Iterator</li></ul><div class="why">Алгоритм сравнения вынесен в объект и подменяется без изменения сортировки.</div></div>
+<div class="mcq" data-ok="3"><p>Чем Proxy отличается от Decorator?</p><ul><li>У них разные интерфейсы</li><li>Proxy всегда создаётся рефлексией</li><li>Decorator нельзя вкладывать</li><li>Структура одинакова, различается назначение: Proxy управляет доступом к объекту, Decorator наращивает поведение</li></ul><div class="why">На практике граница размыта; важно намерение и то, кто собирает обёртку — клиент или инфраструктура.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какие паттерны вы видите в Spring?</summary><div class="a"><p>Proxy (AOP, транзакции), Template Method (refresh, JdbcTemplate с колбэками — на самом деле ближе к Strategy), Factory (BeanFactory, FactoryBean), Singleton (scope), Observer (события), Chain of Responsibility (фильтры, интерцепторы), Strategy (резолверы, конвертеры), Adapter (HandlerAdapter), Decorator (обёртки запроса), Composite (составные резолверы).</p></div></details>
+<details class="q"><summary>Как лямбды и sealed-типы изменили паттерны?</summary><div class="a"><p>Strategy, Command, Template Method, Factory часто сводятся к передаче функции. State и Visitor заменяются sealed-иерархией с исчерпывающим switch. Builder для небольших объектов вытесняется record. Идеи остались, церемоний стало меньше.</p></div></details>
+<details class="q"><summary>Когда не нужно применять паттерн?</summary><div class="a"><p>Когда нет вариативности, которую он обслуживает: один алгоритм, одна реализация, простая конструкция объекта. Абстракцию дешевле добавить при появлении второго случая, чем поддерживать лишнюю заранее.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

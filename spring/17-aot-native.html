@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · AOT, GraalVM, быстрый старт</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ПРОДАКШЕН</div>
+  <h1>AOT, GraalVM native image и быстрый старт</h1>
+  <p class="lead">Классический Spring делает много работы при запуске: сканирует classpath, читает аннотации, вычисляет условия, генерирует прокси. Это даёт гибкость, но стоит секунд старта и сотен мегабайт памяти. Spring AOT переносит часть этой работы на этап сборки, а GraalVM компилирует приложение в нативный исполняемый файл. Разберём, что именно переносится, чем за это платят и какие есть промежуточные варианты.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">Spring AOT</span><span class="tag">RuntimeHints</span><span class="tag">native image</span><span class="tag">CDS / AOT cache</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">17.1</span>На что уходит время старта</h2>
+<div class="table-wrap"><table>
+<tr><th>Этап</th><th>Что происходит</th><th>Чем ускоряется</th></tr>
+<tr><td>Загрузка классов JVM</td><td>тысячи классов читаются из jar, верифицируются, линкуются</td><td>CDS, AOT cache JDK, распакованный jar</td></tr>
+<tr><td>Разбор конфигурации</td><td>сканирование пакетов, чтение аннотаций, ~150 автоконфигураций и их условия</td><td>Spring AOT</td></tr>
+<tr><td>Создание бинов</td><td>рефлексия, генерация CGLIB-классов, инициализация Hibernate, пулов, клиентов</td><td>Spring AOT, ленивая инициализация</td></tr>
+<tr><td>Прогрев JIT</td><td>первые запросы выполняются интерпретатором</td><td>native image (AOT-компиляция), CRaC, AOT cache с профилями</td></tr>
+</table></div>
+
+<h2 id="options"><span class="h-num">17.2</span>Варианты и их цена</h2>
+<div class="table-wrap"><table>
+<tr><th>Подход</th><th>Старт (ориентир)</th><th>Память</th><th>Цена</th></tr>
+<tr><td>Обычная JVM</td><td>2–6 с</td><td>250–500 МБ</td><td>—</td></tr>
+<tr><td>CDS / AOT cache (JDK 25+: <code>-XX:AOTCache</code>; Boot поддерживает AOT cache с Java 25)</td><td>на 30–50% быстрее</td><td>чуть меньше</td><td>тренировочный запуск при сборке образа; тот же JDK и classpath</td></tr>
+<tr><td>Spring AOT на JVM (<code>-Dspring.aot.enabled=true</code>)</td><td>ещё на 10–20% быстрее</td><td>меньше</td><td>набор бинов фиксируется при сборке</td></tr>
+<tr><td>GraalVM native image</td><td>0,05–0,2 с</td><td>50–150 МБ</td><td>сборка минуты и гигабайты RAM; «закрытый мир»; пиковая производительность ниже без PGO; сложнее диагностика</td></tr>
+<tr><td>CRaC (checkpoint/restore)</td><td>~0,05 с с прогретым JIT</td><td>как у JVM</td><td>Linux, специальный JDK; в снимке памяти могут оказаться секреты; ресурсы надо закрывать и переоткрывать</td></tr>
+</table></div>
+<div class="callout interview"><span class="c-title">Когда native оправдан</span>
+Serverless и scale-to-zero (холодный старт важнее всего), CLI-утилиты, очень плотная упаковка подов по памяти. Для долгоживущего сервиса с постоянной нагрузкой обычная JVM с JIT обычно даёт лучшую пропускную способность, а CDS/AOT cache закрывает вопрос старта дешевле.
+</div>
+
+<h2 id="aot"><span class="h-num">17.3</span>Что делает Spring AOT</h2>
+<div class="widget stepper" id="ao">
+  <div class="widget-title">Пошагово: работа, перенесённая со старта на сборку</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="aoBuild"><h5>Сборка (processAot, nativeCompile)</h5><div class="items">
+      <span class="chip" data-from="1">классы приложения</span><span class="chip acc" data-from="2">условия вычислены</span><span class="chip ok" data-from="3">*__BeanDefinitions.java</span><span class="chip ok" data-from="3">*__ApplicationContextInitializer.java</span><span class="chip ok" data-from="4">reachability-metadata.json</span><span class="chip ok" data-from="5">классы CGLIB-прокси</span><span class="chip warn" data-from="6">нативный бинарник</span></div></div>
+    <div class="lane node" id="aoRun"><h5>Запуск</h5><div class="items">
+      <span class="chip ok" data-from="7">описания регистрируются готовым кодом</span><span class="chip ok" data-from="7">бины создаются без рефлексии</span><span class="chip bad" data-from="8">смена профиля не меняет набор бинов</span></div></div>
+  </div>
+  <section class="st-step" data-t="Компиляция" data-hl="aoBuild">
+    <h4>1. Обычная компиляция</h4>
+    <p>Ваш код компилируется как всегда. Затем плагин Boot (<code>org.springframework.boot.aot</code> в Gradle, <code>process-aot</code> в Maven) запускает отдельный процесс — <code>SpringApplicationAotProcessor</code>.</p>
+  </section>
+  <section class="st-step" data-t="Обработка контекста" data-hl="aoBuild">
+    <h4>2. Контекст доводится до конца шага 5 refresh()</h4>
+    <p>AOT-процессор создаёт <code>ApplicationContext</code> и выполняет <code>refreshForAotProcessing</code>: пост-процессоры фабрики отрабатывают (сканирование, <code>@Import</code>, автоконфигурация, <b>все условия</b>), но обычные бины <b>не создаются</b>. Получается итоговый набор BeanDefinition.</p>
+    <p>Условия вычисляются с окружением сборки: <code>@ConditionalOnProperty</code>, <code>@Profile</code>, <code>@ConditionalOnClass</code> решаются сейчас и навсегда.</p>
+  </section>
+  <section class="st-step" data-t="Генерация кода описаний" data-hl="aoBuild">
+    <h4>3. BeanDefinition → Java-код</h4>
+<pre><code class="java">// сгенерировано: OrderService__BeanDefinitions.java
+public class OrderService__BeanDefinitions {
+    public static BeanDefinition getOrderServiceBeanDefinition() {
+        RootBeanDefinition bd = new RootBeanDefinition(OrderService.class);
+        bd.setInstanceSupplier(BeanInstanceSupplier.&lt;OrderService&gt;forConstructor(OrderRepository.class, PaymentClient.class)
+            .withGenerator((registeredBean, args) -&gt; new OrderService(args.get(0), args.get(1))));  // прямой вызов конструктора
+        return bd;
+    }
+}</code></pre>
+    <p>И один <code>ShopApplication__ApplicationContextInitializer</code>, который регистрирует все описания. Точки <code>@Autowired</code> на полях тоже превращаются в код.</p>
+  </section>
+  <section class="st-step" data-t="RuntimeHints" data-hl="aoBuild">
+    <h4>4. Подсказки для native image</h4>
+    <p>GraalVM должен заранее знать обо всей рефлексии, ресурсах, JDK-прокси и сериализации. Spring собирает <code>RuntimeHints</code>: методы контроллеров, DTO для Jackson, <code>@ConfigurationProperties</code>, <code>application.yml</code>, интерфейсы репозиториев — и пишет их в <code>META-INF/native-image/…/reachability-metadata.json</code> (единый формат GraalVM в Spring 7; до 6.2 — reflect-config.json, resource-config.json и соседние файлы).</p>
+  </section>
+  <section class="st-step" data-t="Прокси заранее" data-hl="aoBuild">
+    <h4>5. Классы прокси генерируются при сборке</h4>
+    <p>В нативном образе нельзя создавать классы в рантайме. Поэтому CGLIB-подклассы для <code>@Configuration</code>, AOP-прокси (<code>@Transactional</code>…) и scoped proxy генерируются сейчас и записываются как обычные <code>.class</code>.</p>
+  </section>
+  <section class="st-step" data-t="native-image" data-hl="aoBuild">
+    <h4>6. Компиляция GraalVM (только для native)</h4>
+    <p><code>native-image</code> выполняет статический анализ достижимости от <code>main</code>: в бинарник попадает только код, который может быть вызван («закрытый мир»). Весь байткод компилируется в машинный, часть классов инициализируется при сборке, и их состояние сохраняется в образе кучи. Результат — один исполняемый файл без JVM.</p>
+  </section>
+  <section class="st-step" data-t="Запуск" data-hl="aoRun">
+    <h4>7. Старт AOT-приложения</h4>
+    <p><code>SpringApplication</code> видит AOT-режим и вместо разбора конфигурации вызывает сгенерированный инициализатор. Нет сканирования, нет чтения аннотаций, нет вычисления условий, нет генерации классов. Дальше обычные шаги: создание бинов (через instance supplier — прямые вызовы конструкторов), BeanPostProcessor-ы, lifecycle.</p>
+  </section>
+  <section class="st-step" data-t="Ограничения" data-hl="aoRun">
+    <h4>8. Что нельзя после AOT</h4>
+    <ul>
+      <li>Менять набор бинов профилями и свойствами при запуске: условия уже вычислены. <b>Значения</b> свойств менять можно.</li>
+      <li>Рефлексия, <code>Class.forName</code>, ресурсы без подсказки → <code>MissingReflectionRegistrationError</code> / <code>ClassNotFoundException</code> в нативном образе.</li>
+      <li>Java-агенты, динамическая загрузка классов, часть библиотек с генерацией байткода.</li>
+    </ul>
+  </section>
+</div>
+
+<h2 id="hints"><span class="h-num">17.4</span>Свои подсказки</h2>
+<pre><code class="java">@Configuration
+@ImportRuntimeHints(ReportHints.class)
+@RegisterReflectionForBinding({ ReportRow.class, ReportMeta.class })     // DTO, которые сериализуются «вручную»
+class ReportConfig { }
+
+class ReportHints implements RuntimeHintsRegistrar {
+    @Override public void registerHints(RuntimeHints hints, ClassLoader cl) {
+        hints.resources().registerPattern("templates/*.xlsx");
+        hints.reflection().registerType(LegacyFormatter.class, MemberCategory.INVOKE_PUBLIC_METHODS);
+        hints.proxies().registerJdkProxy(ReportListener.class);
+    }
+}</code></pre>
+<p>Как узнать, каких подсказок не хватает: запустить обычное приложение с агентом трассировки GraalVM (<code>-agentlib:native-image-agent=config-output-dir=…</code>) под тестами; для библиотек — общий репозиторий GraalVM Reachability Metadata, который подключает плагин сборки. Проверка в тестах: <code>RuntimeHintsPredicates</code> и запуск тестов в нативном режиме (<code>./gradlew nativeTest</code>).</p>
+<pre data-title="Сборка"><code class="txt">./gradlew nativeCompile              # бинарник в build/native/nativeCompile/
+./gradlew bootBuildImage             # контейнер с нативным приложением через buildpacks (GraalVM локально не нужен)
+java -Dspring.aot.enabled=true -jar app.jar     # AOT-режим на обычной JVM</code></pre>
+
+<h2 id="cds"><span class="h-num">17.5</span>CDS и AOT cache JDK: дешёвое ускорение</h2>
+<p>Class Data Sharing сохраняет в архив уже разобранные и проверенные классы; при следующем запуске JVM отображает архив в память, а не загружает классы заново. В JDK 24 это развилось в AOT cache (JEP 483, двухшаговый вариант), в JDK 25 — одношаговый -XX:AOTCacheOutput (JEP 514/515); Spring Boot поддерживает AOT cache с Java 25: кэшируются ещё и результаты линковки и профили методов.</p>
+<pre data-title="Dockerfile: тренировочный запуск при сборке образа"><code class="txt">RUN java -Djarmode=tools -jar app.jar extract --destination app          # распакованный вид: быстрее и нужен для CDS
+WORKDIR /app
+# тренировочный запуск: поднять контекст и сразу выйти
+RUN java -XX:AOTCacheOutput=app.aot -Dspring.context.exit=onRefresh -jar app.jar
+ENTRYPOINT ["java", "-XX:AOTCache=app.aot", "-jar", "app.jar"]
+# JDK 21–23: -XX:ArchiveClassesAtExit=app.jsa  →  -XX:SharedArchiveFile=app.jsa</code></pre>
+<p>Условия: тот же JDK, тот же classpath и порядок jar. Buildpacks делают это одной настройкой (<code>BP_JVM_CDS_ENABLED=true</code>).</p>
+
+<h2 id="other"><span class="h-num">17.6</span>Другие рычаги</h2>
+<div class="grid-2">
+  <div class="card"><h4>Ленивая инициализация</h4><p><code>spring.main.lazy-initialization=true</code> — бины создаются при первом обращении. Старт быстрее, но ошибки конфигурации всплывают на первом запросе, а первый запрос медленный. Годится для локальной разработки и тестов, в проде — осторожно.</p></div>
+  <div class="card"><h4>Меньше работы</h4><p>Уберите ненужные стартеры (каждый — автоконфигурации и классы), отключите неиспользуемое (<code>spring.jmx.enabled=false</code> уже по умолчанию), найдите медленные бины через <code>/actuator/startup</code>. Самые тяжёлые обычно Hibernate (метамодель), Flyway/Liquibase, клиенты с прогревом.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">17.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Приложение собрано с Spring AOT с профилем default. При запуске указали --spring.profiles.active=prod, в коде есть @Bean @Profile("prod"). Появится ли этот бин?</p><ul><li>Да, профили вычисляются при старте</li><li>Нет: условия, включая @Profile, вычислены при сборке, набор бинов зафиксирован</li><li>Да, но без зависимостей</li><li>Приложение не запустится</li></ul><div class="why">AOT фиксирует результат шага invokeBeanFactoryPostProcessors. Профиль при запуске влияет только на значения свойств (файлы application-prod.yml).</div></div>
+<div class="mcq" data-ok="3"><p>Почему в native image нужны RuntimeHints для рефлексии?</p><ul><li>Рефлексия в GraalVM запрещена</li><li>Для ускорения JIT</li><li>Это требование Spring, а не GraalVM</li><li>Статический анализ включает в образ только достижимый код; о классах и методах, вызываемых через рефлексию, компилятор не знает, если ему не сообщить</li></ul><div class="why">«Закрытый мир»: всё, что не видно анализу и не объявлено в метаданных, в бинарнике отсутствует.</div></div>
+<div class="mcq" data-ok="0"><p>Какой способ ускорить старт требует меньше всего изменений и почти не имеет ограничений?</p><ul><li>CDS / AOT cache JDK с тренировочным запуском</li><li>GraalVM native image</li><li>Переписать на WebFlux</li><li>CRaC</li></ul><div class="why">Поведение приложения не меняется, нужна только стадия сборки образа. Native и CRaC дают больше, но с ограничениями.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что именно Spring AOT делает на этапе сборки?</summary><div class="a"><p>Поднимает контекст до конца обработки BeanFactoryPostProcessor-ов (без создания бинов), вычисляет условия, и по итоговым BeanDefinition генерирует: Java-код регистрации описаний и создания бинов без рефлексии, классы прокси, RuntimeHints (рефлексия, ресурсы, прокси, сериализация). На старте вместо разбора конфигурации выполняется сгенерированный ApplicationContextInitializer.</p></div></details>
+<details class="q"><summary>Чем приходится платить за native image?</summary><div class="a"><p>Долгая и ресурсоёмкая сборка; закрытый мир — нет динамической загрузки классов, агентов, часть библиотек требует метаданных; набор бинов фиксирован; пиковая производительность без PGO ниже JIT; другой GC по умолчанию (Serial в community-версии); отладка и профилирование сложнее; тесты надо гонять и в нативном режиме.</p></div></details>
+<details class="q"><summary>Как найти, что тормозит старт приложения?</summary><div class="a"><p>BufferingApplicationStartup + /actuator/startup (длительности шагов и бинов), DEBUG-лог создания бинов, JFR с FlightRecorderApplicationStartup, отчёт условий для лишних автоконфигураций. Затем: убрать лишние стартеры, отложить тяжёлую инициализацию, CDS/AOT cache.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

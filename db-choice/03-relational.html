@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Реляционные СУБД как выбор по умолчанию</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Реляционные СУБД как выбор по умолчанию</h1>
+  <p class="lead">Почему для большинства приложений первой базой должна быть реляционная, что именно она даёт «бесплатно», как далеко масштабируется один сервер, чем различаются PostgreSQL, MySQL и коммерческие СУБД — и по каким признакам понять, что вы упираетесь в её пределы. Подробности внутреннего устройства — в пособии «Реляционные базы данных изнутри».</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">ACID</span><span class="tag">PostgreSQL vs MySQL</span><span class="tag">jsonb</span><span class="tag">расширения</span><span class="tag">пределы</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="gives"><span class="h-num">3.1</span>Что даёт реляционная база</h2>
+<div class="grid-2">
+  <div class="card"><h4>Гарантии</h4><ul><li>Транзакции между любыми строками и таблицами (ACID).</li><li>Ограничения: уникальность, внешние ключи, CHECK — инварианты, которые не обойдёт ни один баг в коде.</li><li>Предсказуемая согласованность: прочитал после коммита — видишь.</li></ul></div>
+  <div class="card"><h4>Гибкость запросов</h4><ul><li>Произвольные запросы, о которых не думали при проектировании: JOIN, агрегаты, окна.</li><li>Новый путь доступа — это индекс, а не перепроектирование хранилища.</li><li>Один язык (SQL) для приложения, аналитиков, поддержки.</li></ul></div>
+</div>
+<p>Последнее особенно ценно в начале продукта: требования неизвестны, и через полгода появятся отчёты и фильтры, о которых никто не думал. В key-value или wide-column базе каждый новый запрос — новая таблица под него и миграция данных.</p>
+
+<h2 id="scale"><span class="h-num">3.2</span>Сколько выдержит один сервер</h2>
+<div class="table-wrap"><table>
+<tr><th>Ресурс</th><th>Реалистичные значения для одного узла (2025–2026)</th></tr>
+<tr><td>Объём данных</td><td>единицы–десятки ТБ на NVMe; сотни ГБ — вообще не проблема</td></tr>
+<tr><td>Память</td><td>до нескольких ТБ ОЗУ — рабочий набор многих систем целиком в памяти</td></tr>
+<tr><td>Транзакции</td><td>десятки тысяч простых транзакций записи в секунду; сотни тысяч чтений по ключу</td></tr>
+<tr><td>Масштаб чтения</td><td>× число реплик (с учётом отставания)</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Ориентир</span>
+Крупные продукты годами живут на одном primary PostgreSQL/MySQL с репликами: публичные примеры — OpenAI (ChatGPT) с одним primary PostgreSQL и десятками реплик, GitLab.com долгое время на одном primary. Пределы обычно наступают из-за плохих запросов, а не железа.
+</div>
+
+<h2 id="vs"><span class="h-num">3.3</span>PostgreSQL, MySQL и другие</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>PostgreSQL</th><th>MySQL (InnoDB)</th><th>Oracle / SQL Server</th></tr>
+<tr><td>Сильные стороны</td><td>богатые типы (jsonb, массивы, диапазоны), индексы (GIN, GiST, BRIN), расширения, строгость, SSI</td><td>простота эксплуатации, огромный опыт индустрии, кластерный индекс, зрелые инструменты шардинга (Vitess)</td><td>зрелые HA/DR, партиционирование, параллелизм, поддержка вендора</td></tr>
+<tr><td>Слабые стороны</td><td>процесс на соединение (нужен пул), VACUUM, обновления мажорных версий</td><td>меньше типов и индексов, REPEATABLE READ без защиты от lost update, менее строгие режимы по умолчанию в старых версиях</td><td>лицензии и стоимость, привязка к вендору</td></tr>
+<tr><td>Типичный выбор</td><td>новые проекты по умолчанию</td><td>существующая экспертиза, веб-нагрузка, Vitess/PlanetScale</td><td>корпоративные системы, наследие</td></tr>
+</table></div>
+
+<h2 id="multi"><span class="h-num">3.4</span>Одна база — много моделей</h2>
+<p>Расширения и типы PostgreSQL позволяют закрыть многие специализированные задачи без второй системы — пока объёмы и требования умеренные:</p>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>В PostgreSQL</th><th>Отдельная система, когда…</th></tr>
+<tr><td>Документы</td><td>jsonb + GIN</td><td>шардинг документов на десятки ТБ, команда мыслит документами (MongoDB)</td></tr>
+<tr><td>Поиск</td><td>tsvector, pg_trgm</td><td>релевантность, синонимы, фасеты, большие каталоги (OpenSearch)</td></tr>
+<tr><td>Геоданные</td><td>PostGIS — эталон индустрии</td><td>редко</td></tr>
+<tr><td>Временные ряды</td><td>TimescaleDB, BRIN, партиции</td><td>миллионы точек в секунду, долгосрочное хранение метрик (VictoriaMetrics, ClickHouse)</td></tr>
+<tr><td>Векторы</td><td>pgvector (HNSW)</td><td>сотни миллионов векторов, фильтрованный ANN на большом масштабе (Qdrant, Milvus)</td></tr>
+<tr><td>Очередь</td><td>SKIP LOCKED, pgmq</td><td>высокая пропускная способность, fan-out, перечитывание (Kafka)</td></tr>
+<tr><td>Кэш</td><td>UNLOGGED-таблицы</td><td>микросекунды, сотни тысяч операций в секунду (Redis)</td></tr>
+<tr><td>Аналитика</td><td>реплика, матпредставления</td><td>сканы миллиардов строк (ClickHouse, DuckDB, хранилище данных)</td></tr>
+</table></div>
+
+<h2 id="sandbox"><span class="h-num">3.5</span>Песочница: реляционные данные и документы вместе</h2>
+<p>В SQLite (как и в PostgreSQL с jsonb) атрибуты, которые различаются между товарами, удобно хранить документом рядом со строгими столбцами.</p>
+<div class="sqlbox" data-schema="hybridSchema">
+  <div class="widget-title">Товары со строгими полями + JSON-атрибуты</div>
+  <div class="sql-presets">
+    <button type="button" data-sql="SELECT id, name, category, price, attrs FROM products;">все товары</button>
+    <button type="button" data-sql="-- фильтр по полю документа (в PostgreSQL: attrs-&gt;&gt;'color' или attrs @&gt; '{&quot;color&quot;:&quot;black&quot;}')&#10;SELECT name, json_extract(attrs, '$.color') AS color FROM products&#10;WHERE json_extract(attrs, '$.color') = 'black';">фильтр по JSON</button>
+    <button type="button" data-sql="-- индекс по выражению из документа&#10;CREATE INDEX IF NOT EXISTS products_ram ON products (json_extract(attrs, '$.ram_gb'));&#10;EXPLAIN QUERY PLAN SELECT name FROM products WHERE json_extract(attrs, '$.ram_gb') &gt;= 16;">индекс по полю JSON</button>
+    <button type="button" data-sql="-- транзакция через реляционные и документные данные&#10;BEGIN;&#10;UPDATE products SET price = price * 0.9 WHERE category = 'ноутбуки';&#10;INSERT INTO price_log(product_id, note) SELECT id, 'скидка 10%' FROM products WHERE category = 'ноутбуки';&#10;COMMIT;&#10;SELECT p.name, p.price, l.note FROM products p JOIN price_log l ON l.product_id = p.id;">транзакция</button>
+    <button type="button" data-sql="-- разворот массива из документа в строки&#10;SELECT p.name, t.value AS tag FROM products p, json_each(p.attrs, '$.tags') t;">массив тегов</button>
+  </div>
+  <textarea>SELECT name, json_extract(attrs, '$.color') AS color FROM products
+WHERE json_extract(attrs, '$.color') = 'black';</textarea>
+</div>
+<script type="text/plain" id="hybridSchema">
+CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0), attrs TEXT CHECK (json_valid(attrs)));
+CREATE TABLE price_log (id INTEGER PRIMARY KEY, product_id INTEGER REFERENCES products(id), note TEXT);
+INSERT INTO products VALUES
+ (1, 'Ультрабук 14', 'ноутбуки', 120000, '{"color":"silver","ram_gb":16,"tags":["лёгкий","oled"]}'),
+ (2, 'Игровой 16', 'ноутбуки', 180000, '{"color":"black","ram_gb":32,"gpu":"RTX","tags":["игры"]}'),
+ (3, 'Мышь беспроводная', 'аксессуары', 2500, '{"color":"black","dpi":4000,"tags":["bluetooth"]}'),
+ (4, 'Футболка', 'одежда', 1500, '{"color":"white","size":["S","M","L"],"tags":["хлопок"]}'),
+ (5, 'Ноутбук офисный', 'ноутбуки', 60000, '{"color":"black","ram_gb":8,"tags":[]}');
+</script>
+
+<h2 id="limits"><span class="h-num">3.6</span>Признаки, что вы упираетесь в пределы</h2>
+<ul>
+  <li><b>Запись</b> упёрлась в один primary после оптимизаций, батчей и вертикального роста → шардинг (Citus, Vitess) или распределённый SQL (тема 14).</li>
+  <li><b>Аналитические запросы</b> мешают OLTP даже на реплике, отчёты идут минутами → колоночная копия (тема 09).</li>
+  <li><b>Поиск</b> требует релевантности и фасетов на миллионах документов → поисковый движок (тема 07).</li>
+  <li><b>Поток событий</b> на сотни тысяч в секунду, нужны многие потребители и перечитывание → журнал событий (тема 12).</li>
+  <li><b>Мультирегиональная запись</b> с низкой задержкой → распределённые базы (темы 06, 14).</li>
+  <li><b>Горячие ключи</b> с микросекундными требованиями → кэш (тема 04).</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">3.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему реляционная база — хороший выбор на старте продукта, когда требования меняются?</p><ul><li>Она быстрее всех других на любой нагрузке</li><li>Новые запросы решаются индексами и SQL без перепроектирования хранилища</li><li>Она не требует схемы</li><li>Она масштабирует запись горизонтально</li></ul><div class="why">Гибкость запросов — главное преимущество реляционной модели.</div></div>
+<div class="mcq" data-ok="3"><p>Каталог с разными атрибутами у разных категорий товаров. Что разумно в PostgreSQL?</p><ul><li>EAV-таблица (entity, attribute, value) для всего</li><li>По таблице на категорию</li><li>Только MongoDB</li><li>Общие поля столбцами + различающиеся атрибуты в jsonb с GIN-индексом</li></ul><div class="why">Гибрид даёт ограничения для общих полей и гибкость для остальных.</div></div>
+<div class="mcq" data-ok="0"><p>Что из перечисленного — реальный повод добавить систему рядом с PostgreSQL?</p><ul><li>Отчёты по миллиардам событий тормозят OLTP даже на реплике</li><li>В таблице 10 млн строк</li><li>Хочется гибкой схемы</li><li>Нужен JOIN трёх таблиц</li></ul><div class="why">10 млн строк — маленькая таблица; аналитика по миллиардам — задача колоночных систем.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>PostgreSQL или MySQL для нового сервиса — как решить?</summary><div class="a"><p>Если у команды и платформы нет сильной экспертизы в одном из них — PostgreSQL как более универсальный (типы, индексы, расширения, строгая изоляция). MySQL — если есть опыт, инфраструктура и инструменты (бэкапы, мониторинг, Vitess), или нужен его профиль (кластерный индекс, простая репликация). Различия в типичных OLTP-задачах меньше, чем различия в качестве эксплуатации.</p></div></details>
+<details class="q"><summary>Почему внешние ключи и ограничения важны, если «всё проверяется в коде»?</summary><div class="a"><p>Кода много (сервисы, миграции, скрипты, ручные правки), он меняется и содержит гонки. Ограничение в базе проверяется атомарно при каждой записи из любого источника. Цена — небольшая стоимость проверки при записи и необходимость индексов на внешних ключах.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

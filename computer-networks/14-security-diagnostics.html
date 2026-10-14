@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Безопасность и диагностика</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · ИНЖЕНЕРИЯ · РОАДМАП m6, m7</div>
+  <h1>Безопасность и диагностика</h1>
+  <p class="lead">Угрозы на каждом уровне стека и способы защиты, а затем — методика поиска сетевых проблем: от «у пользователя не работает» до конкретного пакета в tcpdump.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">практикум</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="threats"><span class="h-num">14.1</span>Угрозы по уровням</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Атака</th><th>Суть</th><th>Защита</th></tr>
+<tr><td>L2</td><td>ARP spoofing</td><td>подделанные ARP-ответы: «шлюз — это я» → перехват трафика в локальной сети</td><td>TLS везде; Dynamic ARP Inspection на коммутаторах</td></tr>
+<tr><td>L2/L3</td><td>Rogue DHCP</td><td>чужой DHCP раздаёт свой шлюз и DNS</td><td>DHCP snooping</td></tr>
+<tr><td>L3</td><td>IP spoofing</td><td>поддельный адрес источника (основа отражённых DDoS)</td><td>фильтрация на границе (BCP 38)</td></tr>
+<tr><td>L3</td><td>BGP hijack</td><td>чужие анонсы ваших префиксов</td><td>RPKI, мониторинг маршрутов</td></tr>
+<tr><td>L4</td><td>SYN flood</td><td>забить очередь полуоткрытых соединений</td><td>SYN cookies, scrubbing</td></tr>
+<tr><td>L7</td><td>DNS/NTP amplification</td><td>маленький запрос с подделанным адресом жертвы → большой ответ ей</td><td>закрытые резолверы, rate limiting, anycast-защита</td></tr>
+<tr><td>L7</td><td>HTTP flood, Slowloris</td><td>много «законных» запросов; медленные запросы, держащие соединения</td><td>WAF, лимиты, таймауты чтения заголовков, CDN</td></tr>
+<tr><td>L7</td><td>MITM / downgrade</td><td>перехват с подменой сертификата или откат на HTTP</td><td>проверка сертификатов, HSTS</td></tr>
+<tr><td>L7</td><td>SSRF</td><td>сервер по указке злоумышленника ходит во внутреннюю сеть или к <code>169.254.169.254</code> за облачными ключами</td><td>allowlist адресов, запрет приватных диапазонов после разрешения DNS, IMDSv2</td></tr>
+</table></div>
+
+<h2 id="ddos"><span class="h-num">14.2</span>DDoS</h2>
+<div class="grid-3">
+  <div class="card"><h4>Объёмные</h4><p>Забить канал гигабитами (часто отражёнными). Защищает только тот, у кого канал шире: провайдер, CDN, anycast-скраббинг.</p></div>
+  <div class="card"><h4>Протокольные</h4><p>Исчерпать таблицы состояний: SYN flood, переполнение conntrack на файрволах и балансировщиках.</p></div>
+  <div class="card"><h4>Прикладные</h4><p>Дорогие запросы (поиск, отчёты, логин с bcrypt). Защищают лимиты, кэш, капча, приоритизация аутентифицированных клиентов.</p></div>
+</div>
+<p><b>HSTS</b> (<code>Strict-Transport-Security: max-age=31536000; includeSubDomains</code>) — браузер больше никогда не идёт на домен по HTTP, что закрывает атаку через первый незашифрованный запрос.</p>
+
+<h2 id="fw"><span class="h-num">14.3</span>Файрволы, VPN, zero trust</h2>
+<ul>
+  <li><b>Stateless ACL</b> проверяет каждый пакет отдельно (облачные Network ACL) — ответный трафик надо разрешать явно, включая эфемерные порты.</li>
+  <li><b>Stateful</b> (security groups, iptables с conntrack, NGFW) помнит соединения: разрешили исходящее — ответ пройдёт автоматически.</li>
+  <li><b>WAF</b> — L7-фильтр: SQL-инъекции, XSS, боты, лимиты.</li>
+  <li><b>VPN</b>: IPsec (site-to-site между офисами и облаком), WireGuard (простой, быстрый, современная криптография), TLS-VPN. Помните о MTU туннеля.</li>
+  <li><b>Zero trust</b>: «внутренняя сеть» не означает доверие. Каждый запрос аутентифицирован (mTLS, токены), доступ по минимальным правам, сеть сегментирована.</li>
+</ul>
+
+<h2 id="monitoring"><span class="h-num">14.4</span>Мониторинг сети</h2>
+<div class="table-wrap"><table>
+<tr><th>Инструмент</th><th>Что даёт</th></tr>
+<tr><td><b>SNMP</b></td><td>классика сетевого оборудования: опрос счётчиков интерфейсов, ошибок, загрузки по MIB (UDP 161) и асинхронные уведомления (traps, UDP 162). v3 — с аутентификацией и шифрованием. Сейчас дополняется streaming telemetry.</td></tr>
+<tr><td><b>NetFlow / sFlow / IPFIX</b></td><td>кто с кем и сколько обменивался — анализ трафика и аномалий</td></tr>
+<tr><td><b>Синтетический мониторинг</b></td><td>проверки извне из разных регионов (blackbox exporter, uptime-сервисы): DNS, TCP, TLS-сроки, HTTP</td></tr>
+<tr><td><b>Метрики приложения</b></td><td>время подключения, ошибки по типам, занятость пулов, ретраи — сеть глазами сервиса</td></tr>
+</table></div>
+
+<h2 id="method"><span class="h-num">14.5</span>Методика: снизу вверх по стеку</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 360" role="img" aria-label="Алгоритм диагностики">
+  <defs><marker id="l1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <g font-size="12.5">
+    <rect x="20" y="20" width="180" height="50" rx="9" class="box-info"/><text x="110" y="42" text-anchor="middle" font-weight="700">1. Имя</text><text x="110" y="60" text-anchor="middle" class="mono" font-size="11">dig / nslookup</text>
+    <rect x="215" y="20" width="180" height="50" rx="9" class="box-info"/><text x="305" y="42" text-anchor="middle" font-weight="700">2. Маршрут</text><text x="305" y="60" text-anchor="middle" class="mono" font-size="11">ping / mtr</text>
+    <rect x="410" y="20" width="180" height="50" rx="9" class="box-info"/><text x="500" y="42" text-anchor="middle" font-weight="700">3. Порт</text><text x="500" y="60" text-anchor="middle" class="mono" font-size="11">nc -vz / telnet</text>
+    <rect x="605" y="20" width="175" height="50" rx="9" class="box-info"/><text x="692" y="42" text-anchor="middle" font-weight="700">4. TLS</text><text x="692" y="60" text-anchor="middle" class="mono" font-size="11">openssl s_client</text>
+    <path d="M200 45 H211" class="ln" marker-end="url(#l1)"/><path d="M395 45 H406" class="ln" marker-end="url(#l1)"/><path d="M590 45 H601" class="ln" marker-end="url(#l1)"/>
+    <rect x="20" y="100" width="180" height="50" rx="9" class="box-acc"/><text x="110" y="122" text-anchor="middle" font-weight="700">5. HTTP</text><text x="110" y="140" text-anchor="middle" class="mono" font-size="11">curl -v, -w таймингов</text>
+    <rect x="215" y="100" width="180" height="50" rx="9" class="box-acc"/><text x="305" y="122" text-anchor="middle" font-weight="700">6. Соединения</text><text x="305" y="140" text-anchor="middle" class="mono" font-size="11">ss, метрики пулов</text>
+    <rect x="410" y="100" width="180" height="50" rx="9" class="box-acc"/><text x="500" y="122" text-anchor="middle" font-weight="700">7. Пакеты</text><text x="500" y="140" text-anchor="middle" class="mono" font-size="11">tcpdump + Wireshark</text>
+    <rect x="605" y="100" width="175" height="50" rx="9" class="box-ok"/><text x="692" y="122" text-anchor="middle" font-weight="700">8. Вывод</text><text x="692" y="140" text-anchor="middle" font-size="11">гипотеза → проверка</text>
+    <path d="M692 70 C 692 86, 110 82, 110 96" class="ln" marker-end="url(#l1)"/>
+    <path d="M200 125 H211" class="ln" marker-end="url(#l1)"/><path d="M395 125 H406" class="ln" marker-end="url(#l1)"/><path d="M590 125 H601" class="ln" marker-end="url(#l1)"/>
+  </g>
+  <text x="20" y="190" font-weight="700" font-size="13">Сначала сузить область:</text>
+  <text x="20" y="212" font-size="12.5">• У всех или у части? (регион, провайдер, IPv6 vs IPv4, браузер vs сервер)</text>
+  <text x="20" y="232" font-size="12.5">• Всегда или периодически? (каждые N минут — таймауты, кэши)</text>
+  <text x="20" y="252" font-size="12.5">• Что изменилось? (деплой, сертификат, DNS, правила файрвола, версия JDK)</text>
+  <text x="20" y="272" font-size="12.5">• С какой стороны смотрим? (клиент, балансировщик, под)</text>
+  <text x="20" y="292" font-size="12.5">• Ошибка или медленно? Медленно → разложить время: DNS / connect / TLS / TTFB / передача.</text>
+  <text x="20" y="320" font-size="12.5" class="muted">Проверяйте с той же машины, что и проблемный сервис (kubectl exec / debug-под):</text>
+  <text x="20" y="338" font-size="12.5" class="muted">результат часто отличается от проверки с ноутбука.</text>
+</svg>
+</figure>
+
+<h2 id="tools"><span class="h-num">14.6</span>Инструменты: рецепты</h2>
+<pre data-title="Разложение времени запроса"><code class="sh">$ curl -o /dev/null -s -w '\
+dns:        %{time_namelookup}\n\
+connect:    %{time_connect}\n\
+tls:        %{time_appconnect}\n\
+ttfb:       %{time_starttransfer}\n\
+total:      %{time_total}\n\
+http:       %{http_version} %{response_code}\n' https://api.example.com/health
+# connect−dns ≈ 1 RTT; tls−connect ≈ 1 RTT (TLS 1.3); ttfb−tls = RTT + время сервера</code></pre>
+<pre data-title="Маршрут и потери"><code class="sh">$ mtr -rwzbc 100 api.example.com     # отчёт: потери и задержка на каждом прыжке, AS (-z)
+$ nc -vz -w 2 db.internal 3306        # порт открыт? refused → никто не слушает; timeout → фильтруется
+$ curl --resolve api.example.com:443:10.0.5.20 https://api.example.com/   # обойти DNS, ударить в конкретный IP</code></pre>
+<pre data-title="Сокеты на хосте"><code class="sh">$ ss -tanp state established '( dport = :5432 )' | wc -l   # сколько соединений к PostgreSQL
+$ ss -tan state time-wait | wc -l                         # TIME_WAIT
+$ ss -tan state close-wait                                # утечки в приложении
+$ ss -ti dst 10.0.5.20                                    # rtt, cwnd, retrans по каждому соединению!</code></pre>
+<pre data-title="tcpdump"><code class="sh">$ sudo tcpdump -i any -nn -s0 -w cap.pcap 'host 10.0.5.20 and tcp port 443'
+$ sudo tcpdump -i any -nn 'tcp[tcpflags] &amp; (tcp-rst) != 0'   # кто шлёт RST
+$ sudo tcpdump -i any -nn 'udp port 53'                      # DNS-запросы в реальном времени
+# Kubernetes: kubectl debug -it pod/payments-7c9 --image=nicolaka/netshoot --target=app -- tcpdump -i any -w /tmp/cap.pcap</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Фильтр Wireshark</th><th>Что найдёт</th></tr>
+<tr><td><code>tcp.analysis.retransmission</code></td><td>повторные передачи — потери в сети</td></tr>
+<tr><td><code>tcp.flags.reset == 1</code></td><td>сбросы соединений и кто их инициировал</td></tr>
+<tr><td><code>tcp.analysis.zero_window</code></td><td>получатель не успевает читать (проблема приложения, не сети)</td></tr>
+<tr><td><code>tcp.time_delta &gt; 1</code></td><td>долгие паузы внутри потока</td></tr>
+<tr><td><code>tls.handshake.type == 1</code></td><td>ClientHello: SNI, версии, ALPN</td></tr>
+<tr><td><code>http.response.code &gt;= 500</code></td><td>ошибки сервера (для незашифрованного трафика)</td></tr>
+</table></div>
+<p>Чтобы видеть содержимое HTTPS в Wireshark, браузер или curl могут записывать ключи сессий в файл (<code>SSLKEYLOGFILE</code>) — только на своей машине для отладки.</p>
+
+<h2 id="cases"><span class="h-num">14.7</span>Разбор кейсов</h2>
+<details class="q"><summary>Кейс 1: p99 вызова соседнего сервиса вырос с 20 до 1 200 мс, p50 не изменился.</summary><div class="a"><p>Похоже на потери и повторы: ~1 с — характерно для повторной передачи SYN (начальный RTO 1 с) или таймаута RTO. Проверка: <code>ss -ti</code> (retrans), tcpdump с фильтром retransmission, метрики connect time. Если растёт именно время подключения — потери SYN (перегружен conntrack/NAT, переполнена accept queue на сервере — <code>nstat</code> / <code>ListenOverflows</code>). Если время чтения — потери на пути или паузы GC на сервере.</p></div></details>
+<details class="q"><summary>Кейс 2: из офиса API работает, у части мобильных пользователей — нет.</summary><div class="a"><p>Сузить: оператор, IPv6 vs IPv4 (у мобильных часто IPv6-only + NAT64), регион. Проверить AAAA-запись и доступность по IPv6, MTU (у мобильных сетей меньше, большие TLS-ответы), блокировки/фильтрацию у оператора, сертификат (старые устройства не знают новый корневой CA).</p></div></details>
+<details class="q"><summary>Кейс 3: раз в час все запросы к БД падают с Communications link failure.</summary><div class="a"><p>Периодичность → таймаут. Сопоставить с <code>wait_timeout</code> MySQL, idle timeout прокси/NAT/файрвола между сервисом и БД, <code>maxLifetime</code> и <code>idleTimeout</code> пула. Соединения, простоявшие дольше таймаута по пути, молча закрыты; пул выдаёт их как живые. Лечится maxLifetime меньше самого короткого таймаута по пути и keepalive.</p></div></details>
+
+<h2 id="sim"><span class="h-num">14.8</span>Интерактив: диагностика «сервис недоступен» по шагам</h2>
+<div class="widget" id="dgW">
+  <div class="widget-title">Тренажёр: найдите причину, двигаясь по стеку</div>
+  <p class="hint">Сервис <code>orders</code> не может достучаться до <code>https://payments.internal:8443/charge</code>. Выберите, что показала очередная проверка, — тренажёр подскажет вывод и следующий шаг.</p>
+  <div class="st-count" id="dgStep"></div>
+  <div class="out" id="dgCmd"></div>
+  <div class="controls" id="dgOpts"></div>
+  <div class="log" id="dgLog"></div>
+  <div class="verdict" id="dgOut" hidden></div>
+  <div class="controls"><button class="btn" type="button" id="dgReset">↺ начать заново</button></div>
+</div>
+<script>
+(function () {
+  var N = {
+    dns: { cmd: "$ dig +short payments.internal\n$ getent hosts payments.internal", q: "1. Имя разрешается?", o: [["адрес получен: 10.2.3.40", "route"], ["NXDOMAIN / пусто", "!Проблема DNS: неверное имя, не тот resolver (посмотрите /etc/resolv.conf и search-домены), запись не создана. В Kubernetes — проверьте имя сервиса и namespace: payments.<ns>.svc.cluster.local."], ["ответ через 5 секунд", "!DNS-таймаут: первый сервер из resolv.conf не отвечает, срабатывает запасной. Симптом — ровные задержки 5 с на новых соединениях. Ещё вариант — ndots:5 и перебор search-доменов."]] },
+    route: { cmd: "$ ping -c 3 10.2.3.40\n$ ip route get 10.2.3.40\n$ traceroute -n 10.2.3.40", q: "2. Есть ли связность по IP?", o: [["ping проходит", "port"], ["100% потерь, traceroute обрывается на 3-м узле", "!Маршрутизация или фильтр по пути: нет маршрута, ACL, security group. Но помните: ICMP часто запрещён, а TCP открыт — отсутствие ping не доказательство. Проверьте порт напрямую."], ["ping не проходит, но это ожидаемо (ICMP закрыт)", "port"]] },
+    port: { cmd: "$ nc -vz -w 3 10.2.3.40 8443\n$ curl -v --connect-timeout 3 https://payments.internal:8443/", q: "3. Что с TCP-портом?", o: [["Connected / succeeded", "tls"], ["Connection refused (сразу)", "!Хост доступен, но на порту никто не слушает: пришёл RST. Сервис упал, слушает другой порт или только 127.0.0.1 (ss -ltnp на целевом хосте)."], ["таймаут (тишина)", "!Пакеты SYN молча отбрасываются: файрвол, security group, network policy — или хост выключен. Отличие от refused принципиально: refused = «дошёл, но закрыто», timeout = «не дошёл или отфильтрован»."], ["то подключается, то таймаут", "!Часть бэкендов за балансировщиком недоступна, либо переполнена accept-очередь сервера, либо исчерпаны порты NAT. Смотрите health-check балансировщика и ss -s / nstat на сервере."]] },
+    tls: { cmd: "$ openssl s_client -connect payments.internal:8443 -servername payments.internal </dev/null", q: "4. Проходит ли TLS-рукопожатие?", o: [["Verify return code: 0 (ok)", "http"], ["certificate has expired", "!Истёк сертификат сервера. Самая частая «внезапная» авария: нужен мониторинг срока и автоматическое обновление."], ["unable to get local issuer certificate", "!Клиент не доверяет издателю: внутренний CA не добавлен в truststore, или сервер не отдаёт промежуточный сертификат (в выводе s_client видна неполная цепочка)."], ["соединение закрыто сразу после ClientHello", "!Несовпадение версий TLS/шифров, требуется клиентский сертификат (mTLS), или вы подключились TLS-клиентом к не-TLS порту."]] },
+    http: { cmd: "$ curl -sv -m 5 https://payments.internal:8443/charge -d '{}' -H 'Content-Type: application/json'", q: "5. Что отвечает приложение?", o: [["200 за 50 мс", "!Сеть и сервис исправны. Проблема на стороне orders: исчерпан пул соединений, устаревший DNS-кэш в JVM, неверный URL/порт в конфигурации, прокси в переменных окружения. Смотрите thread dump и метрики пула."], ["502 / 503 от балансировщика", "!Балансировщик жив, но не может получить ответ от бэкендов: все поды упали или не готовы, либо бэкенд рвёт соединение (несовпадение keep-alive таймаутов даёт редкие 502)."], ["ответ через 30 секунд", "!Сеть ни при чём: сервис перегружен или ждёт собственную зависимость. Трейс запроса, метрики и thread dump на стороне payments."], ["401 / 403", "!Прикладной уровень: токен, права, mTLS-идентичность. Сетевая связность доказана."]] }
+  };
+  var cur, log, $ = function (i) { return document.getElementById(i); };
+  function show(k) {
+    cur = k; var n = N[k];
+    $("dgStep").textContent = n.q; $("dgCmd").textContent = n.cmd; $("dgOut").hidden = true;
+    var box = $("dgOpts"); box.innerHTML = "";
+    n.o.forEach(function (o) { var b = document.createElement("button"); b.type = "button"; b.className = "btn"; b.textContent = o[0]; b.addEventListener("click", function () { log.push(n.q + " → " + o[0]); $("dgLog").textContent = log.join("\n"); if (o[1][0] === "!") { box.innerHTML = ""; $("dgCmd").textContent = ""; $("dgStep").textContent = "Диагноз"; var v = $("dgOut"); v.hidden = false; v.className = "verdict " + (/исправны/.test(o[1]) ? "warn" : "bad"); v.textContent = o[1].slice(1); } else show(o[1]); }); box.appendChild(b); });
+  }
+  $("dgReset").addEventListener("click", function () { log = []; $("dgLog").textContent = ""; show("dns"); });
+  log = []; show("dns");
+})();
+</script>
+<p>Порядок не случаен: каждый шаг проверяет один уровень и исключает всё, что ниже. Имя → маршрут → порт → TLS → приложение. Перескакивая сразу к логам приложения, легко потратить час на то, что <code>nc</code> показал бы за три секунды.</p>
+
+<h2 id="quiz"><span class="h-num">14.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем «Connection refused» отличается от таймаута соединения?</p><ul><li>Ничем</li><li>Refused — хост ответил RST: порт закрыт; таймаут — ответа нет вовсе: пакеты отфильтрованы или хост недоступен</li><li>Refused означает проблему DNS</li><li>Таймаут означает неверный пароль</li></ul><div class="why">Первое — быстрый однозначный ответ, второе — тишина. По этой разнице сразу понятно, где искать.</div></div>
+<div class="mcq" data-ok="2"><p>Как SYN flood выводит сервер из строя и что помогает?</p><ul><li>Перегружает диск; помогает RAID</li><li>Занимает CPU шифрованием; помогает TLS 1.3</li><li>Заполняет очередь полуоткрытых соединений; помогают SYN cookies и фильтрация на границе сети</li><li>Подменяет DNS; помогает DNSSEC</li></ul><div class="why">SYN cookies позволяют не хранить состояние до завершения рукопожатия.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое zero trust в сетевой безопасности?</p><ul><li>Не доверять запросу только потому, что он пришёл из внутренней сети: каждый вызов аутентифицируется и авторизуется</li><li>Запрет всех соединений</li><li>Отказ от шифрования внутри периметра</li><li>Использование только VPN</li></ul><div class="why">Периметр не считается границей доверия: mTLS между сервисами, минимальные права, проверка на каждом шаге.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем stateful-файрвол отличается от stateless ACL на практике?</summary><div class="a"><p>Stateful отслеживает соединения: правило «исходящий TCP на 443» автоматически пропустит ответы. Stateless проверяет каждый пакет без контекста — нужно явно разрешить входящие ответы на эфемерные порты. Зато stateful-устройства имеют таблицу соединений, которую можно переполнить (атака или просто нагрузка).</p></div></details>
+<details class="q"><summary>Что такое SSRF и почему адрес 169.254.169.254 особенно опасен?</summary><div class="a"><p>Server-Side Request Forgery: приложение делает запрос по URL, который контролирует атакующий (вебхуки, загрузка картинок по ссылке). Так можно попасть во внутренние сервисы. 169.254.169.254 — сервис метаданных облака, выдающий временные ключи роли инстанса. Защита: allowlist, проверка IP <b>после</b> разрешения DNS (иначе DNS rebinding), запрет редиректов, IMDSv2 с токеном.</p></div></details>
+<details class="q"><summary>Два замера curl: (1) dns=0.002 connect=0.014 tls=0.027 ttfb=2.41; (2) dns=5.012 connect=5.025 tls=5.038 ttfb=5.090. Где проблема в каждом?</summary><div class="a"><p>(1) RTT ≈ 12 мс (connect − dns), TLS — ещё ~1 RTT, всё нормально; ttfb − tls ≈ 2,4 с — время сервера: смотреть трейсы, медленные запросы к БД, внешние вызовы. Сеть ни при чём. (2) Ровно ~5 с на DNS при быстрых connect и TLS — классический таймаут и повтор DNS-запроса (потерянный UDP-ответ, гонка conntrack в Kubernetes, недоступный первый nameserver в resolv.conf). Сам сервер ответил быстро.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

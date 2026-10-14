@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Kafka в Spring</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ИНТЕГРАЦИЯ И АРХИТЕКТУРА</div>
+  <h1>Kafka в Spring: KafkaTemplate и @KafkaListener изнутри</h1>
+  <p class="lead">Spring for Apache Kafka прячет цикл <code>poll()</code>, коммит смещений и обработку ошибок за аннотацией <code>@KafkaListener</code>. Чтобы не терять и не дублировать сообщения, нужно знать, что именно делает контейнер слушателя: в каком потоке он работает, когда коммитит offset, что происходит с «ядовитым» сообщением и почему запись в БД и отправка в Kafka не бывают атомарными. Сама Kafka (партиции, ISR, ребаланс) разобрана в пособии System Design.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">listener container</span><span class="tag">AckMode</span><span class="tag">DLT</span><span class="tag">Outbox</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="parts"><span class="h-num">18.1</span>Компоненты</h2>
+<div class="flow">
+  <div class="node"><b>ProducerFactory</b><small>один потокобезопасный KafkaProducer</small></div><span class="to">→</span>
+  <div class="node acc"><b>KafkaTemplate</b><small>send(topic, key, value)</small></div><span class="to">→</span>
+  <div class="node info"><b>Kafka</b></div><span class="to">→</span>
+  <div class="node"><b>ConsumerFactory</b></div><span class="to">→</span>
+  <div class="node acc"><b>ConcurrentMessageListenerContainer</b><small>N потоков, в каждом свой KafkaConsumer</small></div><span class="to">→</span>
+  <div class="node ok"><b>@KafkaListener метод</b></div>
+</div>
+<pre data-title="application.yml"><code class="yaml">spring:
+  kafka:
+    bootstrap-servers: kafka:9092
+    producer:
+      acks: all                                    # ждать подтверждения всех in-sync реплик
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer   # Spring Kafka 4 (Jackson 3); JsonSerializer устарел
+      properties:
+        enable.idempotence: true                   # без дублей при ретраях продюсера
+        delivery.timeout.ms: 120000
+    consumer:
+      group-id: billing
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.shop.events
+        max.poll.records: 100
+        max.poll.interval.ms: 300000
+    listener:
+      ack-mode: record
+      concurrency: 3</code></pre>
+
+<h2 id="producer"><span class="h-num">18.2</span>Отправка</h2>
+<pre><code class="java">@Service
+class OrderEvents {
+    private final KafkaTemplate&lt;String, OrderPlaced&gt; kafka;
+    OrderEvents(KafkaTemplate&lt;String, OrderPlaced&gt; kafka) { this.kafka = kafka; }
+
+    void publish(OrderPlaced e) {
+        kafka.send("orders.placed", e.orderId().toString(), e)        // ключ → партиция → порядок событий одного заказа
+             .whenComplete((result, ex) -&gt; {                          // send асинхронный: CompletableFuture&lt;SendResult&gt;
+                 if (ex != null) log.error("send failed for order {}", e.orderId(), ex);
+                 else log.debug("sent to {}-{}@{}", result.getRecordMetadata().topic(),
+                         result.getRecordMetadata().partition(), result.getRecordMetadata().offset());
+             });
+    }
+}</code></pre>
+<p><code>send()</code> кладёт запись в буфер продюсера и сразу возвращается; фоновый поток <code>kafka-producer-network-thread</code> отправляет батчи. Метод может заблокироваться до <code>max.block.ms</code>, если буфер полон или нет метаданных. Игнорировать future нельзя: ошибка доставки иначе останется незамеченной.</p>
+
+<h2 id="listener"><span class="h-num">18.3</span>Как работает @KafkaListener</h2>
+<ol class="steps">
+  <li><code>KafkaListenerAnnotationBeanPostProcessor</code> при инициализации бинов находит методы с <code>@KafkaListener</code> и регистрирует endpoint в <code>KafkaListenerEndpointRegistry</code>.</li>
+  <li>Для каждого endpoint фабрика <code>ConcurrentKafkaListenerContainerFactory</code> создаёт <code>ConcurrentMessageListenerContainer</code>; он содержит <code>concurrency</code> штук <code>KafkaMessageListenerContainer</code>.</li>
+  <li>Контейнеры — <code>SmartLifecycle</code>: стартуют в <code>finishRefresh()</code>, когда все бины готовы, и останавливаются первыми при закрытии контекста.</li>
+  <li>Каждый дочерний контейнер запускает один поток (<code>…-0-C-1</code>) со своим <code>KafkaConsumer</code> (он не потокобезопасен) и крутит цикл: <code>poll()</code> → для каждой записи: конвертация аргументов → вызов вашего метода → коммит offset по <code>AckMode</code>.</li>
+</ol>
+<pre><code class="java">@Component
+class BillingListener {
+    @KafkaListener(topics = "orders.placed", groupId = "billing", concurrency = "3")
+    void onOrder(@Payload OrderPlaced event,
+                 @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+                 @Header(KafkaHeaders.OFFSET) long offset) {
+        billing.charge(event);            // исключение отсюда → ErrorHandler контейнера
+    }
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>AckMode</th><th>Когда коммитится offset</th></tr>
+<tr><td><code>BATCH</code> (по умолчанию)</td><td>после обработки всех записей одного <code>poll()</code></td></tr>
+<tr><td><code>RECORD</code></td><td>после каждой записи — меньше повторов при сбое, больше коммитов</td></tr>
+<tr><td><code>MANUAL</code> / <code>MANUAL_IMMEDIATE</code></td><td>когда код вызвал <code>Acknowledgment.acknowledge()</code></td></tr>
+<tr><td><code>TIME</code>, <code>COUNT</code></td><td>по времени или числу записей</td></tr>
+</table></div>
+<p>Spring Kafka выставляет <code>enable.auto.commit=false</code> и коммитит сам — после успешной обработки. Отсюда гарантия <b>at-least-once</b>: при падении между обработкой и коммитом запись придёт повторно. Обработчик должен быть <b>идемпотентным</b> (ключ идемпотентности, upsert, таблица обработанных событий).</p>
+
+<h2 id="errors"><span class="h-num">18.4</span>Обработка ошибок</h2>
+<p>Исключение слушателя ловит <code>DefaultErrorHandler</code>. По умолчанию: <b>10 попыток без паузы</b> (FixedBackOff(0, 9)), затем запись логируется и <b>пропускается</b>. Между попытками контейнер делает <code>seek</code> назад на сбойный offset — партиция стоит, пока запись не обработана или не пропущена.</p>
+<pre data-title="Ретраи с паузой + Dead Letter Topic"><code class="java">@Bean
+DefaultErrorHandler errorHandler(KafkaTemplate&lt;Object, Object&gt; template) {
+    var recoverer = new DeadLetterPublishingRecoverer(template);     // → orders.placed-dlt (с Spring Kafka 3.3; раньше .DLT), та же партиция, заголовки с причиной
+    var backOff = new ExponentialBackOffWithMaxRetries(4);            // 1с, 2с, 4с, 8с
+    backOff.setInitialInterval(1000); backOff.setMultiplier(2.0);
+    var handler = new DefaultErrorHandler(recoverer, backOff);
+    handler.addNotRetryableExceptions(ValidationException.class);     // сразу в DLT, без повторов
+    return handler;                                                    // Boot подключит бин к фабрике контейнеров
+}</code></pre>
+
+<div class="widget" id="kf">
+  <div class="widget-title">Симулятор: сбойное сообщение в партиции</div>
+  <p class="hint">В партиции записи с offset 0–5. Запись offset=2 вызывает исключение в слушателе.</p>
+  <div class="controls">
+    <label>ошибка<select id="kfErr"><option value="transient">временная: пройдёт с 3-й попытки</option><option value="permanent">постоянная: «ядовитое» сообщение</option><option value="deser">не десериализуется (битый JSON)</option></select></label>
+    <label>стратегия<select id="kfStr"><option value="default">DefaultErrorHandler по умолчанию</option><option value="dlt">backoff 1с×3 + DLT</option><option value="infinite">бесконечные повторы</option><option value="topic">@RetryableTopic (неблокирующие ретраи)</option></select></label>
+    <label>десериализатор<select id="kfDes"><option value="eh">ErrorHandlingDeserializer</option><option value="plain">обычный JacksonJsonDeserializer</option></select></label>
+  </div>
+  <div class="lanes"><div class="lane"><h5>Партиция orders.placed-0</h5><div class="items" id="kfPart"></div></div><div class="lane"><h5>Куда попала запись 2</h5><div class="items" id="kfFate"></div></div></div>
+  <div class="log" id="kfLog"></div>
+  <div class="verdict" id="kfOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var err = $("kfErr").value, st = $("kfStr").value, des = $("kfDes").value, L = [], cls = "ok", v, fate, blocked = false, done = [0, 1];
+    L.push("poll() → записи 0..5"); L.push("offset 0 ✓   offset 1 ✓");
+    if (err === "deser" && des === "plain") {
+      L.push("poll() → SerializationException при разборе offset 2 — исключение летит из самого poll(), до слушателя и ErrorHandler дело не доходит");
+      L.push("контейнер повторяет poll() → та же запись → та же ошибка → …");
+      blocked = true; cls = "bad"; fate = '<span class="chip bad">никуда: бесконечный цикл</span>';
+      v = "Poison pill: потребитель навсегда застрял на offset 2, лог заполняется ошибками, lag растёт. Лечится ErrorHandlingDeserializer: он ловит ошибку разбора и передаёт её в ErrorHandler как обычный сбой записи.";
+    } else {
+      var perm = err !== "transient";
+      if (err === "deser") L.push("offset 2: ErrorHandlingDeserializer вернул null + заголовок с DeserializationException → ErrorHandler (исключение не повторяемое)");
+      if (st === "default") {
+        if (err === "deser") { L.push("offset 2 → не повторяется → лог ERROR, запись ПРОПУЩЕНА"); fate = '<span class="chip bad">потеряна (только в логе)</span>'; cls = "warn"; v = "Партиция не заблокирована, но запись потеряна. Добавьте DeadLetterPublishingRecoverer."; done.push(3, 4, 5); }
+        else if (!perm) { L.push("offset 2 ✘ попытка 1 → seek(2) → попытка 2 ✘ → seek(2) → попытка 3 ✓  (без пауз)"); fate = '<span class="chip ok">обработана с 3-й попытки</span>'; v = "Сработало, но повторы без паузы бесполезны, если причина — недоступность внешней системы на секунды. Настройте backoff."; done.push(2, 3, 4, 5); }
+        else { L.push("offset 2 ✘ × 10 попыток подряд без пауз → лог ERROR «Backoff exhausted» → запись ПРОПУЩЕНА, offset закоммичен"); fate = '<span class="chip bad">потеряна (только в логе)</span>'; cls = "bad"; v = "Сообщение молча потеряно после 10 мгновенных попыток. Поведение по умолчанию редко подходит для продакшена."; done.push(3, 4, 5); }
+      } else if (st === "dlt") {
+        if (err === "deser") { L.push("offset 2 → сразу в orders.placed-dlt (исходные байты + заголовки kafka_dlt-exception-*)"); fate = '<span class="chip warn">orders.placed-dlt</span>'; v = "Запись сохранена для разбора, партиция идёт дальше."; done.push(3, 4, 5); }
+        else if (!perm) { L.push("offset 2 ✘ → пауза 1с → ✘ → пауза 1с → ✓   (партиция ждала 2 с)"); fate = '<span class="chip ok">обработана с 3-й попытки</span>'; v = "Временный сбой пережит. Пока идут ретраи, поток стоит — следите, чтобы суммарная пауза была меньше max.poll.interval.ms, иначе ребаланс."; done.push(2, 3, 4, 5); }
+        else { L.push("offset 2 ✘ → 1с → ✘ → 1с → ✘ → 1с → ✘ → DeadLetterPublishingRecoverer → orders.placed-dlt"); L.push("offset 2 закоммичен, обработка продолжается"); fate = '<span class="chip warn">orders.placed-dlt</span>'; v = "Запись в DLT с причиной в заголовках; партиция простояла 3 с и пошла дальше. Нужен процесс разбора DLT: алерт, повторная отправка после исправления."; done.push(3, 4, 5); }
+      } else if (st === "infinite") {
+        if (!perm) { L.push("offset 2 ✘ → пауза → ✘ → пауза → ✓"); fate = '<span class="chip ok">обработана</span>'; v = "Для временных сбоев работает, порядок сохранён."; done.push(2, 3, 4, 5); }
+        else { L.push("offset 2 ✘ → пауза → ✘ → пауза → ✘ → … бесконечно"); blocked = true; cls = "bad"; fate = '<span class="chip bad">блокирует партицию</span>'; v = "Строгий порядок сохранён ценой остановки: всё после offset 2 в этой партиции не обрабатывается, пока сообщение не починят или не пропустят вручную. Оправдано, только если пропуск недопустим."; }
+      } else {
+        if (err === "deser") { L.push("offset 2 → не повторяемое → сразу в orders.placed-dlt"); fate = '<span class="chip warn">orders.placed-dlt</span>'; }
+        else if (!perm) { L.push("offset 2 ✘ → переслана в orders.placed-retry-0 (задержка 1с), offset 2 закоммичен"); L.push("offset 3 ✓ 4 ✓ 5 ✓ — основная партиция не ждёт"); L.push("retry-0: offset 2 ✘ → orders.placed-retry-1 (2с) → ✓"); fate = '<span class="chip ok">обработана из retry-топика</span>'; }
+        else { L.push("offset 2 ✘ → orders.placed-retry-1000 (1с) → ✘ → retry-2000 (2с) → ✘ → retry-4000 (4с) → ✘ → orders.placed-dlt"); L.push("основная партиция всё это время обрабатывала 3, 4, 5"); fate = '<span class="chip warn">orders.placed-dlt</span>'; }
+        done.push(3, 4, 5); if (!perm && err !== "deser") done.push(2);
+        cls = "warn"; v = "Основной поток не блокируется, но порядок нарушен: запись 2 обработана ПОСЛЕ 3, 4, 5. Не подходит, если события одного ключа должны идти строго по порядку.";
+      }
+    }
+    var part = "";
+    for (var i = 0; i <= 5; i++) {
+      var c = done.indexOf(i) >= 0 ? "ok" : (i === 2 ? "bad" : (blocked ? "" : "warn"));
+      part += '<span class="chip ' + c + '">' + i + (i === 2 ? " ⚠" : "") + "</span>";
+    }
+    $("kfPart").innerHTML = part + (blocked ? '<span class="chip bad">lag растёт</span>' : "");
+    $("kfFate").innerHTML = fate; $("kfLog").textContent = L.join("\n");
+    $("kfOut").className = "verdict " + cls; $("kfOut").textContent = v;
+  }
+  ["kfErr", "kfStr", "kfDes"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+
+<h2 id="tx"><span class="h-num">18.5</span>БД и Kafka: атомарности нет</h2>
+<pre class="bad-code" data-title="Двойная запись — ошибка, которую не видно в тестах"><code class="java">@Transactional
+public Order place(Cart cart) {
+    Order o = repo.save(Order.from(cart));
+    kafka.send("orders.placed", o.idString(), OrderPlaced.of(o));   // 1) ушло в Kafka, а транзакция потом откатилась → событие-призрак
+    return o;                                                        // 2) или коммит прошёл, а send упал → событие потеряно
+}</code></pre>
+<p>Транзакция БД и Kafka — разные системы; общий коммит возможен только через XA, который Kafka не поддерживает. Рабочие решения:</p>
+<div class="grid-2">
+  <div class="card"><h4>Transactional Outbox</h4><p>В той же транзакции БД записать событие в таблицу <code>outbox</code>. Отдельный процесс (Debezium CDC или <code>@Scheduled</code>-поллер) читает таблицу и отправляет в Kafka, помечая отправленные. Гарантия at-least-once без потерь и призраков.</p></div>
+  <div class="card"><h4>Идемпотентный потребитель</h4><p>Раз доставка «минимум один раз», потребитель хранит id обработанных событий (уникальный индекс) в той же транзакции, что и свои изменения, и пропускает повторы.</p></div>
+</div>
+<pre data-title="Outbox: запись в одной транзакции с бизнес-данными"><code class="java">@Transactional
+public Order place(Cart cart) {
+    Order o = repo.save(Order.from(cart));
+    outbox.save(new OutboxEvent(UUID.randomUUID(), "orders.placed", o.idString(), json(OrderPlaced.of(o))));
+    return o;
+}
+
+@Scheduled(fixedDelay = 500)
+@SchedulerLock(name = "outbox-relay")                         // один экземпляр за раз (ShedLock)
+void relay() {
+    for (OutboxEvent e : outbox.findTop100ByPublishedAtIsNullOrderByCreatedAt()) {
+        kafka.send(e.topic(), e.key(), e.payload()).join();   // дождаться подтверждения брокера
+        outbox.markPublished(e.id());                         // упали между строками → повторная отправка → нужен идемпотентный потребитель
+    }
+}</code></pre>
+<p>Транзакции самой Kafka (<code>transactional.id</code>, <code>KafkaTransactionManager</code>) дают exactly-once только в цепочке «прочитал из Kafka → обработал → записал в Kafka»: offset и выходные записи коммитятся атомарно. К базе данных это не относится.</p>
+
+<h2 id="scale"><span class="h-num">18.6</span>Параллелизм и порядок</h2>
+<ul>
+  <li><code>concurrency</code> больше числа партиций бессмысленна: лишние потоки простаивают. Одна партиция — один потребитель группы.</li>
+  <li>Порядок гарантируется только внутри партиции, то есть для записей с одним ключом.</li>
+  <li>Долгая обработка: если между <code>poll()</code> проходит больше <code>max.poll.interval.ms</code>, брокер считает потребителя мёртвым → ребаланс → записи перечитает другой экземпляр → дубли. Уменьшайте <code>max.poll.records</code> или выносите тяжёлую работу.</li>
+  <li>Пакетный слушатель (<code>List&lt;ConsumerRecord&gt;</code>, <code>spring.kafka.listener.type=batch</code>) — для массовых вставок в БД.</li>
+  <li>Graceful shutdown: контейнер дожидается обработки текущих записей и коммитит offset-ы.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">18.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что делает DefaultErrorHandler по умолчанию при постоянной ошибке в слушателе?</p><ul><li>Останавливает контейнер</li><li>Повторяет бесконечно</li><li>10 попыток без паузы, затем логирует и пропускает запись</li><li>Отправляет в DLT</li></ul><div class="why">FixedBackOff(0, 9) и восстановление «залогировать». DLT появляется, только если задать DeadLetterPublishingRecoverer.</div></div>
+<div class="mcq" data-ok="0"><p>Почему нельзя просто вызвать kafka.send() внутри @Transactional-метода, сохраняющего заказ?</p><ul><li>Транзакция БД и Kafka не атомарны: возможны событие без заказа или заказ без события</li><li>KafkaTemplate не работает в транзакциях</li><li>Это замедляет запрос</li><li>Kafka требует autocommit</li></ul><div class="why">Проблема двойной записи. Решения — outbox или события AFTER_COMMIT с допущением потерь при падении.</div></div>
+<div class="mcq" data-ok="3"><p>В топике 4 партиции, у слушателя concurrency = 10, приложение в одном экземпляре. Сколько потоков реально обрабатывают сообщения?</p><ul><li>10</li><li>1</li><li>40</li><li>4 — по одному потребителю на партицию, остальные 6 простаивают</li></ul><div class="why">Партицию в группе читает ровно один потребитель.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что происходит от старта приложения до вызова метода @KafkaListener?</summary><div class="a"><p>BPP регистрирует endpoint → фабрика создаёт ConcurrentMessageListenerContainer → он стартует как SmartLifecycle в finishRefresh → каждый дочерний контейнер в своём потоке создаёт KafkaConsumer, подписывается, в цикле делает poll, для каждой записи конвертирует аргументы и вызывает метод, затем коммитит offset по AckMode; исключения идут в ErrorHandler.</p></div></details>
+<details class="q"><summary>Как обеспечить обработку «ровно один раз» по эффекту?</summary><div class="a"><p>Доставка at-least-once + идемпотентность потребителя: уникальный id события, таблица обработанных в одной транзакции с бизнес-изменениями, либо естественно идемпотентные операции (upsert, установка статуса). На стороне отправителя — outbox и идемпотентный продюсер.</p></div></details>
+<details class="q"><summary>Блокирующие и неблокирующие ретраи — в чём компромисс?</summary><div class="a"><p>Блокирующие (DefaultErrorHandler с backoff): порядок в партиции сохраняется, но партиция стоит на время повторов, риск превысить max.poll.interval.ms. Неблокирующие (@RetryableTopic): запись уходит в retry-топики с задержками, основная партиция идёт дальше, но порядок нарушается и появляется дополнительная инфраструктура топиков.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

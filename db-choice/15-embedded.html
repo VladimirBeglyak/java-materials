@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Встраиваемые базы: SQLite, DuckDB, RocksDB</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Встраиваемые базы: SQLite, DuckDB, RocksDB</h1>
+  <p class="lead">Не каждой базе нужен сервер. Встраиваемая СУБД — библиотека внутри вашего процесса: нет сети, нет администрирования, данные — файл. SQLite — самая распространённая база в мире (в каждом телефоне и браузере), DuckDB — «SQLite для аналитики», RocksDB — движок внутри десятков распределённых систем. Разбираем, где они уместны, их ограничения и как SQLite выходит на сервер. Песочницы этого курса работают как раз на SQLite в браузере.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">SQLite</span><span class="tag">WAL-режим</span><span class="tag">DuckDB</span><span class="tag">RocksDB</span><span class="tag">Litestream</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="overview"><span class="h-num">15.1</span>Обзор</h2>
+<div class="table-wrap"><table>
+<tr><th>Библиотека</th><th>Модель</th><th>Где применяют</th></tr>
+<tr><td><b>SQLite</b></td><td>реляционная, строковая, B-tree, ACID, один файл</td><td>мобильные и настольные приложения, браузеры, IoT и edge, конфигурация и кэши приложений, небольшие веб-сайты, тесты и инструменты</td></tr>
+<tr><td><b>DuckDB</b></td><td>колоночная, векторное исполнение, OLAP</td><td>аналитика на ноутбуке и в пайплайнах, запросы к Parquet/CSV/JSON и S3, замена pandas для больших данных, встроенная аналитика в продукте</td></tr>
+<tr><td><b>RocksDB</b> (LevelDB, Pebble)</td><td>упорядоченное key-value, LSM</td><td>движок хранения внутри других систем: Kafka Streams (state stores), CockroachDB, TiKV, Flink, MyRocks</td></tr>
+<tr><td><b>LMDB</b></td><td>key-value, B-tree с отображением в память, копирование при записи</td><td>много чтений, конкурентные читатели без блокировок</td></tr>
+<tr><td><b>H2, HSQLDB, Derby</b> (Java)</td><td>реляционные в JVM</td><td>прототипы, утилиты; для тестов предпочтительнее Testcontainers с настоящей СУБД</td></tr>
+</table></div>
+
+<h2 id="sqlite"><span class="h-num">15.2</span>SQLite в деталях</h2>
+<ul>
+  <li><b>Один писатель</b> на файл в каждый момент; читателей много. В режиме <code>journal_mode=WAL</code> читатели не блокируют писателя и наоборот.</li>
+  <li>Транзакция на запись — миллисекунды; тысячи транзакций в секунду с <code>synchronous=NORMAL</code> в WAL-режиме, сотни тысяч вставок в секунду пачкой.</li>
+  <li>Типизация «по значению» (type affinity): в столбец INTEGER можно записать строку — используйте <code>STRICT</code>-таблицы (3.37+).</li>
+  <li>Внешние ключи выключены по умолчанию: <code>PRAGMA foreign_keys = ON</code> на каждом соединении.</li>
+  <li>Есть: CTE, оконные функции, JSON, полнотекстовый поиск FTS4 (в новых сборках — FTS5), R-Tree, UPSERT, RETURNING.</li>
+</ul>
+<pre data-title="рекомендуемые настройки для приложения"><code class="sql">PRAGMA journal_mode = WAL;        -- читатели не мешают писателю
+PRAGMA synchronous = NORMAL;      -- в WAL: долговечность при сбое приложения, окно потерь при сбое ОС
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;       -- ждать блокировку записи до 5 с вместо мгновенного SQLITE_BUSY
+PRAGMA cache_size = -64000;       -- 64 МБ кэша страниц
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at INTEGER NOT NULL) STRICT;</code></pre>
+
+<div class="sqlbox" data-schema="notesSchema">
+  <div class="widget-title">Песочница: возможности SQLite (это настоящий SQLite 3, скомпилированный в WebAssembly)</div>
+  <div class="sql-presets">
+    <button type="button" data-sql="SELECT sqlite_version() AS version;">версия</button>
+    <button type="button" data-sql="-- STRICT-таблица не принимает строку в INTEGER&#10;INSERT INTO notes_strict (id, title, views) VALUES (10, 'x', 'много');">STRICT</button>
+    <button type="button" data-sql="-- обычная таблица молча примет&#10;INSERT INTO notes_loose (id, title, views) VALUES (10, 'x', 'много');&#10;SELECT id, views, typeof(views) FROM notes_loose;">без STRICT</button>
+    <button type="button" data-sql="-- полнотекстовый поиск FTS4 (в новых сборках — FTS5)&#10;SELECT title, snippet(notes_fts, '[', ']', '…', 1, 6) AS fragment&#10;FROM notes_fts WHERE notes_fts MATCH 'база OR индекс';">FTS</button>
+    <button type="button" data-sql="-- UPSERT + RETURNING&#10;INSERT INTO counters (name, value) VALUES ('visits', 1)&#10;ON CONFLICT (name) DO UPDATE SET value = value + 1&#10;RETURNING name, value;">UPSERT</button>
+    <button type="button" data-sql="PRAGMA table_info(notes_strict);">структура таблицы</button>
+  </div>
+  <textarea>SELECT title, snippet(notes_fts, '[', ']', '…', 1, 6) AS fragment
+FROM notes_fts WHERE notes_fts MATCH 'база OR индекс';</textarea>
+</div>
+<script type="text/plain" id="notesSchema">
+CREATE TABLE notes_strict (id INTEGER PRIMARY KEY, title TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0) STRICT;
+CREATE TABLE notes_loose (id INTEGER PRIMARY KEY, title TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE VIRTUAL TABLE notes_fts USING fts4(title, body);
+INSERT INTO notes_fts VALUES
+ ('Встраиваемая база', 'SQLite хранит всю базу в одном файле и работает внутри процесса приложения'),
+ ('Индексы', 'B-tree индекс ускоряет поиск по ключу и сортировку'),
+ ('Аналитика', 'DuckDB выполняет аналитические запросы к файлам Parquet'),
+ ('Резервные копии', 'Litestream непрерывно копирует журнал базы в объектное хранилище');
+</script>
+
+<h2 id="server"><span class="h-num">15.3</span>SQLite на сервере</h2>
+<p>Для небольших и средних веб-приложений с одним сервером SQLite — серьёзный вариант: нулевая задержка запросов (функция, а не сеть), простота, дешёвые бэкапы. Ограничения — один узел-писатель и один процесс-владелец файла.</p>
+<ul>
+  <li><b>Litestream</b> — непрерывная репликация WAL в S3 (восстановление на момент времени).</li>
+  <li><b>LiteFS</b>, <b>rqlite</b>, <b>Turso/libSQL</b> — реплики для чтения на edge, распределение.</li>
+  <li>Не подходит: много серверов приложения пишут в одну базу; сетевые файловые системы (NFS) — блокировки ненадёжны, возможна порча файла.</li>
+</ul>
+
+<h2 id="duckdb"><span class="h-num">15.4</span>DuckDB: аналитика без кластера</h2>
+<pre data-title="DuckDB из Java (JDBC) и SQL по файлам"><code class="java">try (Connection c = DriverManager.getConnection("jdbc:duckdb:");          // в памяти
+     Statement s = c.createStatement()) {
+    ResultSet rs = s.executeQuery("""
+        SELECT date_trunc('day', ts) AS day, count(*) AS events, approx_count_distinct(user_id) AS users
+        FROM read_parquet('/data/events/*.parquet')
+        WHERE ts &gt;= DATE '2026-10-01'
+        GROUP BY ALL ORDER BY day""");
+}</code></pre>
+<p>Обрабатывает сотни миллионов строк на одном ноутбуке за секунды, умеет данные больше памяти (выгрузка на диск), читает PostgreSQL напрямую (<code>ATTACH 'postgres:…'</code>). Не для конкурентной записи многими процессами.</p>
+
+<h2 id="decide"><span class="h-num">15.5</span>Встраиваемая или серверная</h2>
+<div class="widget" id="ebW">
+  <div class="widget-title">Подойдёт ли встраиваемая база</div>
+  <div class="checks col" id="ebC"></div>
+  <div class="verdict" id="ebV"></div>
+</div>
+<script>
+(function () {
+  var Q = [["Данные нужны одному процессу/устройству (или один процесс-писатель)", 1], ["Объём до сотен ГБ", 1], ["Важны простота, ноль администрирования и отсутствие сети", 1], ["Приложение работает офлайн (телефон, настольное, IoT)", 2], ["Несколько серверов приложения должны писать в одни данные", -3], ["Нужны тысячи одновременных пишущих транзакций", -2], ["Нужен доступ к данным другим сервисам и людям по сети", -2], ["Аналитика по файлам/выгрузкам на одной машине", 1]];
+  var $ = function (i) { return document.getElementById(i); };
+  $("ebC").innerHTML = Q.map(function (q, i) { return '<label><input type="checkbox" data-i="' + i + '"' + (i < 3 ? " checked" : "") + "> " + q[0] + "</label>"; }).join("");
+  function run() {
+    var s = 0, neg = false; $("ebC").querySelectorAll("input:checked").forEach(function (c) { var w = Q[+c.getAttribute("data-i")][1]; s += w; if (w < 0) neg = true; });
+    var v = $("ebV");
+    if (neg) { v.className = "verdict bad"; v.textContent = "Есть требование, которое встраиваемая база не закрывает (совместная запись по сети, много писателей): нужна серверная СУБД. Встраиваемую можно использовать как локальный кэш или для аналитики рядом."; }
+    else if (s >= 3) { v.className = "verdict ok"; v.textContent = "Встраиваемая база — сильный кандидат: SQLite для транзакционных данных, DuckDB для аналитики, RocksDB для key-value внутри своего сервиса. Продумайте бэкапы (Litestream, копии файла через backup API)."; }
+    else { v.className = "verdict warn"; v.textContent = "Аргументов мало в обе стороны: начните с того, что проще эксплуатировать в вашей среде."; }
+  }
+  $("ebC").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">15.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что даёт <code>journal_mode=WAL</code> в SQLite?</p><ul><li>Несколько одновременных писателей</li><li>Читатели не блокируют писателя и писатель не блокирует читателей</li><li>Репликацию на другой сервер</li><li>Шифрование файла</li></ul><div class="why">Писатель по-прежнему один.</div></div>
+<div class="mcq" data-ok="3"><p>Почему H2 в тестах вместо PostgreSQL — источник проблем?</p><ul><li>H2 медленнее</li><li>H2 не поддерживает SQL</li><li>H2 нельзя запускать в CI</li><li>Диалект, типы, блокировки и поведение отличаются — тесты проходят, а на проде ошибки; лучше Testcontainers с той же СУБД</li></ul><div class="why">Тестируйте на том, что работает в продакшене.</div></div>
+<div class="mcq" data-ok="0"><p>Где RocksDB встречается чаще всего?</p><ul><li>Как движок хранения внутри других систем (Kafka Streams, CockroachDB, TiKV, Flink)</li><li>Как основная база веб-приложений с SQL</li><li>Как кэш браузера</li><li>Как брокер сообщений</li></ul><div class="why">Это библиотека key-value на LSM.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Мобильное приложение заметок с синхронизацией между устройствами — как хранить данные?</summary><div class="a"><p>Локально — SQLite (Room на Android, GRDB/Core Data на iOS) для офлайн-работы и мгновенного интерфейса; на сервере — основная база (PostgreSQL) как источник истины. Синхронизация — журнал изменений с версиями/отметками времени и разрешением конфликтов (последняя запись, слияние по полям или CRDT). Готовые решения: PowerSync, ElectricSQL, Couchbase Lite.</p></div></details>
+<details class="q"><summary>Когда DuckDB заменит кластер аналитики?</summary><div class="a"><p>Когда данные анализирует один человек или один пайплайн, объём — до единиц ТБ, а данные лежат в файлах (Parquet в S3) или выгружаются из базы. Один современный сервер с DuckDB обрабатывает удивительно много. Кластер нужен при многих одновременных пользователях, постоянной загрузке данных и общем доступе.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

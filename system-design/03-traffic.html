@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Балансировка, шлюзы и прокси</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ТРАФИК И API</div>
+  <h1>Балансировка, шлюзы и прокси</h1>
+  <p class="lead">Между клиентом и вашим кодом почти всегда стоит посредник — и не один. Балансировщик, API-шлюз, обратный и прямой прокси похожи по устройству, но решают разные задачи. Эта глава разводит их по местам.</p>
+  <div class="meta"><span class="tag">3 конспекта</span><span class="tag">~1,5 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="lb"><span class="h-num">3.1</span>Балансировка нагрузки<span class="sk-num">#8</span></h2>
+<p>Балансировщик распределяет входящий трафик между несколькими серверами, чтобы ни один не был перегружен, и перестаёт отправлять запросы на те, что не прошли проверку здоровья. Именно он делает возможным горизонтальное масштабирование и обновление без простоя.</p>
+<figure class="sketch"><a href="img/08-load-balancing.jpg"><img src="img/08-load-balancing.jpg" width="1024" height="1536" loading="lazy" alt="Балансировка нагрузки: зачем, виды, алгоритмы, возможности, размещение"></a><figcaption><b>Конспект #8.</b> Load Balancing <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<h3>Алгоритмы</h3>
+<div class="table-wrap"><table>
+<tr><th>Алгоритм</th><th>Как выбирает</th><th>Когда подходит</th></tr>
+<tr><td>Round Robin</td><td>По очереди</td><td>Одинаковые серверы, короткие однородные запросы</td></tr>
+<tr><td>Weighted Round Robin</td><td>По очереди с учётом веса</td><td>Серверы разной мощности, канареечный релиз (5% на новую версию)</td></tr>
+<tr><td>Least Connections</td><td>Тому, у кого меньше активных соединений</td><td>Запросы разной длительности, долгие соединения</td></tr>
+<tr><td>Least Response Time</td><td>Самому быстрому сейчас</td><td>Серверы с разной текущей загрузкой</td></tr>
+<tr><td>IP Hash</td><td>Хэш адреса клиента → сервер</td><td>Нужна привязка клиента к серверу</td></tr>
+<tr><td><i>Consistent hashing</i></td><td>Хэш ключа на кольце</td><td>Кэши и шарды: при изменении числа серверов перемещается лишь малая часть ключей</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Чего нет на схеме</span>
+<ul>
+  <li><b>L4 и L7.</b> L4-балансировщик видит только IP и порты и пробрасывает TCP-соединение целиком — быстро и для любого протокола. L7 разбирает HTTP: маршрутизирует по пути и заголовкам, завершает TLS, делает ретраи. L7 балансирует <i>запросы</i>, L4 — <i>соединения</i>; из-за этого долгоживущие HTTP/2- и gRPC-соединения через L4 распределяются неравномерно. Подробно — <a href="../computer-networks/13-infrastructure.html">«Компьютерные сети», тема 13</a>.</li>
+  <li><b>Сам балансировщик — точка отказа.</b> Его резервируют: пара узлов с плавающим IP (VRRP/keepalived), несколько экземпляров за anycast-адресом или управляемый облачный сервис, распределённый по зонам.</li>
+  <li><b>Sticky sessions — костыль.</b> Привязка клиента к серверу нужна, когда состояние лежит в памяти сервера. Она ломает равномерность и усложняет деплой; правильнее вынести состояние в Redis или в токен.</li>
+  <li><b>Health check: liveness ≠ readiness.</b> «Процесс жив» и «готов принимать трафик» (прогрет, подключён к БД) — разные проверки. В Spring Boot это <code>/actuator/health/liveness</code> и <code>/readiness</code>.</li>
+</ul>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль конспекта</span>
+Балансировщик <b>не увеличивает</b> мощность серверов — он помогает эффективно использовать имеющуюся. Если все серверы загружены на 100%, балансировка не спасёт: нужны новые экземпляры (автомасштабирование) или защита от перегрузки (<a href="04-api.html#rate-limit">rate limiting</a>).
+</div>
+
+<h2 id="lb-vs-gw"><span class="h-num">3.2</span>Балансировщик и API-шлюз<span class="sk-num">#9</span></h2>
+<p>Их часто путают, потому что оба принимают запрос и пересылают его дальше. Разница — в вопросе, на который они отвечают. Балансировщик: «<i>на какой экземпляр</i> одного и того же сервиса отправить запрос?» Шлюз: «<i>какому сервису</i> этот запрос предназначен и можно ли его вообще пропускать?»</p>
+<figure class="sketch"><a href="img/09-lb-vs-api-gateway.jpg"><img src="img/09-lb-vs-api-gateway.jpg" width="1024" height="1536" loading="lazy" alt="Сравнение балансировщика нагрузки и API-шлюза"></a><figcaption><b>Конспект #9.</b> Load Balancer vs API Gateway <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th></th><th>Load Balancer</th><th>API Gateway</th></tr>
+<tr><td>Назначение</td><td>Распределить трафик между экземплярами</td><td>Единая точка входа и управление API</td></tr>
+<tr><td>Уровень OSI</td><td>4 или 7</td><td>7</td></tr>
+<tr><td>Маршрутизация</td><td>По IP, порту, домену, пути</td><td>По эндпоинту API к конкретному микросервису</td></tr>
+<tr><td>Возможности</td><td>Health checks, TLS, sticky sessions</td><td>Аутентификация, лимиты, преобразование запросов, кэш, версионирование, логирование</td></tr>
+<tr><td>Бизнес-логика</td><td>Нет</td><td>Немного сквозной: проверка токена, квоты</td></tr>
+<tr><td>Инструменты</td><td>Nginx, HAProxy, AWS ELB, GCP LB</td><td>Kong, Apigee, AWS API Gateway, Spring Cloud Gateway</td></tr>
+</table></div>
+<p><b>Вместе, а не вместо.</b> В реальной системе работают оба, причём балансировщиков несколько: внешний распределяет трафик между экземплярами самого шлюза (шлюз тоже нужно резервировать), шлюз проверяет токен и выбирает сервис, а дальше запрос попадает на внутренний балансировщик этого сервиса (в Kubernetes — Service). На рисунке конспекта показана только вторая половина цепочки.</p>
+<p>Подробнее о шлюзе — в <a href="15-microservices.html#gateway">теме 15</a>.</p>
+
+<h2 id="proxy"><span class="h-num">3.3</span>Обратный и прямой прокси<span class="sk-num">#10</span></h2>
+<p>Оба — посредники, но стоят на разных сторонах и представляют разные стороны. <b>Reverse proxy</b> стоит перед серверами и действует от их имени: клиент не знает, какой сервер ему ответил. <b>Forward proxy</b> стоит перед клиентами и действует от их имени: сервер не знает, какой клиент к нему обратился.</p>
+<figure class="sketch"><a href="img/10-reverse-vs-forward-proxy.jpg"><img src="img/10-reverse-vs-forward-proxy.jpg" width="1024" height="1536" loading="lazy" alt="Сравнение обратного и прямого прокси"></a><figcaption><b>Конспект #10.</b> Reverse Proxy vs Forward Proxy <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="vs">
+  <div class="card"><h4>Reverse proxy — защищает серверы</h4><ul><li>Скрывает внутреннюю сеть.</li><li>Балансировка входящего трафика.</li><li>Завершение TLS, сжатие.</li><li>Кэш статики, защита от DDoS.</li><li>Nginx, HAProxy, Envoy.</li></ul></div>
+  <div class="card"><h4>Forward proxy — помогает клиентам</h4><ul><li>Скрывает клиента (анонимность).</li><li>Контроль доступа и фильтрация контента.</li><li>Обход сетевых ограничений.</li><li>Кэш для экономии канала.</li><li>Squid, Zscaler, корпоративный прокси.</li></ul></div>
+</div>
+<div class="callout info"><span class="c-title">Как это связано с предыдущими разделами</span>
+L7-балансировщик и API-шлюз — это частные случаи обратного прокси с разным набором функций. Один и тот же Nginx или Envoy в зависимости от конфигурации играет любую из этих ролей. Важное практическое следствие: за обратным прокси сервер видит IP прокси, а не клиента. Настоящий адрес приходит в заголовке <code>X-Forwarded-For</code>, и доверять ему можно, только если он выставлен вашим собственным прокси.
+</div>
+<div class="callout interview"><span class="c-title">С прямым прокси вы сталкиваетесь как разработчик</span>
+В корпоративной сети исходящие запросы сервиса к внешнему API идут через forward proxy: его нужно прописать в HTTP-клиенте (<code>https.proxyHost</code> в JVM), а его сертификат — добавить в truststore, если прокси расшифровывает TLS. Типичная причина «у меня локально работает, а на стенде — <code>PKIX path building failed</code>».
+</div>
+
+<h2 id="sim"><span class="h-num">3.4</span>Интерактив: алгоритмы балансировки под нагрузкой</h2>
+<div class="widget" id="lbW">
+  <div class="widget-title">Симулятор: 60 запросов, три сервера, один из них медленный</div>
+  <p class="hint">Серверы S1 и S2 обрабатывают запрос за 100 мс, S3 — за 500 мс (сборка мусора, шумный сосед). Запросы приходят каждые 40 мс.</p>
+  <div class="controls">
+    <label>алгоритм<select id="lbAlg" style="max-width:100%"><option value="rr">Round robin</option><option value="wrr">Weighted round robin (веса 5 : 5 : 1)</option><option value="lc">Least connections</option><option value="p2c">Power of two choices</option><option value="hash">Хэш по IP клиента (3 клиента, один активнее)</option></select></label>
+    <label>медленный S3<select id="lbSlow"><option value="500">500 мс</option><option value="100">100 мс (все равны)</option><option value="5000">5000 мс (почти завис)</option></select></label>
+  </div>
+  <div id="lbBars"></div>
+  <div class="verdict" id="lbOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var alg = $("lbAlg").value, slow = +$("lbSlow").value, svc = [100, 100, slow], N = 60, gap = 40;
+    var free = [0, 0, 0], active = [[], [], []], cnt = [0, 0, 0], lat = [], rr = 0, wseq = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 2], seed = 7;
+    function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+    for (var i = 0; i < N; i++) {
+      var t = i * gap, s;
+      for (var k = 0; k < 3; k++) active[k] = active[k].filter(function (e) { return e > t; });
+      if (alg === "rr") s = rr++ % 3;
+      else if (alg === "wrr") s = wseq[rr++ % wseq.length];
+      else if (alg === "lc") { s = 0; for (var j = 1; j < 3; j++) if (active[j].length < active[s].length) s = j; }
+      else if (alg === "p2c") { var a = Math.floor(rnd() * 3), b = Math.floor(rnd() * 3); if (b === a) b = (a + 1) % 3; s = active[a].length <= active[b].length ? a : b; }
+      else { var client = rnd() < 0.6 ? 0 : (rnd() < 0.5 ? 1 : 2); s = [2, 0, 1][client]; }
+      var start = Math.max(t, free[s]), end = start + svc[s]; free[s] = end; active[s].push(end); cnt[s]++; lat.push(end - t);
+    }
+    lat.sort(function (x, y) { return x - y; });
+    var avg = lat.reduce(function (x, y) { return x + y; }, 0) / N, p99 = lat[Math.floor(N * 0.99) - 1] || lat[N - 1], mx = Math.max.apply(null, cnt);
+    $("lbBars").innerHTML = cnt.map(function (c, i) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px"><span><b>S' + (i + 1) + "</b> — " + svc[i] + ' мс на запрос</span><span style="font-family:var(--font-mono)">' + c + ' запросов</span></div><div class="bar ' + (i === 2 && slow > 100 ? "bad" : "ok") + '"><i style="width:' + (c / mx * 100) + '%"></i></div>'; }).join("") +
+      '<div class="out">среднее время ответа: ' + avg.toFixed(0) + " мс     p99: " + p99.toFixed(0) + " мс     (идеал при равных серверах: 100 мс)</div>";
+    var o = $("lbOut"), tips = {
+      rr: "Round robin не знает о состоянии серверов: медленный S3 получает ровно треть запросов, за ним растёт очередь, и треть пользователей видит задержки. Годится только для одинаковых серверов и однотипных запросов.",
+      wrr: "Веса заданы заранее, вручную. Помогают при серверах разной мощности, но не реагируют на то, что сервер замедлился СЕЙЧАС.",
+      lc: "Сервер, который медленно отвечает, держит больше открытых запросов — и получает меньше новых. Алгоритм сам уводит трафик от проблемного узла. Осторожно с новым пустым сервером: на него хлынет всё сразу (нужен slow start).",
+      p2c: "Выбрать два случайных сервера и взять менее загруженный. Почти так же хорош, как least connections, но не требует знать состояние всех серверов и не создаёт «стадного» эффекта при множестве балансировщиков.",
+      hash: "Клиент всегда попадает на один сервер — полезно для кэша и сессий. Но нагрузка зависит от распределения клиентов: один активный клиент (или один NAT целого офиса) перегружает свой сервер, и медленный узел не разгружается."
+    };
+    o.className = "verdict " + (p99 > 1500 ? "bad" : (p99 > 400 ? "warn" : "ok")); o.textContent = tips[alg];
+  }
+  $("lbAlg").addEventListener("change", run); $("lbSlow").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">3.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем API-шлюз отличается от балансировщика нагрузки?</p><ul><li>Ничем</li><li>Балансировщик распределяет трафик между копиями одного сервиса; шлюз — единая точка входа к разным сервисам с маршрутизацией по API, аутентификацией, лимитами, преобразованиями</li><li>Шлюз работает на L4</li><li>Балансировщик умеет аутентификацию</li></ul><div class="why">Они дополняют друг друга: шлюз обычно сам стоит за балансировщиком и балансирует вызовы к сервисам.</div></div>
+<div class="mcq" data-ok="2"><p>Какой прокси скрывает серверы от клиентов?</p><ul><li>Прямой (forward)</li><li>SOCKS</li><li>Обратный (reverse): клиент обращается к нему как к серверу</li><li>VPN</li></ul><div class="why">Прямой прокси работает от имени клиентов (корпоративный выход в интернет), обратный — от имени серверов (nginx, CDN).</div></div>
+<div class="mcq" data-ok="0"><p>Балансировщик — единая точка отказа. Как это решают?</p><ul><li>Несколько экземпляров: активный-резервный с плавающим IP (VRRP) или активный-активный за anycast/DNS</li><li>Никак</li><li>Увеличивают его память</li><li>Отключают health check</li></ul><div class="why">Тот же принцип резервирования применяется к каждому уровню, включая сам балансировщик.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему round robin плохо работает для запросов разной длительности и что выбрать вместо него?</summary><div class="a"><p>Он считает запросы, а не нагрузку: одному серверу могут достаться три тяжёлых отчёта подряд, другому — три лёгких запроса. Least connections учитывает текущую занятость. Ещё лучше в распределённой конфигурации — «power of two choices»: выбрать два случайных сервера и отправить на менее загруженный.</p></div></details>
+<details class="q"><summary>В какой последовательности запрос проходит балансировщик и API-шлюз?</summary><div class="a"><p>Обычно так: внешний балансировщик → один из экземпляров шлюза → (внутренний балансировщик) → экземпляр сервиса. Шлюз — такой же сервис, его нужно масштабировать и резервировать, поэтому перед ним тоже стоит балансировщик.</p></div></details>
+<details class="q"><summary>Чем reverse proxy отличается от forward proxy одной фразой?</summary><div class="a"><p>Обратный прокси настраивает владелец серверов, и клиент о нём не знает; прямой прокси настраивает клиент (или его сеть), и сервер о нём не знает.</p></div></details>
+<details class="q"><summary>Сервис пишет в лог IP-адреса клиентов, и все они одинаковые. Почему?</summary><div class="a"><p>Сервис стоит за обратным прокси или L7-балансировщиком и видит адрес последнего перехода. Адрес клиента нужно брать из <code>X-Forwarded-For</code> (или <code>Forwarded</code>), предварительно настроив список доверенных прокси — иначе клиент сможет подделать заголовок и обойти, например, лимиты по IP.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

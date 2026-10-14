@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · @Async, @Scheduled, кэширование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ПРОДАКШЕН</div>
+  <h1>@Async, @Scheduled и кэширование</h1>
+  <p class="lead">Три аннотации, которые выглядят как «включил и работает», а в продакшене дают неограниченные очереди, задачи, выполняющиеся на каждом из пяти подов, и кэш, который не сбрасывается. Все три построены на уже знакомых механизмах: прокси, пост-процессорах и пулах потоков. Разберём их устройство и правила безопасного использования.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">TaskExecutor</span><span class="tag">TaskScheduler</span><span class="tag">CacheManager</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="async"><span class="h-num">15.1</span>@Async</h2>
+<p><code>@EnableAsync</code> регистрирует <code>AsyncAnnotationBeanPostProcessor</code>. Он оборачивает бины с <code>@Async</code> в прокси с <code>AnnotationAsyncExecutionInterceptor</code>: вызов метода превращается в задачу, отправленную в <code>TaskExecutor</code>, а вызывающий сразу получает управление.</p>
+<div class="table-wrap"><table>
+<tr><th>Возвращаемый тип</th><th>Что получает вызывающий</th><th>Куда девается исключение</th></tr>
+<tr><td><code>void</code></td><td>ничего</td><td><code>AsyncUncaughtExceptionHandler</code> (по умолчанию — лог)</td></tr>
+<tr><td><code>CompletableFuture&lt;T&gt;</code></td><td>future, который завершится результатом</td><td>в future (<code>exceptionally</code>, <code>join</code>)</td></tr>
+<tr><td><code>Future&lt;T&gt;</code></td><td>future</td><td>в <code>get()</code> как <code>ExecutionException</code></td></tr>
+</table></div>
+<h3>Какой executor будет использован</h3>
+<ol class="steps">
+  <li>Имя в аннотации: <code>@Async("reportExecutor")</code> — бин с этим именем.</li>
+  <li>Иначе <code>AsyncConfigurer.getAsyncExecutor()</code>, если вы его реализовали.</li>
+  <li>Иначе единственный бин <code>TaskExecutor</code> или бин с именем <code>taskExecutor</code>.</li>
+  <li>В Spring Boot таким бином будет <code>applicationTaskExecutor</code> — <code>ThreadPoolTaskExecutor</code> с <b>8 потоками и неограниченной очередью</b> (<code>spring.task.execution.pool.*</code>) — если вы не объявили свой Executor: иначе автоконфигурация отступает (кроме <code>spring.task.execution.mode=force</code>), и @Async без имени попадёт в ваш единственный TaskExecutor, а с <code>spring.threads.virtual.enabled=true</code> — <code>SimpleAsyncTaskExecutor</code> на виртуальных потоках.</li>
+</ol>
+<pre data-title="Отдельный ограниченный пул и перенос контекста"><code class="java">@Configuration
+@EnableAsync
+class AsyncConfig {
+    @Bean
+    ThreadPoolTaskExecutor reportExecutor() {
+        var ex = new ThreadPoolTaskExecutor();
+        ex.setThreadNamePrefix("report-");
+        ex.setCorePoolSize(4);
+        ex.setMaxPoolSize(8);
+        ex.setQueueCapacity(200);                                  // ограниченная очередь!
+        ex.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        ex.setTaskDecorator(task -&gt; {                              // MDC и SecurityContext из вызывающего потока
+            Map&lt;String, String&gt; mdc = MDC.getCopyOfContextMap();
+            SecurityContext sc = SecurityContextHolder.getContext();
+            return () -&gt; {
+                try { if (mdc != null) MDC.setContextMap(mdc); SecurityContextHolder.setContext(sc); task.run(); }
+                finally { MDC.clear(); SecurityContextHolder.clearContext(); }
+            };
+        });
+        ex.setWaitForTasksToCompleteOnShutdown(true);
+        ex.setAwaitTerminationSeconds(30);
+        return ex;
+    }
+}
+
+@Service
+class ReportService {
+    @Async("reportExecutor")
+    public CompletableFuture&lt;Report&gt; build(long id) {
+        return CompletableFuture.completedFuture(heavyBuild(id));
+    }
+}</code></pre>
+<div class="callout bad"><span class="c-title">Ловушки @Async</span>
+Self-invocation (вызов из того же класса выполнится синхронно). Транзакция вызывающего не переходит в асинхронный метод. Неограниченная очередь по умолчанию копит задачи до OOM. Request-scoped бины и <code>RequestContextHolder</code> в потоке пула недоступны. <code>@Async</code> и циклическая зависимость на этом же бине дают ошибку «has been injected into other beans in its raw version» (тема 03).
+</div>
+
+<h2 id="scheduled"><span class="h-num">15.2</span>@Scheduled</h2>
+<p><code>@EnableScheduling</code> → <code>ScheduledAnnotationBeanPostProcessor</code> находит методы с <code>@Scheduled</code> и регистрирует их в <code>ScheduledTaskRegistrar</code>; задачи запускаются после refresh контекста на <code>TaskScheduler</code>. В Boot это <code>ThreadPoolTaskScheduler</code> с <b>одним потоком</b> (<code>spring.task.scheduling.pool.size</code>).</p>
+<pre><code class="java">@Component
+class Jobs {
+    @Scheduled(fixedRate = 30, timeUnit = TimeUnit.SECONDS)     // от начала до начала; запуски не перекрываются
+    void refreshRates() { /* ... */ }
+
+    @Scheduled(fixedDelay = 10_000, initialDelay = 5_000)       // пауза от конца предыдущего
+    void pollOutbox() { /* ... */ }
+
+    @Scheduled(cron = "0 0 3 * * MON-FRI", zone = "Europe/Moscow")  // 6 полей: секунды первыми!
+    void nightlyReport() { /* ... */ }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Один поток на всех</h4><p>Если <code>nightlyReport</code> работает 20 минут, все остальные задачи ждут. Увеличьте пул или включите виртуальные потоки (<code>SimpleAsyncTaskScheduler</code>: каждый запуск в своём виртуальном потоке).</p></div>
+  <div class="card"><h4>Несколько экземпляров</h4><p>5 подов — задача выполнится 5 раз. Решения: ShedLock (блокировка в БД/Redis через аннотацию <code>@SchedulerLock</code>), лидер-выборы (Spring Integration, Kubernetes Lease), Quartz в кластерном режиме, вынести задачу в отдельный CronJob.</p></div>
+</div>
+<p>Исключение в задаче логируется через <code>ErrorHandler</code>, следующий запуск состоится (в отличие от голого <code>ScheduledExecutorService</code>, где исключение отменяет расписание). Endpoint <code>/actuator/scheduledtasks</code> показывает все зарегистрированные задачи; метрики выполнения даёт Observation (<code>tasks.scheduled.execution</code>).</p>
+
+<h2 id="cache"><span class="h-num">15.3</span>Абстракция кэширования</h2>
+<p><code>@EnableCaching</code> добавляет advisor с <code>CacheInterceptor</code>. Прокси перед вызовом вычисляет ключ, ищет значение в <code>Cache</code> из <code>CacheManager</code> и при попадании не вызывает метод вовсе. Хранилище подключаемое: <code>ConcurrentMapCacheManager</code> (Boot по умолчанию, без TTL и лимита — только для разработки), Caffeine (локальный, с TTL и размером), Redis (распределённый).</p>
+<pre data-title="Аннотации кэша"><code class="java">@Service
+class PriceService {
+    @Cacheable(cacheNames = "prices", key = "#sku", sync = true)   // sync=true нельзя сочетать с unless; null отсекайте настройкой кэша
+    public Price get(String sku) { return repo.load(sku); }            // ключ по умолчанию: один аргумент — он сам, нет аргументов — SimpleKey.EMPTY, несколько — SimpleKey(args)
+
+    @CachePut(cacheNames = "prices", key = "#p.sku")                    // всегда вызывает метод и обновляет кэш
+    public Price update(Price p) { return repo.save(p); }
+
+    @CacheEvict(cacheNames = "prices", allEntries = true)
+    public void reloadAll() { /* ... */ }
+}</code></pre>
+<pre data-title="application.yml: Caffeine с TTL"><code class="yaml">spring:
+  cache:
+    type: caffeine
+    cache-names: prices,stock
+    caffeine:
+      spec: maximumSize=10000,expireAfterWrite=5m,recordStats   # статистика → метрики cache.gets{result=hit|miss}</code></pre>
+
+<div class="widget" id="cc">
+  <div class="widget-title">Симулятор CacheInterceptor</div>
+  <p class="hint">Кэш <code>prices</code> пуст. Каждый вызов метода (промах) идёт в БД за 120 мс.</p>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="get:A1">get("A1")</button>
+    <button class="btn primary" type="button" data-a="get:B2">get("B2")</button>
+    <button class="btn" type="button" data-a="put:A1">update(A1 → 990 ₽)</button>
+    <button class="btn" type="button" data-a="self:A1">this.get("A1") изнутри бина</button>
+    <button class="btn" type="button" data-a="dbchange:B2">цена B2 изменилась в БД напрямую</button>
+    <button class="btn" type="button" data-a="evict">reloadAll() — evict all</button>
+    <button class="btn" type="button" data-a="storm">10 параллельных get("C3")</button>
+  </div>
+  <div class="checks"><label><input type="checkbox" id="ccSync" checked>sync = true</label></div>
+  <div class="lanes"><div class="lane"><h5>Кэш prices</h5><div class="items" id="ccCache"></div></div><div class="lane"><h5>Счётчики</h5><div class="items" id="ccStat"></div></div></div>
+  <div class="log" id="ccLog"></div>
+</div>
+<script>
+(function () {
+  var db = { A1: 1200, B2: 450, C3: 80 }, cache = {}, hits = 0, miss = 0, dbCalls = 0, log = [];
+  function el(id) { return document.getElementById(id); }
+  function load(k) { dbCalls++; return db[k]; }
+  function act(a) {
+    var p = a.split(":"), op = p[0], k = p[1];
+    if (op === "get") {
+      if (k in cache) { hits++; log.unshift('get("' + k + '") → HIT ' + cache[k] + " ₽, метод не вызывался (≈0,1 мс)"); }
+      else { miss++; cache[k] = load(k); log.unshift('get("' + k + '") → MISS → метод → SELECT (120 мс) → put в кэш: ' + cache[k] + " ₽"); }
+    } else if (op === "put") { db[k] = 990; dbCalls++; cache[k] = 990; log.unshift("update(A1) → метод выполнен всегда (@CachePut), UPDATE в БД, кэш перезаписан: 990 ₽"); }
+    else if (op === "self") { dbCalls++; log.unshift('this.get("' + k + '") → вызов мимо прокси: кэш не проверялся, SELECT выполнен (' + db[k] + " ₽), кэш не обновлён"); }
+    else if (op === "dbchange") { db[k] = 999; log.unshift("Цену B2 изменили SQL-скриптом / другим сервисом → в БД 999 ₽. Кэш об этом не знает" + (k in cache ? ": отдаёт устаревшие " + cache[k] + " ₽ до TTL или evict" : "")); }
+    else if (op === "evict") { cache = {}; log.unshift("@CacheEvict(allEntries = true) → кэш очищен"); }
+    else if (op === "storm") {
+      if ("C3" in cache) { hits += 10; log.unshift('10 × get("C3") → все HIT'); }
+      else if (el("ccSync").checked) { miss++; hits += 9; cache.C3 = load("C3"); log.unshift('10 × get("C3"), sync=true → первый поток грузит значение под блокировкой ключа, 9 ждут и получают его: 1 SELECT'); }
+      else { miss += 10; for (var i = 0; i < 10; i++) load("C3"); cache.C3 = db.C3; log.unshift('10 × get("C3"), sync=false → все 10 промахнулись одновременно: 10 одинаковых SELECT (cache stampede)'); }
+    }
+    render();
+  }
+  function render() {
+    el("ccCache").innerHTML = Object.keys(cache).map(function (k) { return '<span class="chip ' + (cache[k] !== db[k] ? "bad" : "ok") + '">' + k + " = " + cache[k] + " ₽" + (cache[k] !== db[k] ? " (устарело)" : "") + "</span>"; }).join("") || '<span class="chip">пусто</span>';
+    el("ccStat").innerHTML = '<span class="chip ok">hit ' + hits + '</span><span class="chip warn">miss ' + miss + '</span><span class="chip info">запросов в БД ' + dbCalls + "</span>";
+    el("ccLog").textContent = log.slice(0, 30).join("\n");
+  }
+  document.querySelectorAll("#cc [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  render();
+})();
+</script>
+<div class="callout warn"><span class="c-title">О чём помнить с кэшем</span>
+<b>Инвалидация</b>: изменения в обход аннотированных методов (другой сервис, SQL) кэш не видит — нужен TTL или событийная инвалидация. <b>Локальный кэш в кластере</b>: у каждого пода своя копия, <code>@CacheEvict</code> чистит только локальную. <b>Транзакции</b>: <code>@CachePut</code> внутри откатившейся транзакции оставит в кэше несуществующее значение — <code>TransactionAwareCacheManagerProxy</code> откладывает запись до коммита. <b>Ключи</b>: по умолчанию сам аргумент (если он один) или <code>SimpleKey</code> из всех аргументов — изменяемые объекты в качестве аргументов портят кэш. <b>Redis</b>: значения сериализуются — нужен согласованный сериализатор (JSON) и версионирование формата.
+</div>
+
+<h2 id="quiz"><span class="h-num">15.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В Boot без настроек @Async-методы получают тысячи задач в минуту, каждая работает долго. Что случится?</p><ul><li>Spring создаст новые потоки под нагрузку</li><li>applicationTaskExecutor с 8 потоками и неограниченной очередью будет копить задачи — растут задержка и память</li><li>Лишние задачи будут отклонены</li><li>Задачи выполнятся синхронно</li></ul><div class="why">Очередь по умолчанию неограниченная, поэтому потоков больше core не станет, а отказов не будет — до OOM. Задайте queue-capacity и политику.</div></div>
+<div class="mcq" data-ok="2"><p>Приложение развёрнуто в 3 экземплярах, в нём @Scheduled(cron = "0 0 * * * *") отправляет отчёт. Сколько отчётов в час?</p><ul><li>Один — Spring синхронизирует экземпляры</li><li>Ноль</li><li>Три — каждый экземпляр запускает свой планировщик</li><li>Зависит от БД</li></ul><div class="why">@Scheduled ничего не знает о других экземплярах. Нужен ShedLock, лидер-выборы или вынос задачи.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает sync = true в @Cacheable?</p><ul><li>При одновременных промахах по одному ключу метод вызывается один раз, остальные потоки ждут результат</li><li>Синхронизирует кэш между экземплярами</li><li>Записывает в кэш синхронно с транзакцией</li><li>Делает метод synchronized</li></ul><div class="why">Защита от cache stampede на уровне одного экземпляра; поддержка зависит от реализации кэша (Caffeine — да).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как работает @Async внутри и как выбирается executor?</summary><div class="a"><p>AsyncAnnotationBeanPostProcessor оборачивает бин в прокси с AnnotationAsyncExecutionInterceptor; вызов упаковывается в Callable и отправляется в executor: по имени из аннотации, из AsyncConfigurer, единственный TaskExecutor или бин taskExecutor (в Boot — applicationTaskExecutor). void-исключения уходят в AsyncUncaughtExceptionHandler.</p></div></details>
+<details class="q"><summary>Чем fixedRate отличается от fixedDelay?</summary><div class="a"><p>fixedRate — интервал между началами запусков (если запуск длится дольше интервала, следующий стартует сразу после окончания, параллельно не запускается на одном потоке). fixedDelay — пауза между окончанием предыдущего и началом следующего.</p></div></details>
+<details class="q"><summary>Какие проблемы у локального кэша в нескольких экземплярах и как их решать?</summary><div class="a"><p>Каждый экземпляр видит свою копию: evict на одном не чистит другие, данные расходятся. Решения: короткий TTL, распределённый кэш (Redis), двухуровневый кэш с инвалидацией через pub/sub, или кэшировать только неизменяемые/редко меняющиеся данные.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

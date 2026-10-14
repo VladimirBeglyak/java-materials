@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Векторный поиск и RAG</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+#vsSvg { width: 100%; max-width: 420px; display: block; margin: 10px auto; background: var(--bg-sunk); border-radius: 8px; cursor: crosshair; }
+#vsSvg text { font: 11px var(--font-mono); fill: var(--fg); }
+#vsSvg .pt { fill: var(--fg-muted); }
+#vsSvg .pt.top { fill: var(--ok); }
+#vsSvg .q { fill: var(--accent); }
+#vsSvg line { stroke: var(--ok); stroke-width: 1; stroke-dasharray: 3 3; }
+</style>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Векторный поиск и RAG</h1>
+  <p class="lead">Модели превращают текст, изображения и товары в векторы-эмбеддинги так, что близкие по смыслу объекты оказываются рядом. Найти «похожее» — значит найти ближайшие векторы среди миллионов за миллисекунды. Разбираем меры близости, почему точный поиск не масштабируется, как работают HNSW и квантование, сколько это стоит по памяти, как фильтровать, строить RAG — и когда хватит pgvector, а когда нужна отдельная векторная база.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">эмбеддинги</span><span class="tag">косинус</span><span class="tag">ANN</span><span class="tag">HNSW</span><span class="tag">квантование</span><span class="tag">RAG</span><span class="tag">pgvector</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="embeddings"><span class="h-num">11.1</span>Эмбеддинги и близость</h2>
+<p>Эмбеддинг — вектор из сотен–тысяч чисел (384, 768, 1536, 3072 измерения). Мера близости зависит от модели: <b>косинусная</b> (угол между векторами, самая частая для текста), <b>скалярное произведение</b> (для нормированных векторов совпадает с косинусной), <b>евклидово расстояние</b>. Ниже — игрушечное двумерное пространство: щёлкните, чтобы поставить запрос.</p>
+<div class="widget" id="vsW">
+  <div class="widget-title">Ближайшие соседи по косинусной близости</div>
+  <svg id="vsSvg" viewBox="0 0 400 300" role="img" aria-label="Двумерное пространство эмбеддингов"></svg>
+  <div class="controls"><label>k<select id="vsK"><option>1</option><option selected>3</option><option>5</option></select></label><label>мера<select id="vsM"><option value="cos">косинусная</option><option value="l2">евклидова</option></select></label></div>
+  <div class="out" id="vsOut"></div>
+</div>
+<script>
+(function () {
+  var P = [["кошка", 60, 60], ["котёнок", 80, 75], ["собака", 70, 130], ["щенок", 95, 140], ["тигр", 40, 40], ["ноутбук", 300, 220], ["компьютер", 320, 245], ["клавиатура", 280, 260], ["банан", 240, 60], ["яблоко", 265, 85], ["груша", 290, 70], ["смартфон", 340, 200]];
+  var q = [110, 100], $ = function (i) { return document.getElementById(i); }, C = [200, 150];
+  function v(p) { return [p[0] - C[0], C[1] - p[1]]; }
+  function cos(a, b) { return (a[0] * b[0] + a[1] * b[1]) / (Math.hypot(a[0], a[1]) * Math.hypot(b[0], b[1]) || 1); }
+  function run() {
+    var k = +$("vsK").value, m = $("vsM").value, qv = v(q);
+    var sc = P.map(function (p) { var pv = v([p[1], p[2]]); return [p, m === "cos" ? cos(qv, pv) : -Math.hypot(qv[0] - pv[0], qv[1] - pv[1])]; }).sort(function (a, b) { return b[1] - a[1]; });
+    var top = sc.slice(0, k).map(function (x) { return x[0]; });
+    var s = '<circle cx="200" cy="150" r="2.5" class="pt"/><text x="204" y="146" opacity=".5">0</text>';
+    top.forEach(function (p) { s += '<line x1="' + q[0] + '" y1="' + q[1] + '" x2="' + p[1] + '" y2="' + p[2] + '"/>'; });
+    P.forEach(function (p) { var t = top.indexOf(p) >= 0; s += '<circle cx="' + p[1] + '" cy="' + p[2] + '" r="5" class="pt' + (t ? " top" : "") + '"/><text x="' + (p[1] + 7) + '" y="' + (p[2] + 4) + '">' + p[0] + "</text>"; });
+    s += '<circle cx="' + q[0] + '" cy="' + q[1] + '" r="7" class="q"/><text x="' + (q[0] + 9) + '" y="' + (q[1] - 6) + '">запрос</text>';
+    $("vsSvg").innerHTML = s;
+    $("vsOut").textContent = sc.slice(0, k).map(function (x, i) { return (i + 1) + ". " + x[0][0] + "  " + (m === "cos" ? "cos = " + x[1].toFixed(3) : "dist = " + (-x[1]).toFixed(1)); }).join("\n") + (m === "cos" ? "\nкосинусная мера смотрит на направление от начала координат (0), а не на расстояние" : "");
+  }
+  $("vsSvg").addEventListener("click", function (e) { var r = $("vsSvg").getBoundingClientRect(); q = [(e.clientX - r.left) / r.width * 400, (e.clientY - r.top) / r.height * 300]; run(); });
+  ["vsK", "vsM"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="ann"><span class="h-num">11.2</span>Точный и приближённый поиск</h2>
+<p>Точный поиск (kNN) сравнивает запрос с каждым вектором: 10 млн × 1536 измерений = 15 млрд умножений на запрос. Индексы приближённого поиска (ANN) жертвуют небольшой долей точности (<b>recall</b> — доля настоящих ближайших соседей в ответе) ради скорости в сотни раз.</p>
+<div class="grid-2">
+  <div class="card"><h4>HNSW</h4><p>Многоуровневый граф «малого мира»: верхние уровни — редкие длинные связи, нижний — все векторы с ближайшими соседями. Поиск: жадный спуск сверху вниз, на каждом уровне идём к соседу ближе к запросу. Высокий recall и скорость, но граф в памяти и долгое построение. Параметры: <code>m</code> (связей на узел), <code>ef_construction</code>, <code>ef_search</code> (ширина поиска: больше — точнее и медленнее).</p></div>
+  <div class="card"><h4>IVF (+PQ)</h4><p>Векторы кластеризуются (k-means) на списки; запрос сравнивается с центрами и просматривает <code>nprobe</code> ближайших списков. Меньше памяти, быстрое построение, хорошо сочетается с квантованием (PQ) для миллиардов векторов. Recall чувствителен к nprobe и к дрейфу данных (центры устаревают).</p></div>
+</div>
+
+<h2 id="memory"><span class="h-num">11.3</span>Сколько памяти нужно</h2>
+<div class="widget" id="vmW">
+  <div class="widget-title">Калькулятор размера векторного индекса</div>
+  <div class="controls">
+    <label>векторов, млн<input type="number" id="vmN" value="20" min="0.01" step="1"></label>
+    <label>размерность<select id="vmD"><option>384</option><option>768</option><option selected>1536</option><option>3072</option></select></label>
+    <label>хранение<select id="vmQ"><option value="4">float32 (4 байта)</option><option value="2">float16 / halfvec (2 байта)</option><option value="1">int8 скалярное квантование</option><option value="0.125">бинарное квантование (1 бит)</option></select></label>
+    <label>HNSW m<select id="vmM"><option>16</option><option>32</option></select></label>
+  </div>
+  <div class="out" id="vmOut"></div>
+  <div class="verdict" id="vmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(0.01, +$("vmN").value) * 1e6, d = +$("vmD").value, q = +$("vmQ").value, m = +$("vmM").value, G = Math.pow(1024, 3);
+    var vec = n * d * q, graph = n * m * 2 * 4 * 1.1, raw = n * d * 4, tot = vec + graph;
+    $("vmOut").textContent = "векторы: " + (vec / G).toFixed(1) + " ГБ" + (q < 4 ? "  (оригиналы float32 для пересчёта близости — ещё " + (raw / G).toFixed(1) + " ГБ на диске)" : "") + "\nграф HNSW (m=" + m + "): ~" + (graph / G).toFixed(1) + " ГБ\nвсего в памяти для быстрого поиска: ~" + (tot / G).toFixed(1) + " ГБ";
+    var v = $("vmV");
+    v.className = "verdict " + (tot / G < 64 ? "ok" : tot / G < 512 ? "warn" : "bad");
+    v.textContent = tot / G < 64 ? "Помещается в память одного сервера — pgvector или одиночный инстанс векторной базы." : tot / G < 512 ? "Нужен крупный сервер или квантование; рассмотрите специализированную базу с квантованием и хранением на диске (Qdrant, Milvus, DiskANN)." : "Масштаб миллиардов: шардирование, IVF-PQ/DiskANN, специализированные системы. Проверьте, нужны ли все векторы (дедупликация, меньшая размерность модели — Matryoshka-эмбеддинги).";
+  }
+  ["vmN", "vmD", "vmQ", "vmM"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="pgvector"><span class="h-num">11.4</span>pgvector: векторы рядом с данными</h2>
+<pre data-title="поиск похожих документов с фильтром"><code class="sql">CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE chunks (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  doc_id     bigint NOT NULL REFERENCES documents(id),
+  tenant_id  bigint NOT NULL,
+  content    text NOT NULL,
+  embedding  vector(1536) NOT NULL
+);
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+SET hnsw.ef_search = 100;
+SET hnsw.iterative_scan = relaxed_order;     -- pgvector 0.8+: дочитывать граф, если фильтр отсёк результаты
+SELECT id, content, 1 - (embedding &lt;=&gt; $1) AS similarity
+FROM chunks
+WHERE tenant_id = $2
+ORDER BY embedding &lt;=&gt; $1
+LIMIT 8;</code></pre>
+<div class="callout warn"><span class="c-title">Фильтрация — главная сложность ANN</span>
+Индекс находит 40 ближайших, а фильтр <code>tenant_id = 7</code> оставляет 0 из них. Варианты: итеративный поиск (pgvector 0.8+), фильтрация внутри обхода графа (Qdrant, Weaviate — payload-индексы), отдельные индексы или партиции на крупных арендаторов, частичные индексы. Проверяйте recall на реальных фильтрах.
+</div>
+
+<h2 id="rag"><span class="h-num">11.5</span>RAG: поиск для языковой модели</h2>
+<div class="flow col">
+  <div class="node"><b>Индексация</b><small>документы → разбиение на фрагменты (300–800 токенов с перекрытием) → эмбеддинги → векторное хранилище + метаданные (источник, права, дата)</small></div><span class="to">↓</span>
+  <div class="node acc"><b>Запрос</b><small>вопрос → эмбеддинг → гибридный поиск (векторы + BM25) с фильтрами по правам → 20–50 кандидатов</small></div><span class="to">↓</span>
+  <div class="node info"><b>Переранжирование</b><small>cross-encoder/reranker отбирает 5–10 лучших фрагментов</small></div><span class="to">↓</span>
+  <div class="node ok"><b>Генерация</b><small>LLM отвечает по найденным фрагментам со ссылками на источники</small></div>
+</div>
+<ul>
+  <li>Качество RAG чаще определяется разбиением, метаданными и гибридным поиском, чем выбором векторной базы.</li>
+  <li>Смена модели эмбеддингов = пересчёт всех векторов (храните версию модели рядом с вектором).</li>
+  <li>Права доступа — фильтром при поиске, а не после генерации.</li>
+</ul>
+
+<h2 id="choose"><span class="h-num">11.6</span>Что выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Вариант</th><th>Когда</th></tr>
+<tr><td>pgvector (PostgreSQL)</td><td>до десятков миллионов векторов, нужна согласованность с данными, фильтры SQL, нет желания вводить новую систему</td></tr>
+<tr><td>Qdrant, Weaviate, Milvus</td><td>сотни миллионов+, сложная фильтрация, квантование, хранение на диске, шардирование</td></tr>
+<tr><td>OpenSearch/Elasticsearch kNN</td><td>уже есть поисковый движок, нужен гибридный поиск в одном месте</td></tr>
+<tr><td>Pinecone, управляемые сервисы облаков</td><td>без эксплуатации, оплата за использование</td></tr>
+<tr><td>Redis, LanceDB, DuckDB VSS</td><td>низкая задержка в памяти; встраиваемые сценарии и эксперименты</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">11.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что такое recall в ANN-поиске?</p><ul><li>Скорость ответа</li><li>Доля настоящих k ближайших соседей, найденных индексом</li><li>Размер индекса</li><li>Число запросов в секунду</li></ul><div class="why">ANN жертвует частью recall ради скорости; ef_search/nprobe регулируют баланс.</div></div>
+<div class="mcq" data-ok="3"><p>Векторный поиск с фильтром по арендатору возвращает слишком мало результатов. Причина?</p><ul><li>Неверная метрика</li><li>Мало измерений</li><li>Нужно больше реплик</li><li>Индекс нашёл ближайших среди всех, а фильтр отбросил большинство — нужен итеративный поиск или фильтрация внутри обхода</li></ul><div class="why">Post-filtering — частая ловушка.</div></div>
+<div class="mcq" data-ok="0"><p>Что произойдёт при смене модели эмбеддингов?</p><ul><li>Нужно пересчитать все векторы: пространства разных моделей несовместимы</li><li>Ничего, векторы совместимы</li><li>Достаточно перестроить индекс</li><li>Нужно изменить только метрику</li></ul><div class="why">Храните версию модели и планируйте переиндексацию.</div></div>
+<div class="mcq" data-ok="2"><p>Почему гибридный поиск часто лучше чисто векторного?</p><ul><li>Он дешевле</li><li>Он не требует индексов</li><li>Векторы плохо находят точные идентификаторы и редкие термины, а BM25 — перефразирования; вместе они дополняют друг друга</li><li>Он всегда возвращает больше результатов</li></ul><div class="why">Результаты объединяют, например, через RRF.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как оценить качество векторного поиска перед продакшеном?</summary><div class="a"><p>Собрать набор запросов с размеченными релевантными документами; измерить recall@k индекса относительно точного поиска и метрики качества выдачи (nDCG, MRR) для всей цепочки; подобрать параметры (ef_search, m, квантование) по компромиссу recall/задержка; проверить на реальных фильтрах и арендаторах; мониторить качество после изменений модели и данных.</p></div></details>
+<details class="q"><summary>pgvector или Qdrant для поиска по базе знаний компании на 2 млн фрагментов?</summary><div class="a"><p>pgvector: объём небольшой (2 млн × 1536 × 4 байта ≈ 12 ГБ + граф), данные и права доступа уже в PostgreSQL, фильтры SQL, транзакционное обновление. Qdrant стоит рассматривать при росте до сотен миллионов, при сложной фильтрации на большом масштабе или если команда хочет отдельный сервис поиска.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

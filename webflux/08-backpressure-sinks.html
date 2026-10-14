@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Противодавление и Sinks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · REACTOR</div>
+  <h1>Противодавление и Sinks</h1>
+  <p class="lead">Противодавление (backpressure) — способ медленного потребителя сказать быстрому производителю «не больше n». Пока производитель умеет подчиняться (база, файл, генератор), потерь нет. Когда не умеет (таймер, клики, сообщения из сокета, ваш код через Sinks) — нужна стратегия: буферизовать, отбрасывать, оставлять последнее или падать. Разбираем, как спрос течёт по цепочке, моделируем стратегии и учимся безопасно отправлять события через Sinks.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">request(n)</span><span class="tag">prefetch</span><span class="tag">limitRate</span><span class="tag">onBackpressure*</span><span class="tag">Sinks</span><span class="tag">EmitResult</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="demand"><span class="h-num">8.1</span>Как спрос течёт по цепочке</h2>
+<p>Спрос не передаётся «как есть» от подписчика к источнику: операторы с очередью (publishOn, limitRate, внутренние подписки flatMap) запрашивают у источника свою <b>предвыборку</b> (prefetch) и пополняют её, когда израсходовано 75% (порог replenish). flatMap у самого источника запрашивает concurrency элементов и добирает по одному на каждый завершившийся внутренний издатель; concatMap (с 3.5) предвыборки не делает.</p>
+<div class="table-wrap"><table>
+<tr><th>Оператор</th><th>Запрос вверх</th></tr>
+<tr><td><code>subscribe(lambda)</code></td><td>request(Long.MAX_VALUE) — «без ограничений»</td></tr>
+<tr><td><code>publishOn</code></td><td>256 (Queues.SMALL_BUFFER_SIZE), затем порциями по 192</td></tr>
+<tr><td><code>flatMap</code></td><td>concurrency (256) у источника, prefetch 32 у каждого внутреннего</td></tr>
+<tr><td><code>concatMap</code></td><td>с 3.5 по умолчанию без предвыборки: следующий элемент запрашивается только после завершения текущего внутреннего издателя; <code>concatMap(f, 32)</code> — с явной предвыборкой (так было по умолчанию в 3.4)</td></tr>
+<tr><td><code>limitRate(n)</code></td><td>n, затем по 0,75·n; <code>limitRate(high, low)</code> — явный порог</td></tr>
+<tr><td><code>limitRequest(n) / take(n)</code></td><td>не больше n всего (take с 3.5 тоже ограничивает спрос)</td></tr>
+</table></div>
+<pre data-title="Видно в log()"><code class="txt">Flux.range(1, 1000).log().limitRate(100).subscribe()
+
+| request(100)
+| onNext(1) … onNext(75)
+| request(75)            ← пополнение после 75% израсходованного
+| onNext(76) …</code></pre>
+
+<h2 id="sim"><span class="h-num">8.2</span>Быстрый производитель, медленный потребитель</h2>
+<div class="widget" id="bpW">
+  <div class="widget-title">10 секунд работы: производитель не умеет замедляться (таймер, сокет, Sinks)</div>
+  <div class="controls">
+    <label>производитель, событий/с<input type="number" id="bpP" value="1000" min="1"></label>
+    <label>потребитель, событий/с<input type="number" id="bpC" value="700" min="1"></label>
+    <label>Стратегия<select id="bpS">
+      <option value="none">нет (Flux.interval + publishOn)</option>
+      <option value="buf">onBackpressureBuffer(2000)</option>
+      <option value="unb">onBackpressureBuffer() — без лимита</option>
+      <option value="drop">onBackpressureDrop()</option>
+      <option value="latest">onBackpressureLatest()</option>
+      <option value="pull">источник с противодавлением (generate, R2DBC)</option>
+    </select></label>
+  </div>
+  <div class="rows" id="bpRows"></div>
+  <div class="verdict" id="bpV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var P = Math.max(1, +$("bpP").value), C = Math.max(1, +$("bpC").value), s = $("bpS").value;
+    var cap = s === "buf" ? 2000 + 256 : s === "unb" ? Infinity : 256, q = 0, prod = 0, done = 0, drop = 0, maxQ = 0, err = null, accP = 0, accC = 0, dt = 0.01;
+    for (var t = 0; t < 10 - 1e-9; t += dt) {
+      accP += P * dt; accC += C * dt;
+      var np = Math.floor(accP); accP -= np;
+      if (s === "pull") { np = Math.min(np, cap - q); }
+      for (var k = 0; k < np; k++) {
+        prod++;
+        if (q < cap) q++;
+        else if (s === "drop") drop++;
+        else if (s === "latest") drop++;
+        else { err = t; break; }
+      }
+      if (err !== null) break;
+      var nc = Math.min(q, Math.floor(accC)); accC -= Math.floor(accC); q -= nc; done += nc; maxQ = Math.max(maxQ, q);
+    }
+    function row(name, val, frac, cls) { return '<div class="row"><b>' + name + '</b><span class="bar ' + (cls || "") + '"><i style="width:' + Math.min(100, Math.max(0, frac * 100)).toFixed(1) + '%"></i></span><span>' + val + "</span></div>"; }
+    var base = Math.max(prod, 1);
+    $("bpRows").innerHTML = row("произведено", prod, prod / base) + row("обработано", done, done / base, "ok") + row("потеряно", drop, drop / base, drop ? "bad" : "") + row("макс. очередь", maxQ + (maxQ ? " (~" + Math.round(maxQ * 0.2) + " КБ при 200 Б)" : ""), cap === Infinity ? Math.min(1, maxQ / 10000) : maxQ / cap, maxQ > 2000 ? "bad" : "");
+    var v = $("bpV"), msg, cls = "ok";
+    if (err !== null) { cls = "bad"; msg = (s === "none" ? "OverflowException: Could not emit tick 256 due to lack of requests (interval doesn't support small downstream requests that replenish slower than the ticks) — " : "OverflowException: буфер переполнен — ") + "через " + err.toFixed(2) + " с поток завершился ошибкой. Производитель быстрее потребителя на " + (P - C) + " событий/с."; }
+    else if (s === "unb" && P > C) { cls = "bad"; msg = "Очередь растёт на " + (P - C) + " событий/с без предела: за час — " + ((P - C) * 3600).toLocaleString("ru") + " объектов в куче. Отложенный OutOfMemoryError."; }
+    else if (drop) { cls = "warn"; msg = "Потеряно " + Math.round(drop / prod * 100) + "% событий. " + (s === "latest" ? "Latest хранит одно последнее значение — подписчик всегда видит самое свежее (котировки, состояние)." : "Drop отбрасывает всё, что пришло без спроса (метрики, логи, где потеря допустима).") + " Можно передать колбэк: onBackpressureDrop(e -> metrics.increment(\"dropped\"))."; }
+    else if (s === "pull") { msg = P > C ? "Источник подчиняется спросу и замедляется до " + C + " событий/с: ни потерь, ни роста памяти — так работают R2DBC, Flux.generate, чтение файла, Kafka-receiver." : "Потребитель успевает, спрос никогда не исчерпывается."; }
+    else { msg = P <= C ? "Потребитель успевает — стратегия не задействована. Но пик нагрузки может это изменить." : "Буфер сгладил разницу за 10 секунд, но при длительной перегрузке он переполнится."; if (P > C) cls = "warn"; }
+    v.className = "verdict " + cls; v.textContent = msg;
+  }
+  ["bpP", "bpC", "bpS"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<pre data-title="Буфер с политикой переполнения"><code class="java">source.onBackpressureBuffer(
+        10_000,
+        dropped -&gt; log.warn("dropped {}", dropped),
+        BufferOverflowStrategy.DROP_OLDEST)    // ERROR (по умолчанию), DROP_LATEST, DROP_OLDEST
+      .publishOn(Schedulers.boundedElastic())
+      .concatMap(this::slowWrite);</code></pre>
+
+<h2 id="sinks"><span class="h-num">8.3</span>Sinks: как отдавать события из императивного кода</h2>
+<p>Sinks — безопасная замена устаревшим Processor: объект, в который вы «кладёте» сигналы, и Flux/Mono, на который подписываются потребители.</p>
+<div class="table-wrap"><table>
+<tr><th>Sink</th><th>Подписчиков</th><th>Поздний подписчик</th><th>Нет спроса</th></tr>
+<tr><td><code>Sinks.one()</code></td><td>много</td><td>получает значение</td><td>—</td></tr>
+<tr><td><code>Sinks.empty()</code></td><td>много</td><td>получает complete/error</td><td>—</td></tr>
+<tr><td><code>many().unicast().onBackpressureBuffer()</code></td><td>один</td><td>получает всё накопленное до подписки</td><td>буферизует (неограниченно)</td></tr>
+<tr><td><code>many().multicast().onBackpressureBuffer()</code></td><td>много</td><td>только новые (+ буфер до первого подписчика)</td><td>копит до 256, затем FAIL_OVERFLOW; медленный тормозит всех</td></tr>
+<tr><td><code>many().multicast().directBestEffort()</code></td><td>много</td><td>только новые</td><td>медленному элемент не доставляется, остальным — да</td></tr>
+<tr><td><code>many().multicast().directAllOrNothing()</code></td><td>много</td><td>только новые</td><td>если хоть один не готов — не получает никто</td></tr>
+<tr><td><code>many().replay().limit(n | Duration)</code></td><td>много</td><td>последние n / за период</td><td>буферизует</td></tr>
+</table></div>
+<pre data-title="Шина событий для SSE" class="good-code"><code class="java">@Component
+class OrderEvents {
+    private final Sinks.Many&lt;OrderEvent&gt; sink =
+        Sinks.many().multicast().directBestEffort();      // медленный клиент не тормозит остальных
+
+    void publish(OrderEvent e) {
+        Sinks.EmitResult r = sink.tryEmitNext(e);
+        if (r.isFailure()) log.warn("emit {} failed: {}", e.id(), r);
+    }
+    Flux&lt;OrderEvent&gt; stream() {
+        return sink.asFlux().onBackpressureBuffer(100);   // свой буфер на каждого подписчика
+    }
+}</code></pre>
+<div class="widget" id="emW">
+  <div class="widget-title">Что вернёт tryEmitNext?</div>
+  <div class="controls"><label>Ситуация<select id="emS">
+    <option value="ok">обычная отправка</option>
+    <option value="ns">два потока вызвали tryEmitNext одновременно</option>
+    <option value="zs">multicast, нет подписчиков, буфер полон</option>
+    <option value="ov">подписчик медленный, буфер multicast исчерпан</option>
+    <option value="term">sink уже завершён tryEmitComplete</option>
+    <option value="can">единственный подписчик unicast отменил подписку</option>
+  </select></label></div>
+  <div class="out" id="emOut"></div>
+  <div class="verdict" id="emV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var M = {
+    ok: ["OK", "ok", "Сигнал доставлен (или поставлен в буфер)."],
+    ns: ["FAIL_NON_SERIALIZED", "bad", "Sinks не потокобезопасны для параллельной отправки: проигравший поток получает FAIL_NON_SERIALIZED и сигнал теряется. Решения: emitNext(e, EmitFailureHandler.busyLooping(Duration.ofMillis(100))) — повтор в цикле, или синхронизация на стороне производителя."],
+    zs: ["FAIL_ZERO_SUBSCRIBER", "warn", "У multicast нет подписчиков, и буфер «прогрева» заполнен — элемент отброшен. directBestEffort/AllOrNothing без подписчиков возвращают это сразу."],
+    ov: ["FAIL_OVERFLOW", "warn", "Буфер переполнен из-за медленного подписчика. Для onBackpressureBuffer multicast это блокирует всех: выдача идёт со скоростью самого медленного."],
+    term: ["FAIL_TERMINATED", "bad", "После complete/error sink закрыт навсегда. Нужен новый экземпляр."],
+    can: ["FAIL_CANCELLED", "warn", "Подписчик unicast отменил подписку — sink больше никому не может доставить данные."]
+  };
+  function run() { var m = M[$("emS").value]; $("emOut").textContent = "Sinks.EmitResult." + m[0] + "\nisSuccess() = " + (m[0] === "OK") + "\nisFailure() = " + (m[0] !== "OK"); $("emV").className = "verdict " + m[1]; $("emV").textContent = m[2]; }
+  $("emS").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">emitNext против tryEmitNext</span>
+<code>tryEmitNext</code> возвращает результат и не бросает. <code>emitNext(v, handler)</code> вызывает handler при неудаче (повторить или нет); <code>EmitFailureHandler.FAIL_FAST</code>: на FAIL_NON_SERIALIZED бросит <code>EmissionException</code>, на FAIL_ZERO_SUBSCRIBER тихо отбросит элемент, на FAIL_OVERFLOW завершит sink ошибкой переполнения. Не вызывайте emit из нескольких потоков без busyLooping — это самая частая причина «потерянных» событий.
+</div>
+
+<h2 id="quiz"><span class="h-num">8.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему <code>Flux.interval(1ms).publishOn(single()).map(slow)</code> падает с OverflowException?</p><ul><li>interval не поддерживает publishOn</li><li>Таймер не умеет замедляться, а очередь publishOn (256) переполняется</li><li>single() запрещён для interval</li><li>map бросает исключение</li></ul><div class="why">Нужна стратегия onBackpressure* перед publishOn.</div></div>
+<div class="mcq" data-ok="2"><p>Котировки: потребителю нужно только самое свежее значение. Стратегия?</p><ul><li>onBackpressureBuffer()</li><li>onBackpressureError()</li><li>onBackpressureLatest()</li><li>onBackpressureDrop()</li></ul><div class="why">Latest хранит последнее непереданное значение.</div></div>
+<div class="mcq" data-ok="0"><p>Что вернёт tryEmitNext при одновременном вызове из двух потоков?</p><ul><li>Одному из них — FAIL_NON_SERIALIZED</li><li>Оба OK</li><li>Бросит ConcurrentModificationException</li><li>Заблокирует второй поток</li></ul><div class="why">Sinks детектируют гонку, но не разрешают её за вас.</div></div>
+<div class="mcq" data-ok="3"><p>Сколько элементов запросит <code>limitRate(100)</code> после первых 75 полученных?</p><ul><li>100</li><li>25</li><li>1</li><li>75</li></ul><div class="why">Пополнение на 75% от размера окна.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Работает ли противодавление по HTTP между WebFlux-сервером и клиентом?</summary><div class="a"><p>Частично. Внутри приложения — да, по протоколу Reactive Streams. На границе сети Reactor Netty переводит спрос в управление чтением из сокета: если подписчик не запрашивает данные, Netty перестаёт читать (autoRead=false), заполняется приёмный буфер TCP, и окно TCP сообщает отправителю замедлиться. Так что медленное чтение ответа клиентом в итоге притормозит запись сервером. Точного «request(n)» по HTTP нет — это умеет RSocket.</p></div></details>
+<details class="q"><summary>Чем Sinks.many().multicast().onBackpressureBuffer() опасен для SSE с множеством клиентов?</summary><div class="a"><p>Буфер общий: если один клиент читает медленно, буфер (256) заполняется, и sink начинает возвращать FAIL_OVERFLOW для всех — один медленный клиент тормозит или ломает доставку всем. Для broadcast клиентам с разной скоростью лучше directBestEffort плюс индивидуальный onBackpressureBuffer/Latest/Drop на asFlux() каждого подписчика.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

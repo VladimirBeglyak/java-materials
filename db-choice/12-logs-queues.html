@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Журналы событий и очереди: Kafka</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Журналы событий и очереди: Kafka</h1>
+  <p class="lead">Kafka часто называют брокером сообщений, но по сути это распределённое хранилище — долговечный упорядоченный журнал, который читают многие независимые потребители, каждый со своей позиции, и могут перечитать. Разбираем модель журнала против очереди, партиции и порядок, группы потребителей, гарантии доставки, ретенцию и компактизацию, и выбор между Kafka, RabbitMQ, SQS, Redis Streams и очередью в PostgreSQL.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">журнал vs очередь</span><span class="tag">партиции</span><span class="tag">consumer groups</span><span class="tag">at-least-once</span><span class="tag">compaction</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="log-vs-queue"><span class="h-num">12.1</span>Журнал против очереди</h2>
+<div class="grid-2">
+  <div class="card"><h4>Очередь (RabbitMQ, SQS)</h4><ul><li>Сообщение доставляется одному потребителю и удаляется после подтверждения.</li><li>Брокер следит за каждым сообщением: повторы, задержки, DLQ, приоритеты, маршрутизация.</li><li>Хорошо для задач («отправить письмо», «сгенерировать отчёт»).</li></ul></div>
+  <div class="card"><h4>Журнал (Kafka, Redpanda, Pulsar, Kinesis)</h4><ul><li>Записи дописываются в конец и хранятся по ретенции (дни, навсегда).</li><li>Каждый потребитель хранит свою позицию (offset) — читать могут десятки независимых систем, перечитать с любого места.</li><li>Хорошо для событий («заказ создан»), интеграции, потоковой обработки, CDC.</li></ul></div>
+</div>
+
+<h2 id="partitions"><span class="h-num">12.2</span>Топики, партиции, порядок</h2>
+<p>Топик делится на партиции — независимые журналы на разных брокерах. Порядок гарантирован <b>только внутри партиции</b>. Партиция выбирается хэшем ключа сообщения: все события одного заказа (ключ <code>order_id</code>) попадут в одну партицию и будут прочитаны по порядку.</p>
+<div class="widget" id="kpW">
+  <div class="widget-title">Партиции и группа потребителей</div>
+  <div class="controls">
+    <label>партиций<select id="kpP"><option>3</option><option selected>6</option><option>12</option></select></label>
+    <label>потребителей в группе<input type="number" id="kpC" value="4" min="1" max="16"></label>
+    <label>ключ сообщения<input type="text" id="kpK" value="order-1001"></label>
+  </div>
+  <div class="lanes" id="kpL"></div>
+  <div class="verdict" id="kpV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function h(s) { var x = 0; for (var i = 0; i < s.length; i++) x = (x * 31 + s.charCodeAt(i)) >>> 0; return x; }
+  function run() {
+    var p = +$("kpP").value, c = Math.max(1, Math.min(16, +$("kpC").value)), key = $("kpK").value, kp = h(key) % p, html = "";
+    for (var i = 0; i < c; i++) {
+      var parts = []; for (var j = 0; j < p; j++) if (j % c === i) parts.push(j);
+      html += '<div class="lane"><h5>потребитель ' + (i + 1) + '</h5><div class="items">' + (parts.length ? parts.map(function (j) { return '<span class="chip' + (j === kp ? " acc" : "") + '">P' + j + (j === kp ? " ← " + key : "") + "</span>"; }).join("") : '<span class="chip bad">простаивает</span>') + "</div></div>";
+    }
+    $("kpL").innerHTML = html;
+    var v = $("kpV");
+    v.className = "verdict " + (c > p ? "warn" : "ok");
+    v.textContent = "Ключ «" + key + "» → партиция P" + kp + " (хэш ключа mod " + p + "): все его события обработает один потребитель по порядку. " + (c > p ? "Потребителей больше, чем партиций: " + (c - p) + " простаивают. Параллелизм группы ограничен числом партиций — закладывайте их с запасом (увеличить можно, но это меняет соответствие ключ → партиция)." : "Каждый потребитель читает свои партиции; при падении одного его партиции перераспределятся (rebalance).");
+  }
+  ["kpP", "kpC", "kpK"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="delivery"><span class="h-num">12.3</span>Гарантии доставки</h2>
+<div class="widget stepper" id="dlvSim">
+  <div class="widget-title">Почему «at-least-once» означает дубликаты</div>
+  <div class="flow st-stage">
+    <div class="node" id="dK"><b>Kafka: offset 41</b></div><span class="to">→</span>
+    <div class="node" id="dC"><b>потребитель</b></div><span class="to">→</span>
+    <div class="node" id="dDb"><b>база: начислить бонус</b></div><span class="to">→</span>
+    <div class="node" id="dCm"><b>commit offset 42</b></div>
+  </div>
+  <section class="st-step" data-t="Прочитать" data-hl="dK dC" data-log="poll(): получено сообщение offset 41 «заказ 1001 оплачен»"><p>Потребитель получил сообщение с offset 41.</p></section>
+  <section class="st-step" data-t="Обработать" data-hl="dDb" data-log="UPDATE bonus SET points = points + 100 WHERE user = 42 → COMMIT в базе"><p>Обработка: начислили бонус в базе, транзакция базы зафиксирована.</p></section>
+  <section class="st-step" data-t="Сбой до commit offset" data-hl="dC" data-log="💥 процесс упал до коммита offset 42"><p>Процесс упал до того, как сохранил в Kafka позицию 42.</p></section>
+  <section class="st-step" data-t="Повтор" data-hl="dK dC dDb" data-log="rebalance → другой потребитель читает с последнего закоммиченного offset 41 → бонус начислен второй раз"><p>После перебалансировки другой экземпляр начинает с последней сохранённой позиции — 41 — и обрабатывает сообщение повторно. Бонус начислен дважды.</p></section>
+  <section class="st-step" data-t="Решение: идемпотентность" data-hl="dDb dCm" data-log="INSERT INTO processed(event_id) … ON CONFLICT DO NOTHING + начисление в одной транзакции → повтор безопасен"><p>Коммит offset до обработки даёт at-most-once (потеря при сбое). Поэтому стандарт — at-least-once + <b>идемпотентный обработчик</b>: таблица обработанных event_id в той же транзакции, что и эффект, или естественно идемпотентные операции (UPSERT по ключу). Exactly-once в Kafka (транзакции продюсера, <code>read_committed</code>) работает внутри Kafka (читать → писать в топик), но не распространяется на внешние базы.</p></section>
+</div>
+<pre data-title="продюсер без потерь и дубликатов на стороне Kafka"><code class="yaml">spring:
+  kafka:
+    producer:
+      acks: all                        # запись подтверждена всеми in-sync репликами
+      properties:
+        enable.idempotence: true       # повторы продюсера не создают дубликатов в партиции
+        max.in.flight.requests.per.connection: 5
+    consumer:
+      enable-auto-commit: false        # коммит offset после успешной обработки
+      isolation-level: read_committed
+# топик: replication.factor=3, min.insync.replicas=2</code></pre>
+
+<h2 id="retention"><span class="h-num">12.4</span>Ретенция и компактизация: Kafka как хранилище</h2>
+<div class="table-wrap"><table>
+<tr><th>Политика</th><th>Что хранится</th><th>Применение</th></tr>
+<tr><td><code>cleanup.policy=delete</code>, <code>retention.ms</code></td><td>все события за N дней/байт</td><td>события, логи, CDC-поток для переигрывания</td></tr>
+<tr><td><code>cleanup.policy=compact</code></td><td>последнее значение для каждого ключа (null — удаление)</td><td>текущее состояние: справочники, профили, KTable; восстановление кэшей и локальных хранилищ</td></tr>
+<tr><td>Tiered storage</td><td>старые сегменты в объектном хранилище</td><td>долгая ретенция без дорогих дисков брокеров</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Журнал как источник истины?</span>
+Event sourcing с Kafka как единственным хранилищем соблазнителен, но сложен: нет запросов по содержимому, нет транзакций с проверкой инвариантов, схемы событий живут годами. Обычная схема — состояние в базе + события в Kafka через outbox/CDC (тема 16).
+</div>
+
+<h2 id="compare"><span class="h-num">12.5</span>Что выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Система</th><th>Модель</th><th>Когда</th></tr>
+<tr><td>Kafka / Redpanda</td><td>журнал, партиции, высокая пропускная способность</td><td>шина событий между сервисами, CDC, потоковая обработка, аналитика в реальном времени</td></tr>
+<tr><td>RabbitMQ</td><td>очереди и маршрутизация (exchange), подтверждения на сообщение</td><td>задачи с повторами и задержками, RPC, сложная маршрутизация, умеренные объёмы</td></tr>
+<tr><td>Amazon SQS / SNS, Google Pub/Sub</td><td>управляемые очереди и рассылка</td><td>облако, без эксплуатации</td></tr>
+<tr><td>Redis Streams</td><td>журнал в памяти с группами потребителей</td><td>лёгкие потоки, когда Redis уже есть и объём ограничен памятью</td></tr>
+<tr><td>NATS / JetStream</td><td>лёгкий обмен сообщениями + хранение</td><td>низкая задержка, edge, IoT</td></tr>
+<tr><td>Очередь в PostgreSQL (SKIP LOCKED, pgmq)</td><td>таблица задач в транзакции с данными</td><td>до тысяч задач в секунду, нужна транзакционность с бизнес-данными, нет желания вводить брокер</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">12.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как гарантировать порядок обработки событий одного заказа в Kafka?</p><ul><li>Один топик на заказ</li><li>Один потребитель на весь кластер</li><li>Использовать order_id как ключ сообщения: события попадут в одну партицию</li><li>Порядок в Kafka не гарантируется никогда</li></ul><div class="why">Порядок — внутри партиции; ключ определяет партицию.</div></div>
+<div class="mcq" data-ok="0"><p>В группе 10 потребителей, в топике 6 партиций. Сколько потребителей работают?</p><ul><li>6, остальные 4 простаивают</li><li>10</li><li>1</li><li>Партиции делятся между всеми 10</li></ul><div class="why">Одна партиция — максимум один потребитель группы.</div></div>
+<div class="mcq" data-ok="3"><p>Что нужно, чтобы повторная доставка сообщения не начислила бонус дважды?</p><ul><li>Включить exactly-once в Kafka — этого достаточно для любой базы</li><li>Коммитить offset до обработки</li><li>Увеличить число партиций</li><li>Идемпотентный обработчик: учёт обработанных event_id в той же транзакции, что и эффект</li></ul><div class="why">At-least-once + идемпотентность — стандарт.</div></div>
+<div class="mcq" data-ok="1"><p>Чем журнал отличается от классической очереди?</p><ul><li>Журнал не хранит сообщения</li><li>Сообщения хранятся по ретенции, и каждый потребитель независимо читает со своей позиции, может перечитать</li><li>Журнал доставляет сообщение только одному получателю на всю систему</li><li>Очередь всегда быстрее</li></ul><div class="why">Отсюда fan-out и переигрывание событий.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как выбрать число партиций топика?</summary><div class="a"><p>По целевой пропускной способности: максимум (требуемая скорость / скорость одного потребителя, требуемая скорость / скорость записи в партицию) с запасом на рост, учитывая, что увеличение числа партиций меняет распределение ключей. Слишком много партиций — накладные расходы на брокерах и долгие перебалансировки. Типично — десятки на топик для нагруженных сервисов.</p></div></details>
+<details class="q"><summary>RabbitMQ или Kafka для отправки уведомлений пользователям?</summary><div class="a"><p>Если это задачи с повторами, задержками, приоритетами и одним потребителем — RabbitMQ (или SQS) проще и удобнее. Если событие «заказ оплачен» нужно многим сервисам (уведомления, бонусы, аналитика) и важно перечитывание — Kafka, а сервис уведомлений — один из потребителей. Часто используют оба: Kafka как шина событий, очередь — внутри сервиса для задач.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

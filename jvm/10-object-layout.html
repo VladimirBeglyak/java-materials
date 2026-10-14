@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Объект в памяти: заголовок и раскладка</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.ol-bytes { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 2px; margin: 10px 0; max-width: 520px; }
+.ol-bytes span { font: 11px var(--font-mono); text-align: center; padding: 6px 0; border-radius: 3px; background: var(--bg-sunk); overflow: hidden; white-space: nowrap; }
+.ol-bytes .h { background: var(--info-soft); } .ol-bytes .k { background: var(--accent-soft); } .ol-bytes .f { background: var(--ok-soft); } .ol-bytes .p { background: repeating-linear-gradient(45deg, var(--bg-sunk), var(--bg-sunk) 3px, var(--line) 3px, var(--line) 5px); }
+</style>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ПАМЯТЬ</div>
+  <h1>Объект в памяти: заголовок и раскладка</h1>
+  <p class="lead">Сколько байт занимает <code>new Integer(5)</code>? А <code>ArrayList</code> из миллиона Integer? Ответ определяется заголовком объекта, сжатыми указателями, выравниванием и тем, как JVM раскладывает поля. Разберём mark word и klass pointer, compressed oops и «обрыв на 32 ГБ», компактные заголовки Java 25, соберём раскладку своего класса в калькуляторе, повторяющем вывод JOL.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">mark word</span><span class="tag">klass pointer</span><span class="tag">compressed oops</span><span class="tag">выравнивание</span><span class="tag">compact headers</span><span class="tag">JOL</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="header"><span class="h-num">10.1</span>Заголовок объекта</h2>
+<div class="table-wrap"><table>
+<tr><th>Часть</th><th>Размер (64 бит)</th><th>Содержимое</th></tr>
+<tr><td><b>Mark word</b></td><td>8 байт</td><td>в зависимости от состояния: identity hash code (31 бит), возраст для GC (4 бита), биты блокировки; при блокировке — указатель на запись блокировки или монитор; при сборке — пересылочный адрес</td></tr>
+<tr><td><b>Klass pointer</b></td><td>4 байта (сжатый) или 8</td><td>указатель на структуру Klass в metaspace: тип, vtable, раскладка полей</td></tr>
+<tr><td>Длина массива</td><td>4 байта</td><td>только у массивов</td></tr>
+</table></div>
+<p>Итого обычный заголовок — <b>12 байт</b>, у массива — 16. С <b>компактными заголовками</b> (JEP 450 экспериментально в Java 24, JEP 519 — продуктовая опция в Java 25: <code>-XX:+UseCompactObjectHeaders</code>) klass pointer сжимается до 22 бит и помещается в mark word — заголовок 8 байт, экономия 10–20% кучи в типичных приложениях.</p>
+
+<div class="widget stepper" id="mwSim">
+  <div class="widget-title">Состояния mark word (64 бита, упрощённо)</div>
+  <div class="flow st-stage">
+    <div class="node" id="mw1"><b>unlocked</b><small>…hash:31 | age:4 | 0 | 01</small></div>
+    <div class="node" id="mw2"><b>lightweight locked</b><small>…| 00</small></div>
+    <div class="node" id="mw3"><b>monitor (inflated)</b><small>ptr ObjectMonitor | 10</small></div>
+    <div class="node" id="mw4"><b>marked (GC)</b><small>forwarding ptr | 11</small></div>
+  </div>
+  <section class="st-step" data-t="Новый объект" data-hl="mw1" data-log="mark = 0x0000000000000001: хэша нет, возраст 0, не заблокирован"><p>Только что созданный объект: хэш ещё не вычислен (identity hash code вычисляется лениво при первом <code>System.identityHashCode</code> / <code>Object.hashCode</code> и записывается в заголовок), возраст 0, два младших бита <code>01</code> — «не заблокирован».</p></section>
+  <section class="st-step" data-t="Пережил сборки" data-hl="mw1" data-log="после 3 молодых сборок: age = 3; при age ≥ MaxTenuringThreshold (15) объект переводится в старое поколение"><p>Каждая молодая сборка, которую объект пережил, увеличивает 4-битный возраст. Достигнув порога (до 15 — потолок 4 бит), объект переводится в старое поколение (тема 12).</p></section>
+  <section class="st-step" data-t="synchronized без конкуренции" data-hl="mw2" data-log="lightweight locking (Java 21+): поток помечает биты 00, объект в lock-stack потока"><p>Поток входит в <code>synchronized</code>, конкуренции нет: «лёгкая» блокировка меняет биты атомарной операцией CAS. С Java 21 (по умолчанию с Java 23) HotSpot использует новую lightweight locking со стеком блокировок в потоке; biased locking удалён (Java 15–18, тема 18).</p></section>
+  <section class="st-step" data-t="Конкуренция / wait()" data-hl="mw3" data-log="второй поток ждёт или вызван wait(): блокировка «раздувается» в ObjectMonitor, mark хранит указатель на монитор"><p>При конкуренции или вызове <code>wait()</code> блокировка «раздувается»: создаётся нативный <code>ObjectMonitor</code> с очередями ожидающих, а mark word хранит указатель на него. Хэш при этом сохраняется в мониторе.</p></section>
+  <section class="st-step" data-t="Во время сборки" data-hl="mw4" data-log="копирующий GC: объект перемещён, mark старой копии = адрес новой (forwarding pointer)"><p>Копирующий сборщик, переместив объект, записывает в mark старой копии адрес новой — так другие ссылки находят, куда объект переехал. После сборки старая область освобождается целиком.</p></section>
+</div>
+<div class="callout info"><span class="c-title">Почему identityHashCode «стабилен», а объекты двигаются</span>
+Хэш — не адрес (адрес меняется при каждом копировании), а случайное число, вычисленное один раз и сохранённое в заголовке. Если объект заблокирован, хэш хранится в мониторе. С компактными заголовками для хэша при перемещении иногда добавляется дополнительное поле.
+</div>
+
+<h2 id="oops"><span class="h-num">10.2</span>Сжатые указатели и обрыв на 32 ГБ</h2>
+<p>Ссылки на объекты (oops) в 64-битной JVM по умолчанию хранятся в 32 битах: так как объекты выровнены по 8 байт, младшие 3 бита адреса всегда нули, и 32-битное число, сдвинутое на 3, адресует 2³² × 8 = <b>32 ГБ</b>. Если <code>-Xmx</code> ≥ ~32 ГБ, сжатие отключается: каждая ссылка — 8 байт, и куча 33 ГБ вмещает <b>меньше</b> объектов, чем 31 ГБ.</p>
+<div class="widget" id="ooW">
+  <div class="widget-title">Обрыв на 32 ГБ</div>
+  <div class="controls"><label>-Xmx, ГБ<input type="number" id="ooX" value="31" min="1" max="256"></label><label>доля ссылок в объёме кучи, %<input type="number" id="ooR" value="40" min="5" max="80"></label></div>
+  <div class="out" id="ooOut"></div>
+  <div class="verdict" id="ooV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var x = Math.max(1, +$("ooX").value), r = +$("ooR").value / 100, comp = x < 32;
+    var eff = comp ? x : x / (1 + r * 0.8);
+    $("ooOut").textContent = "сжатые указатели: " + (comp ? "да (ссылка 4 байта" + (x <= 4 ? ", база 0, без сдвига — самый быстрый режим" : x <= 28 ? ", zero-based со сдвигом на 3" : ", с базой и сдвигом") + ")" : "нет (ссылка 8 байт, klass pointer остаётся сжатым)") +
+      "\nполезная ёмкость кучи ≈ " + eff.toFixed(1) + " ГБ в пересчёте на данные при сжатых ссылках";
+    $("ooV").className = "verdict " + (comp ? "ok" : "warn");
+    $("ooV").textContent = comp ? "Куча меньше 32 ГБ — ссылки компактные." : "Ссылки удвоились: куча " + x + " ГБ вмещает примерно столько же, сколько " + eff.toFixed(0) + " ГБ со сжатием. Либо держитесь ниже 31 ГБ, либо идите сразу на 48+ ГБ. Альтернатива для огромных куч — -XX:ObjectAlignmentInBytes=16 (сжатие до 64 ГБ ценой выравнивания).";
+  }
+  ["ooX", "ooR"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+
+<h2 id="layout"><span class="h-num">10.3</span>Раскладка полей: калькулятор</h2>
+<p>JVM переставляет поля (порядок в исходнике не сохраняется): раскладывает примитивные поля от больших к меньшим, затем ссылки, заполняя «дырки» (в том числе 4 байта после 12-байтного заголовка) подходящими по размеру полями, чтобы каждое было выровнено по своему размеру; поля суперкласса идут раньше полей подкласса. Размер объекта выравнивается до кратного 8.</p>
+<div class="widget" id="lyW">
+  <div class="widget-title">Раскладка экземпляра класса (как java -jar jol-cli.jar internals)</div>
+  <div class="controls">
+    <label>long/double<input type="number" id="lyL" value="1" min="0" max="8"></label>
+    <label>int/float<input type="number" id="lyI" value="1" min="0" max="8"></label>
+    <label>short/char<input type="number" id="lyS" value="0" min="0" max="8"></label>
+    <label>byte/boolean<input type="number" id="lyB" value="2" min="0" max="8"></label>
+    <label>ссылки<input type="number" id="lyR" value="2" min="0" max="8"></label>
+    <label>заголовок<select id="lyH"><option value="12">обычный, сжатые указатели (12 Б)</option><option value="8">compact headers Java 25 (8 Б)</option><option value="16">без сжатия klass (16 Б)</option></select></label>
+    <label>ссылки<select id="lyO"><option value="4">compressed oops (4 Б)</option><option value="8">несжатые (8 Б)</option></select></label>
+  </div>
+  <div class="ol-bytes" id="lyMap"></div>
+  <pre style="margin:0"><code class="txt" id="lyOut"></code></pre>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var H = +$("lyH").value, O = +$("lyO").value, f = [];
+    function add(n, sz, t) { for (var i = 0; i < n; i++) f.push([t + (n > 1 ? i + 1 : ""), sz]); }
+    add(+$("lyL").value, 8, "long l"); add(+$("lyR").value, O, "Object r"); add(+$("lyI").value, 4, "int i"); add(+$("lyS").value, 2, "short s"); add(+$("lyB").value, 1, "boolean b");
+    f.sort(function (a, b) { var ra = /^Object/.test(a[0]), rb = /^Object/.test(b[0]); return ra - rb || b[1] - a[1]; });   // как HotSpot: примитивы по убыванию размера, ссылки — в конце
+    var used = [], placed = [];
+    for (var k = 0; k < H; k++) used[k] = "h";
+    f.forEach(function (x) {
+      var off = H;
+      while (true) { off = Math.ceil(off / x[1]) * x[1]; var free = true; for (var j = 0; j < x[1]; j++) if (used[off + j] !== undefined) { free = false; break; } if (free) break; off += x[1]; }
+      for (var j2 = 0; j2 < x[1]; j2++) used[off + j2] = placed.length;
+      placed.push([off, x[1], x[0]]);
+    });
+    var end = Math.max(H, used.length), size = Math.ceil(end / 8) * 8, gaps = 0;
+    for (var b = 0; b < size; b++) if (used[b] === undefined) gaps++;
+    placed.sort(function (a, b2) { return a[0] - b2[0]; });
+    var cells = "";
+    for (var c = 0; c < size; c++) { var u = used[c]; cells += u === "h" ? '<span class="' + (c < 8 ? "h" : "k") + '">' + (c < 8 ? "mark" : "klass") + "</span>" : u === undefined ? '<span class="p">—</span>' : '<span class="f">' + placed.filter(function (p) { return p[0] <= c && c < p[0] + p[1]; })[0][2].split(" ")[1] + "</span>"; }
+    $("lyMap").innerHTML = cells;
+    var lines = ["OFF  SZ   TYPE / FIELD", "  0   8   (object header: mark)"];
+    if (H === 12) lines.push("  8   4   (object header: class)"); else if (H === 16) lines.push("  8   8   (object header: class)"); else lines[1] = "  0   8   (object header: compact mark + class)";
+    var cur = H;
+    placed.forEach(function (p) { if (p[0] > cur) lines.push(String(cur).padStart(3) + String(p[0] - cur).padStart(4) + "   (alignment/padding gap)"); lines.push(String(p[0]).padStart(3) + String(p[1]).padStart(4) + "   " + p[2]); cur = Math.max(cur, p[0] + p[1]); });
+    if (size > cur) lines.push(String(cur).padStart(3) + String(size - cur).padStart(4) + "   (object alignment gap)");
+    lines.push("Instance size: " + size + " bytes;  потери на выравнивание: " + gaps + " bytes");
+    $("lyOut").textContent = lines.join("\n");
+  }
+  ["lyL", "lyI", "lyS", "lyB", "lyR", "lyH", "lyO"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="costs"><span class="h-num">10.4</span>Сколько на самом деле занимают коллекции</h2>
+<div class="widget" id="csW">
+  <div class="widget-title">Память на миллион элементов</div>
+  <div class="controls"><label>структура<select id="csS" class="wide">
+    <option value="intarr">int[] на 1 млн</option>
+    <option value="alist">ArrayList&lt;Integer&gt; (значения вне кэша −128..127)</option>
+    <option value="llist">LinkedList&lt;Integer&gt;</option>
+    <option value="hmap">HashMap&lt;Long, Long&gt;</option>
+    <option value="hset">HashSet&lt;String&gt; (строки по 10 латинских символов)</option>
+    <option value="strs">String[] (по 10 символов)</option>
+  </select></label></div>
+  <div class="out" id="csOut"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    intarr: [4, "16 Б заголовок массива + 4 Б на int"],
+    alist: [4 + 16 + 0.5 * 4, "ссылка 4 Б в Object[] (+ ~50% запас ёмкости) + Integer 16 Б (12 заголовок + 4 значение)"],
+    llist: [24 + 16, "узел Node 24 Б (заголовок 12 + item + next + prev по 4) + Integer 16 Б"],
+    hmap: [32 + 24 + 24 + 4 / 0.75 * 1.3, "Node 32 Б (hash, key, value, next) + Long 24 Б × 2 + ячейка таблицы 4 Б при заполнении ≤ 0.75"],
+    hset: [32 + 24 + 32 + 4 / 0.75 * 1.3, "HashSet = HashMap внутри: Node 32 Б + String 24 Б + byte[] (16 + 10 → 32 Б, LATIN1 компактные строки) + ячейка"],
+    strs: [4 + 24 + 32, "ссылка 4 + String 24 + byte[] 32 (заголовок 16 + 10 байт, выравнивание до 8)"]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("csS").value], mb = d[0] * 1e6 / 1048576; $("csOut").textContent = "≈ " + d[0].toFixed(0) + " байт на элемент → " + mb.toFixed(0) + " МБ на 1 млн\nиз чего: " + d[1] + "\nсравните: полезных данных в int — 4 байта; накладные расходы объектной модели — в разы"; }
+  $("csS").addEventListener("change", run); run();
+})();
+</script>
+<p>Отсюда практические приёмы: примитивные коллекции (Eclipse Collections, fastutil, HPPC) для больших объёмов чисел, массивы вместо списков узлов, отказ от <code>LinkedList</code>, компактные строки (LATIN1, Java 9+), дедупликация строк G1 (<code>-XX:+UseStringDeduplication</code>), а в будущем — value-классы проекта Valhalla без заголовков и ссылок.</p>
+<pre data-title="JOL: посмотреть раскладку по-настоящему"><code class="java">// org.openjdk.jol:jol-core
+System.out.println(VM.current().details());
+System.out.println(ClassLayout.parseClass(Order.class).toPrintable());
+System.out.println(GraphLayout.parseInstance(map).toFootprint());   // вся достижимая структура
+// или CLI: java -jar jol-cli.jar internals -cp app.jar com.shop.Order</code></pre>
+
+<h2 id="quiz"><span class="h-num">10.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сколько байт занимает объект <code>Integer</code> на 64-битной JVM со сжатыми указателями (без компактных заголовков)?</p><ul><li>4</li><li>16 (12 заголовок + 4 значение)</li><li>8</li><li>24</li></ul><div class="why">С компактными заголовками 8 + 4 = 12 → тоже 16 после выравнивания: выигрыш получают объекты, у которых освободившиеся 4 байта уменьшают размер после выравнивания.</div></div>
+<div class="mcq" data-ok="3"><p>Почему куча 34 ГБ может вместить меньше данных, чем 30 ГБ?</p><ul><li>GC медленнее</li><li>Ошибка JVM</li><li>Больше заголовков</li><li>Выше ~32 ГБ отключаются сжатые указатели, и каждая ссылка занимает 8 байт вместо 4</li></ul><div class="why">Обрыв на 32 ГБ.</div></div>
+<div class="mcq" data-ok="0"><p>Где хранится identity hash code объекта?</p><ul><li>В mark word заголовка (или в мониторе, если объект заблокирован)</li><li>Это адрес объекта</li><li>В отдельной хэш-таблице JVM</li><li>В klass pointer</li></ul><div class="why">Вычисляется лениво и не меняется при перемещении объекта.</div></div>
+<div class="mcq" data-ok="2"><p>Сохраняет ли JVM порядок полей из исходного кода?</p><ul><li>Да, всегда</li><li>Да, если поля public</li><li>Нет: поля переставляются для плотной упаковки и выравнивания; суперкласс раньше подкласса</li><li>Только для records</li></ul><div class="why">@Contended (jdk.internal.vm.annotation) — способ развести поля по разным кэш-линиям.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как оценить память структуры из 10 млн объектов до запуска?</summary><div class="a"><p>Посчитать по раскладке: заголовок 12 Б (8 с compact headers), поля по их размерам, ссылки 4 Б при куче &lt; 32 ГБ, выравнивание до 8; добавить накладные расходы контейнера (узлы, массивы-таблицы с коэффициентом заполнения), объекты-обёртки (Integer, Long, String + byte[]). Проверить JOL GraphLayout на выборке и экстраполировать; затем подтвердить гистограммой кучи (jcmd GC.class_histogram).</p></div></details>
+<details class="q"><summary>Что дают компактные заголовки и есть ли у них цена?</summary><div class="a"><p>Заголовок 8 байт вместо 12: меньше куча (по замерам 10–20%), меньше нагрузка на GC и кэши процессора, иногда быстрее. Ограничения: klass pointer 22 бита (до ~4 млн классов), особенности хранения хэша при перемещении; в Java 25 это продуктовая, но не включённая по умолчанию опция — проверяйте на своей нагрузке.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

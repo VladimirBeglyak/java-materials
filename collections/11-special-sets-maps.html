@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · EnumSet, EnumMap, IdentityHashMap, WeakHashMap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.bits { display: flex; gap: 3px; flex-wrap: wrap; margin: 8px 0; }
+.bits label { display: flex; flex-direction: column; align-items: center; font: 11px var(--font-mono); gap: 3px; padding: 6px; border: 1.5px solid var(--line); border-radius: 6px; cursor: pointer; }
+.bits label.on { background: var(--ok-soft); border-color: var(--ok); }
+.ip { display: flex; flex-wrap: wrap; gap: 3px; margin: 10px 0; }
+.ip span { min-width: 54px; text-align: center; font: 11px var(--font-mono); padding: 6px 2px; border: 1.5px solid var(--line); border-radius: 4px; }
+.ip span.k { background: var(--info-soft); } .ip span.v { background: var(--ok-soft); } .ip span.p { border-color: var(--accent); }
+</style>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ХЕШ-СТРУКТУРЫ</div>
+  <h1>EnumSet, EnumMap, IdentityHashMap, WeakHashMap</h1>
+  <p class="lead">Специализированные множества и карты, которые в своих задачах в разы быстрее и компактнее HashMap: <code>EnumSet</code> — битовая маска в одном <code>long</code>, <code>EnumMap</code> — массив по <code>ordinal</code>, <code>IdentityHashMap</code> — открытая адресация и сравнение по <code>==</code>, <code>WeakHashMap</code> — ключи, не мешающие сборке мусора. И заодно — как устроен сам <code>HashSet</code>.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">битовые маски</span><span class="tag">ordinal</span><span class="tag">открытая адресация</span><span class="tag">==</span><span class="tag">слабые ключи</span><span class="tag">HashSet внутри</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="hashset"><span class="h-num">11.1</span>HashSet — это HashMap</h2>
+<pre data-title="java.util.HashSet"><code class="java">public class HashSet&lt;E&gt; … {
+    private transient HashMap&lt;E, Object&gt; map;
+    private static final Object PRESENT = new Object();          // одно общее значение-заглушка
+    public boolean add(E e)      { return map.put(e, PRESENT) == null; }
+    public boolean contains(Object o) { return map.containsKey(o); }
+    public Iterator&lt;E&gt; iterator() { return map.keySet().iterator(); }
+}
+// LinkedHashSet → LinkedHashMap, TreeSet → TreeMap, ConcurrentHashMap.newKeySet() → CHM
+// любую Map можно превратить в Set: Collections.newSetFromMap(new WeakHashMap&lt;&gt;())</code></pre>
+<p>Следствие: элемент HashSet стоит столько же, сколько запись HashMap (~32 байта узла + слот таблицы), все свойства — порядок, null, fail-fast — те же.</p>
+
+<h2 id="enumset"><span class="h-num">11.2</span>EnumSet: множество как биты</h2>
+<p>Для enum с ≤ 64 константами <code>RegularEnumSet</code> хранит множество в одном <code>long</code>: бит i = константа с <code>ordinal() == i</code>. Больше 64 — <code>JumboEnumSet</code> с массивом long. Все операции — побитовые, порядок итерации — по ordinal, памяти — 8 байт.</p>
+<div class="widget" id="esW">
+  <div class="widget-title">EnumSet&lt;DayOfWeek&gt;</div>
+  <div class="bits" id="esA"></div>
+  <div class="hint">отметьте дни множества <b>a</b>; множество <b>b</b> = {SATURDAY, SUNDAY} (выходные)</div>
+  <div class="out" id="esOut"></div>
+</div>
+<script>
+(function () {
+  var D = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"], a = 0b0010101, b = 0b1100000;
+  var $ = function (i) { return document.getElementById(i); };
+  function bin(x) { return x.toString(2).padStart(7, "0"); }
+  function names(x) { return "[" + D.filter(function (d, i) { return x & (1 << i); }).map(function (d) { return d.slice(0, 3); }).join(", ") + "]"; }
+  function draw() {
+    $("esA").innerHTML = D.map(function (d, i) { var on = a & (1 << i); return '<label class="' + (on ? "on" : "") + '"><input type="checkbox" data-i="' + i + '"' + (on ? " checked" : "") + ">" + d.slice(0, 3) + "<span>бит " + i + "</span></label>"; }).join("");
+    $("esOut").textContent = "a.elements = 0b" + bin(a) + "  " + names(a) + "\nb.elements = 0b" + bin(b) + "  " + names(b) +
+      "\n\na.addAll(b)     → elements | b.elements  = 0b" + bin(a | b) + "  " + names(a | b) +
+      "\na.retainAll(b)  → elements & b.elements  = 0b" + bin(a & b) + "  " + names(a & b) +
+      "\na.removeAll(b)  → elements & ~b.elements = 0b" + bin(a & ~b & 127) + "  " + names(a & ~b & 127) +
+      "\ncomplementOf(a) → ~elements & маска всех = 0b" + bin(~a & 127) + "  " + names(~a & 127) +
+      "\na.contains(SAT) → (elements & (1L << 5)) != 0 → " + ((a & 32) !== 0) + "\na.size()        → Long.bitCount(elements) = " + bin(a).split("").filter(function (c) { return c === "1"; }).length;
+  }
+  $("esA").addEventListener("change", function (e) { var i = +e.target.getAttribute("data-i"); a ^= 1 << i; draw(); });
+  draw();
+})();
+</script>
+<pre data-title="EnumSet и EnumMap вместо битовых флагов int"><code class="java">enum Perm { READ, WRITE, EXECUTE, ADMIN }
+Set&lt;Perm&gt; perms = EnumSet.of(Perm.READ, Perm.WRITE);
+EnumSet.allOf(Perm.class); EnumSet.noneOf(Perm.class); EnumSet.range(Perm.READ, Perm.EXECUTE);
+
+Map&lt;Perm, Long&gt; usage = new EnumMap&lt;&gt;(Perm.class);   // массив Object[4], индекс = ordinal; без хэширования
+usage.merge(Perm.READ, 1L, Long::sum);</code></pre>
+
+<h2 id="identity"><span class="h-num">11.3</span>IdentityHashMap: равенство по ==</h2>
+<p>Нарушает общий контракт Map сознательно: ключи сравниваются по ссылке, хэш — <code>System.identityHashCode</code>. Устроена иначе, чем HashMap: <b>открытая адресация с линейным пробированием</b> в одном массиве, где ключи и значения чередуются: <code>[k0, v0, k1, v1, …]</code>.</p>
+<div class="widget" id="ihW">
+  <div class="widget-title">Линейное пробирование (таблица на 8 пар)</div>
+  <div class="controls"><label>объект<select id="ihK"><option value="A">obj A (hash→2)</option><option value="B">obj B (hash→2)</option><option value="C">obj C (hash→5)</option><option value="D">obj D (hash→7)</option><option value="E">obj E (hash→7)</option></select></label><button class="btn primary" type="button" id="ihPut">put</button><button class="btn" type="button" id="ihR">↺</button></div>
+  <div class="ip" id="ihT"></div>
+  <div class="log" id="ihLog"></div>
+</div>
+<script>
+(function () {
+  var H = { A: 2, B: 2, C: 5, D: 7, E: 7 }, $ = function (i) { return document.getElementById(i); }, t, log, last;
+  function reset() { t = new Array(8).fill(null); log = ["массив table длиной 16: пары (ключ, значение) в соседних ячейках"]; last = -1; draw(); }
+  function put(k) {
+    var i = H[k], probes = 0;
+    while (t[i] !== null && t[i] !== k) { i = (i + 1) % 8; probes++; if (probes > 8) { log.push("таблица полна"); return draw(); } }
+    var ex = t[i] === k; t[i] = k; last = i;
+    log.push("put(" + k + "): начальная пара " + H[k] + (probes ? ", занято → пробирование +" + probes + " → пара " + i : "") + (ex ? " (тот же объект — значение заменено)" : "")); draw();
+  }
+  function draw() {
+    var h = ""; for (var i = 0; i < 8; i++) { h += '<span class="k' + (i === last ? " p" : "") + '">[' + (2 * i) + "] " + (t[i] ? "key " + t[i] : "·") + '</span><span class="v' + (i === last ? " p" : "") + '">[' + (2 * i + 1) + "] " + (t[i] ? "val " + t[i] : "·") + "</span>"; }
+    $("ihT").innerHTML = h; $("ihLog").textContent = log.slice(-6).join("\n");
+  }
+  $("ihPut").addEventListener("click", function () { put($("ihK").value); }); $("ihR").addEventListener("click", reset); reset();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Когда нужна IdentityHashMap</th><th>Почему</th></tr>
+<tr><td>Обход графа объектов (сериализация, глубокое копирование, поиск циклов)</td><td>нужно помнить, какие именно объекты уже посещены, даже если они equals друг другу</td></tr>
+<tr><td>Прокси и метаданные к объектам, у которых «сломан» или дорогой equals/hashCode</td><td>не вызывает пользовательские equals/hashCode</td></tr>
+<tr><td>Множество посещённых — <code>Collections.newSetFromMap(new IdentityHashMap&lt;&gt;())</code></td><td>identity-set</td></tr>
+</table></div>
+
+<h2 id="weak"><span class="h-num">11.4</span>WeakHashMap</h2>
+<p>Ключи хранятся через <code>WeakReference</code>: когда на ключ больше нет сильных ссылок, GC его соберёт, а запись удалится при следующем обращении к карте (через ReferenceQueue). Применение — метаданные «рядом» с чужими объектами, не продлевающие им жизнь. Ловушки — значение, ссылающееся на ключ (запись не удалится никогда), строковые литералы и интернированные строки как ключи, отсутствие потокобезопасности. Подробно — в пособии «JVM изнутри», тема 15.</p>
+
+<h2 id="quiz"><span class="h-num">11.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как EnumSet для enum из 10 констант хранит элементы?</p><ul><li>В HashMap</li><li>В массиве ссылок</li><li>В битах одного long</li><li>В TreeMap</li></ul><div class="why">RegularEnumSet; больше 64 констант — массив long.</div></div>
+<div class="mcq" data-ok="0"><p>Чем IdentityHashMap отличается от HashMap?</p><ul><li>Сравнивает ключи по ==, использует identityHashCode и открытую адресацию</li><li>Хранит ключи в дереве</li><li>Потокобезопасна</li><li>Запрещает null</li></ul><div class="why">Сознательное нарушение контракта Map.</div></div>
+<div class="mcq" data-ok="1"><p>Сколько памяти дополнительно занимает элемент HashSet по сравнению с записью HashMap?</p><ul><li>Вдвое меньше</li><li>Столько же — HashSet хранит элементы ключами HashMap с общим значением-заглушкой</li><li>Вдвое больше</li><li>Ноль байт</li></ul><div class="why">Для enum — EnumSet, для чисел — примитивные множества.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Зачем EnumMap, если HashMap работает с enum-ключами?</summary><div class="a"><p>EnumMap — массив размером с число констант, индекс — ordinal: нет хэширования, коллизий, узлов; порядок итерации — по объявлению констант; меньше памяти и быстрее. null-ключи запрещены, значения — можно. Аналогично EnumSet вместо HashSet&lt;Enum&gt;.</p></div></details>
+<details class="q"><summary>Открытая адресация против цепочек: плюсы и минусы.</summary><div class="a"><p>Открытая адресация (IdentityHashMap, многие C++/Rust таблицы, примитивные коллекции) хранит всё в одном массиве: нет узлов, лучше локальность памяти, меньше памяти. Минусы: деградация при высоком заполнении (кластеризация), сложнее удаление (сдвиг или «надгробия»), нужен низкий load factor. Цепочки (HashMap) терпимее к плохим хэшам и высокой загрузке, позволяют деревья в корзинах, но тратят память на узлы и хуже по кэшу.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

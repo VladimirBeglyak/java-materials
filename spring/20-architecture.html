@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Архитектура и Spring Modulith</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ИНТЕГРАЦИЯ И АРХИТЕКТУРА</div>
+  <h1>Архитектура приложения и Spring Modulith</h1>
+  <p class="lead">Spring не навязывает структуру кода: в контекст можно сложить что угодно, и любой бин может внедрить любой другой. Именно поэтому большие Spring-приложения превращаются в клубок, где всё зависит от всего. Разберём, как раскладывать код по слоям и модулям, как держать границы средствами языка и как Spring Modulith проверяет их автоматически.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">слои</span><span class="tag">порты и адаптеры</span><span class="tag">модульный монолит</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="layers"><span class="h-num">20.1</span>Слои и их ответственность</h2>
+<div class="table-wrap"><table>
+<tr><th>Слой</th><th>Отвечает за</th><th>Не должен</th></tr>
+<tr><td>Web (<code>@RestController</code>)</td><td>HTTP: маршруты, разбор и валидация формата, коды ответа, DTO API</td><td>содержать бизнес-правила, открывать транзакции, отдавать наружу JPA-сущности</td></tr>
+<tr><td>Application / Service (<code>@Service</code>)</td><td>сценарии использования, границы транзакций, координация</td><td>знать про HTTP (<code>HttpServletRequest</code>, <code>ResponseEntity</code>)</td></tr>
+<tr><td>Domain</td><td>бизнес-правила и инварианты: сущности, value objects, доменные сервисы</td><td>зависеть от инфраструктуры и по возможности от Spring</td></tr>
+<tr><td>Infrastructure (<code>@Repository</code>, клиенты, продюсеры)</td><td>БД, очереди, внешние API</td><td>содержать бизнес-решения</td></tr>
+</table></div>
+<div class="vs">
+  <div class="card"><h4>Пакеты по функциям (рекомендуется)</h4><p><code>com.shop.order</code>, <code>com.shop.payment</code>, <code>com.shop.catalog</code> — внутри каждого свои контроллер, сервис, репозиторий. Связанный код лежит рядом, а большинство классов можно сделать package-private: модификатор доступа Java становится границей модуля.</p></div>
+  <div class="card"><h4>Пакеты по слоям</h4><p><code>controller</code>, <code>service</code>, <code>repository</code> на всё приложение. Всё обязано быть <code>public</code>, любой сервис видит любой репозиторий, границы функций не существуют. Работает только для маленьких сервисов.</p></div>
+</div>
+
+<h2 id="hexagonal"><span class="h-num">20.2</span>Порты и адаптеры со Spring</h2>
+<p>Идея: бизнес-логика объявляет <b>порты</b> — интерфейсы того, что ей нужно снаружи. Инфраструктура предоставляет <b>адаптеры</b> — реализации. Зависимости направлены внутрь: домен не знает про JPA и Kafka. Spring связывает их через DI.</p>
+<pre><code class="java">// --- com.shop.order (ядро модуля) ---
+public interface PaymentPort {                                   // порт: что нужно сценарию
+    PaymentResult charge(OrderId id, Money amount);
+}
+
+@Service
+class PlaceOrderUseCase {                                        // package-private: снаружи модуля не виден
+    private final OrderRepository orders;
+    private final PaymentPort payments;
+    private final ApplicationEventPublisher events;
+
+    @Transactional
+    public OrderId place(PlaceOrderCommand cmd) {
+        Order order = Order.create(cmd.customer(), cmd.items());  // инварианты — в самой сущности
+        orders.save(order);
+        events.publishEvent(new OrderPlaced(order.id(), order.total()));
+        return order.id();
+    }
+}
+
+// --- com.shop.order.adapter.payment (адаптер) ---
+@Component
+class StripePaymentAdapter implements PaymentPort {              // знает про HTTP-клиент и формат Stripe
+    private final RestClient stripe;
+    public PaymentResult charge(OrderId id, Money amount) { /* ... */ }
+}</code></pre>
+<div class="callout info">Не доводите до догмы. Для CRUD-сервиса три слоя интерфейсов и мапперов — лишняя церемония. Признак, что порт оправдан: реализаций действительно несколько, внешняя система нестабильна или её нужно подменять в тестах.</div>
+
+<h2 id="modulith"><span class="h-num">20.3</span>Модульный монолит и Spring Modulith</h2>
+<p>Модульный монолит — одно развёртываемое приложение с жёсткими внутренними границами. Он даёт большую часть пользы микросервисов (независимые модули, понятные зависимости) без сетевых вызовов, распределённых транзакций и зоопарка инфраструктуры. Spring Modulith формализует это соглашениями:</p>
+<ul>
+  <li><b>Модуль</b> — прямой подпакет главного пакета приложения: <code>com.shop.order</code>, <code>com.shop.inventory</code>.</li>
+  <li><b>API модуля</b> — типы в корневом пакете модуля. Всё в подпакетах (<code>order.internal</code>, <code>order.web</code>) — внутреннее, другим модулям обращаться к нему нельзя. Дополнительные публичные пакеты объявляются <code>@NamedInterface</code>.</li>
+  <li><b>Циклы между модулями запрещены</b>.</li>
+  <li>Проверка — обычный тест на базе ArchUnit:</li>
+</ul>
+<pre><code class="java">class ModularityTests {
+    ApplicationModules modules = ApplicationModules.of(ShopApplication.class);
+
+    @Test void verifiesModularStructure() { modules.verify(); }             // падает при циклах и доступе к internal
+
+    @Test void writesDocumentation() { new Documenter(modules).writeDocumentation(); }   // C4/PlantUML-диаграммы модулей
+}</code></pre>
+
+<div class="widget" id="md">
+  <div class="widget-title">Симулятор modules.verify()</div>
+  <p class="hint">Четыре модуля: <code>order</code>, <code>inventory</code>, <code>payment</code>, <code>catalog</code>. Включайте зависимости между ними и смотрите результат проверки.</p>
+  <div class="checks col" id="mdDeps"></div>
+  <div class="out" id="mdGraph"></div>
+  <div class="verdict" id="mdOut"></div>
+</div>
+<script>
+(function () {
+  var deps = [
+    { f: "order", t: "catalog", on: true, d: "OrderService вызывает CatalogApi.price(sku)" },
+    { f: "order", t: "inventory", on: true, d: "OrderService вызывает InventoryApi.reserve()" },
+    { f: "order", t: "payment", on: false, d: "OrderService вызывает PaymentApi.charge() напрямую" },
+    { f: "payment", t: "order", on: true, ev: true, d: "payment слушает событие OrderPlaced из API модуля order" },
+    { f: "inventory", t: "order", on: false, d: "InventoryService вызывает OrderApi.cancel() при нехватке товара" },
+    { f: "payment", t: "order", on: false, internal: true, d: "PaymentService внедряет order.internal.OrderRepository" },
+    { f: "catalog", t: "inventory", on: false, d: "CatalogService вызывает InventoryApi.available()" },
+    { f: "inventory", t: "catalog", on: false, d: "InventoryService вызывает CatalogApi.dimensions()" }
+  ];
+  var box = document.getElementById("mdDeps");
+  box.innerHTML = deps.map(function (d, i) { return '<label><input type="checkbox" data-i="' + i + '"' + (d.on ? " checked" : "") + "><span><b style=\"font-family:var(--font-mono);font-size:13px\">" + d.f + " → " + d.t + (d.internal ? ".internal" : "") + "</b> — " + SG.esc(d.d) + "</span></label>"; }).join("");
+  function run() {
+    box.querySelectorAll("input").forEach(function (c) { deps[+c.dataset.i].on = c.checked; });
+    var g = {}, viol = [], lines = [];
+    deps.filter(function (d) { return d.on; }).forEach(function (d) {
+      (g[d.f] = g[d.f] || {})[d.t] = 1;
+      lines.push("  " + d.f + " ──" + (d.ev ? "(слушает событие)" : (d.internal ? "(internal!)" : "(API)")) + "──▶ " + d.t);
+      if (d.internal) viol.push("- Module '" + d.f + "' depends on non-exposed type com.shop." + d.t + ".internal.OrderRepository within module '" + d.t + "'!");
+    });
+    var cycles = {}, nodes = ["order", "inventory", "payment", "catalog"];
+    function dfs(start, cur, path) {
+      Object.keys(g[cur] || {}).forEach(function (n) {
+        if (n === start) { var c = path.concat(start); var key = c.slice(0, -1).sort().join(","); if (!cycles[key]) cycles[key] = c; }
+        else if (path.indexOf(n) < 0) dfs(start, n, path.concat(n));
+      });
+    }
+    nodes.forEach(function (n) { dfs(n, n, [n]); });
+    Object.keys(cycles).forEach(function (k) { viol.push("- Cycle detected: " + cycles[k].map(function (m) { return "Slice " + m; }).join(" -> ")); });
+    document.getElementById("mdGraph").textContent = "Зависимости модулей:\n" + (lines.join("\n") || "  (нет)");
+    var o = document.getElementById("mdOut");
+    if (viol.length) {
+      var hasPayCycle = cycles["order,payment"];
+      o.className = "verdict bad";
+      o.innerHTML = "<b>org.springframework.modulith.core.Violations:</b><br>" + viol.map(SG.esc).join("<br>") +
+        (hasPayCycle ? "<br><br>Цикл order ↔ payment: order вызывает payment напрямую, а payment зависит от события из order. Уберите прямой вызов — пусть payment реагирует на OrderPlaced, а о результате сообщает своим событием." : "") +
+        (Object.keys(cycles).length && !hasPayCycle ? "<br><br>Как разорвать цикл: заменить один из вызовов событием, либо вынести общее понятие в третий модуль, от которого зависят оба." : "");
+    } else { o.className = "verdict ok"; o.textContent = "verify() прошёл: циклов нет, обращений к внутренним пакетам нет. Зависимости образуют направленный ациклический граф."; }
+  }
+  box.addEventListener("change", run); run();
+})();
+</script>
+
+<h3>События между модулями</h3>
+<pre><code class="java">// модуль payment
+@Component
+class PaymentOnOrder {
+    @ApplicationModuleListener        // = @Async + @Transactional(REQUIRES_NEW) + @TransactionalEventListener(AFTER_COMMIT)
+    void on(OrderPlaced event) { payments.charge(event.orderId(), event.total()); }
+}</code></pre>
+<p>Проблема обычного <code>AFTER_COMMIT</code>-слушателя — потеря события при падении процесса (тема 05). Modulith добавляет <b>Event Publication Registry</b>: при публикации событие для каждого транзакционного слушателя записывается в таблицу <code>event_publication</code> в <b>той же транзакции</b>, что и бизнес-данные; после успешного завершения слушателя запись помечается выполненной. Незавершённые публикации можно повторить при рестарте (<code>spring.modulith.events.republish-outstanding-events-on-restart</code>) или по расписанию. Это встроенный outbox. Аннотация <code>@Externalized("orders.placed::#{orderId()}")</code> дополнительно отправляет событие в Kafka/RabbitMQ.</p>
+<pre data-title="Интеграционный тест одного модуля"><code class="java">@ApplicationModuleTest                           // поднимает только модуль order (и при необходимости его зависимости)
+class OrderModuleTests {
+    @Autowired PlaceOrderFacade facade;
+
+    @Test
+    void publishesOrderPlaced(Scenario scenario) {
+        scenario.stimulate(() -&gt; facade.place(command()))
+                .andWaitForEventOfType(OrderPlaced.class)
+                .toArriveAndVerify(e -&gt; assertThat(e.total()).isEqualTo(Money.rub(1500)));
+    }
+}</code></pre>
+
+<h2 id="practices"><span class="h-num">20.4</span>Практики, которые окупаются</h2>
+<div class="grid-2">
+  <div class="card"><h4>DTO на границах</h4><p>API и события — отдельные record-ы, не JPA-сущности: иначе изменение схемы БД ломает контракт, а ленивые связи вызывают N+1 и <code>LazyInitializationException</code> при сериализации. Маппинг — MapStruct или вручную.</p></div>
+  <div class="card"><h4>Транзакция = сценарий</h4><p><code>@Transactional</code> на методе сервиса-сценария, а не на классе «на всякий случай» и не на репозитории. Чтение — <code>readOnly = true</code>. Внешние вызовы — вне транзакции.</p></div>
+  <div class="card"><h4>Конфигурация по модулям</h4><p>У каждого модуля свой <code>@ConfigurationProperties</code>-record с префиксом (<code>shop.payment.*</code>) и при необходимости своя <code>@Configuration</code>. Никакого общего <code>AppConfig</code> на 500 строк.</p></div>
+  <div class="card"><h4>Доменные исключения</h4><p>Свои unchecked-исключения домена (<code>OrderNotFound</code>, <code>InsufficientStock</code>), маппинг в HTTP — в одном <code>@RestControllerAdvice</code>. Сервисы не возвращают <code>ResponseEntity</code>.</p></div>
+</div>
+
+<h2 id="anti"><span class="h-num">20.5</span>Анти-паттерны</h2>
+<div class="table-wrap"><table>
+<tr><th>Анти-паттерн</th><th>Почему плохо</th><th>Вместо этого</th></tr>
+<tr><td>Полевое внедрение, <code>@Autowired ApplicationContext</code> + <code>getBean</code></td><td>скрытые зависимости, не тестируется без контейнера</td><td>конструктор; <code>ObjectProvider</code> для ленивых</td></tr>
+<tr><td>«Божественный» сервис на 30 зависимостей</td><td>всё зависит от всего, любая правка рискованна</td><td>сценарии-классы, модули</td></tr>
+<tr><td>Статический доступ к бинам (<code>SpringContext.getBean</code>)</td><td>порядок инициализации, тесты, скрытая связь</td><td>DI</td></tr>
+<tr><td>Логика в контроллерах</td><td>не переиспользуется, тестируется только через HTTP</td><td>тонкий контроллер → сервис</td></tr>
+<tr><td>Сущности JPA в ответах API</td><td>утечка схемы, ленивые связи, циклы сериализации</td><td>DTO / проекции</td></tr>
+<tr><td>Циклические зависимости бинов</td><td>признак спутанных ответственностей; запрещены в Boot по умолчанию</td><td>события, третий бин</td></tr>
+<tr><td><code>catch (Exception e) { log }</code> в сервисе</td><td>транзакция коммитится после ошибки, вызывающий не знает о сбое</td><td>пробрасывать; ловить только то, что умеете обработать</td></tr>
+<tr><td>Профиль на каждое окружение с разными бинами</td><td>в проде исполняется непротестированная конфигурация</td><td>одинаковые бины, разные значения свойств</td></tr>
+<tr><td>Общая библиотека «common» с бизнес-кодом между сервисами</td><td>скрытая связность, синхронные релизы</td><td>только технические утилиты и стартеры</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">20.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что Spring Modulith считает внутренней частью модуля com.shop.order?</p><ul><li>Классы с аннотацией @Internal</li><li>Все package-private классы</li><li>Всё, что лежит в подпакетах модуля (order.internal, order.web…), если пакет не объявлен @NamedInterface</li><li>Классы без @Component</li></ul><div class="why">API модуля — типы корневого пакета модуля. Подпакеты закрыты для других модулей по соглашению, и verify() это проверяет.</div></div>
+<div class="mcq" data-ok="1"><p>Модуль order вызывает inventory, а inventory должен отменить заказ при нехватке товара. Как избежать цикла?</p><ul><li>Сделать оба класса @Lazy</li><li>inventory публикует событие StockShortage, order на него подписывается</li><li>Включить allow-circular-references</li><li>Объединить модули в один пакет common</li></ul><div class="why">Событие разворачивает зависимость: inventory ничего не знает об order, а order уже зависит от API inventory (в том числе от типа события).</div></div>
+<div class="mcq" data-ok="0"><p>Чем Event Publication Registry лучше простого @TransactionalEventListener(AFTER_COMMIT)?</p><ul><li>Публикация сохраняется в БД в той же транзакции и может быть повторена, если слушатель не завершился</li><li>Работает быстрее</li><li>Не требует транзакции</li><li>Гарантирует порядок событий</li></ul><div class="why">Это outbox для внутренних событий: падение между коммитом и обработкой больше не теряет событие.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Пакеты по слоям или по функциям — что выбрать и почему?</summary><div class="a"><p>По функциям: связанный код рядом, высокая связность внутри и низкая между пакетами, можно использовать package-private как границу модуля, проще выделить сервис позже. По слоям допустимо для небольших сервисов; на росте приводит к тому, что всё публично и всё зависит от всего.</p></div></details>
+<details class="q"><summary>Когда модульный монолит лучше микросервисов?</summary><div class="a"><p>Одна команда или несколько тесно связанных, домен ещё меняется, нет требований к независимому масштабированию и релизам частей. Монолит даёт транзакции, простые вызовы и одну инфраструктуру; модульность сохраняет возможность выделить сервис, когда появится реальная причина (нагрузка, команда, технология).</p></div></details>
+<details class="q"><summary>Как обеспечить, чтобы границы модулей не размывались со временем?</summary><div class="a"><p>Автоматические проверки в сборке: Spring Modulith verify() или правила ArchUnit (запрет зависимостей между пакетами, циклов, обращений к internal), package-private по умолчанию, ревью публичного API модуля, события вместо обратных вызовов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

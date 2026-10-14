@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · HTTP для бэкенда</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ПРИКЛАДНОЙ УРОВЕНЬ · РОАДМАП j8</div>
+  <h1>HTTP: семантика для бэкенда</h1>
+  <p class="lead">Семантика HTTP (RFC 9110) не зависит от версии протокола: методы, коды, заголовки и кэширование одинаковы в HTTP/1.1, /2 и /3. Здесь — то, что нужно для проектирования API, работы с прокси и CDN и безопасности в браузере.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">RFC 9110, 9111</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="message"><span class="h-num">10.1</span>Сообщение</h2>
+<div class="grid-2">
+<pre data-title="Запрос"><code class="http">POST /v1/payments HTTP/1.1
+Host: api.bank.by
+Content-Type: application/json
+Content-Length: 58
+Authorization: Bearer eyJhbGciOi...
+Idempotency-Key: 6f1c2a9e-3b7d-4c2e
+traceparent: 00-4bf92f3577b34da6-00f067aa0ba902b7-01
+
+{"from":"BY12...","to":"BY98...","amount":"150.00"}</code></pre>
+<pre data-title="Ответ"><code class="http">HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /v1/payments/8812
+Cache-Control: no-store
+Content-Length: 41
+
+{"id":8812,"status":"PROCESSING"}</code></pre>
+</div>
+<p><code>Host</code> обязателен: по нему один IP обслуживает много сайтов (virtual hosting). Длина тела задаётся <code>Content-Length</code> или кодированием <code>Transfer-Encoding: chunked</code> в HTTP/1.1 (поток неизвестной длины). Расхождение между ними на цепочке прокси — основа атак HTTP request smuggling.</p>
+
+<h2 id="methods"><span class="h-num">10.2</span>Методы и идемпотентность</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Safe</th><th>Идемпотентный</th><th>Кэшируемый</th><th>Смысл</th></tr>
+<tr><td>GET / HEAD</td><td>✔</td><td>✔</td><td>✔</td><td>получить представление (HEAD — только заголовки)</td></tr>
+<tr><td>PUT</td><td>✘</td><td>✔</td><td>✘</td><td>заменить ресурс целиком по известному URI</td></tr>
+<tr><td>DELETE</td><td>✘</td><td>✔</td><td>✘</td><td>удалить</td></tr>
+<tr><td>POST</td><td>✘</td><td>✘</td><td>редко</td><td>создать / выполнить действие</td></tr>
+<tr><td>PATCH</td><td>✘</td><td>не гарантирован</td><td>✘</td><td>частичное изменение</td></tr>
+<tr><td>OPTIONS</td><td>✔</td><td>✔</td><td>✘</td><td>возможности ресурса, CORS preflight</td></tr>
+</table></div>
+<p><b>Идемпотентность</b> — повтор запроса даёт тот же эффект на сервере, что и один запрос. Это вопрос сети, а не стиля: при таймауте клиент <b>не знает</b>, дошёл ли запрос. Повторять безопасно только идемпотентные запросы — так делают прокси, балансировщики и HTTP-клиенты (иногда автоматически!). Для POST, создающих платёж, нужен ключ идемпотентности: сервер сохраняет результат по <code>Idempotency-Key</code> и на повтор возвращает его же, а не создаёт второй платёж.</p>
+
+<h2 id="status"><span class="h-num">10.3</span>Коды ответа</h2>
+<div class="table-wrap"><table>
+<tr><th>Код</th><th>Когда</th><th>Кто генерирует</th></tr>
+<tr><td>200 / 201 / 202 / 204</td><td>успех / создан (с <code>Location</code>) / принят к асинхронной обработке / успех без тела</td><td>приложение</td></tr>
+<tr><td>301 / 308</td><td>перемещён навсегда (308 сохраняет метод и тело)</td><td>приложение, прокси</td></tr>
+<tr><td>302 / 307</td><td>временно (307 сохраняет метод)</td><td></td></tr>
+<tr><td>304 Not Modified</td><td>условный запрос: у клиента актуальная версия</td><td>сервер, CDN</td></tr>
+<tr><td>400 / 422</td><td>некорректный запрос / не прошёл валидацию по смыслу</td><td>приложение</td></tr>
+<tr><td>401 / 403</td><td>не аутентифицирован (с <code>WWW-Authenticate</code>) / нет прав</td><td></td></tr>
+<tr><td>404 / 409 / 412</td><td>нет ресурса / конфликт состояния / не выполнено условие <code>If-Match</code></td><td></td></tr>
+<tr><td>429 Too Many Requests</td><td>превышен лимит; укажите <code>Retry-After</code></td><td>приложение, API-шлюз</td></tr>
+<tr><td>500</td><td>необработанная ошибка приложения</td><td>приложение</td></tr>
+<tr><td><b>502 Bad Gateway</b></td><td>прокси не получил корректного ответа от бэкенда: соединение отклонено/сброшено, бэкенд упал</td><td><b>прокси/балансировщик</b></td></tr>
+<tr><td><b>503 Service Unavailable</b></td><td>нет здоровых бэкендов, перегрузка, обслуживание</td><td>прокси или приложение</td></tr>
+<tr><td><b>504 Gateway Timeout</b></td><td>бэкенд не ответил за таймаут прокси</td><td><b>прокси/балансировщик</b></td></tr>
+</table></div>
+<div class="callout info">При разборе инцидента по 502/504 первым делом спросите: <b>какой из прокси</b> его сгенерировал (CDN, ингресс, sidecar) — каждый имеет свои таймауты, и их иерархия должна быть согласованной (тема 12).</div>
+
+<h2 id="caching"><span class="h-num">10.4</span>Кэширование</h2>
+<div class="table-wrap"><table>
+<tr><th>Директива Cache-Control</th><th>Смысл</th></tr>
+<tr><td><code>max-age=600</code></td><td>свежий 600 с для любых кэшей</td></tr>
+<tr><td><code>s-maxage=60</code></td><td>для общих кэшей (CDN, прокси) — переопределяет max-age</td></tr>
+<tr><td><code>private</code> / <code>public</code></td><td>только браузер пользователя / можно хранить в общих кэшах</td></tr>
+<tr><td><code>no-cache</code></td><td>хранить можно, но <b>перед использованием проверить</b> на сервере (не «не кэшировать»!)</td></tr>
+<tr><td><code>no-store</code></td><td>не хранить вообще — для персональных и финансовых данных</td></tr>
+<tr><td><code>immutable</code></td><td>не перепроверять до истечения: для файлов с хэшем в имени (<code>app.3f9a1c.js</code>)</td></tr>
+<tr><td><code>stale-while-revalidate=30</code></td><td>отдать устаревшее и обновить в фоне</td></tr>
+</table></div>
+<figure class="diagram">
+<svg viewBox="0 0 800 210" role="img" aria-label="Условный запрос">
+  <defs><marker id="i1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="120" y="20" text-anchor="middle" font-weight="700">Клиент / CDN</text><text x="680" y="20" text-anchor="middle" font-weight="700">Сервер</text>
+  <path d="M120 28 V200" class="ln"/><path d="M680 28 V200" class="ln"/>
+  <path d="M120 40 L676 62" class="ln" marker-end="url(#i1)"/><text x="400" y="44" text-anchor="middle" class="mono" font-size="12">GET /rates</text>
+  <path d="M680 72 L124 94" class="ln" marker-end="url(#i1)"/><text x="400" y="78" text-anchor="middle" class="mono" font-size="12">200 ETag: "v42"  Cache-Control: max-age=60</text>
+  <text x="140" y="120" font-size="12" class="muted">… 60 секунд ответ берётся из кэша без запроса …</text>
+  <path d="M120 140 L676 162" class="ln" marker-end="url(#i1)"/><text x="400" y="144" text-anchor="middle" class="mono" font-size="12">GET /rates  If-None-Match: "v42"</text>
+  <path d="M680 172 L124 194" class="ln" marker-end="url(#i1)"/><text x="400" y="178" text-anchor="middle" class="mono" font-size="12">304 Not Modified (без тела)</text>
+</svg>
+</figure>
+<ul>
+  <li><b>ETag</b> + <code>If-None-Match</code> — экономия трафика. <b>ETag</b> + <code>If-Match</code> на PUT/PATCH — <b>оптимистическая блокировка</b> по HTTP: если ресурс изменили с момента чтения, сервер вернёт 412.</li>
+  <li><b>Vary</b>: от каких заголовков запроса зависит ответ (<code>Vary: Accept-Encoding, Accept-Language</code>). Забытый <code>Vary</code> — CDN отдаёт одному пользователю ответ, закэшированный для другого.</li>
+  <li><b>Опасность</b>: персональный ответ с <code>public</code> или без <code>Cache-Control</code> может закэшироваться на CDN и утечь другим пользователям. Для API с авторизацией по умолчанию — <code>no-store</code> или <code>private</code>.</li>
+</ul>
+
+<h2 id="cookies"><span class="h-num">10.5</span>Cookies</h2>
+<pre><code class="http">Set-Cookie: SESSION=8f2c...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=1800</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Атрибут</th><th>Защищает от</th></tr>
+<tr><td><code>Secure</code></td><td>отправки по незашифрованному HTTP</td></tr>
+<tr><td><code>HttpOnly</code></td><td>кражи через JavaScript при XSS</td></tr>
+<tr><td><code>SameSite=Lax/Strict</code></td><td>CSRF: cookie не отправляется в межсайтовых POST. <code>None</code> требует <code>Secure</code>. Браузеры по умолчанию считают отсутствие атрибута как Lax.</td></tr>
+<tr><td><code>Domain</code></td><td>без него cookie только для точного хоста; с <code>Domain=bank.by</code> — для всех поддоменов (шире, чем нужно)</td></tr>
+</table></div>
+
+<h2 id="cors"><span class="h-num">10.6</span>CORS</h2>
+<p><b>Same-origin policy</b>: JavaScript со страницы <code>https://app.bank.by</code> не может читать ответы от другого origin (схема + хост + порт), например <code>https://api.bank.by</code>. CORS — способ серверу <b>разрешить</b> это.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 230" role="img" aria-label="CORS preflight">
+  <defs><marker id="i2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="120" y="20" text-anchor="middle" font-weight="700">Браузер (app.bank.by)</text><text x="680" y="20" text-anchor="middle" font-weight="700">api.bank.by</text>
+  <path d="M120 28 V220" class="ln"/><path d="M680 28 V220" class="ln"/>
+  <path d="M120 40 L676 66" class="ln" marker-end="url(#i2)"/><text x="400" y="44" text-anchor="middle" class="mono" font-size="11.5">OPTIONS /v1/payments  Origin: https://app.bank.by</text>
+  <text x="400" y="60" text-anchor="middle" class="mono" font-size="11">Access-Control-Request-Method: POST, …-Headers: authorization</text>
+  <path d="M680 80 L124 116" class="ln" marker-end="url(#i2)"/>
+  <text x="400" y="88" text-anchor="middle" class="mono" font-size="11">204  Access-Control-Allow-Origin: https://app.bank.by</text>
+  <text x="400" y="104" text-anchor="middle" class="mono" font-size="11">Allow-Methods: POST  Allow-Headers: authorization  Max-Age: 600</text>
+  <path d="M120 140 L676 166" class="ln" marker-end="url(#i2)"/><text x="400" y="148" text-anchor="middle" class="mono" font-size="11.5">POST /v1/payments  (настоящий запрос)</text>
+  <path d="M680 176 L124 202" class="ln" marker-end="url(#i2)"/><text x="400" y="184" text-anchor="middle" class="mono" font-size="11.5">201 + Access-Control-Allow-Origin</text>
+</svg>
+<figcaption>Preflight (OPTIONS) нужен для «непростых» запросов: методы кроме GET/HEAD/POST, JSON-тело, заголовок Authorization. <code>Max-Age</code> кэширует разрешение, экономя RTT.</figcaption>
+</figure>
+<div class="callout warn"><span class="c-title">CORS — не защита сервера</span>
+CORS ограничивает только браузер. curl, Postman и бэкенды его игнорируют. Он защищает пользователя от чужого сайта, который хочет читать ответы от его имени. <code>Access-Control-Allow-Origin: *</code> нельзя совмещать с <code>Allow-Credentials: true</code>; отражать любой <code>Origin</code> в ответе вместе с credentials — уязвимость.
+</div>
+
+<h2 id="other"><span class="h-num">10.7</span>Сжатие, диапазоны, согласование</h2>
+<ul>
+  <li><b>Сжатие</b>: <code>Accept-Encoding: gzip, br, zstd</code> → <code>Content-Encoding: br</code>. JSON сжимается в 5–10 раз. Не сжимайте мелкие ответы и уже сжатые форматы (изображения, zip).</li>
+  <li><b>Range</b>: <code>Range: bytes=1000000-</code> → <code>206 Partial Content</code> — докачка, видео.</li>
+  <li><b>Content negotiation</b>: <code>Accept: application/json</code>, <code>Accept-Language</code>.</li>
+  <li><b>Корреляция</b>: <code>traceparent</code> (W3C Trace Context) и <code>X-Request-Id</code> прокидываются через все сервисы — так собираются распределённые трейсы.</li>
+</ul>
+
+<h2 id="sim"><span class="h-num">10.8</span>Интерактив: что сделает кэш</h2>
+<div class="widget" id="hcW">
+  <div class="widget-title">Симулятор HTTP-кэширования</div>
+  <div class="controls">
+    <label>ответ сервера содержит<select id="hcResp" style="max-width:100%">
+      <option value="maxage">Cache-Control: max-age=3600 + ETag</option>
+      <option value="nocache">Cache-Control: no-cache + ETag</option>
+      <option value="nostore">Cache-Control: no-store</option>
+      <option value="private">Cache-Control: private, max-age=600</option>
+      <option value="immutable">Cache-Control: public, max-age=31536000, immutable</option>
+      <option value="smaxage">Cache-Control: public, max-age=60, s-maxage=600</option>
+      <option value="swr">Cache-Control: max-age=60, stale-while-revalidate=300</option>
+      <option value="none">нет Cache-Control, есть Last-Modified</option>
+    </select></label>
+    <label>повторный запрос через<select id="hcWhen"><option value="30">30 секунд</option><option value="200">200 секунд</option><option value="5000">5000 секунд</option></select></label>
+    <label>ресурс на сервере<select id="hcChanged"><option value="no">не менялся</option><option value="yes">изменился</option></select></label>
+  </div>
+  <div class="grid-2">
+    <div><b style="font-size:14px">Браузер пользователя</b><div class="verdict" id="hcB"></div></div>
+    <div><b style="font-size:14px">CDN / общий прокси</b><div class="verdict" id="hcC"></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function decide(maxAge, t, changed, opts) {
+    opts = opts || {};
+    if (opts.nostore) return ["bad", "Ничего не сохраняет. Каждый запрос идёт на сервер целиком: 200 и полное тело."];
+    if (opts.skip) return ["warn", "Не кэширует: ответ помечен private — он предназначен одному пользователю."];
+    if (maxAge > 0 && t < maxAge) return [changed ? "warn" : "ok", "Свежая копия: отдаёт из кэша БЕЗ обращения к серверу." + (changed ? " Сервер уже отдал бы новое содержимое, но кэш об этом не узнает до истечения срока — пользователь видит старое." : "")];
+    if (opts.swr && t < maxAge + opts.swr) return ["ok", "Копия устарела, но в окне stale-while-revalidate: отдаёт старую мгновенно и в фоне обновляет кэш. Пользователь не ждёт."];
+    if (opts.heuristic) return ["warn", "Явного срока нет → эвристика: обычно 10% от возраста ресурса по Last-Modified. Поведение разное в разных кэшах — так возникают «непонятно почему закэшировалось»."];
+    return changed ? ["ok", "Копия устарела → условный запрос If-None-Match: \"etag\". Ресурс изменился → 200 с новым телом и новым ETag."] : ["ok", "Копия устарела → условный запрос If-None-Match: \"etag\". Не изменился → 304 Not Modified без тела: экономия трафика, но не обращения к серверу."];
+  }
+  function run() {
+    var r = $("hcResp").value, t = +$("hcWhen").value, ch = $("hcChanged").value === "yes", b, c;
+    if (r === "maxage") { b = decide(3600, t, ch); c = decide(3600, t, ch); }
+    else if (r === "nocache") { b = decide(0, t, ch); c = decide(0, t, ch); b[1] = "no-cache НЕ значит «не кэшировать»: копия хранится, но перед каждым использованием проверяется. " + b[1]; }
+    else if (r === "nostore") { b = decide(0, t, ch, { nostore: 1 }); c = decide(0, t, ch, { nostore: 1 }); }
+    else if (r === "private") { b = decide(600, t, ch); c = decide(0, t, ch, { skip: 1 }); }
+    else if (r === "immutable") { b = decide(31536000, t, ch); c = decide(31536000, t, ch); if (ch) { b = ["bad", "Отдаёт старую копию ещё год, даже при перезагрузке страницы. Такой заголовок допустим только для файлов с хэшем в имени (app.3f9a1c.js): изменилось содержимое — изменился URL."]; c = b; } }
+    else if (r === "smaxage") { b = decide(60, t, ch); c = decide(600, t, ch); c[1] = "Для общих кэшей действует s-maxage=600. " + c[1]; }
+    else if (r === "swr") { b = decide(60, t, ch, { swr: 300 }); c = decide(60, t, ch, { swr: 300 }); }
+    else { b = decide(0, t, ch, { heuristic: 1 }); c = b; }
+    $("hcB").className = "verdict " + b[0]; $("hcB").textContent = b[1]; $("hcC").className = "verdict " + c[0]; $("hcC").textContent = c[1];
+  }
+  ["hcResp", "hcWhen", "hcChanged"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout bad"><span class="c-title">Самая дорогая ошибка кэширования</span>
+Ответ с персональными данными (<code>/api/me</code>, страница с именем пользователя) без <code>private</code> или <code>no-store</code> за CDN: общий кэш отдаст страницу одного пользователя другому. Для всего, что зависит от авторизации, — <code>Cache-Control: private</code> или <code>no-store</code> и <code>Vary</code> по заголовкам, влияющим на ответ.</div>
+
+<h2 id="quiz"><span class="h-num">10.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какие методы HTTP идемпотентны?</p><ul><li>Только GET</li><li>GET и POST</li><li>GET, HEAD, PUT, DELETE, OPTIONS — повтор не меняет результат; POST и PATCH — не обязаны</li><li>Все</li></ul><div class="why">Идемпотентные запросы клиент и прокси могут безопасно повторять при обрыве. Для POST нужен ключ идемпотентности.</div></div>
+<div class="mcq" data-ok="1"><p>Чем 401 отличается от 403?</p><ul><li>Ничем</li><li>401 — клиент не аутентифицирован (нужны учётные данные); 403 — аутентифицирован, но доступ запрещён</li><li>401 — ошибка сервера</li><li>403 — ресурс не найден</li></ul><div class="why">Названия исторически путают: 401 «Unauthorized» на деле означает «не аутентифицирован».</div></div>
+<div class="mcq" data-ok="0"><p>Браузер перед запросом PUT на другой домен отправил OPTIONS. Что это?</p><ul><li>CORS preflight: браузер спрашивает сервер, разрешён ли такой запрос с этого origin</li><li>Проверка доступности сервера</li><li>Ошибка браузера</li><li>Запрос сертификата</li></ul><div class="why">CORS — защита пользователя, реализованная в браузере. curl и серверные клиенты её не выполняют, поэтому «в Postman работает, в браузере нет».</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Клиент отправил POST /payments и получил таймаут. Можно ли повторить?</summary><div class="a"><p>Без ключа идемпотентности — нельзя: запрос мог быть выполнен, и повтор создаст второй платёж. С <code>Idempotency-Key</code> сервер сохранит результат первого выполнения и вернёт его на повтор. Повторять нужно с тем же ключом и с экспоненциальной паузой.</p></div></details>
+<details class="q"><summary>Чем no-cache отличается от no-store?</summary><div class="a"><p>no-cache — сохранять можно, но каждый раз перепроверять у сервера (условный запрос, часто 304). no-store — не сохранять нигде и никогда.</p></div></details>
+<details class="q"><summary>Чем 502 отличается от 504?</summary><div class="a"><p>Оба генерирует прокси. 502 — бэкенд ответил некорректно или соединение не удалось/сброшено (бэкенд упал, отказал в соединении, закрыл keep-alive соединение). 504 — бэкенд не ответил вовремя по таймауту прокси.</p></div></details>
+<details class="q"><summary>Как реализовать оптимистическую блокировку через HTTP?</summary><div class="a"><p>GET возвращает <code>ETag</code> (версию ресурса). Клиент шлёт PUT/PATCH с <code>If-Match: "версия"</code>. Если версия на сервере изменилась — 412 Precondition Failed, клиент перечитывает и повторяет. Это аналог <code>version</code>-колонки в БД.</p></div></details>
+<details class="q"><summary>Защищает ли CORS API от запросов злоумышленника?</summary><div class="a"><p>Нет. Это политика браузера, защищающая пользователя от чтения ответов чужим сайтом. Прямые запросы (curl, скрипты, бэкенды) CORS не проверяют. Защита API — аутентификация, авторизация, лимиты.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

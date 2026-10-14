@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Мини-Spring своими руками</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ПРАКТИКА</div>
+  <h1>Мини-Spring своими руками</h1>
+  <p class="lead">Лучший способ понять контейнер — написать свой. В этой главе мы за 120 строк Java соберём IoC-контейнер с двумя фазами запуска, внедрением через конструктор и поля, <code>@PostConstruct</code>, обнаружением циклов и пост-процессором, создающим прокси. Каждая часть — упрощённая копия настоящего класса Spring. Сначала поиграйте с песочницей в браузере, потом перепишите код руками.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">рефлексия</span><span class="tag">BeanPostProcessor</span><span class="tag">JDK Proxy</span><span class="tag">песочница</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="sandbox"><span class="h-num">21.1</span>Песочница: контейнер в браузере</h2>
+<div class="widget" id="mc">
+  <div class="widget-title">Опишите бины — контейнер их создаст</div>
+  <p class="hint">Формат строки: <code>Имя -&gt; Зависимость1, Зависимость2 @Флаг</code>. Флаги: <code>@Transactional</code> (обернуть в прокси), <code>@Lazy</code> (не создавать на старте), <code>@Field</code> (зависимости через поля, а не конструктор). Сломайте конфигурацию: добавьте цикл, удалите бин, от которого зависят другие. Песочница разрешает циклы через поля, как Spring с <code>allow-circular-references=true</code>.</p>
+  <div class="grid-2">
+    <div><textarea id="mcSrc" spellcheck="false" style="min-height:200px">OrderController -> OrderService
+OrderService -> OrderRepository, PaymentClient @Transactional
+OrderRepository -> DataSource
+PaymentClient -> HttpClient
+ReportService -> OrderRepository @Lazy
+DataSource
+HttpClient</textarea>
+      <div class="controls">
+        <button class="btn primary" type="button" id="mcRun">refresh()</button>
+        <button class="btn" type="button" data-p="cycle">цикл в конструкторах</button>
+        <button class="btn" type="button" data-p="fieldcycle">цикл через поля</button>
+        <button class="btn" type="button" data-p="missing">нет бина</button>
+        <button class="btn" type="button" data-p="ok">исходный пример</button>
+      </div>
+    </div>
+    <div><div class="log" id="mcLog" style="max-height:330px"></div></div>
+  </div>
+  <div class="verdict" id="mcOut"></div>
+</div>
+<script>
+(function () {
+  var presets = {
+    ok: "OrderController -> OrderService\nOrderService -> OrderRepository, PaymentClient @Transactional\nOrderRepository -> DataSource\nPaymentClient -> HttpClient\nReportService -> OrderRepository @Lazy\nDataSource\nHttpClient",
+    cycle: "OrderService -> PaymentService\nPaymentService -> AuditService\nAuditService -> OrderService",
+    fieldcycle: "OrderService -> PaymentService @Field @Transactional\nPaymentService -> OrderService @Field",
+    missing: "OrderController -> OrderService\nOrderService -> OrderRepository, MailSender\nOrderRepository"
+  };
+  var src = document.getElementById("mcSrc"), logEl = document.getElementById("mcLog"), out = document.getElementById("mcOut");
+  function lc(s) { return s.charAt(0).toLowerCase() + s.slice(1); }
+  function run() {
+    var defs = {}, order = [], L = [], err = null;
+    src.value.split("\n").forEach(function (line) {
+      line = line.trim(); if (!line || line[0] === "#") return;
+      var flags = (line.match(/@\w+/g) || []).map(function (f) { return f.toLowerCase(); });
+      line = line.replace(/@\w+/g, "").trim();
+      var p = line.split("->"), name = p[0].trim();
+      if (!name) return;
+      defs[name] = { deps: p[1] ? p[1].split(",").map(function (s) { return s.trim(); }).filter(Boolean) : [], tx: flags.indexOf("@transactional") >= 0, lazy: flags.indexOf("@lazy") >= 0, field: flags.indexOf("@field") >= 0 };
+      order.push(name);
+    });
+    L.push("── Фаза 1: регистрация описаний ──");
+    order.forEach(function (n) { L.push("  BeanDefinition '" + lc(n) + "' → " + n + (defs[n].lazy ? " [lazy]" : "")); });
+    L.push("── Фаза 2: preInstantiateSingletons ──");
+    var singletons = {}, early = {}, stack = [], created = [];
+    function fail(msg) { if (!err) err = msg; throw new Error("stop"); }
+    function getBean(name, depth, requester) {
+      var pad = new Array(depth + 1).join("  ");
+      if (singletons[name]) { L.push(pad + "getBean('" + lc(name) + "') → из кэша singletonObjects"); return singletons[name]; }
+      if (!defs[name]) fail("NoSuchBeanDefinitionException: No qualifying bean of type '" + name + "' available: expected at least 1 bean which qualifies as autowire candidate.\n\nParameter 0 of constructor in " + requester + " required a bean of type '" + name + "' that could not be found.\n\nAction: Consider defining a bean of type '" + name + "' in your configuration.");
+      if (stack.indexOf(name) >= 0) {
+        if (early[name]) { L.push(pad + "getBean('" + lc(name) + "') → бин в создании, отдаём РАННЮЮ ссылку из singletonFactories" + (defs[name].tx ? " (прокси создан заранее: getEarlyBeanReference)" : "")); return early[name]; }
+        var cyc = stack.slice(stack.indexOf(name)).concat(name);
+        fail("BeanCurrentlyInCreationException: Requested bean is currently in creation: Is there an unresolvable circular reference or an asynchronous initialization dependency?\n\nThe dependencies of some of the beans in the application context form a cycle:\n\n┌─────┐\n" + cyc.slice(0, -1).map(function (c) { return "|  " + lc(c); }).join("\n↑     ↓\n") + "\n└─────┘");
+      }
+      var d = defs[name];
+      stack.push(name);
+      L.push(pad + "createBean('" + lc(name) + "')");
+      var obj = (d.tx ? "Proxy(" : "") + name + (d.tx ? ")" : "");
+      if (d.field) {
+        L.push(pad + "  new " + name + "()  — конструктор без аргументов");
+        early[name] = obj; L.push(pad + "  addSingletonFactory('" + lc(name) + "') — ранняя ссылка доступна");
+        d.deps.forEach(function (dep) { L.push(pad + "  @Autowired поле " + lc(dep) + ":"); getBean(dep, depth + 2, name); });
+      } else {
+        d.deps.forEach(function (dep) { L.push(pad + "  аргумент конструктора " + dep + ":"); getBean(dep, depth + 2, name); });
+        L.push(pad + "  new " + name + "(" + d.deps.map(lc).join(", ") + ")");
+      }
+      L.push(pad + "  BeanPostProcessor-ы: @PostConstruct" + (d.tx ? " → AutoProxyCreator: найден @Transactional → CGLIB-прокси" : " → прокси не нужен"));
+      singletons[name] = obj; created.push(name); stack.pop(); delete early[name];
+      L.push(pad + "  → singletonObjects['" + lc(name) + "'] = " + obj);
+      return obj;
+    }
+    try { order.forEach(function (n) { if (defs[n].lazy) { L.push("пропуск '" + lc(n) + "' — @Lazy, создастся при первом обращении"); return; } getBean(n, 0, n); }); }
+    catch (e) { if (!err) err = String(e); }
+    logEl.textContent = L.join("\n");
+    if (err) { out.className = "verdict bad"; out.innerHTML = "<b>APPLICATION FAILED TO START</b><pre style=\"margin:8px 0 0;white-space:pre-wrap;font-size:13px;background:none;color:inherit;padding:0\">" + SG.esc(err) + "</pre>" + (created.length ? "Уже созданные бины (" + created.map(lc).join(", ") + ") будут уничтожены: destroyBeans()." : ""); }
+    else { out.className = "verdict ok"; out.innerHTML = "Контекст поднят. Порядок создания: <b>" + created.map(lc).join(" → ") + "</b>. Зависимости всегда создаются раньше зависящих от них бинов; порядок объявления влияет только при прочих равных."; }
+  }
+  document.getElementById("mcRun").addEventListener("click", run);
+  document.querySelectorAll("#mc [data-p]").forEach(function (b) { b.addEventListener("click", function () { src.value = presets[b.getAttribute("data-p")]; run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="plan"><span class="h-num">21.2</span>Что будем строить</h2>
+<div class="table-wrap"><table>
+<tr><th>В мини-контейнере</th><th>В Spring</th></tr>
+<tr><td><code>Map&lt;String, Class&lt;?&gt;&gt; definitions</code></td><td><code>beanDefinitionMap</code> с <code>BeanDefinition</code> (тема 02)</td></tr>
+<tr><td><code>register()</code> затем <code>refresh()</code></td><td>две фазы: описания → экземпляры</td></tr>
+<tr><td><code>Map&lt;String, Object&gt; singletons</code></td><td><code>singletonObjects</code> в <code>DefaultSingletonBeanRegistry</code></td></tr>
+<tr><td><code>Set&lt;String&gt; inCreation</code></td><td><code>singletonsCurrentlyInCreation</code></td></tr>
+<tr><td><code>instantiate()</code></td><td><code>createBeanInstance</code> + <code>ConstructorResolver</code></td></tr>
+<tr><td><code>injectFields()</code></td><td><code>populateBean</code> + <code>AutowiredAnnotationBeanPostProcessor</code></td></tr>
+<tr><td><code>initialize()</code></td><td><code>initializeBean</code>: BPP before → init → BPP after</td></tr>
+<tr><td><code>LoggingPostProcessor</code></td><td><code>AbstractAutoProxyCreator</code> + <code>JdkDynamicAopProxy</code></td></tr>
+</table></div>
+
+<h2 id="annotations"><span class="h-num">21.3</span>Шаг 1. Аннотации и точка расширения</h2>
+<pre data-title="mini/Annotations.java"><code class="java">package mini;
+
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE)   @interface Component { }
+@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.FIELD)  @interface Inject { }
+@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) @interface PostConstruct { }
+@Retention(RetentionPolicy.RUNTIME) @Target(ElementType.METHOD) @interface Logged { }
+
+interface BeanPostProcessor {
+    default Object before(Object bean, String name) { return bean; }
+    default Object after(Object bean, String name)  { return bean; }   // может вернуть другой объект — прокси
+}</code></pre>
+
+<h2 id="context"><span class="h-num">21.4</span>Шаг 2. Контейнер</h2>
+<pre data-title="mini/MiniContext.java"><code class="java">package mini;
+
+import java.beans.Introspector;
+import java.lang.reflect.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+final class MiniContext {
+    private final Map&lt;String, Class&lt;?&gt;&gt; definitions = new LinkedHashMap&lt;&gt;();   // имя → «описание»
+    private final Map&lt;String, Object&gt; singletons = new ConcurrentHashMap&lt;&gt;();
+    private final Set&lt;String&gt; inCreation = new LinkedHashSet&lt;&gt;();
+    private final List&lt;BeanPostProcessor&gt; postProcessors = new ArrayList&lt;&gt;();
+
+    MiniContext(Class&lt;?&gt;... components) {
+        for (Class&lt;?&gt; c : components) register(c);     // фаза 1: только описания, объектов ещё нет
+        refresh();                                      // фаза 2: экземпляры
+    }
+
+    private void register(Class&lt;?&gt; c) {
+        if (!c.isAnnotationPresent(Component.class))
+            throw new IllegalArgumentException(c.getName() + " is not a @Component");
+        definitions.put(Introspector.decapitalize(c.getSimpleName()), c);
+    }
+
+    private void refresh() {
+        // как registerBeanPostProcessors(): пост-процессоры создаются раньше остальных бинов
+        definitions.forEach((name, type) -&gt; {
+            if (BeanPostProcessor.class.isAssignableFrom(type)) postProcessors.add((BeanPostProcessor) getBean(name));
+        });
+        // как preInstantiateSingletons(): создаём всё остальное
+        definitions.keySet().forEach(this::getBean);
+    }
+
+    Object getBean(String name) {
+        Object existing = singletons.get(name);
+        if (existing != null) return existing;                                   // кэш singleton-ов
+        Class&lt;?&gt; type = definitions.get(name);
+        if (type == null) throw new IllegalStateException("No bean named '" + name + "'");
+        if (!inCreation.add(name))                                               // уже создаётся выше по стеку
+            throw new IllegalStateException("Circular dependency: " + inCreation + " -&gt; " + name);
+        try {
+            Object bean = instantiate(type);            // createBeanInstance
+            injectFields(bean);                         // populateBean
+            Object exposed = initialize(bean, name);    // initializeBean — может вернуть прокси
+            singletons.put(name, exposed);
+            return exposed;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to create bean '" + name + "'", e);
+        } finally {
+            inCreation.remove(name);
+        }
+    }
+
+    &lt;T&gt; T getBean(Class&lt;T&gt; type) {                                             // поиск по типу
+        List&lt;String&gt; names = definitions.entrySet().stream()
+                .filter(e -&gt; type.isAssignableFrom(e.getValue()))
+                .map(Map.Entry::getKey).toList();
+        if (names.size() != 1)
+            throw new IllegalStateException("Expected single bean of type " + type.getName() + " but found " + names);
+        return type.cast(getBean(names.get(0)));
+    }
+
+    private Object instantiate(Class&lt;?&gt; type) throws ReflectiveOperationException {
+        Constructor&lt;?&gt; ctor = type.getDeclaredConstructors()[0];                 // считаем, что конструктор один
+        Class&lt;?&gt;[] paramTypes = ctor.getParameterTypes();
+        Object[] args = new Object[paramTypes.length];
+        for (int i = 0; i &lt; args.length; i++) args[i] = getBean(paramTypes[i]);    // рекурсия: сначала зависимости
+        ctor.setAccessible(true);
+        return ctor.newInstance(args);
+    }
+
+    private void injectFields(Object bean) throws IllegalAccessException {
+        for (Field f : bean.getClass().getDeclaredFields()) {
+            if (f.isAnnotationPresent(Inject.class)) {
+                f.setAccessible(true);
+                f.set(bean, getBean(f.getType()));
+            }
+        }
+    }
+
+    private Object initialize(Object bean, String name) throws ReflectiveOperationException {
+        Object current = bean;
+        for (BeanPostProcessor pp : postProcessors) current = pp.before(current, name);
+        for (Method m : bean.getClass().getDeclaredMethods()) {
+            if (m.isAnnotationPresent(PostConstruct.class)) { m.setAccessible(true); m.invoke(bean); }
+        }
+        for (BeanPostProcessor pp : postProcessors) current = pp.after(current, name);
+        return current;
+    }
+}</code></pre>
+<div class="callout info"><span class="c-title">Что уже видно</span>
+<b>Порядок создания</b> определяется зависимостями: рекурсивный <code>getBean</code> в <code>instantiate</code> создаёт сначала листья графа. <b>Цикл в конструкторах</b> обнаруживается множеством <code>inCreation</code> — и разрешить его нельзя: объекта ещё нет. <b>@PostConstruct вызывается на исходном объекте</b>, до <code>after()</code>, который создаёт прокси, — ровно как в Spring.
+</div>
+
+<h2 id="proxy"><span class="h-num">21.5</span>Шаг 3. Пост-процессор с прокси</h2>
+<pre data-title="mini/LoggingPostProcessor.java"><code class="java">package mini;
+
+import java.lang.reflect.*;
+import java.util.Arrays;
+
+@Component
+class LoggingPostProcessor implements BeanPostProcessor {
+    @Override
+    public Object after(Object bean, String name) {
+        Class&lt;?&gt; type = bean.getClass();
+        boolean hasAdvice = Arrays.stream(type.getDeclaredMethods()).anyMatch(m -&gt; m.isAnnotationPresent(Logged.class));
+        if (!hasAdvice || type.getInterfaces().length == 0) return bean;         // прокси не нужен — отдаём как есть
+
+        InvocationHandler handler = (proxy, method, args) -&gt; {
+            Method impl = type.getMethod(method.getName(), method.getParameterTypes());   // аннотация стоит на методе класса
+            long t0 = System.nanoTime();
+            try {
+                return method.invoke(bean, args);                                  // вызов настоящего объекта (target)
+            } catch (InvocationTargetException e) {
+                throw e.getCause();                                                // пробрасываем исходное исключение
+            } finally {
+                if (impl.isAnnotationPresent(Logged.class))
+                    System.out.printf("[%s.%s] %d µs%n", name, method.getName(), (System.nanoTime() - t0) / 1_000);
+            }
+        };
+        return Proxy.newProxyInstance(type.getClassLoader(), type.getInterfaces(), handler);
+    }
+}</code></pre>
+
+<h2 id="demo"><span class="h-num">21.6</span>Шаг 4. Запускаем</h2>
+<pre data-title="mini/Demo.java"><code class="java">package mini;
+
+import java.time.Instant;
+
+interface Greeter { String greet(String who); String shout(String who); }
+
+@Component class Clock { Instant now() { return Instant.now(); } }
+
+@Component class Stats { int calls; }
+
+@Component
+class GreeterImpl implements Greeter {
+    private final Clock clock;                        // через конструктор
+    @Inject private Stats stats;                      // через поле
+
+    GreeterImpl(Clock clock) { this.clock = clock; System.out.println("1. constructor, stats = " + stats); }
+
+    @PostConstruct void init() { System.out.println("2. @PostConstruct, stats = " + (stats != null)); }
+
+    @Logged public String greet(String who) { stats.calls++; return "Hello, " + who + " @ " + clock.now(); }
+
+    public String shout(String who) { return greet(who).toUpperCase(); }     // self-invocation!
+}
+
+public class Demo {
+    public static void main(String[] args) {
+        MiniContext ctx = new MiniContext(LoggingPostProcessor.class, Clock.class, Stats.class, GreeterImpl.class);
+        Greeter g = ctx.getBean(Greeter.class);
+        System.out.println("3. " + g.getClass().getSimpleName());           // $Proxy… — не GreeterImpl
+        System.out.println(g.greet("Spring"));                               // лог времени печатается
+        System.out.println(g.shout("Spring"));                               // лог НЕ печатается: greet вызван через this
+        // ctx.getBean(GreeterImpl.class) → ClassCastException: прокси реализует Greeter, но не наследует GreeterImpl
+    }
+}</code></pre>
+<pre data-title="Вывод"><code class="txt">1. constructor, stats = null
+2. @PostConstruct, stats = true
+3. $Proxy5
+[greeterImpl.greet] 412 µs
+Hello, Spring @ 2026-10-10T09:15:02.118Z
+HELLO, SPRING @ 2026-10-10T09:15:02.131Z</code></pre>
+<p>На 120 строках воспроизвелись четыре «загадки» Spring: поле с <code>@Inject</code> равно <code>null</code> в конструкторе; <code>@PostConstruct</code> видит внедрённые поля; self-invocation обходит прокси; JDK-прокси нельзя получить по классу реализации.</p>
+
+<h2 id="exercises"><span class="h-num">21.7</span>Упражнения: приближаем к настоящему Spring</h2>
+<ol class="steps">
+  <li><b>Сканирование пакета.</b> Вместо списка классов найдите все <code>.class</code> в пакете через <code>ClassLoader.getResources(path)</code> и зарегистрируйте помеченные <code>@Component</code>. (В Spring — <code>ClassPathBeanDefinitionScanner</code>, читает байткод без загрузки классов — через ASM, а в Spring Framework 7 на Java 24+ через ClassFile API.)</li>
+  <li><b>@Primary и неоднозначность.</b> Сейчас два бина одного типа дают ошибку. Добавьте <code>@Primary</code> и выбор по имени параметра.</li>
+  <li><b>Scope prototype.</b> Аннотация <code>@Prototype</code>: не класть в <code>singletons</code>, создавать при каждом <code>getBean</code>.</li>
+  <li><b>Ранние ссылки.</b> Разрешите цикл через поля: после <code>instantiate</code> кладите «сырой» объект в карту <code>early</code> и отдавайте его при повторном запросе. Что сломается, если пост-процессор оборачивает бин в прокси? Это и есть причина третьего уровня кэша (тема 03).</li>
+  <li><b>Уничтожение.</b> Метод <code>close()</code>, вызывающий <code>@PreDestroy</code> в порядке, обратном созданию.</li>
+  <li><b>BeanFactoryPostProcessor.</b> Точка расширения между <code>register</code> и <code>refresh</code>, получающая <code>definitions</code>: сделайте процессор, который удаляет описания классов с <code>@Profile("dev")</code>, если системное свойство <code>profile</code> не равно <code>dev</code>.</li>
+  <li><b>События.</b> <code>publish(Object event)</code> и методы с <code>@Listener</code>: соберите их в <code>initialize</code> и вызывайте по типу параметра.</li>
+  <li><b>CGLIB-стиль.</b> Замените JDK-прокси на подкласс через ByteBuddy — исчезнет требование интерфейса, появится ограничение на <code>final</code>.</li>
+</ol>
+
+<h2 id="missing"><span class="h-num">21.8</span>Чего здесь нет и зачем оно в Spring</h2>
+<div class="table-wrap"><table>
+<tr><th>Отсутствует</th><th>Зачем нужно в настоящем контейнере</th></tr>
+<tr><td>Полноценный <code>BeanDefinition</code></td><td>scope, lazy, фабричные методы (<code>@Bean</code>), init/destroy, primary, qualifiers — контейнер работает с описанием, а не с классом</td></tr>
+<tr><td>Разрешение по generics, <code>@Qualifier</code>, коллекции</td><td><code>List&lt;Handler&gt;</code>, <code>Repository&lt;User&gt;</code>, <code>ObjectProvider</code></td></tr>
+<tr><td>Три уровня кэша</td><td>циклы через поля с корректными прокси</td></tr>
+<tr><td>Блокировки при создании</td><td>потокобезопасный <code>getBean</code> для ленивых бинов</td></tr>
+<tr><td>Environment, условия, профили</td><td>один код — разные окружения; автоконфигурация</td></tr>
+<tr><td>Lifecycle, события, scopes</td><td>управляемый запуск/остановка, слабая связность, web-scopes</td></tr>
+<tr><td>Цепочка advisors</td><td>несколько перехватчиков с порядком, pointcut-ы, кэш решений</td></tr>
+<tr><td>AOT</td><td>всё то же без рефлексии в рантайме</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">21.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В мини-контейнере GreeterImpl печатает в конструкторе «stats = null». Почему?</p><ul><li>Бин Stats ещё не зарегистрирован</li><li>Поля внедряются после создания объекта: конструктор уже отработал, когда вызывается injectFields</li><li>Ошибка в рефлексии</li><li>Stats — prototype</li></ul><div class="why">Чтобы записать поле, нужен существующий объект. Это общая причина, почему полевые зависимости недоступны в конструкторе и в Spring.</div></div>
+<div class="mcq" data-ok="2"><p>Почему пост-процессоры создаются в refresh() раньше остальных бинов?</p><ul><li>Они легче</li><li>Так требует JVM</li><li>Бин, созданный до регистрации пост-процессора, через него не пройдёт — и не получит прокси</li><li>Чтобы избежать циклов</li></ul><div class="why">Тот же принцип, что в registerBeanPostProcessors(): сначала вся обрабатывающая инфраструктура, потом обычные бины.</div></div>
+<div class="mcq" data-ok="0"><p>Что нужно добавить, чтобы разрешить цикл A ↔ B через поля?</p><ul><li>Раннюю публикацию «сырого» объекта после вызова конструктора и до внедрения полей</li><li>Второй поток</li><li>Сортировку бинов по имени</li><li>Ничего, это невозможно</li></ul><div class="why">Именно это делает addSingletonFactory в Spring; фабрика вместо готового объекта нужна, чтобы ранняя ссылка могла быть прокси.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите минимальный алгоритм getBean для singleton.</summary><div class="a"><p>Проверить кэш → найти описание → отметить «в создании» (иначе цикл) → разрешить аргументы конструктора рекурсивным getBean и создать объект → внедрить поля/сеттеры → BPP before → init-методы → BPP after (возможна подмена на прокси) → положить в кэш → снять отметку.</p></div></details>
+<details class="q"><summary>Почему контейнеру нужны две фазы — описания и экземпляры?</summary><div class="a"><p>Чтобы создать бин, нужно знать обо всех остальных: кого внедрять, есть ли кандидаты, не переопределён ли бин, какие пост-процессоры применить. Сначала собирается полная картина (её ещё можно менять — BFPP, условия), и только затем создаются объекты в порядке зависимостей.</p></div></details>
+<details class="q"><summary>Как на рефлексии и JDK Proxy реализовать аналог @Transactional?</summary><div class="a"><p>BeanPostProcessor в after() проверяет наличие аннотации на методах класса, создаёт Proxy.newProxyInstance с InvocationHandler: перед вызовом открыть транзакцию (connection.setAutoCommit(false), положить соединение в ThreadLocal), вызвать method.invoke(target), commit; при исключении rollback и проброс причины; в finally очистить ThreadLocal и вернуть соединение.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Балансировщики и Kubernetes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · ИНЖЕНЕРИЯ · РОАДМАП s2, s3, s4, s5, s7</div>
+  <h1>Балансировщики, Kubernetes, overlay-сети</h1>
+  <p class="lead">Между пользователем и вашим кодом стоят CDN, балансировщики, ингресс, kube-proxy, sidecar. Каждый из них — отдельное TCP-соединение со своими таймаутами и правилами. Понимание этой цепочки — главное отличие senior-инженера при разборе инцидентов.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="lb"><span class="h-num">13.1</span>L4 и L7 балансировка</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>L4 (TCP/UDP)</th><th>L7 (HTTP, gRPC)</th></tr>
+<tr><td>Что видит</td><td>IP и порты</td><td>метод, путь, заголовки, cookies, тело</td></tr>
+<tr><td>Единица балансировки</td><td>соединение</td><td>запрос</td></tr>
+<tr><td>Соединения</td><td>пробрасывает (NAT/DSR) — одно сквозное соединение</td><td>два независимых: клиент↔прокси, прокси↔бэкенд (пул)</td></tr>
+<tr><td>TLS</td><td>passthrough</td><td>терминирует</td></tr>
+<tr><td>Возможности</td><td>скорость, любой протокол (БД, Kafka, MQTT)</td><td>маршрутизация по пути, канареечные релизы, ретраи, rate limit, WAF, сжатие</td></tr>
+<tr><td>Примеры</td><td>AWS NLB, IPVS, MetalLB, HAProxy в режиме tcp</td><td>Nginx, Envoy, HAProxy http, AWS ALB, ингресс-контроллеры</td></tr>
+</table></div>
+<div class="grid-2">
+  <div class="card"><h4>Алгоритмы</h4><ul><li><b>Round robin</b> — по кругу.</li><li><b>Least connections / least requests</b> — учитывает медленные бэкенды.</li><li><b>Power of two choices</b> — взять двух случайных, выбрать менее загруженного: почти оптимально и дёшево (Envoy).</li><li><b>Consistent hashing</b> — один ключ всегда на один бэкенд (кэши, шардирование), минимум перестановок при изменении состава.</li></ul></div>
+  <div class="card"><h4>Проверки здоровья</h4><ul><li><b>Активные</b>: балансировщик опрашивает <code>/health</code>.</li><li><b>Пассивные / outlier detection</b>: выкидывает бэкенд после серии ошибок реальных запросов.</li><li>Liveness ≠ readiness: «процесс жив» и «готов принимать трафик» (прогрет, есть соединение с БД) — разные вопросы.</li><li>Health-check не должен проверять все зависимости: падение БД не должно «убивать» все поды.</li></ul></div>
+</div>
+<p><b>Sticky sessions</b> (по cookie или IP) — костыль для состояния в памяти: ломают равномерность, мешают масштабированию и деплою. Лучше вынести состояние (Redis, БД, токены). <b>IP клиента</b> на L7 теряется — передавайте его в <code>X-Forwarded-For</code>/<code>Forwarded</code> и доверяйте этому заголовку только от своих прокси; на L4 — PROXY protocol.</p>
+
+<h2 id="ha"><span class="h-num">13.2</span>Отказоустойчивость самого балансировщика</h2>
+<ul>
+  <li><b>VRRP / keepalived</b>: два узла делят плавающий виртуальный IP; при отказе активного резервный забирает IP (gratuitous ARP).</li>
+  <li><b>ECMP + anycast</b>: несколько балансировщиков анонсируют один адрес, маршрутизатор распределяет потоки по хэшу.</li>
+  <li><b>Облачные балансировщики</b> распределены между зонами доступности; DNS-имя балансировщика возвращает несколько адресов.</li>
+  <li><b>Несколько регионов</b>: GeoDNS или anycast спереди, асинхронная репликация данных позади — с осознанным выбором между согласованностью и доступностью.</li>
+</ul>
+
+<h2 id="k8s"><span class="h-num">13.3</span>Сеть Kubernetes</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 360" role="img" aria-label="Путь запроса в Kubernetes">
+  <defs><marker id="k1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <rect x="20" y="20" width="130" height="50" rx="9" class="box"/><text x="85" y="50" text-anchor="middle">Клиент</text>
+  <rect x="190" y="20" width="170" height="50" rx="9" class="box-info"/><text x="275" y="42" text-anchor="middle" font-weight="700">Облачный LB</text><text x="275" y="60" text-anchor="middle" font-size="11">Service type=LoadBalancer</text>
+  <rect x="400" y="20" width="190" height="50" rx="9" class="box-acc"/><text x="495" y="42" text-anchor="middle" font-weight="700">Ingress-контроллер</text><text x="495" y="60" text-anchor="middle" font-size="11">Nginx/Envoy, L7, TLS</text>
+  <rect x="630" y="20" width="150" height="50" rx="9" class="box-warn"/><text x="705" y="42" text-anchor="middle" font-weight="700">Service</text><text x="705" y="60" text-anchor="middle" font-size="11">ClusterIP 10.96.4.12</text>
+  <path d="M150 45 H186" class="ln-acc" marker-end="url(#k1)"/><path d="M360 45 H396" class="ln-acc" marker-end="url(#k1)"/><path d="M590 45 H626" class="ln-acc" marker-end="url(#k1)"/>
+  <rect x="20" y="110" width="370" height="230" rx="12" class="box" stroke-dasharray="5 4"/><text x="40" y="134" font-weight="700">Узел 1</text>
+  <rect x="410" y="110" width="370" height="230" rx="12" class="box" stroke-dasharray="5 4"/><text x="430" y="134" font-weight="700">Узел 2</text>
+  <rect x="40" y="150" width="330" height="40" rx="7" class="box-warn"/><text x="205" y="175" text-anchor="middle" font-size="12">kube-proxy / eBPF: ClusterIP → IP пода (DNAT)</text>
+  <rect x="430" y="150" width="330" height="40" rx="7" class="box-warn"/><text x="595" y="175" text-anchor="middle" font-size="12">то же правило на каждом узле</text>
+  <rect x="40" y="210" width="150" height="56" rx="8" class="box-ok"/><text x="115" y="234" text-anchor="middle" font-weight="700">pod A</text><text x="115" y="252" text-anchor="middle" class="mono" font-size="11">10.244.1.7</text>
+  <rect x="220" y="210" width="150" height="56" rx="8" class="box-ok"/><text x="295" y="234" text-anchor="middle" font-weight="700">pod B</text><text x="295" y="252" text-anchor="middle" class="mono" font-size="11">10.244.1.8</text>
+  <rect x="430" y="210" width="150" height="56" rx="8" class="box-ok"/><text x="505" y="234" text-anchor="middle" font-weight="700">pod C</text><text x="505" y="252" text-anchor="middle" class="mono" font-size="11">10.244.2.3</text>
+  <rect x="40" y="284" width="720" height="40" rx="7" class="box-info"/><text x="400" y="309" text-anchor="middle" font-size="12">CNI (Calico, Cilium, Flannel): плоская сеть подов — маршрутизация или overlay VXLAN между узлами</text>
+  <path d="M705 70 V140" class="ln-acc" marker-end="url(#k1)"/>
+</svg>
+</figure>
+<ul>
+  <li><b>Каждый под получает свой IP</b>, и любые поды видят друг друга без NAT (модель Kubernetes). Адреса подов эфемерны — обращайтесь по имени Service.</li>
+  <li><b>Service ClusterIP</b> — виртуальный адрес, которого нет ни на одном интерфейсе: kube-proxy на каждом узле переписывает его в адрес одного из подов. Это <b>L4</b>-балансировка соединений (см. проблему долгих HTTP/2-соединений в теме 11).</li>
+  <li><b>Headless Service</b> (<code>clusterIP: None</code>) — DNS возвращает адреса всех подов: для клиентской балансировки, StatefulSet, Kafka.</li>
+  <li><b>Ingress / Gateway API</b> — L7-вход в кластер по хостам и путям.</li>
+  <li><b>NetworkPolicy</b> — файрвол между подами (по меткам). По умолчанию всё разрешено — в финтехе включают deny-by-default.</li>
+</ul>
+<div class="callout bad"><span class="c-title">Ошибки при деплое: гонка завершения пода</span>
+При удалении пода Kubernetes параллельно отправляет SIGTERM в контейнер и удаляет под из эндпоинтов Service. Обновление правил kube-proxy, ингресса и облачного балансировщика занимает секунды, и в это время на под ещё приходят запросы — а приложение уже закрыло порт: 502 и <code>Connection refused</code> на каждом релизе. Лечится <code>preStop</code> с паузой 5–15 с перед остановкой, корректным graceful shutdown (Spring Boot <code>server.shutdown=graceful</code>) и readiness-пробой.
+</div>
+
+<h2 id="mesh"><span class="h-num">13.4</span>Service mesh</h2>
+<p>Sidecar-прокси (Envoy) рядом с каждым подом перехватывает весь трафик: mTLS между сервисами, ретраи, таймауты, circuit breaking, метрики и трейсы — без изменения кода. Цена: дополнительные прыжки (единицы миллисекунд), ресурсы, сложность. Новые варианты (Istio ambient, Cilium) убирают sidecar и переносят функции на уровень узла. Важно: при mesh у вас <b>ещё один слой таймаутов и ретраев</b> — согласуйте их с настройками в коде (правило «ретраи на одном уровне» из темы 12).</p>
+
+<h2 id="overlay"><span class="h-num">13.5</span>Overlay-сети и SDN</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 120" role="img" aria-label="Инкапсуляция VXLAN">
+  <g font-size="11.5">
+    <rect x="20" y="30" width="110" height="40" class="box-warn"/><text x="75" y="55" text-anchor="middle">внешний Ethernet</text>
+    <rect x="130" y="30" width="100" height="40" class="box-ok"/><text x="180" y="55" text-anchor="middle">внешний IP</text>
+    <rect x="230" y="30" width="110" height="40" class="box-info"/><text x="285" y="55" text-anchor="middle">UDP :4789</text>
+    <rect x="340" y="30" width="110" height="40" class="box-acc"/><text x="395" y="55" text-anchor="middle">VXLAN (VNI)</text>
+    <rect x="450" y="30" width="330" height="40" class="box"/><text x="615" y="55" text-anchor="middle">исходный кадр: Ethernet пода → IP пода → TCP → данные</text>
+  </g>
+  <text x="20" y="20" font-weight="700" font-size="13">VXLAN: L2-кадр внутри UDP-пакета между узлами</text>
+  <text x="20" y="96" font-size="12.5" class="muted">+50 байт накладных расходов → MTU внутри overlay 1450 при 1500 снаружи (вспомните тему 02).</text>
+  <text x="20" y="114" font-size="12.5" class="muted">24-битный VNI даёт ~16 млн изолированных сетей против 4094 VLAN.</text>
+</svg>
+</figure>
+<p><b>SDN</b> разделяет <i>control plane</i> (централизованный контроллер решает, как должны идти пакеты) и <i>data plane</i> (коммутаторы, vSwitch, eBPF на узлах просто исполняют правила). VPC в облаке, CNI в Kubernetes — это SDN: вы декларативно описываете подсети и правила, контроллер программирует хосты.</p>
+
+<h2 id="qos"><span class="h-num">13.6</span>QoS и MPLS — обзорно</h2>
+<div class="grid-2">
+  <div class="card"><h4>QoS</h4><p>Пакеты помечаются классом в поле DSCP IP-заголовка, маршрутизаторы ставят их в разные очереди с приоритетами и гарантированной полосой: голос и видео впереди резервного копирования. Работает внутри одной управляемой сети (корпоративная WAN, провайдер); в публичном Интернете метки обычно сбрасываются. Для разработчика: QoS не спасёт перегруженный сервис — нужен backpressure на уровне приложения.</p></div>
+  <div class="card"><h4>MPLS</h4><p>Провайдерская технология: пакету на входе в сеть присваивается метка, и дальше его пересылают по метке, а не по IP-маршруту. Позволяет строить явные пути (traffic engineering) и изолированные L3VPN для компаний. Вы встретите её как «канал между офисом и дата-центром от провайдера»; в облаках её место заняли SD-WAN и VPN поверх Интернета.</p></div>
+</div>
+
+<h2 id="sim"><span class="h-num">13.7</span>Интерактив: балансировка по хэшу и добавление сервера</h2>
+<div class="widget" id="chsW">
+  <div class="widget-title">Симулятор: 10 000 ключей по бэкендам</div>
+  <p class="hint">Ключ — идентификатор сессии или ключ кэша. Сравните, сколько ключей сменят сервер при изменении числа бэкендов.</p>
+  <div class="controls">
+    <label>бэкендов было<input type="number" id="chsN" value="4" min="1" max="20"></label>
+    <label>событие<select id="chsEv"><option value="add">добавили один сервер</option><option value="rem">один сервер упал</option></select></label>
+    <label>виртуальных узлов на сервер<input type="number" id="chsV" value="100" min="1" max="500" style="width:80px"></label>
+  </div>
+  <div id="chsBars"></div>
+  <div class="verdict" id="chsOut"></div>
+</div>
+<script>
+(function () {
+  function h(s) { var x = 2166136261; for (var i = 0; i < s.length; i++) { x ^= s.charCodeAt(i); x = Math.imul(x, 16777619); } x ^= x >>> 15; x = Math.imul(x, 2246822507); x ^= x >>> 13; return x >>> 0; }
+  function ring(n, v) { var r = []; for (var s = 0; s < n; s++) for (var k = 0; k < v; k++) r.push([h("srv" + s + "#" + k), s]); r.sort(function (a, b) { return a[0] - b[0]; }); return r; }
+  function find(r, x) { var lo = 0, hi = r.length; while (lo < hi) { var m = (lo + hi) >> 1; if (r[m][0] < x) lo = m + 1; else hi = m; } return r[lo % r.length][1]; }
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.min(20, Math.max(1, +$("chsN").value)), v = Math.min(500, Math.max(1, +$("chsV").value)), add = $("chsEv").value === "add", n2 = add ? n + 1 : Math.max(1, n - 1), K = 10000;
+    var r1 = ring(n, v), r2 = ring(n2, v), movedMod = 0, movedRing = 0, load = [];
+    for (var s = 0; s < n2; s++) load.push(0);
+    for (var i = 0; i < K; i++) {
+      var x = h("key-" + i);
+      if (x % n !== x % n2) movedMod++;
+      var a = find(r1, x), b = find(r2, x); if (a !== b) movedRing++;
+      load[b]++;
+    }
+    var ideal = add ? 1 / n2 : 1 / n, mx = Math.max.apply(null, load), mn = Math.min.apply(null, load);
+    function bar(label, val, cls) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px;flex-wrap:wrap"><span><b>' + label + '</b></span><span style="font-family:var(--font-mono)">' + (val / K * 100).toFixed(1) + '% ключей сменили сервер</span></div><div class="bar ' + cls + '"><i style="width:' + Math.max(1, val / K * 100) + '%"></i></div>'; }
+    $("chsBars").innerHTML = bar("hash(key) mod N", movedMod, "bad") + bar("Согласованное хэширование (кольцо)", movedRing, "ok") +
+      '<div class="out">Распределение по ' + n2 + " серверам после события (кольцо): " + load.join(" / ") + "\nразброс: от " + (mn / K * 100).toFixed(1) + "% до " + (mx / K * 100).toFixed(1) + "% при идеале " + (100 / n2).toFixed(1) + "%</div>";
+    $("chsOut").className = "verdict ok";
+    $("chsOut").textContent = "При mod N смена числа серверов перемешивает почти все ключи: кэш оказывается «холодным» целиком, а привязанные сессии теряются. На кольце переезжает только доля ≈ " + (ideal * 100).toFixed(0) + "% — ключи, принадлежавшие изменившемуся участку. Виртуальные узлы выравнивают нагрузку: попробуйте поставить 1 и посмотрите на разброс.";
+  }
+  ["chsN", "chsV"].forEach(function (i) { $(i).addEventListener("input", run); }); $("chsEv").addEventListener("change", run);
+  run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Алгоритм</th><th>Когда подходит</th><th>Слабое место</th></tr>
+<tr><td>Round robin</td><td>одинаковые серверы, короткие однотипные запросы</td><td>не видит загрузки: медленный сервер получает столько же</td></tr>
+<tr><td>Least connections</td><td>долгие соединения и запросы разной длительности</td><td>новый сервер получает лавину запросов (нужен slow start)</td></tr>
+<tr><td>Power of two choices</td><td>большие пулы: выбрать лучший из двух случайных</td><td>—</td></tr>
+<tr><td>Хэш по ключу / согласованное хэширование</td><td>кэш, привязка сессий, шардинг</td><td>«горячий» ключ перегружает один сервер</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">13.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем L7-балансировщик отличается от L4?</p><ul><li>Он быстрее</li><li>Он разбирает HTTP: маршрутизирует по пути и заголовкам, терминирует TLS, балансирует отдельные запросы; L4 оперирует соединениями по адресам и портам</li><li>Он работает только с UDP</li><li>Ничем</li></ul><div class="why">Цена L7 — больше работы на запрос; выигрыш — умная маршрутизация, ретраи, наблюдаемость.</div></div>
+<div class="mcq" data-ok="2"><p>Как Service типа ClusterIP в Kubernetes доставляет трафик на поды?</p><ul><li>Через отдельный прокси-под на каждом узле для каждого сервиса</li><li>DNS возвращает адреса всех подов</li><li>Виртуальный IP перехватывается правилами iptables/IPVS (или eBPF) на узле и подменяется адресом одного из подов</li><li>Через внешний балансировщик облака</li></ul><div class="why">ClusterIP нигде не «слушает» — это адрес, существующий только в правилах трансляции на каждом узле.</div></div>
+<div class="mcq" data-ok="0"><p>Что балансировщик делает с бэкендом, не прошедшим health check?</p><ul><li>Исключает его из ротации и продолжает проверять; вернёт после нескольких успешных проверок</li><li>Перезапускает его</li><li>Удаляет навсегда</li><li>Отправляет ему больше трафика для прогрева</li></ul><div class="why">Перезапуск — дело оркестратора (liveness), балансировщик только перестаёт слать трафик.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем L7-балансировщик отличается от L4 с точки зрения соединений?</summary><div class="a"><p>L4 пробрасывает соединение клиента к одному бэкенду — одно TCP-соединение (через NAT). L7 завершает соединение клиента, разбирает запросы и отправляет каждый по своему пулу соединений к бэкендам. Поэтому L7 балансирует запросы, а L4 — соединения; у L7 два набора таймаутов.</p></div></details>
+<details class="q"><summary>Что такое ClusterIP и где он «живёт»?</summary><div class="a"><p>Виртуальный адрес Service, не назначенный ни одному интерфейсу. Правила kube-proxy (iptables/IPVS) или eBPF-программы на каждом узле перехватывают пакеты к нему и делают DNAT на адрес выбранного пода.</p></div></details>
+<details class="q"><summary>Почему при каждом деплое бывают 502, хотя есть readiness-проба?</summary><div class="a"><p>SIGTERM и удаление из эндпоинтов происходят параллельно, а распространение изменений по kube-proxy, ингрессу и облачному LB занимает время. Приложение закрывается раньше, чем на него перестают слать трафик. Нужна пауза в preStop и graceful shutdown, дорабатывающий текущие запросы.</p></div></details>
+<details class="q"><summary>Зачем power of two choices, если есть least connections?</summary><div class="a"><p>Точный least connections требует глобального знания нагрузки, а у множества независимых балансировщиков оно устаревшее — все шлют на «самый свободный» одновременно (herding). Случайный выбор двух и сравнение даёт почти тот же результат, дёшев и устойчив к устаревшим данным.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Паттерны и практика</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ИНЖЕНЕРИЯ</div>
+  <h1>Паттерны, задачи, собеседование</h1>
+  <p class="lead">Итоговая тема. Сначала — алгоритм, по которому можно объяснить любую многопоточную программу. Затем паттерны проектирования и задачи с решениями: попробуйте написать каждую сами, прежде чем раскрывать ответ.</p>
+  <div class="meta"><span class="tag">~6 часов практики</span><span class="tag">Яндекс · Т-Банк</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="method"><span class="h-num">12.1</span>Шесть вопросов: как объяснить любую программу</h2>
+<p>Используйте этот порядок и на собеседовании («объясните, что здесь происходит»), и на code review, и при проектировании своего кода.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="Шесть вопросов анализа">
+  <defs><marker id="l1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <g>
+    <rect x="20" y="20" width="240" height="76" rx="10" class="box-info"/><text x="40" y="46" font-weight="700">1. Потоки</text><text x="40" y="68" font-size="12">кто исполняет код, сколько,</text><text x="40" y="86" font-size="12">откуда берутся (пул, VT, event loop)</text>
+    <rect x="280" y="20" width="240" height="76" rx="10" class="box-info"/><text x="300" y="46" font-weight="700">2. Общее состояние</text><text x="300" y="68" font-size="12">какие объекты видят ≥ 2 потока,</text><text x="300" y="86" font-size="12">какие из них изменяемые</text>
+    <rect x="540" y="20" width="240" height="76" rx="10" class="box-acc"/><text x="560" y="46" font-weight="700">3. Безопасность</text><text x="560" y="68" font-size="12">механизм для каждого поля → HB;</text><text x="560" y="86" font-size="12">атомарность составных действий</text>
+    <rect x="20" y="130" width="240" height="76" rx="10" class="box-warn"/><text x="40" y="156" font-weight="700">4. Живучесть</text><text x="40" y="178" font-size="12">deadlock, голодание, ожидания</text><text x="40" y="196" font-size="12">без таймаута, потерянные сигналы</text>
+    <rect x="280" y="130" width="240" height="76" rx="10" class="box-ok"/><text x="300" y="156" font-weight="700">5. Производительность</text><text x="300" y="178" font-size="12">конкуренция за локи, размер пулов,</text><text x="300" y="196" font-size="12">очереди, false sharing</text>
+    <rect x="540" y="130" width="240" height="76" rx="10" class="box-bad"/><text x="560" y="156" font-weight="700">6. Отказы, жизн. цикл</text><text x="560" y="178" font-size="12">исключения, отмена, перегрузка,</text><text x="560" y="196" font-size="12">shutdown, потеря задач</text>
+  </g>
+  <path d="M260 58 H276" class="ln" marker-end="url(#l1)"/><path d="M520 58 H536" class="ln" marker-end="url(#l1)"/>
+  <path d="M660 96 V110 H140 V126" class="ln" marker-end="url(#l1)"/>
+  <path d="M260 168 H276" class="ln" marker-end="url(#l1)"/><path d="M520 168 H536" class="ln" marker-end="url(#l1)"/>
+  <text x="400" y="250" text-anchor="middle" font-size="13.5">Безопасность (ничего плохого не случается) → Живучесть (хорошее когда-нибудь случается) →</text>
+  <text x="400" y="272" text-anchor="middle" font-size="13.5">Производительность (случается быстро) → Отказы (что будет, когда что-то пойдёт не так)</text>
+</svg>
+</figure>
+
+<h3>Разбор на примере</h3>
+<pre data-title="RateService.java — объясните эту программу"><code class="java">public final class RateService implements AutoCloseable {
+    private volatile Map&lt;String, BigDecimal&gt; rates = Map.of();
+    private final ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().name("rates-refresh").factory());
+    private final RatesApi api;
+    private final LongAdder misses = new LongAdder();
+
+    public RateService(RatesApi api) {
+        this.api = api;
+        scheduler.scheduleWithFixedDelay(this::refresh, 0, 30, TimeUnit.SECONDS);
+    }
+
+    private void refresh() {
+        try {
+            rates = Map.copyOf(api.fetchAll());          // новый неизменяемый снимок
+        } catch (Exception e) {
+            log.warn("rates refresh failed, keeping old snapshot", e);
+        }
+    }
+
+    public Optional&lt;BigDecimal&gt; rate(String ccy) {      // вызывается из потоков Tomcat
+        BigDecimal r = rates.get(ccy);
+        if (r == null) misses.increment();
+        return Optional.ofNullable(r);
+    }
+
+    @Override public void close() { scheduler.shutdownNow(); }
+}</code></pre>
+
+<div class="table-wrap"><table>
+<tr><th>Вопрос</th><th>Ответ для этой программы</th></tr>
+<tr><td>1. Потоки</td><td>Один поток планировщика <code>rates-refresh</code> пишет; N потоков веб-сервера читают через <code>rate()</code>.</td></tr>
+<tr><td>2. Общее состояние</td><td><code>rates</code> (ссылка), сама карта, <code>misses</code>. <code>api</code> и <code>scheduler</code> — final, задаются в конструкторе.</td></tr>
+<tr><td>3. Безопасность</td><td>Карта неизменяемая (<code>Map.copyOf</code>) → безопасна после публикации. Публикация через <code>volatile</code>: запись ссылки HB чтения в <code>rate()</code>, поэтому читатель видит полностью построенную карту. Один писатель — нет read-modify-write на <code>rates</code>. <code>misses</code> — <code>LongAdder</code>, атомарный инкремент. Каждый читатель видит согласованный снимок всех курсов. <i>Замечание:</i> планировщик стартует из конструктора — <code>this</code> утекает в другой поток до конца конструктора; здесь безопасно, потому что все поля уже присвоены, а <code>schedule</code> даёт HB, но лучше вынести запуск в метод <code>start()</code>.</td></tr>
+<tr><td>4. Живучесть</td><td>Локов нет → deadlock невозможен. Риск: <code>api.fetchAll()</code> без таймаута повиснет, и обновления прекратятся навсегда (single thread). Нужен таймаут на HTTP-клиенте.</td></tr>
+<tr><td>5. Производительность</td><td>Чтение — одно volatile-чтение + HashMap lookup, без конкуренции. <code>LongAdder</code> вместо <code>AtomicLong</code> — нет contention на счётчике. Копия карты раз в 30 с — пренебрежимо.</td></tr>
+<tr><td>6. Отказы</td><td>Исключение в <code>refresh</code> поймано — иначе расписание бы отменилось. При отказе API остаётся старый снимок (нужна метрика «возраст курсов» и алерт). <code>scheduleWithFixedDelay</code> — запуски не накладываются. <code>close()</code> прерывает поток.</td></tr>
+</table></div>
+
+<h2 id="patterns"><span class="h-num">12.2</span>Паттерны потокобезопасного дизайна</h2>
+<p>В порядке предпочтения — от «не нужно синхронизировать» к «синхронизируем аккуратно»:</p>
+<div class="table-wrap"><table>
+<tr><th>#</th><th>Паттерн</th><th>Идея</th><th>Где встречается</th></tr>
+<tr><td>1</td><td><b>Stateless</b></td><td>нет полей — нечего защищать</td><td>Spring-сервисы, контроллеры</td></tr>
+<tr><td>2</td><td><b>Immutability</b></td><td>final-поля, record, <code>List.copyOf</code></td><td>DTO, события, конфиг, Money</td></tr>
+<tr><td>3</td><td><b>Thread confinement</b></td><td>объект принадлежит одному потоку</td><td>локальные переменные, JDBC Connection в транзакции, actor/event loop</td></tr>
+<tr><td>4</td><td><b>Immutable snapshot + volatile/CAS</b></td><td>меняем ссылку на новую неизменяемую версию</td><td>кэш конфигурации, RateService выше, CopyOnWriteArrayList</td></tr>
+<tr><td>5</td><td><b>Single writer</b></td><td>все изменения через один поток (очередь), читатели — по снимку</td><td>Disruptor, Kafka partition consumer, LMAX</td></tr>
+<tr><td>6</td><td><b>Delegation</b></td><td>отдать безопасность готовому классу</td><td>ConcurrentHashMap, AtomicLong, BlockingQueue</td></tr>
+<tr><td>7</td><td><b>Monitor / lock</b></td><td>инвариант нескольких полей под одним локом</td><td>буферы, агрегаты с балансом</td></tr>
+<tr><td>8</td><td><b>Producer–consumer</b></td><td>передача владения через ограниченную очередь</td><td>пайплайны, пулы</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Связь с вашей практикой</span>
+Тот же принцип «один писатель на ключ» обеспечивает порядок в Kafka: партиция обрабатывается одним consumer'ом, поэтому события одного счёта (ключ = accountId) применяются последовательно без локов. Идемпотентность и DLQ из вашего Webhook Engine — это обработка 6-го вопроса (отказы) на уровне архитектуры.
+</div>
+
+<h2 id="tasks"><span class="h-num">12.3</span>Задачи</h2>
+<p>Порядок работы: прочитать условие → написать код в IDE → прогнать стресс-тест → объяснить по шести вопросам → сверить с решением.</p>
+
+<h3>Задача 1. Чередование чёт/нечет</h3>
+<p>Два потока печатают числа от 1 до N: первый — нечётные, второй — чётные, строго по очереди. Без <code>sleep</code>.</p>
+<details class="q"><summary>Решение на ReentrantLock + Condition</summary><div class="a">
+<pre><code class="java">public final class OddEvenPrinter {
+    private final int max;
+    private int current = 1;                                    // guarded by lock
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition turnChanged = lock.newCondition();
+
+    public OddEvenPrinter(int max) { this.max = max; }
+
+    public void run(boolean odd) throws InterruptedException {
+        while (true) {
+            lock.lock();
+            try {
+                while (current &lt;= max &amp;&amp; (current % 2 == 1) != odd) turnChanged.await();
+                if (current &gt; max) { turnChanged.signalAll(); return; }   // разбудить партнёра для выхода
+                System.out.println(Thread.currentThread().getName() + " " + current++);
+                turnChanged.signalAll();
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        OddEvenPrinter p = new OddEvenPrinter(10);
+        Thread a = Thread.ofPlatform().name("odd").start(() -&gt; { try { p.run(true); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } });
+        Thread b = Thread.ofPlatform().name("even").start(() -&gt; { try { p.run(false); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } });
+        a.join(); b.join();
+    }
+}</code></pre>
+<p>Альтернатива — два <code>Semaphore</code> (oddTurn=1, evenTurn=0): каждый поток делает <code>acquire</code> своего и <code>release</code> чужого. Объясните, почему здесь signalAll можно заменить на signal (ждёт максимум один поток).</p>
+</div></details>
+
+<h3>Задача 2. Rate limiter со скользящим окном</h3>
+<p>Не более <i>limit</i> вызовов за любое окно длиной <i>window</i>. Потокобезопасно, время инжектируется для тестов.</p>
+<details class="q"><summary>Решение (sliding log)</summary><div class="a">
+<pre><code class="java">public final class SlidingWindowRateLimiter {
+    private final int limit;
+    private final long windowMillis;
+    private final Clock clock;
+    private final ArrayDeque&lt;Long&gt; timestamps = new ArrayDeque&lt;&gt;();   // guarded by this
+
+    public SlidingWindowRateLimiter(int limit, Duration window, Clock clock) {
+        if (limit &lt;= 0) throw new IllegalArgumentException("limit");
+        this.limit = limit;
+        this.windowMillis = window.toMillis();
+        this.clock = clock;
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = clock.millis();
+        while (!timestamps.isEmpty() &amp;&amp; now - timestamps.peekFirst() &gt;= windowMillis) {
+            timestamps.pollFirst();                 // выкидываем вышедшие из окна
+        }
+        if (timestamps.size() &lt; limit) {
+            timestamps.addLast(now);
+            return true;
+        }
+        return false;
+    }
+}</code></pre>
+<p>Разбор: check-then-act (размер → добавить) должен быть атомарным — поэтому весь метод под одним локом. Память O(limit). Если limit огромный — sliding window counter (два счётчика соседних окон с весом) или токен-бакет на <code>AtomicLong</code> с CAS. В кластере — Redis + Lua. Тест: <code>Clock</code> из фиксированного мутабельного источника, проверка границ окна (ровно <code>windowMillis</code> — вышел или нет).</p>
+</div></details>
+
+<h3>Задача 3. Memoizer: вычислить один раз на ключ</h3>
+<p>Дорогая функция <code>f(k)</code>. Параллельные запросы одного ключа должны вызвать её ровно один раз; ошибки не кэшировать; не держать лок во время вычисления.</p>
+<details class="q"><summary>Решение</summary><div class="a">
+<pre><code class="java">public final class Memoizer&lt;K, V&gt; {
+    private final ConcurrentHashMap&lt;K, CompletableFuture&lt;V&gt;&gt; cache = new ConcurrentHashMap&lt;&gt;();
+    private final Function&lt;K, V&gt; fn;
+    private final Executor executor;
+
+    public Memoizer(Function&lt;K, V&gt; fn, Executor executor) { this.fn = fn; this.executor = executor; }
+
+    public CompletableFuture&lt;V&gt; get(K key) {
+        CompletableFuture&lt;V&gt; f = cache.computeIfAbsent(key,
+                k -&gt; CompletableFuture.supplyAsync(() -&gt; fn.apply(k), executor)); // под локом бакета — только создание future
+        f.whenComplete((v, ex) -&gt; {
+            if (ex != null) cache.remove(key, f);   // remove(key, value): не удалить чужой, более новый future
+        });
+        return f;
+    }
+}</code></pre>
+<p>Это эволюция Memoizer из JCiP (там — <code>putIfAbsent</code> + <code>FutureTask</code>). Почему нельзя <code>computeIfAbsent(key, fn)</code>? Вычисление под локом бакета блокирует другие ключи и запрещает рекурсивные обращения к кэшу. Для продакшена с вытеснением — Caffeine <code>AsyncLoadingCache</code>.</p>
+</div></details>
+
+<h3>Задача 4. Single-flight (схлопывание запросов)</h3>
+<p>Как Memoizer, но без постоянного кэша: пока запрос по ключу выполняется, новые вызовы присоединяются к нему; после завершения ключ освобождается.</p>
+<details class="q"><summary>Решение</summary><div class="a">
+<pre><code class="java">public final class SingleFlight&lt;K, V&gt; {
+    private final ConcurrentHashMap&lt;K, CompletableFuture&lt;V&gt;&gt; inFlight = new ConcurrentHashMap&lt;&gt;();
+
+    public CompletableFuture&lt;V&gt; execute(K key, Supplier&lt;V&gt; loader, Executor executor) {
+        CompletableFuture&lt;V&gt; mine = new CompletableFuture&lt;&gt;();
+        CompletableFuture&lt;V&gt; existing = inFlight.putIfAbsent(key, mine);
+        if (existing != null) return existing;                 // присоединились к идущему запросу
+
+        CompletableFuture.supplyAsync(loader, executor).whenComplete((v, ex) -&gt; {
+            inFlight.remove(key, mine);                        // сначала освобождаем ключ
+            if (ex != null) mine.completeExceptionally(ex); else mine.complete(v);
+        });
+        return mine;
+    }
+}</code></pre>
+<p>Применение: защита от «стада» (thundering herd) при протухании кэша — 1000 запросов за одним курсом превращаются в один вызов API.</p>
+</div></details>
+
+<h3>Задача 5. Потокобезопасный LRU-кэш</h3>
+<p>Ёмкость N, <code>get</code>/<code>put</code> из многих потоков.</p>
+<details class="q"><summary>Решение и обсуждение</summary><div class="a">
+<pre><code class="java">public final class LruCache&lt;K, V&gt; {
+    private final Map&lt;K, V&gt; map;
+    public LruCache(int capacity) {
+        this.map = new LinkedHashMap&lt;&gt;(16, 0.75f, true) {            // accessOrder = true
+            @Override protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; e) { return size() &gt; capacity; }
+        };
+    }
+    public synchronized V get(K k) { return map.get(k); }            // get МЕНЯЕТ порядок → тоже под локом
+    public synchronized void put(K k, V v) { map.put(k, v); }
+}</code></pre>
+<p>Ключевой момент: в LRU даже чтение — запись (перестановка в списке), поэтому ReadWriteLock не поможет. Узкое место — один лок. Масштабирование: шардирование на M независимых LRU по <code>hash(key) % M</code> (приблизительный LRU) или буферизация обращений и их пакетное применение — так делает Caffeine (W-TinyLFU + ring buffers).</p>
+</div></details>
+
+<h3>Задача 6. Переводы между счетами</h3>
+<p>Сервис переводов с in-memory счетами: без deadlock, без потери денег, инвариант «сумма всех балансов постоянна». Напишите стресс-тест, который это проверяет.</p>
+<details class="q"><summary>Ключевые элементы решения</summary><div class="a">
+<p>Порядок захвата локов по id (тема 11), проверка достаточности баланса внутри обоих локов, <code>BigDecimal</code> для сумм. Тест: 100 счетов, 16 потоков × 100 000 случайных переводов между случайными парами (включая обратные), старт через latch, <code>future.get</code> с таймаутом (таймаут = обнаруженный deadlock), в конце — сумма балансов равна начальной и нет отрицательных. Плюс <code>ThreadMXBean.findDeadlockedThreads()</code> в случае таймаута для диагностики.</p>
+</div></details>
+
+<h3>Задача 7. Параллельная агрегация с дедлайном</h3>
+<p>Запросить 5 провайдеров курсов параллельно, вернуть медиану ответивших за 200 мс, минимум 3 ответа, иначе ошибка.</p>
+<details class="q"><summary>Решение</summary><div class="a">
+<pre><code class="java">public BigDecimal medianRate(List&lt;RateProvider&gt; providers, String pair) {
+    List&lt;CompletableFuture&lt;BigDecimal&gt;&gt; calls = providers.stream()
+            .map(p -&gt; CompletableFuture.supplyAsync(() -&gt; p.rate(pair), io)
+                    .completeOnTimeout(null, 200, TimeUnit.MILLISECONDS)   // не успел — null
+                    .exceptionally(ex -&gt; null))                            // упал — null
+            .toList();
+
+    List&lt;BigDecimal&gt; ok = CompletableFuture.allOf(calls.toArray(CompletableFuture[]::new))
+            .thenApply(v -&gt; calls.stream().map(CompletableFuture::join).filter(Objects::nonNull).sorted().toList())
+            .join();
+
+    if (ok.size() &lt; 3) throw new IllegalStateException("quorum not reached: " + ok.size());
+    return ok.get(ok.size() / 2);
+}</code></pre>
+<p>Вариант с StructuredTaskScope (JDK 25 preview) — свой <code>Joiner</code>, который собирает успешные результаты, а <code>withTimeout</code> отменит оставшиеся подзадачи; не забудьте таймаут на самих HTTP-клиентах провайдеров.</p>
+</div></details>
+
+<h3>Задача 8. Найдите баги</h3>
+<pre class="bad-code"><code class="java">public class OrderProcessor {
+    private final ExecutorService pool = Executors.newFixedThreadPool(4);
+    private final Map&lt;Long, Order&gt; orders = new HashMap&lt;&gt;();
+    private boolean stopped;
+    private static final ThreadLocal&lt;User&gt; USER = new ThreadLocal&lt;&gt;();
+
+    public void submit(Order o, User u) {
+        pool.submit(() -&gt; {
+            USER.set(u);
+            if (!orders.containsKey(o.id())) orders.put(o.id(), o);
+            process(o);
+        });
+    }
+    public void stop() { stopped = true; pool.shutdown(); }
+    private void process(Order o) {
+        if (stopped) return;
+        synchronized (o) { o.setStatus(PROCESSED); notifyExternalSystem(o); }
+    }
+}</code></pre>
+<details class="q"><summary>Ответ: минимум 7 проблем</summary><div class="a">
+<ol>
+<li><code>HashMap</code> из 4 потоков — гонка, порча структуры. → <code>ConcurrentHashMap</code>.</li>
+<li><code>containsKey + put</code> — check-then-act. → <code>putIfAbsent</code>.</li>
+<li><code>stopped</code> без <code>volatile</code> — потоки пула могут не увидеть изменение.</li>
+<li><code>ThreadLocal</code> без <code>remove()</code> в пуле — следующий заказ на этом потоке увидит чужого пользователя.</li>
+<li><code>submit</code> без обработки результата — исключения из <code>process</code> потеряются молча.</li>
+<li><code>newFixedThreadPool</code> — неограниченная очередь, OOM под перегрузкой; потоки без имён.</li>
+<li>Вызов внешней системы под локом <code>o</code> (не open call) — лок держится на время сетевого вызова, риск deadlock; синхронизация на объекте, доступном снаружи.</li>
+<li>Бонус: <code>shutdown()</code> без <code>awaitTermination</code> — вызывающий не знает, когда обработка закончится.</li>
+</ol></div></details>
+
+<h2 id="sim"><span class="h-num">12.4</span>Экспресс-тест по всему курсу</h2>
+<p>Десять ситуаций из реального кода. Сначала ответьте сами, потом проверьте — в объяснении указана тема, где механизм разобран.</p>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Поток-воркер крутится в <code>while (!stopped) { … }</code>, поле <code>boolean stopped</code> без volatile. Главный поток ставит <code>stopped = true</code>. Что возможно?</p><ul><li>Воркер гарантированно остановится</li><li>Воркер может не остановиться никогда: нет happens-before, JIT вправе вынести чтение из цикла</li><li>Ошибка компиляции</li><li>IllegalStateException</li></ul><div class="why">Тема 02: видимость. Нужен volatile, AtomicBoolean или interrupt.</div></div>
+<div class="mcq" data-ok="2"><p><code>synchronized void inc()</code> и <code>static synchronized void reset()</code> в одном классе меняют одно статическое поле. Защищено ли оно?</p><ul><li>Да, оба метода synchronized</li><li>Да, если один экземпляр</li><li>Нет: первый блокирует монитор this, второй — монитор класса; это разные локи</li><li>Нет, static-поля нельзя синхронизировать</li></ul><div class="why">Тема 03: важно, какой именно объект служит монитором.</div></div>
+<div class="mcq" data-ok="0"><p><code>Executors.newFixedThreadPool(10)</code> под нагрузкой, превышающей производительность. Что произойдёт?</p><ul><li>Очередь LinkedBlockingQueue без лимита будет расти до OutOfMemoryError</li><li>Лишние задачи будут отклонены</li><li>Пул создаст новые потоки</li><li>Задачи выполнятся в вызывающем потоке</li></ul><div class="why">Тема 08: ограниченная очередь и политика отказа обязательны.</div></div>
+<div class="mcq" data-ok="3"><p><code>list.parallelStream().forEach(x -&gt; result.add(transform(x)))</code>, где result — ArrayList. Что не так?</p><ul><li>forEach не работает в параллельном стриме</li><li>Порядок элементов изменится, остальное верно</li><li>transform выполнится дважды</li><li>ArrayList не потокобезопасен: возможны потеря элементов, null в списке, ArrayIndexOutOfBoundsException</li></ul><div class="why">Темы 07, 13: используйте <code>.map(transform).toList()</code> — сборку результата делает сам стрим.</div></div>
+<div class="mcq" data-ok="1"><p>В пуле из 4 потоков задача отправляет подзадачу в тот же пул и ждёт <code>future.get()</code>. Четыре такие задачи выполняются одновременно. Итог?</p><ul><li>Подзадачи выполнятся в вызывающих потоках</li><li>Thread starvation deadlock: все потоки ждут подзадачи, которым негде выполняться</li><li>Пул вырастет до 8 потоков</li><li>RejectedExecutionException</li></ul><div class="why">Тема 11: зависимые задачи нельзя выполнять в одном ограниченном пуле.</div></div>
+<div class="mcq" data-ok="2"><p><code>map.put(key, map.getOrDefault(key, 0) + 1)</code> на ConcurrentHashMap из нескольких потоков.</p><ul><li>Корректный счётчик</li><li>ConcurrentModificationException</li><li>Потерянные обновления: два отдельных атомарных вызова не образуют атомарную операцию</li><li>Deadlock</li></ul><div class="why">Тема 07: нужен <code>merge(key, 1, Integer::sum)</code>.</div></div>
+<div class="mcq" data-ok="0"><p>Singleton с ленивой инициализацией через double-checked locking, поле instance не volatile. Риск?</p><ul><li>Другой поток может получить ссылку на не до конца сконструированный объект</li><li>Будет создано много экземпляров при каждом вызове</li><li>Deadlock</li><li>Никакого</li></ul><div class="why">Тема 02: публикация ссылки и инициализация полей могут быть переупорядочены.</div></div>
+<div class="mcq" data-ok="3"><p>Сервис на виртуальных потоках обращается к БД с пулом из 10 соединений, приходит 5000 одновременных запросов. Что будет узким местом?</p><ul><li>Число carrier-потоков</li><li>Память под стеки</li><li>Планировщик ForkJoinPool</li><li>Пул соединений: 4990 потоков ждут соединения, часть получит таймаут</li></ul><div class="why">Тема 10: потоки перестали быть ограничителем — ограничивать конкурентность нужно явно.</div></div>
+<div class="mcq" data-ok="1"><p><code>cf.thenApply(this::blockingCall)</code>, где cf завершается в потоке Netty event loop.</p><ul><li>blockingCall выполнится в commonPool</li><li>blockingCall выполнится в event loop и заблокирует его</li><li>blockingCall выполнится в вызывающем потоке всегда</li><li>Ошибка компиляции</li></ul><div class="why">Тема 09: не-Async колбэк выполняется в потоке, завершившем стадию.</div></div>
+<div class="mcq" data-ok="2"><p>ThreadLocal используется в задачах, выполняемых в пуле потоков, и не очищается. Последствия?</p><ul><li>Никаких</li><li>Значение сбрасывается после каждой задачи</li><li>Утечка памяти и «протекание» данных одной задачи в следующую на том же потоке</li><li>Deadlock</li></ul><div class="why">Тема 01: поток пула живёт долго; <code>remove()</code> в finally обязателен.</div></div>
+
+<h2 id="interview"><span class="h-num">12.5</span>Блиц: вопросы собеседования</h2>
+<div class="quiz">
+<details class="q"><summary>Чем отличаются synchronized и volatile?</summary><div class="a"><p>volatile — видимость и порядок для одной переменной, без взаимного исключения и атомарности составных операций. synchronized — взаимное исключение + видимость + порядок для всего, что сделано под одним монитором.</p></div></details>
+<details class="q"><summary>Что такое happens-before? Назовите 5 правил.</summary><div class="a"><p>Отношение, гарантирующее видимость: если W HB R, то R видит W. Program order, monitor unlock→lock, volatile write→read, Thread.start, join/termination, транзитивность (+ interrupt, final-поля, гарантии j.u.c).</p></div></details>
+<details class="q"><summary>Как работает ConcurrentHashMap и почему get не блокируется?</summary><div class="a"><p>CAS для пустого бакета, synchronized на голове бакета для остальных, деревья при коллизиях, кооперативный resize. get читает volatile-элементы таблицы и volatile поля узлов — запись под локом публикуется через них.</p></div></details>
+<details class="q"><summary>Как устроен ReentrantLock?</summary><div class="a"><p>На AQS: volatile int state (счётчик реентерабельных захватов), владелец, CLH-очередь узлов, парковка через LockSupport. Fair/unfair различаются проверкой очереди перед CAS (barging).</p></div></details>
+<details class="q"><summary>Алгоритм execute() в ThreadPoolExecutor?</summary><div class="a"><p>&lt; core → новый поток; иначе в очередь; очередь полна и &lt; max → новый поток; иначе RejectedExecutionHandler. Следствие: при неограниченной очереди max не работает.</p></div></details>
+<details class="q"><summary>wait vs sleep?</summary><div class="a"><p>wait — метод Object, только под монитором, отпускает этот монитор, просыпается по notify/таймауту/interrupt (или ложно), используется в цикле с условием. sleep — статический метод Thread, ничего не отпускает, только пауза.</p></div></details>
+<details class="q"><summary>Что такое CAS и проблема ABA?</summary><div class="a"><p>Атомарная инструкция «сравнить и заменить». ABA — значение вернулось к ожидаемому через промежуточные изменения, CAS этого не замечает. Лечится версией/штампом.</p></div></details>
+<details class="q"><summary>Когда LongAdder, когда AtomicLong?</summary><div class="a"><p>LongAdder — частые записи из многих потоков, редкое чтение суммы (метрики). AtomicLong — нужна точная атомарная операция с результатом (id) или CAS.</p></div></details>
+<details class="q"><summary>Что дают виртуальные потоки и чего не дают?</summary><div class="a"><p>Дешёвые потоки M:N на carrier'ах: высокая пропускная способность I/O-bound кода в блокирующем стиле. Не ускоряют CPU-задачи, не уменьшают латентность, не снимают лимиты внешних ресурсов; их не пулируют.</p></div></details>
+<details class="q"><summary>Как избежать deadlock?</summary><div class="a"><p>Глобальный порядок захвата локов, tryLock с таймаутом и откатом, open calls, меньше локов (неизменяемые снимки, один лок на инвариант), таймауты на всех ожиданиях.</p></div></details>
+<details class="q"><summary>Почему Double-Checked Locking без volatile сломан?</summary><div class="a"><p>Запись ссылки на объект может стать видимой другому потоку раньше записей полей в конструкторе (нет HB). Поток на первой проверке без синхронизации увидит не-null и полуинициализированный объект. volatile на поле даёт HB.</p></div></details>
+<details class="q"><summary>Как бы вы реализовали очередь задач с приоритетами и ограничением размера?</summary><div class="a"><p><code>PriorityBlockingQueue</code> неограниченна, поэтому: обернуть в Semaphore на ёмкость (acquire перед offer, release после take), или свой класс на ReentrantLock + PriorityQueue + два Condition (notFull/notEmpty) — по образцу BoundedBuffer.</p></div></details>
+</div>
+
+<h2 id="next"><span class="h-num">12.6</span>Что дальше</h2>
+<ol class="steps">
+  <li>Прочитайте исходники <code>ArrayBlockingQueue</code>, <code>ReentrantLock</code>, <code>FutureTask</code> — после этого курса они читаются как справочник.</li>
+  <li>Напишите все 8 задач без подсказок и прогоните стресс-тесты; для задачи 1 — jcstress-вариант.</li>
+  <li>Найдите в своём рабочем коде (Kafka-консьюмеры, планировщики, кэши) три места и разберите их по шести вопросам.</li>
+  <li>Попросите провести mock-собеседование по concurrency — в формате симуляции, как в этом проекте.</li>
+</ol>
+
+</div></main>
+</div>
+</body>
+</html>

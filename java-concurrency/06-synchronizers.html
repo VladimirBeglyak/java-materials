@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Синхронизаторы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ИНСТРУМЕНТЫ</div>
+  <h1>Синхронизаторы</h1>
+  <p class="lead">Готовые объекты, которые координируют потоки по <b>состоянию</b>, а не защищают данные: «подожди, пока N событий не произойдёт», «не больше K одновременно», «все дошли до точки — идём дальше».</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">CountDownLatch</span><span class="tag">Semaphore</span><span class="tag">CyclicBarrier</span><span class="tag">Phaser</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="overview"><span class="h-num">6.1</span>Карта выбора</h2>
+<div class="table-wrap"><table>
+<tr><th>Нужно</th><th>Инструмент</th><th>Переиспользуется</th><th>Кто ждёт</th></tr>
+<tr><td>Дождаться N событий (сервисы поднялись, задачи завершились)</td><td><code>CountDownLatch</code></td><td>нет, одноразовый</td><td>сторонние потоки ждут участников</td></tr>
+<tr><td>Ограничить число одновременных доступов к ресурсу</td><td><code>Semaphore</code></td><td>да</td><td>те, кому не хватило разрешений</td></tr>
+<tr><td>N потоков встречаются в точке, затем все идут дальше; повторять по фазам</td><td><code>CyclicBarrier</code></td><td>да, циклический</td><td>участники ждут друг друга</td></tr>
+<tr><td>То же, но число участников меняется на ходу</td><td><code>Phaser</code></td><td>да</td><td>гибко</td></tr>
+<tr><td>Два потока обмениваются объектами</td><td><code>Exchanger</code></td><td>да</td><td>пара</td></tr>
+<tr><td>Дождаться одного результата</td><td><code>CompletableFuture</code> (тема 09)</td><td>—</td><td>—</td></tr>
+</table></div>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 330" role="img" aria-label="Временные диаграммы Latch и Barrier">
+  <defs><marker id="f1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="20" y="24" font-weight="700">CountDownLatch(3)</text>
+  <text x="20" y="58" class="mono" font-size="12">W1</text><path d="M60 54 H170" class="ln-acc"/><circle cx="170" cy="54" r="5" fill="var(--accent)"/><text x="178" y="58" class="mono" font-size="11">countDown → 2, идёт дальше</text>
+  <text x="20" y="84" class="mono" font-size="12">W2</text><path d="M60 80 H250" class="ln-acc"/><circle cx="250" cy="80" r="5" fill="var(--accent)"/><text x="258" y="84" class="mono" font-size="11">→ 1</text>
+  <text x="20" y="110" class="mono" font-size="12">W3</text><path d="M60 106 H330" class="ln-acc"/><circle cx="330" cy="106" r="5" fill="var(--accent)"/><text x="338" y="110" class="mono" font-size="11">→ 0 открыто</text>
+  <text x="20" y="140" class="mono" font-size="12">main</text><path d="M60 136 H100" class="ln"/><path d="M100 136 H330" class="ln-dash"/><path d="M330 136 H420" class="ln"/><text x="102" y="130" class="mono muted" font-size="11">await() …</text>
+  <path d="M330 30 V150" stroke="var(--ok)" stroke-width="2" stroke-dasharray="4 3"/>
+
+  <text x="20" y="194" font-weight="700">CyclicBarrier(3)</text>
+  <text x="20" y="228" class="mono" font-size="12">T1</text><path d="M60 224 H150" class="ln"/><path d="M150 224 H300" class="ln-dash"/><path d="M300 224 H420" class="ln"/><path d="M420 224 H520" class="ln-dash"/><path d="M520 224 H620" class="ln"/>
+  <text x="20" y="256" class="mono" font-size="12">T2</text><path d="M60 252 H230" class="ln"/><path d="M230 252 H300" class="ln-dash"/><path d="M300 252 H470" class="ln"/><path d="M470 252 H520" class="ln-dash"/><path d="M520 252 H620" class="ln"/>
+  <text x="20" y="284" class="mono" font-size="12">T3</text><path d="M60 280 H300" class="ln"/><path d="M300 280 H520" class="ln"/><path d="M520 280 H620" class="ln"/>
+  <path d="M300 205 V295" stroke="var(--ok)" stroke-width="2" stroke-dasharray="4 3"/><text x="300" y="315" text-anchor="middle" font-size="12">фаза 0 → barrierAction</text>
+  <path d="M520 205 V295" stroke="var(--ok)" stroke-width="2" stroke-dasharray="4 3"/><text x="520" y="315" text-anchor="middle" font-size="12">фаза 1</text>
+  <text x="640" y="228" font-size="12" class="muted">пунктир — ожидание</text>
+</svg>
+<figcaption>Latch: участники не ждут, ждёт наблюдатель. Barrier: участники ждут друг друга, и барьер «взводится» снова.</figcaption>
+</figure>
+
+<h2 id="latch"><span class="h-num">6.2</span>CountDownLatch</h2>
+<pre data-title="Параллельный старт и ожидание завершения — шаблон для нагрузочных тестов"><code class="java">public static long timeTasks(int nThreads, Runnable task) throws InterruptedException {
+    CountDownLatch startGate = new CountDownLatch(1);
+    CountDownLatch endGate = new CountDownLatch(nThreads);
+
+    for (int i = 0; i &lt; nThreads; i++) {
+        Thread.ofPlatform().start(() -&gt; {
+            try {
+                startGate.await();          // все ждут одного сигнала — максимальная конкуренция
+                try { task.run(); }
+                finally { endGate.countDown(); }  // в finally: иначе при исключении await зависнет
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+    }
+    long start = System.nanoTime();
+    startGate.countDown();                  // «марш!»
+    endGate.await();                        // ждём всех
+    return System.nanoTime() - start;
+}</code></pre>
+<ul>
+  <li><code>countDown()</code> HB возврата из <code>await()</code> — результаты участников видны.</li>
+  <li><code>await(timeout, unit)</code> возвращает <code>false</code> по таймауту — используйте в продакшене, бесконечное ожидание опасно.</li>
+  <li>Счётчик нельзя увеличить или сбросить. Нужен сброс — <code>CyclicBarrier</code>/<code>Phaser</code>.</li>
+</ul>
+
+<h2 id="semaphore"><span class="h-num">6.3</span>Semaphore</h2>
+<p>Набор из N разрешений. <code>acquire()</code> берёт одно (ждёт, если нет), <code>release()</code> возвращает. Разрешения не привязаны к потоку: вернуть может другой поток. Semaphore(1) — мьютекс без владельца и без реентерабельности.</p>
+<pre data-title="Bulkhead: не больше 10 одновременных вызовов внешнего платёжного API" class="good-code"><code class="java">public final class PaymentGatewayClient {
+    private final Semaphore permits = new Semaphore(10);
+    private final HttpClient http;
+
+    public PaymentGatewayClient(HttpClient http) { this.http = http; }
+
+    public Response pay(Request req) throws InterruptedException, TimeoutException {
+        if (!permits.tryAcquire(200, TimeUnit.MILLISECONDS)) {
+            throw new TimeoutException("bulkhead full");   // быстрый отказ вместо очереди без конца
+        }
+        try {
+            return http.send(req);
+        } finally {
+            permits.release();                              // строго в finally
+        }
+    }
+}</code></pre>
+<div class="callout warn"><span class="c-title">Типичные ошибки</span>
+<ul style="margin:6px 0 0">
+<li><code>release()</code> без парного <code>acquire()</code> <b>увеличивает</b> число разрешений сверх начального — лимит тихо «расползается».</li>
+<li>Semaphore ограничивает <b>конкурентность</b>, а не <b>частоту</b> (RPS). Для RPS нужен rate limiter (токен-бакет, sliding window — задача в теме 12; в продакшене — Resilience4j <code>RateLimiter</code>/<code>Bulkhead</code>).</li>
+</ul></div>
+
+<h2 id="barrier"><span class="h-num">6.4</span>CyclicBarrier</h2>
+<pre data-title="Итеративный расчёт по частям"><code class="java">static volatile boolean stop;              // поле класса: лямбды читают актуальное значение
+
+int parts = Runtime.getRuntime().availableProcessors();
+double[][] grid = initGrid();
+CyclicBarrier barrier = new CyclicBarrier(parts, () -&gt; {
+    // barrierAction: выполняет последний пришедший поток, пока остальные ждут
+    swapBuffers();
+    if (converged()) stop = true;
+});
+
+for (int p = 0; p &lt; parts; p++) {
+    int part = p;
+    Thread.ofPlatform().start(() -&gt; {
+        try {
+            while (!stop) {
+                computePart(grid, part);   // каждый считает свою полосу
+                barrier.await();           // ждём остальных перед следующей итерацией
+            }
+        } catch (InterruptedException | BrokenBarrierException e) {
+            // если один участник прервался/упал, барьер «ломается» для всех
+        }
+    });
+}</code></pre>
+<p><b>BrokenBarrierException</b>: если любой участник прерван, получил таймаут или barrierAction бросил исключение, барьер переходит в сломанное состояние, и все ожидающие сразу получают исключение. Это защищает от вечного ожидания «пропавшего» участника. <code>reset()</code> чинит барьер.</p>
+
+<h2 id="phaser"><span class="h-num">6.5</span>Phaser</h2>
+<p>Обобщение латча и барьера: участники регистрируются и уходят динамически, фазы нумеруются, можно переопределить <code>onAdvance</code> для завершения.</p>
+<pre><code class="java">Phaser phaser = new Phaser(1);              // 1 = координатор (main)
+for (Task t : tasks) {
+    phaser.register();                      // +1 участник
+    executor.submit(() -&gt; {
+        t.stage1();
+        phaser.arriveAndAwaitAdvance();     // барьер фазы 0
+        t.stage2();
+        phaser.arriveAndDeregister();       // ушёл, больше не ждём его
+    });
+}
+phaser.arriveAndAwaitAdvance();            // main ждёт конца фазы 0
+phaser.arriveAndDeregister();              // main больше не участвует</code></pre>
+<p>На практике Phaser встречается редко; на собеседовании достаточно объяснить, чем он отличается от CyclicBarrier (динамический состав, номер фазы, иерархия phaser'ов для снижения конкуренции).</p>
+
+<h2 id="exchanger"><span class="h-num">6.6</span>Exchanger</h2>
+<p>Точка встречи двух потоков: каждый отдаёт объект и получает объект партнёра. Классика — двойная буферизация: producer заполняет буфер, consumer опустошает, затем меняются.</p>
+<pre><code class="java">Exchanger&lt;ByteBuffer&gt; ex = new Exchanger&lt;&gt;();
+// producer:  full = fill(buf); buf = ex.exchange(full);   // отдал полный, получил пустой
+// consumer:  empty = drain(buf); buf = ex.exchange(empty);</code></pre>
+
+<h2 id="sim"><span class="h-num">6.7</span>Интерактив: выбор синхронизатора и Semaphore в действии</h2>
+<div class="widget" id="syPick">
+  <div class="widget-title">Какой синхронизатор подходит</div>
+  <div class="controls"><label>задача<select id="syCase" style="max-width:100%">
+    <option value="latchStart">Запустить 10 потоков нагрузочного теста строго одновременно</option>
+    <option value="latchWait">Главный поток ждёт, пока 5 сервисов завершат инициализацию</option>
+    <option value="sem">Не более 20 одновременных запросов к внешнему API</option>
+    <option value="barrier">4 потока считают части матрицы итерациями; следующая итерация — когда все закончили текущую</option>
+    <option value="phaser">Число участников меняется от фазы к фазе</option>
+    <option value="exch">Два потока обмениваются буферами: один заполняет, другой опустошает</option>
+    <option value="mutex">Только один поток в критической секции, нужен повторный вход</option>
+    <option value="future">Дождаться результата одной асинхронной задачи</option>
+  </select></label></div>
+  <div class="verdict ok" id="syOut"></div>
+</div>
+<div class="widget" id="smW">
+  <div class="widget-title">Симулятор Semaphore(3)</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="acq">новый поток: acquire()</button>
+    <button class="btn" type="button" data-a="try">новый поток: tryAcquire()</button>
+    <button class="btn" type="button" data-a="rel">работающий поток: release()</button>
+    <button class="btn" type="button" data-a="leak">работающий поток упал до release()</button>
+    <button class="btn" type="button" data-a="extra">release() без acquire()</button>
+  </div>
+  <div class="lanes">
+    <div class="lane"><h5>Разрешения</h5><div class="items" id="smP"></div></div>
+    <div class="lane"><h5>Работают</h5><div class="items" id="smRun"></div></div>
+    <div class="lane"><h5>Ждут в очереди</h5><div class="items" id="smQ"></div></div>
+  </div>
+  <div class="log" id="smLog"></div>
+</div>
+<script>
+(function () {
+  var A = {
+    latchStart: "CountDownLatch(1) как стартовый пистолет: все потоки ждут startGate.await(), главный вызывает countDown() — все стартуют разом.",
+    latchWait: "CountDownLatch(5): каждый сервис в finally вызывает countDown(), главный поток — await(timeout). Одноразовый: сбросить счётчик нельзя.",
+    sem: "Semaphore(20): acquire() перед вызовом, release() в finally. Ограничивает конкурентность, а не частоту (для частоты — rate limiter). С виртуальными потоками — основной способ беречь ресурс вместо размера пула.",
+    barrier: "CyclicBarrier(4, mergeAction): каждый поток вызывает await() в конце итерации; когда пришли все четверо, выполняется действие барьера и все продолжают. Переиспользуется; если один поток упал — остальные получают BrokenBarrierException.",
+    phaser: "Phaser: register()/arriveAndDeregister() позволяют участникам присоединяться и выходить; arriveAndAwaitAdvance() — аналог барьера. Самый гибкий и самый сложный — берите только когда латча и барьера не хватает.",
+    exch: "Exchanger<Buffer>: exchange(buf) блокирует поток до прихода партнёра и возвращает его объект. Редкий инструмент; чаще ту же задачу решает BlockingQueue.",
+    mutex: "Это не синхронизатор-координатор, а блокировка: synchronized или ReentrantLock. Semaphore(1) — не замена: он не реентерабелен и не знает владельца (release может вызвать любой поток).",
+    future: "CompletableFuture / Future.get(). Синхронизаторы — для координации групп потоков, результат одной задачи удобнее получать через future."
+  };
+  var s = document.getElementById("syCase"), o = document.getElementById("syOut");
+  function run() { o.textContent = A[s.value]; } s.addEventListener("change", run); run();
+
+  var permits = 3, running = [], queue = [], id = 0, log = ["new Semaphore(3)"];
+  var $ = function (i) { return document.getElementById(i); };
+  function act(a) {
+    if (a === "acq") { var t = "T" + (++id); if (permits > 0) { permits--; running.push(t); log.unshift(t + ".acquire(): разрешение получено, осталось " + permits); } else { queue.push(t); log.unshift(t + ".acquire(): разрешений нет → поток припаркован в очереди AQS"); } }
+    else if (a === "try") { var t2 = "T" + (++id); if (permits > 0) { permits--; running.push(t2); log.unshift(t2 + ".tryAcquire(): true"); } else log.unshift(t2 + ".tryAcquire(): false — поток не ждёт: можно сразу вернуть 429 / fallback"); }
+    else if (a === "rel") { if (!running.length) { log.unshift("нет работающих потоков"); } else { var r = running.shift(); permits++; log.unshift(r + ".release(): разрешений " + permits); if (queue.length) { var w = queue.shift(); permits--; running.push(w); log.unshift("  " + w + " разбужен и получил разрешение"); } } }
+    else if (a === "leak") { if (running.length) { var d = running.shift(); log.unshift(d + " бросил исключение, release() не в finally → разрешение потеряно НАВСЕГДА. Эффективная ёмкость теперь " + (permits + running.length) + " из 3."); } }
+    else if (a === "extra") { permits++; log.unshift("release() без acquire(): разрешений стало " + permits + " — семафор не проверяет владельца, лимит незаметно вырос."); if (queue.length) { var w2 = queue.shift(); permits--; running.push(w2); } }
+    render();
+  }
+  function render() {
+    $("smP").innerHTML = '<span class="chip ' + (permits ? "ok" : "bad") + '">свободно ' + permits + "</span>";
+    $("smRun").innerHTML = running.map(function (t) { return '<span class="chip acc">' + t + "</span>"; }).join("") || '<span class="chip">—</span>';
+    $("smQ").innerHTML = queue.map(function (t) { return '<span class="chip warn">' + t + "</span>"; }).join("") || '<span class="chip">—</span>';
+    $("smLog").textContent = log.slice(0, 9).join("\n");
+  }
+  document.querySelectorAll("#smW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  render();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">6.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем CountDownLatch отличается от CyclicBarrier?</p><ul><li>Ничем</li><li>Latch одноразовый: одни потоки ждут, другие уменьшают счётчик; Barrier переиспользуемый: потоки ждут друг друга в общей точке</li><li>Barrier одноразовый</li><li>Latch работает только с двумя потоками</li></ul><div class="why">Latch — «дождаться N событий», Barrier — «собраться всем вместе и пойти дальше», повторяемо.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли использовать Semaphore(1) как замену ReentrantLock?</p><ul><li>Да, полностью</li><li>Нет, он не блокирует</li><li>С оговорками: он не реентерабелен (повторный acquire того же потока зависнет) и release может вызвать не владелец</li><li>Да, он быстрее</li></ul><div class="why">Бинарный семафор — не мьютекс с владельцем.</div></div>
+<div class="mcq" data-ok="0"><p>Поток вызвал latch.await() без таймаута, а один из рабочих потоков упал, не вызвав countDown(). Что будет?</p><ul><li>Ожидающий поток зависнет навсегда</li><li>await() бросит исключение</li><li>Счётчик уменьшится автоматически</li><li>JVM завершится</li></ul><div class="why">countDown() — всегда в finally, await — с таймаутом.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем CountDownLatch принципиально отличается от CyclicBarrier?</summary><div class="a"><p>Latch одноразовый, и те, кто вызывает <code>countDown</code>, не ждут — ждут наблюдатели в <code>await</code>. Barrier многоразовый, его участники сами ждут друг друга в <code>await</code>; есть barrierAction и «поломка» при сбое любого участника.</p></div></details>
+<details class="q"><summary>Почему countDown() надо ставить в finally?</summary><div class="a"><p>Если задача бросит исключение, счётчик не уменьшится, и <code>await()</code> без таймаута зависнет навсегда. В <code>finally</code> счётчик уменьшается в любом случае; об ошибке нужно сообщить отдельно (сохранить исключение в общую коллекцию или использовать CompletableFuture).</p></div></details>
+<details class="q"><summary>Чем Semaphore(1) отличается от ReentrantLock?</summary><div class="a"><p>У семафора нет владельца: <code>release</code> может вызвать любой поток, повторный <code>acquire</code> тем же потоком заблокирует его (не реентерабелен), нет <code>Condition</code>. Зато подходит для сценариев «взял в одном потоке, отпустил в другом» (например, в колбэке асинхронного вызова).</p></div></details>
+<details class="q"><summary>Нужно не более 100 запросов в секунду к API. Подойдёт ли Semaphore(100)?</summary><div class="a"><p>Нет. Он ограничит число <b>одновременных</b> запросов. Если запрос длится 10 мс, через 100 разрешений пройдёт до 10 000 запросов в секунду. Нужен rate limiter: токен-бакет или скользящее окно с временными метками.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

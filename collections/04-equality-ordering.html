@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · equals, hashCode, Comparable, Comparator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ОСНОВЫ</div>
+  <h1>equals, hashCode, Comparable, Comparator</h1>
+  <p class="lead">Коллекции ничего не знают о ваших объектах — они полагаются на три контракта: <code>equals</code> (равенство), <code>hashCode</code> (быстрый отбор кандидатов) и сравнение (<code>compareTo</code>/<code>Comparator</code>). Нарушение любого из них не даёт ошибку компиляции, а тихо ломает поиск. Лаборатория ошибок покажет, что происходит с HashMap при неверных ключах, а конструктор компараторов — как собирать сортировку по нескольким полям.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">контракт equals/hashCode</span><span class="tag">изменяемые ключи</span><span class="tag">consistent with equals</span><span class="tag">Comparator API</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="contract"><span class="h-num">4.1</span>Контракты</h2>
+<div class="grid-2">
+  <div class="card"><h4>equals</h4><ul><li>рефлексивность: <code>x.equals(x)</code></li><li>симметричность: x = y ⇔ y = x</li><li>транзитивность</li><li>согласованность: результат не меняется, пока не меняются поля</li><li><code>x.equals(null) == false</code></li></ul></div>
+  <div class="card"><h4>hashCode</h4><ul><li>равные объекты — <b>обязательно</b> равные хэши</li><li>неравные — желательно разные (иначе коллизии и деградация до O(n) или O(log n))</li><li>не меняется, пока не меняются поля, участвующие в equals</li></ul></div>
+</div>
+<p>Как HashMap ищет ключ: вычисляет <code>hashCode()</code> → выбирает корзину → в ней сравнивает сначала хэши, потом ссылки (<code>==</code>), потом <code>equals</code>. Если хэш «не тот», до equals дело не дойдёт вовсе.</p>
+
+<h2 id="lab"><span class="h-num">4.2</span>Лаборатория ошибок ключей</h2>
+<div class="widget" id="kbW">
+  <div class="widget-title">class Point { int x, y; } как ключ HashMap</div>
+  <div class="controls"><label>реализация<select id="kbS" class="wide">
+    <option value="none">не переопределены ни equals, ни hashCode</option>
+    <option value="eq">переопределён только equals</option>
+    <option value="hc">переопределён только hashCode</option>
+    <option value="both">оба (record Point(int x, int y))</option>
+    <option value="mut">оба, но ключ изменили после put</option>
+    <option value="const">hashCode() { return 42; }</option>
+  </select></label></div>
+  <pre style="margin:0"><code class="java" id="kbC"></code></pre>
+  <div class="out" id="kbOut"></div>
+  <div class="verdict" id="kbV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    none: ["map.put(new Point(1, 2), \"A\");\nmap.get(new Point(1, 2));", "hashCode: identity (разные объекты — разные хэши, почти наверняка)\n→ ищем в другой корзине\nget → null;  size после второго put(new Point(1,2)) = 2", "bad", "Без переопределения равенство — это идентичность объекта. Логически равный ключ не найдётся, и в Set окажутся «дубликаты»."],
+    eq: ["// equals сравнивает x и y, hashCode — от Object\nmap.put(new Point(1, 2), \"A\");\nmap.get(new Point(1, 2));", "хэши разных объектов разные → разные корзины\nequals даже не вызывается\nget → null (почти всегда; иногда случайно попадёт в ту же корзину — и найдётся!)", "bad", "Самая коварная ошибка: результат зависит от случайных identity-хэшей и размера таблицы. Нарушен контракт «равные объекты — равные хэши». IDE и records генерируют пару вместе."],
+    hc: ["// hashCode = 31*x + y, equals от Object (==)\nmap.put(new Point(1, 2), \"A\");\nmap.get(new Point(1, 2));", "та же корзина, хэши равны\nсравнение: == ложно, equals (==) ложно\nget → null", "bad", "Корзина правильная, но равенство — по ссылке. Тоже дубликаты в Set."],
+    both: ["record Point(int x, int y) {}   // equals и hashCode по компонентам\nmap.put(new Point(1, 2), \"A\");\nmap.get(new Point(1, 2));", "hash(Point(1,2)) = hash(Point(1,2)) → та же корзина\nequals → true\nget → \"A\"", "ok", "Контракт соблюдён. Records, Lombok @EqualsAndHashCode, Objects.hash(x, y) — простые способы."],
+    mut: ["Point p = new Point(1, 2);    // изменяемый класс с полями x, y\nmap.put(p, \"A\");\np.x = 5;                       // ключ изменён внутри карты!\nmap.get(p);  map.get(new Point(1, 2));  map.containsKey(p);", "запись лежит в корзине hash(1,2)\nget(p): hash(5,2) → другая корзина → null\nget(new Point(1,2)): корзина та, но equals((1,2),(5,2)) = false → null\nзапись недостижима, но занимает память; при обходе entrySet она видна", "bad", "Изменение полей, участвующих в equals/hashCode, после помещения в HashMap/HashSet делает элемент «потерянным». Ключи должны быть неизменяемыми (records, String, Integer)."],
+    "const": ["@Override public int hashCode() { return 42; }   // «правильно», но плохо\nfor (i in 0..100_000) map.put(new Point(i, i), i);", "все ключи в одной корзине\nс 8 элементов корзина становится красно-чёрным деревом (если ключи Comparable) — O(log n)\nиначе — список, поиск O(n): 100 000 put ≈ 5·10⁹ сравнений", "warn", "Контракт формально соблюдён — карта работает правильно, но производительность деградирует. Хэш должен зависеть от тех же полей, что и equals."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("kbS").value]; $("kbC").textContent = d[0]; $("kbOut").textContent = d[1]; $("kbV").className = "verdict " + d[2]; $("kbV").textContent = d[3]; }
+  $("kbS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="consistent"><span class="h-num">4.3</span>Сравнение, согласованное с equals</h2>
+<p>TreeMap и TreeSet вообще не вызывают <code>equals</code> — ключи равны, если <code>compare(a, b) == 0</code>. Если порядок «не согласован с equals», одна и та же пара объектов будет разной для HashSet и TreeSet.</p>
+<pre data-title="классический пример: BigDecimal"><code class="java">var a = new BigDecimal("1.0"); var b = new BigDecimal("1.00");
+a.equals(b);          // false — учитывается масштаб (scale)
+a.compareTo(b);       // 0     — численно равны
+new HashSet&lt;&gt;(List.of(a, b)).size();   // 2
+new TreeSet&lt;&gt;(List.of(a, b)).size();   // 1
+
+var names = new TreeSet&lt;String&gt;(String.CASE_INSENSITIVE_ORDER);
+names.addAll(List.of("Anna", "anna", "ANNA"));   // [Anna] — остальные «дубликаты» по компаратору</code></pre>
+
+<h2 id="comparator"><span class="h-num">4.4</span>Comparator: сборка из частей</h2>
+<div class="widget" id="cpW">
+  <div class="widget-title">Конструктор компаратора</div>
+  <div class="controls">
+    <label>сначала по<select id="cp1"><option value="dept">отделу</option><option value="salary">зарплате</option><option value="name">имени</option><option value="age">возрасту</option></select></label>
+    <label>порядок<select id="cp1r"><option value="asc">по возрастанию</option><option value="desc">по убыванию</option></select></label>
+    <label>затем по<select id="cp2"><option value="none">—</option><option value="salary" selected>зарплате</option><option value="name">имени</option><option value="age">возрасту</option></select></label>
+    <label>порядок<select id="cp2r"><option value="asc">по возрастанию</option><option value="desc" selected>по убыванию</option></select></label>
+    <label>null в отделе<select id="cpN"><option value="last">в конце (nullsLast)</option><option value="first">в начале (nullsFirst)</option></select></label>
+  </div>
+  <pre style="margin:0"><code class="java" id="cpC"></code></pre>
+  <div class="table-wrap"><table id="cpT"></table></div>
+</div>
+<script>
+(function () {
+  var P = [["Анна", "IT", 3200, 29], ["Борис", "Sales", 2100, 41], ["Вера", "IT", 4100, 35], ["Глеб", null, 1800, 23], ["Дина", "Sales", 2600, 31], ["Егор", "IT", 3200, 27], ["Жанна", "HR", 2300, 38]];
+  var F = { name: [0, "Employee::name", "comparing"], dept: [1, "Employee::dept", "comparing"], salary: [2, "Employee::salary", "comparingInt"], age: [3, "Employee::age", "comparingInt"] };
+  var $ = function (i) { return document.getElementById(i); };
+  function cmpField(f, rev, nl) {
+    var i = F[f][0];
+    return function (a, b) { var x = a[i], y = b[i], r;
+      if (x === null || y === null) { r = x === y ? 0 : x === null ? (nl === "first" ? -1 : 1) : (nl === "first" ? 1 : -1); return r; }
+      r = typeof x === "number" ? x - y : x.localeCompare(y, "ru"); return rev ? -r : r; };
+  }
+  function code(f, rev, nl, first) {
+    var ref = F[f][1], isInt = F[f][2] === "comparingInt";
+    if (f === "dept") return (first ? "Comparator.comparing(" : ".thenComparing(") + ref + ", " + (nl === "first" ? "nullsFirst" : "nullsLast") + "(" + (rev ? "reverseOrder()" : "naturalOrder()") + "))";
+    if (first) return "Comparator." + F[f][2] + "(" + ref + ")" + (rev ? ".reversed()" : "");
+    if (rev) return ".thenComparing(" + ref + ", reverseOrder())";
+    return (isInt ? ".thenComparingInt(" : ".thenComparing(") + ref + ")";
+  }
+  function run() {
+    var f1 = $("cp1").value, r1 = $("cp1r").value === "desc", f2 = $("cp2").value, r2 = $("cp2r").value === "desc", nl = $("cpN").value;
+    var c1 = cmpField(f1, r1, nl), c2 = f2 === "none" ? null : cmpField(f2, r2, nl);
+    var s = P.slice().sort(function (a, b) { var r = c1(a, b); return r || (c2 ? c2(a, b) : 0); });
+    $("cpC").textContent = "Comparator<Employee> cmp = " + code(f1, r1, nl, true) + (c2 ? "\n        " + code(f2, r2, nl, false) : "") + ";\nlist.sort(cmp);   // TimSort стабильна: равные по ключам сохраняют исходный порядок";
+    $("cpT").innerHTML = "<tr><th>Имя</th><th>Отдел</th><th>Зарплата</th><th>Возраст</th></tr>" + s.map(function (p) { return "<tr><td>" + p[0] + "</td><td>" + (p[1] === null ? "<i>null</i>" : p[1]) + "</td><td>" + p[2] + "</td><td>" + p[3] + "</td></tr>"; }).join("");
+  }
+  ["cp1", "cp1r", "cp2", "cp2r", "cpN"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout bad"><span class="c-title">Компаратор через вычитание</span>
+<code>(a, b) -&gt; a.age - b.age</code> ломается на больших числах: <code>Integer.MIN_VALUE - 1</code> переполняется и меняет знак — сортировка становится некорректной, а TimSort может бросить <code>IllegalArgumentException: Comparison method violates its general contract!</code>. Используйте <code>Integer.compare</code> или <code>Comparator.comparingInt</code>.
+</div>
+
+<h2 id="quiz"><span class="h-num">4.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Переопределили только equals. Что с HashSet?</p><ul><li>Работает правильно</li><li>Равные объекты почти всегда попадают в разные корзины — дубликаты и «ненаходимые» элементы</li><li>Ошибка компиляции</li><li>ClassCastException</li></ul><div class="why">Равные объекты обязаны иметь равные хэши.</div></div>
+<div class="mcq" data-ok="3"><p>Сколько элементов в <code>new TreeSet&lt;&gt;(List.of(new BigDecimal("2.0"), new BigDecimal("2.00")))</code>?</p><ul><li>2</li><li>0</li><li>Исключение</li><li>1 — TreeSet считает равными элементы с compareTo == 0</li></ul><div class="why">У HashSet — 2, так как equals учитывает масштаб.</div></div>
+<div class="mcq" data-ok="0"><p>Почему ключ HashMap не должен меняться после put?</p><ul><li>Запись остаётся в корзине по старому хэшу и перестаёт находиться и по новому, и по старому ключу</li><li>Карта бросит исключение</li><li>Ключ скопируется</li><li>Ничего страшного</li></ul><div class="why">Используйте неизменяемые ключи.</div></div>
+<div class="mcq" data-ok="2"><p>Чем плох компаратор <code>(a, b) -&gt; a.id - b.id</code>?</p><ul><li>Он медленный</li><li>Он не стабилен</li><li>Переполнение int при больших разностях меняет знак — некорректный порядок и возможное исключение TimSort</li><li>Ничем</li></ul><div class="why">Integer.compare(a.id, b.id).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как правильно реализовать equals в иерархии классов?</summary><div class="a"><p>Проблема: equals между родителем и наследником с дополнительным полем нарушает симметричность или транзитивность. Варианты: сравнивать getClass() (наследники не равны родителю), делать классы final или использовать композицию вместо наследования; records — final по определению. instanceof-equals допустим, если наследники не добавляют полей, участвующих в равенстве.</p></div></details>
+<details class="q"><summary>Что значит «comparison method violates its general contract»?</summary><div class="a"><p>TimSort обнаружил нарушение контракта компаратора: несимметричность (sgn(compare(a,b)) ≠ −sgn(compare(b,a))), нетранзитивность или непостоянство (компаратор зависит от изменяемого состояния, случайности, текущего времени). Частые причины: вычитание с переполнением, сравнение double через вычитание с NaN, компаратор с особыми случаями для null только с одной стороны.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

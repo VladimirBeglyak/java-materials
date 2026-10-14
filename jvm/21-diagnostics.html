@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Диагностика: jcmd, JFR, дампы, профилировщики</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+#fgSvg { width: 100%; display: block; margin: 8px 0; cursor: pointer; }
+#fgSvg rect { stroke: var(--bg); stroke-width: 1; }
+#fgSvg text { font: 11px var(--font-mono); fill: #1d1f24; pointer-events: none; }
+</style>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>Диагностика: jcmd, JFR, дампы, профилировщики</h1>
+  <p class="lead">JVM — одна из самых наблюдаемых сред исполнения: в каждый JDK встроены швейцарский нож <code>jcmd</code>, бортовой самописец Java Flight Recorder с накладными расходами около 1%, дампы потоков и кучи. Разбираем, какой инструмент отвечает на какой вопрос, как читать дамп потоков и флеймграф, и пошагово расследуем классические инциденты: «процесс ест 100% CPU», «всё зависло», «медленно, но непонятно где».</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">jcmd</span><span class="tag">JFR и JMC</span><span class="tag">дамп потоков</span><span class="tag">async-profiler</span><span class="tag">флеймграф</span><span class="tag">расследования</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="tools"><span class="h-num">21.1</span>Инструменты и вопросы</h2>
+<div class="widget" id="tqW">
+  <div class="widget-title">Что запустить, чтобы ответить на вопрос</div>
+  <div class="controls"><label>вопрос<select id="tqQ" class="wide">
+    <option value="cpu">Какой код ест CPU?</option>
+    <option value="hang">Почему запросы зависли?</option>
+    <option value="mem">Что занимает кучу?</option>
+    <option value="alloc">Кто создаёт столько мусора?</option>
+    <option value="lock">Где потоки ждут блокировок?</option>
+    <option value="flags">С какими флагами и настройками работает процесс?</option>
+    <option value="native">Почему RSS больше кучи?</option>
+    <option value="io">Где время уходит на ожидание I/O и сети?</option>
+  </select></label></div>
+  <pre style="margin:0"><code class="txt" id="tqC"></code></pre>
+  <div class="verdict" id="tqV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    cpu: ["asprof -e cpu -d 30 -f cpu.html &lt;pid&gt;\njcmd &lt;pid&gt; JFR.start duration=60s filename=rec.jfr settings=profile", "Сэмплирующий профилировщик (async-profiler или JFR Method Profiling). Флеймграф покажет самые широкие стеки. async-profiler видит и нативный код, JIT-компиляцию, GC."],
+    hang: ["jcmd &lt;pid&gt; Thread.print -l &gt; t1.txt   # трижды с интервалом 5–10 с\njcmd &lt;pid&gt; Thread.dump_to_file -format=json t.json   # с виртуальными потоками", "Несколько дампов потоков: что не меняется между снимками — то и висит. Ищите BLOCKED-цепочки, deadlock (выводится в конце дампа), ожидание пула соединений, сокетов без таймаута."],
+    mem: ["jcmd &lt;pid&gt; GC.class_histogram | head -30\njcmd &lt;pid&gt; GC.heap_dump /tmp/heap.hprof   # пауза! место на диске ≈ куча", "Гистограмма — быстро и почти без пауз (с :live — полная сборка); дамп — полная картина для MAT (тема 14)."],
+    alloc: ["asprof -e alloc -d 30 -f alloc.html &lt;pid&gt;\n# JFR: событие jdk.ObjectAllocationSample (в профиле profile)", "Профиль аллокаций по стекам: где создаются объекты и сколько байт."],
+    lock: ["asprof -e lock -d 30 -f lock.html &lt;pid&gt;\n# JFR: jdk.JavaMonitorEnter, jdk.ThreadPark", "Профиль конкуренции за блокировки: какие мониторы и ReentrantLock чаще всего ждут."],
+    flags: ["jcmd &lt;pid&gt; VM.flags -all | grep ':='\njcmd &lt;pid&gt; VM.system_properties\njcmd &lt;pid&gt; VM.command_line\njcmd &lt;pid&gt; VM.info", "Реальные значения после эргономики, свойства, аргументы, версия и общее состояние JVM."],
+    "native": ["jcmd &lt;pid&gt; VM.native_memory summary scale=MB   # нужен -XX:NativeMemoryTracking=summary\npmap -x &lt;pid&gt; | sort -k3 -n | tail", "NMT по областям JVM и сравнение с RSS ОС (тема 09)."],
+    io: ["asprof -e wall -t -d 30 -f wall.html &lt;pid&gt;\n# JFR: jdk.SocketRead, jdk.FileRead, jdk.JavaMonitorWait", "Профиль по реальному времени (wall clock) показывает и ожидание: блокирующие вызовы сети, БД, sleep. CPU-профиль ожидание не видит."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("tqQ").value]; $("tqC").innerHTML = d[0]; $("tqV").textContent = d[1]; }
+  $("tqQ").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">jcmd вместо зоопарка</span>
+<code>jstack</code>, <code>jmap</code>, <code>jinfo</code> — старые инструменты; <code>jcmd &lt;pid&gt; help</code> покрывает всё через Attach API. В контейнере запускайте jcmd от того же пользователя внутри того же контейнера (или <code>kubectl exec</code>); для distroless-образов — эфемерный отладочный контейнер с JDK.
+</div>
+
+<h2 id="threaddump"><span class="h-num">21.2</span>Читаем дамп потоков</h2>
+<pre data-title="фрагмент jcmd Thread.print"><code class="txt">"http-nio-8080-exec-7" #48 daemon prio=5 os_prio=0 cpu=1532.10ms elapsed=3601.22s tid=0x00007f3a8c01e800 nid=1734 waiting on condition  [0x00007f3a5c7fd000]
+   java.lang.Thread.State: TIMED_WAITING (parking)
+        at jdk.internal.misc.Unsafe.park(java.base@21/Native Method)
+        - parking to wait for  &lt;0x00000000c1a2b3c8&gt; (a java.util.concurrent.SynchronousQueue$TransferStack)
+        at com.zaxxer.hikari.util.ConcurrentBag.borrow(ConcurrentBag.java:151)
+        at com.zaxxer.hikari.pool.HikariPool.getConnection(HikariPool.java:181)
+        at com.shop.OrderRepository.find(OrderRepository.java:42)
+
+"pool-3-thread-1" #61 prio=5 cpu=88112.44ms nid=1802 runnable
+   java.lang.Thread.State: RUNNABLE
+        at java.util.regex.Pattern$Loop.match(Pattern.java:5060)
+        ...
+        at com.shop.Validator.check(Validator.java:77)</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Поле</th><th>Как использовать</th></tr>
+<tr><td><code>nid=1734</code></td><td>id потока ОС (десятичный в новых JDK; в старых — 0x… hex). Связь с <code>top -H -p &lt;pid&gt;</code></td></tr>
+<tr><td><code>cpu=88112ms</code></td><td>сколько CPU поток потратил за жизнь — сравните два дампа, чтобы найти «едока»</td></tr>
+<tr><td>State + «parking to wait for» / «waiting to lock» / «locked»</td><td>кто чего ждёт и кто что держит; построить цепочку до владельца</td></tr>
+<tr><td>Конец дампа: «Found one Java-level deadlock»</td><td>JVM сама находит циклы на мониторах и ReentrantLock</td></tr>
+</table></div>
+<p>В примере: поток HTTP ждёт соединение из пула Hikari (пул исчерпан — почему?), а другой поток крутит регулярное выражение 88 секунд CPU — катастрофический бэктрекинг на вводе пользователя.</p>
+
+<h2 id="cpu"><span class="h-num">21.3</span>Расследование: процесс ест 100% CPU</h2>
+<div class="widget stepper" id="cpuSim">
+  <div class="widget-title">От top до строки кода</div>
+  <div class="flow st-stage">
+    <div class="node" id="c1"><b>top</b></div><span class="to">→</span>
+    <div class="node" id="c2"><b>top -H</b></div><span class="to">→</span>
+    <div class="node" id="c3"><b>Thread.print</b></div><span class="to">→</span>
+    <div class="node" id="c4"><b>профилировщик</b></div><span class="to">→</span>
+    <div class="node" id="c5"><b>причина</b></div>
+  </div>
+  <section class="st-step" data-t="Чей CPU" data-hl="c1" data-log="top: java pid 4321 — 398% CPU (4 ядра заняты)"><p>Процесс JVM занимает 4 ядра. Первый вопрос — это GC/JIT или код приложения?</p></section>
+  <section class="st-step" data-t="Какие потоки" data-hl="c2" data-log="top -H -p 4321: TID 1802 99%, 1803 99%, 1804 98%, 1805 97% — имена в /proc/4321/task/1802/comm: pool-3-thread-1..4"><p><code>top -H -p &lt;pid&gt;</code> показывает потоки. Если это «GC Thread#…» или «G1 Conc#…» — проблема с памятью (тема 14); «C2 CompilerThread» — компиляция (прогрев, деоптимизации). Здесь — прикладные потоки пула.</p></section>
+  <section class="st-step" data-t="Что делают" data-hl="c3" data-log="jcmd 4321 Thread.print | grep -A 15 'nid=1802' → Pattern$Loop.match … Validator.check:77"><p>Ищем поток по <code>nid</code> в дампе (снимите 2–3 дампа: если стек одинаковый — поток там застрял). Видим регулярное выражение в <code>Validator.check</code>.</p></section>
+  <section class="st-step" data-t="Подтверждение" data-hl="c4" data-log="asprof -e cpu -d 30 -f cpu.html 4321 → 92% ширины флеймграфа: Validator.check → Pattern.matches"><p>Профилировщик за 30 секунд подтверждает: 92% CPU — в <code>Pattern.matches</code> из валидатора. Дамп показывает момент, профиль — статистику.</p></section>
+  <section class="st-step" data-t="Причина и исправление" data-hl="c5" data-log="regex (a+)+$ на строке 'aaaaaaaaaaaaaaaaaaaaaaaa!' → экспоненциальный бэктрекинг (ReDoS)"><p>Регулярное выражение с вложенными квантификаторами на «злом» вводе — экспоненциальный перебор (ReDoS). Исправление: переписать без вложенных повторов, ограничить длину ввода, притяжательные квантификаторы. Похожий сценарий даёт бесконечный цикл в HashMap при гонке (старые JDK) или горячий цикл ожидания.</p></section>
+</div>
+
+<h2 id="flame"><span class="h-num">21.4</span>Как читать флеймграф</h2>
+<p>Ось X — доля сэмплов (не время по порядку!), ось Y — глубина стека, снизу корень. Ширина кадра = доля времени, когда метод был на стеке (вместе с вызванными). Ищите широкие «плато» наверху — там тратится время непосредственно. Щёлкните кадр, чтобы приблизить.</p>
+<div class="widget" id="fgW">
+  <div class="widget-title">CPU-флеймграф сервиса заказов</div>
+  <svg id="fgSvg" viewBox="0 0 700 170" role="img" aria-label="Флеймграф"></svg>
+  <div class="out" id="fgOut">Щёлкните по кадру.</div>
+</div>
+<script>
+(function () {
+  var T = ["Thread.run", 100, [["ThreadPoolExecutor.runWorker", 97, [["DispatcherServlet.doService", 80, [["OrderController.list", 62, [["OrderService.find", 40, [["Hibernate…ResultSet", 30, []], ["JdbcPgsql.read", 10, []]]], ["ObjectMapper.writeValue", 22, [["BeanSerializer.serialize", 20, []]]]]], ["SecurityFilterChain", 18, [["JwtDecoder.decode", 15, [["RSA.verify", 14, []]]]]]]], ["LogbackAppender.append", 17, [["String.format", 12, []]]]]], ["GC: G1 Young", 3, []]]];
+  var $ = function (i) { return document.getElementById(i); }, root = T, path = [];
+  var COL = ["#f2b880", "#f6c98f", "#efa970", "#f3c27a", "#ebb36f", "#f0bd85"];
+  function draw() {
+    var s = "", W = 700, H = 24;
+    function rec(n, x, w, d) {
+      var y = 170 - (d + 1) * H; s += '<rect data-n="' + encodeURIComponent(n[0]) + '" x="' + x + '" y="' + y + '" width="' + Math.max(0.5, w - 1) + '" height="' + (H - 2) + '" fill="' + COL[(n[0].length + d) % COL.length] + '"/>';
+      if (w > 60) s += '<text x="' + (x + 4) + '" y="' + (y + 15) + '">' + n[0].slice(0, Math.floor(w / 7)) + "</text>";
+      var cx = x; n[2].forEach(function (c) { var cw = w * c[1] / n[1]; rec(c, cx, cw, d + 1); cx += cw; });
+    }
+    rec(root, 0, W, 0); $("fgSvg").innerHTML = s;
+  }
+  function find(n, name, acc) { if (n[0] === name) return acc.concat([n]); for (var i = 0; i < n[2].length; i++) { var r = find(n[2][i], name, acc.concat([n])); if (r) return r; } return null; }
+  function self(n) { return n[1] - n[2].reduce(function (s, c) { return s + c[1]; }, 0); }
+  $("fgSvg").addEventListener("click", function (e) {
+    var r = e.target.closest("rect"); if (!r) return; var name = decodeURIComponent(r.getAttribute("data-n"));
+    var p = find(T, name, []); if (!p) return; var n = p[p.length - 1];
+    root = n === root ? T : n; draw();
+    $("fgOut").textContent = name + ": " + n[1] + "% всех сэмплов (включая вызванное), собственное время " + self(n) + "%\nпуть: " + p.map(function (x) { return x[0]; }).join(" → ") +
+      ({ "Hibernate…ResultSet": "\n→ треть времени — разбор результатов: выбирается слишком много строк/столбцов? N+1?", "RSA.verify": "\n→ 14% CPU на проверку подписи JWT каждого запроса: кэшируйте результат проверки токена на время его жизни", "String.format": "\n→ 12% на форматирование логов: параметризованные сообщения SLF4J и уровень DEBUG выключен?", "BeanSerializer.serialize": "\n→ 20% на JSON: огромные ответы? пагинация, DTO с нужными полями" }[name] || "") + (root !== T ? "\n(щелчок по корню возвращает весь граф)" : "");
+  });
+  draw();
+})();
+</script>
+
+<h2 id="jfr"><span class="h-num">21.5</span>Java Flight Recorder</h2>
+<pre data-title="непрерывная запись в продакшене (накладные расходы ~1%)"><code class="txt">-XX:StartFlightRecording=disk=true,maxage=6h,maxsize=500m,settings=default,dumponexit=true,filename=/var/log/app/
+jcmd &lt;pid&gt; JFR.dump name=1 filename=/tmp/incident.jfr      # снять запись за последние часы после инцидента
+jcmd &lt;pid&gt; JFR.start duration=2m settings=profile filename=/tmp/p.jfr   # подробный профиль на время
+jfr print --events jdk.GarbageCollection /tmp/incident.jfr | head
+jfr summary /tmp/incident.jfr
+# анализ: JDK Mission Control (автоанализ, вкладки GC, Threads, Method Profiling, Allocations, I/O, Exceptions)</code></pre>
+<p>JFR пишет события JVM (GC, компиляции, safepoints, блокировки, аллокации, исключения, I/O, CPU по потокам) в кольцевой буфер. Свои события — <code>jdk.jfr.Event</code> с аннотациями. JFR Event Streaming (Java 14+) позволяет потреблять события в реальном времени из того же процесса. Spring Boot и Micrometer умеют отправлять метрики по событиям JFR.</p>
+
+<h2 id="quiz"><span class="h-num">21.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Как найти в дампе потоков поток, который top -H показал с TID 1802?</p><ul><li>По имени потока</li><li>По nid=1802 (в старых JDK — nid=0x70a в шестнадцатеричном)</li><li>По tid=0x…</li><li>Никак</li></ul><div class="why">tid — адрес структуры JVM, nid — id потока ОС.</div></div>
+<div class="mcq" data-ok="3"><p>Почему CPU-профиль не покажет, что запросы медленные из-за ожидания БД?</p><ul><li>Профилировщик не видит JDBC</li><li>БД — другой процесс</li><li>Это ошибка инструмента</li><li>Ожидающий поток не тратит CPU и не попадает в CPU-сэмплы — нужен wall-clock профиль или события JFR по I/O</li></ul><div class="why">async-profiler -e wall.</div></div>
+<div class="mcq" data-ok="0"><p>Что означает ширина кадра во флеймграфе?</p><ul><li>Долю сэмплов, в которых метод был на стеке (включая вызванные им)</li><li>Время вызова в мс по порядку</li><li>Число вызовов</li><li>Размер метода</li></ul><div class="why">Ось X — не время по порядку, а агрегированная доля.</div></div>
+<div class="mcq" data-ok="2"><p>Почему стоит держать JFR включённым постоянно?</p><ul><li>Он ускоряет приложение</li><li>Он заменяет логи</li><li>При накладных ~1% он сохраняет данные за последние часы, и после инцидента можно снять запись постфактум</li><li>Он нужен для GC</li></ul><div class="why">Самописец полезен, когда уже включён до аварии.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сервис «завис»: HTTP не отвечает, CPU 0%. Ваши действия?</summary><div class="a"><p>Снять 2–3 дампа потоков с интервалом. Посмотреть потоки обработки запросов: все ждут? чего — пула соединений (Hikari borrow), блокировки (BLOCKED, waiting to lock — найти владельца), ответа внешнего сервиса (socketRead без таймаута), CompletableFuture.get без таймаута? Проверить секцию deadlock. Проверить GC (не идёт ли бесконечный Full GC — тогда CPU не 0). Исправление: таймауты везде, ограниченные пулы, устранение цикла блокировок.</p></div></details>
+<details class="q"><summary>Чем async-profiler лучше «классических» профилировщиков на JVMTI?</summary><div class="a"><p>Нет проблемы safepoint bias: классические сэмплируют стеки только в safepoint, искажая картину; async-profiler использует AsyncGetCallTrace и perf_events, видит нативный код, ядро, JIT и GC; низкие накладные расходы, режимы cpu/wall/alloc/lock/itimer, вывод флеймграфом. JFR тоже не имеет safepoint bias для профилирования методов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Mono и Flux: создание, cold и hot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · REACTOR</div>
+  <h1>Mono и Flux: создание, cold и hot</h1>
+  <p class="lead">Способов создать издатель десятки, и выбор между ними — не вкусовщина: <code>Mono.just(call())</code> вызовет сервис сразу при сборке, а <code>Mono.fromCallable(this::call)</code> — при каждой подписке. Разбираем фабрики, разницу между холодными и горячими издателями, операторы <code>share</code>, <code>cache</code>, <code>replay</code> и мосты из императивного кода.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">just / defer / fromCallable</span><span class="tag">create / generate</span><span class="tag">cold vs hot</span><span class="tag">share / cache / replay</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="factories"><span class="h-num">3.1</span>Фабрики и момент вычисления</h2>
+<div class="widget" id="evW">
+  <div class="widget-title">Когда вызывается loadUser()?</div>
+  <div class="controls"><label>Выражение<select id="evSel">
+    <option value="just">Mono.just(loadUser())</option>
+    <option value="callable">Mono.fromCallable(() -&gt; loadUser())</option>
+    <option value="defer">Mono.defer(() -&gt; Mono.just(loadUser()))</option>
+    <option value="supplier">Mono.fromSupplier(this::loadUser)</option>
+    <option value="future">Mono.fromFuture(loadUserAsync())</option>
+    <option value="futureS">Mono.fromFuture(() -&gt; loadUserAsync())</option>
+    <option value="justempty">Mono.justOrEmpty(optionalUser)</option>
+  </select></label><label>Подписок<select id="evN"><option>0</option><option selected>2</option><option>3</option></select></label></div>
+  <div class="out" id="evOut"></div>
+  <div class="verdict" id="evV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var M = {
+    just: [true, false, "bad", "Аргумент вычисляется при сборке, даже если никто не подпишется, и один раз на все подписки. Для дорогих или побочных вызовов — антипаттерн."],
+    callable: [false, true, "ok", "Ленивый: вызывается при каждой подписке. Исключение превратится в onError, null — в пустой Mono."],
+    defer: [false, true, "ok", "Ленивый: лямбда вызывается при каждой подписке и возвращает новый издатель. Нужен, когда сам выбор издателя зависит от состояния на момент подписки."],
+    supplier: [false, true, "ok", "Как fromCallable, но без checked-исключений."],
+    future: [true, false, "warn", "loadUserAsync() уже запущен при сборке; Mono лишь ждёт его результат. Повторная подписка не перезапустит работу. Отмена Mono по умолчанию вызывает future.cancel(), но уже идущую работу CompletableFuture это не прерывает; fromFuture(f, true) подавляет отмену."],
+    futureS: [false, true, "ok", "Supplier-версия: future создаётся при подписке — ленивость сохранена."],
+    justempty: [true, false, "ok", "Значение уже есть — eager допустимо: just подходит для готовых констант."]
+  };
+  function run() {
+    var k = $("evSel").value, n = +$("evN").value, m = M[k], lines = ["// сборка конвейера"];
+    if (m[0]) lines.push("loadUser() ← вызов #1 (eager)");
+    for (var i = 1; i <= n; i++) { lines.push("// subscribe #" + i); if (m[1]) lines.push("loadUser() ← вызов #" + (i + (m[0] ? 1 : 0) - (m[0] ? 1 : 0))); else lines.push("  (берётся готовое значение)"); }
+    var calls = (m[0] ? 1 : 0) + (m[1] ? n : 0);
+    lines.push("", "итого вызовов: " + calls);
+    $("evOut").textContent = lines.join("\n");
+    $("evV").className = "verdict " + m[2]; $("evV").textContent = m[3];
+  }
+  $("evSel").addEventListener("change", run); $("evN").addEventListener("change", run); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Фабрика</th><th>Назначение</th></tr>
+<tr><td><code>just, empty, error, never</code></td><td>готовые значения; <code>Mono.error(Supplier)</code> — ленивое исключение</td></tr>
+<tr><td><code>fromIterable, fromStream, range, fromArray</code></td><td>из коллекций; Stream одноразовый — лучше <code>fromStream(Supplier)</code></td></tr>
+<tr><td><code>interval, delay</code></td><td>таймеры на Schedulers.parallel()</td></tr>
+<tr><td><code>defer, fromCallable, fromSupplier, fromRunnable</code></td><td>ленивые обёртки императивного кода</td></tr>
+<tr><td><code>fromFuture, fromCompletionStage</code></td><td>мост из CompletableFuture</td></tr>
+<tr><td><code>using, usingWhen</code></td><td>ресурс с гарантированным освобождением (try-with-resources реактивно)</td></tr>
+<tr><td><code>generate</code></td><td>синхронный генератор по одному элементу с состоянием, уважает спрос</td></tr>
+<tr><td><code>create, push</code></td><td>мост из колбэков/слушателей; push — однопоточный производитель</td></tr>
+</table></div>
+
+<h2 id="create"><span class="h-num">3.2</span>generate и create</h2>
+<pre data-title="generate — синхронно, по запросу"><code class="java">Flux&lt;Long&gt; fib = Flux.generate(
+    () -&gt; new long[]{0, 1},                  // начальное состояние
+    (s, sink) -&gt; {
+        sink.next(s[0]);                     // ровно один next за вызов
+        return new long[]{s[1], s[0] + s[1]};
+    });
+fib.take(10).subscribe(System.out::println);  // генератор вызван 10 раз</code></pre>
+<pre data-title="create — мост из асинхронного API со слушателем"><code class="java">Flux&lt;Event&gt; events = Flux.create(sink -&gt; {
+    Listener l = new Listener() {
+        public void onEvent(Event e) { sink.next(e); }
+        public void onClose()        { sink.complete(); }
+        public void onFailure(Throwable t) { sink.error(t); }
+    };
+    bus.register(l);
+    sink.onDispose(() -&gt; bus.unregister(l));          // отмена/завершение
+    sink.onRequest(n -&gt; bus.poll(n));                 // если источник умеет «тянуть»
+}, FluxSink.OverflowStrategy.BUFFER);                 // что делать, если спроса нет</code></pre>
+<p><code>create</code> позволяет производителю толкать элементы из любого потока и в любом количестве — лишнее буферизуется по стратегии (BUFFER по умолчанию, неограниченный буфер!), DROP, LATEST, ERROR, IGNORE. Подробно — в теме 08.</p>
+
+<h2 id="hot"><span class="h-num">3.3</span>Холодные и горячие издатели</h2>
+<p><b>Холодный</b> издатель запускает работу заново для каждого подписчика (HTTP-запрос, запрос к БД, range). <b>Горячий</b> производит данные независимо от подписчиков, поздний подписчик видит только новые элементы (клики, котировки, Sinks.many().multicast()). Операторы превращают холодный в горячий.</p>
+<div class="widget" id="hcW">
+  <div class="widget-title">Подписчик A — в момент 0, подписчик B — в момент 45</div>
+  <div class="controls"><label>Источник<select id="hcSel">
+    <option value="cold">холодный (как есть)</option>
+    <option value="share">.share()  (publish().refCount())</option>
+    <option value="replay">.replay(2).autoConnect()</option>
+    <option value="cache">.cache()</option>
+    <option value="mono">Mono: .cache() vs холодный HTTP</option>
+  </select></label></div>
+  <div id="hcM"></div>
+  <div class="verdict" id="hcV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var src = [10, 25, 40, 55, 70, 85];
+  function ev(times, vals) { return times.map(function (t, i) { return { t: t, v: String(vals[i]), c: (vals[i] - 1) % 6 }; }); }
+  function run() {
+    var k = $("hcSel").value, lanes, msg, cls = "ok";
+    if (k === "mono") {
+      lanes = [{ label: "холодный A", events: [{ t: 20, v: "u", c: 2 }, { t: 20.5, type: "complete" }], note: "HTTP-запрос #1" },
+        { label: "холодный B", events: [{ t: 65, v: "u", c: 2 }, { t: 65.5, type: "complete" }], note: "HTTP-запрос #2 (с 45)" },
+        { label: "cache() A", events: [{ t: 20, v: "u", c: 4 }, { t: 20.5, type: "complete" }], note: "один запрос" },
+        { label: "cache() B", events: [{ t: 45, v: "u", c: 4 }, { t: 45.5, type: "complete" }], note: "мгновенно из кэша" }];
+      msg = "Mono.cache() запоминает результат (и ошибку!) навсегда; cache(Duration) — с TTL. Для «ленивой константы» вроде токена — удобно; ошибку лучше не кэшировать: cache(v -> ttl, e -> Duration.ZERO, () -> Duration.ZERO).";
+    } else {
+      var aT = src, aV = [1, 2, 3, 4, 5, 6], bT, bV;
+      if (k === "cold") { bT = [55, 70, 85]; bV = [1, 2, 3]; msg = "Каждый подписчик получает собственную последовательность с начала: для HTTP это два независимых запроса."; }
+      if (k === "share") { bT = [55, 70, 85]; bV = [4, 5, 6]; msg = "Один общий upstream; B видит только элементы после своей подписки. Когда отпишутся все — источник отменяется (refCount), следующий подписчик запустит его заново."; cls = "warn"; }
+      if (k === "replay") { bT = [45, 47, 55, 70, 85]; bV = [2, 3, 4, 5, 6]; msg = "B сразу получает 2 последних элемента из буфера, затем живые. autoConnect() подключает источник при первом подписчике и не отключает."; }
+      if (k === "cache") { bT = [45, 46, 47, 55, 70, 85]; bV = [1, 2, 3, 4, 5, 6]; msg = "cache() = replay всего: B получает всю историю. Буфер неограничен — для бесконечных потоков это утечка памяти."; cls = "warn"; }
+      lanes = [{ label: "источник", events: ev(aT, aV), note: k === "cold" ? "запуск на каждого подписчика" : "один запуск" }, { label: "A (с 0)", events: ev(aT, aV) }, { label: "B (с 45)", events: ev(bT, bV), note: "подписался в 45" }];
+    }
+    Marble.render("hcM", lanes, { T: 100 });
+    $("hcV").className = "verdict " + cls; $("hcV").textContent = msg;
+  }
+  $("hcSel").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="bridge"><span class="h-num">3.4</span>Мосты из императивного мира</h2>
+<pre data-title="Обёртка блокирующего вызова" class="good-code"><code class="java">Mono&lt;User&gt; user = Mono.fromCallable(() -&gt; legacyClient.load(id))   // блокирует!
+        .subscribeOn(Schedulers.boundedElastic());                    // поэтому — на отдельный пул (тема 07)</code></pre>
+<pre data-title="Выход обратно" class="bad-code"><code class="java">User u = userMono.block();   // в тестах, main, CommandLineRunner — можно;
+                             // в потоке event loop Reactor бросит IllegalStateException:
+                             // "block()/blockFirst()/blockLast() are blocking, which is not supported in thread reactor-http-nio-2"</code></pre>
+<div class="callout info"><span class="c-title">null запрещён</span>
+Reactive Streams запрещает null в onNext. <code>Mono.just(null)</code> бросит NPE, <code>map(x -&gt; null)</code> — NPE в onError. Отсутствие значения выражается пустым Mono: <code>Mono.justOrEmpty</code>, <code>mapNotNull</code>, <code>filter</code>.
+</div>
+
+<h2 id="quiz"><span class="h-num">3.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p><code>Mono&lt;String&gt; m = Mono.just(restCall());</code> — никто не подписался. Сколько раз выполнен restCall?</p><ul><li>0</li><li>1</li><li>Столько, сколько будет подписок</li><li>Зависит от планировщика</li></ul><div class="why">Аргумент just вычисляется Java до вызова метода.</div></div>
+<div class="mcq" data-ok="2"><p>Какой оператор превратит холодный WebClient-запрос в общий для параллельных подписчиков, но позволит повторить запрос, когда все отпишутся?</p><ul><li>cache()</li><li>replay().autoConnect()</li><li>share()</li><li>defer()</li></ul><div class="why">refCount отключается при нуле подписчиков.</div></div>
+<div class="mcq" data-ok="0"><p>Чем generate отличается от create?</p><ul><li>generate синхронный, один next на вызов, по спросу; create — колбэчный, многократный push из любых потоков</li><li>Ничем</li><li>create только для Mono</li><li>generate горячий</li></ul><div class="why">generate естественно поддерживает противодавление.</div></div>
+<div class="mcq" data-ok="3"><p>Что вернёт <code>Flux.just(1,2).map(x -&gt; x == 2 ? null : x)</code>?</p><ul><li>1, null</li><li>только 1, complete</li><li>1, 2</li><li>1, затем onError(NullPointerException)</li></ul><div class="why">null в onNext запрещён; используйте mapNotNull, если нужно отфильтровать.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Нужен Mono, который при каждой подписке читает актуальное значение поля. Как?</summary><div class="a"><p><code>Mono.fromSupplier(() -&gt; this.value)</code> или <code>Mono.defer(() -&gt; Mono.just(this.value))</code>. <code>Mono.just(this.value)</code> захватит значение один раз при сборке.</p></div></details>
+<details class="q"><summary>Как гарантированно закрыть ресурс при отмене или ошибке?</summary><div class="a"><p><code>Flux.using(() -&gt; open(), r -&gt; Flux.fromIterable(r.lines()), r -&gt; r.close())</code> для синхронных ресурсов; <code>usingWhen</code> — для ресурсов с асинхронным закрытием (транзакции, соединения R2DBC): отдельные колбэки на complete, error и cancel. Альтернатива — <code>doFinally(signal -&gt; ...)</code>, вызываемый при любом завершении, включая cancel.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

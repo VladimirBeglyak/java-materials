@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · CAS, барьеры и кэш-линии на железе</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.cl { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 2px; max-width: 520px; margin: 10px 0; }
+.cl span { font: 11px var(--font-mono); text-align: center; padding: 8px 0; border-radius: 3px; background: var(--bg-sunk); border: 1px solid var(--line); }
+.cl span.a { background: var(--info-soft); border-color: var(--info); } .cl span.b { background: var(--warn-soft); border-color: var(--warn); }
+.cl span.pad { opacity: .45; }
+</style>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · ФУНДАМЕНТ</div>
+  <h1>CAS, барьеры и кэш-линии на железе</h1>
+  <p class="lead">Всё в пакете в конечном счёте сводится к нескольким инструкциям процессора. Как compare-and-swap реализован на x86 и ARM, почему успешный CAS стоит десятки наносекунд, а при конкуренции — сотни, что такое протокол когерентности кэшей и «пинг-понг» кэш-линии, как ложное разделение (false sharing) замедляет независимые счётчики в разы и что делают барьеры памяти.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">lock cmpxchg</span><span class="tag">LL/SC и LSE</span><span class="tag">MESI</span><span class="tag">конкуренция</span><span class="tag">false sharing</span><span class="tag">@Contended</span><span class="tag">барьеры</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cas"><span class="h-num">2.1</span>Compare-and-swap</h2>
+<pre data-title="семантика (атомарно, одной инструкцией)"><code class="java">boolean compareAndSet(V expected, V newValue) {
+    // АТОМАРНО:
+    if (this.value == expected) { this.value = newValue; return true; }
+    return false;
+}
+// на этом строится любая lock-free операция — цикл «прочитать, вычислить, попытаться записать»:
+int v;
+do { v = value; } while (!compareAndSet(v, v + 1));</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Архитектура</th><th>Инструкция</th><th>Особенности</th></tr>
+<tr><td>x86-64</td><td><code>lock cmpxchg [mem], reg</code>; для инкремента — <code>lock xadd</code></td><td>префикс lock захватывает кэш-линию в монопольное владение; инструкция — полный барьер памяти</td></tr>
+<tr><td>ARMv8.0</td><td>пара <code>ldaxr</code>/<code>stlxr</code> (load-linked / store-conditional) в цикле</td><td>запись не удаётся, если линию тронул другой — возможны «ложные» неудачи (поэтому существует weakCompareAndSet)</td></tr>
+<tr><td>ARMv8.1+ (LSE)</td><td><code>cas</code>, <code>ldadd</code></td><td>атомарные инструкции «в одну операцию»; HotSpot использует их при наличии (Graviton, Apple M)</td></tr>
+</table></div>
+<p>В Java CAS доступен через <code>VarHandle.compareAndSet</code> (тема 03), классы <code>Atomic*</code> и внутренний <code>jdk.internal.misc.Unsafe</code>. JIT превращает их в одну инструкцию (интринсик).</p>
+
+<h2 id="coherence"><span class="h-num">2.2</span>Когерентность кэшей и цена конкуренции</h2>
+<p>Каждое ядро работает со своим кэшем; протокол когерентности (MESI и его варианты) гарантирует, что запись в линию 64 байта делает её копии в других ядрах недействительными. Атомарная операция требует линию в состоянии <b>Modified/Exclusive</b> — если линией владеет другое ядро, она пересылается через кэш общего уровня или межпроцессорную шину. Это и есть цена конкуренции.</p>
+<div class="widget" id="ctW">
+  <div class="widget-title">N потоков увеличивают один AtomicLong</div>
+  <div class="controls">
+    <label>потоков<select id="ctN"><option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option><option>32</option></select></label>
+    <label>операция<select id="ctO"><option value="xadd">getAndIncrement (lock xadd — не проваливается)</option><option value="cas">CAS-цикл (updateAndGet с функцией)</option><option value="adder">LongAdder.increment</option></select></label>
+    <label>сокеты<select id="ctS"><option value="1">1 процессор</option><option value="2">2 процессора (NUMA)</option></select></label>
+  </div>
+  <div id="ctBars"></div>
+  <div class="verdict" id="ctV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = +$("ctN").value, o = $("ctO").value, s = +$("ctS").value, local = 6, transfer = s === 2 ? 120 : 45, opNs, failRate = 0;
+    if (o === "adder") opNs = n === 1 ? local : local + 4;
+    else if (n === 1) opNs = local;
+    else { opNs = transfer; if (o === "cas") { failRate = 1 - 1 / Math.min(n, 1 + n * 0.6); opNs = transfer / (1 - failRate * 0.85); } }
+    var perThread = 1e3 / opNs * (o === "adder" || n === 1 ? 1 : 1 / n * Math.min(n, 1.3)), total = o === "adder" ? perThread * n : (n === 1 ? 1e3 / local : 1e3 / opNs * 1.3);
+    var single = 1e3 / local;
+    $("ctBars").innerHTML = [["Пропускная способность (всего), млн оп/с", total, single * Math.max(1, n)], ["На поток, млн оп/с", o === "adder" ? 1e3 / opNs : total / n, single]].map(function (r) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>' + r[0] + '</b><span style="font-family:var(--font-mono)">' + r[1].toFixed(1) + '</span></div><div class="bar ' + (r[1] >= r[2] * 0.5 ? "ok" : "bad") + '"><i style="width:' + Math.min(100, r[1] / r[2] * 100) + '%"></i></div>'; }).join("") +
+      (o === "cas" && n > 1 ? '<div class="hint">доля неудачных CAS ≈ ' + Math.round(failRate * 100) + "% — каждая неудача повторяет чтение и вычисление</div>" : "");
+    var v = $("ctV");
+    if (o === "adder") { v.className = "verdict ok"; v.textContent = "Каждый поток пишет в свою ячейку (свою кэш-линию) — масштабируется почти линейно. Цена — sum() обходит все ячейки и неточен во время записи (тема 06)."; }
+    else if (n === 1) { v.className = "verdict ok"; v.textContent = "Без конкуренции линия уже в кэше ядра: атомарная операция — единицы наносекунд (+ барьер)."; }
+    else { v.className = "verdict bad"; v.textContent = "Линия «пинг-понгом» перескакивает между ядрами (≈" + transfer + " нс на передачу" + (s === 2 ? " между сокетами" : "") + "): добавление потоков не увеличивает, а снижает суммарную пропускную способность. " + (o === "cas" ? "CAS-цикл к тому же проваливается и повторяется." : "xadd не проваливается, но сериализует ядра на одной линии."); }
+  }
+  ["ctN", "ctO", "ctS"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p class="hint">Цифры — модель порядков величин, а не измерение; реальные зависят от процессора. Проверяйте JMH с <code>@Threads</code>.</p>
+
+<h2 id="false-sharing"><span class="h-num">2.3</span>Ложное разделение</h2>
+<p>Два независимых поля, которые пишут разные потоки, но которые попали в <b>одну кэш-линию</b>, ведут себя как одно общее: каждая запись одного потока инвалидирует линию у другого. Код без единой общей переменной масштабируется плохо.</p>
+<div class="widget" id="fsW">
+  <div class="widget-title">Кэш-линия 64 байта: поля counterA (поток 1) и counterB (поток 2)</div>
+  <div class="controls"><label>раскладка<select id="fsL"><option value="same">два long подряд</option><option value="pad">ручные отступы 7 × long</option><option value="cont">@jdk.internal.vm.annotation.Contended</option></select></label></div>
+  <div id="fsLines"></div>
+  <div class="verdict" id="fsV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function line(cells) { return '<div class="cl">' + cells.map(function (c) { return '<span class="' + c[1] + '">' + c[0] + "</span>"; }).join("") + "</div>"; }
+  function run() {
+    var l = $("fsL").value, h;
+    if (l === "same") { h = line([["hdr", ""], ["hdr", ""], ["A", "a"], ["B", "b"], ["…", ""], ["…", ""], ["…", ""], ["…", ""]]); }
+    else if (l === "pad") { h = line([["hdr", ""], ["A", "a"], ["p1", "pad"], ["p2", "pad"], ["p3", "pad"], ["p4", "pad"], ["p5", "pad"], ["p6", "pad"]]) + line([["p7", "pad"], ["B", "b"], ["…", ""], ["…", ""], ["…", ""], ["…", ""], ["…", ""], ["…", ""]]); }
+    else { h = line([["hdr", ""], ["…", ""], ["pad 128 Б", "pad"], ["", "pad"], ["", "pad"], ["", "pad"], ["", "pad"], ["", "pad"]]) + line([["A", "a"], ["", "pad"], ["", "pad"], ["", "pad"], ["", "pad"], ["", "pad"], ["", "pad"], ["", "pad"]]) + line([["pad", "pad"], ["", "pad"], ["B", "b"], ["…", ""], ["", ""], ["", ""], ["", ""], ["", ""]]); }
+    $("fsLines").innerHTML = h + '<div class="hint">каждая клетка — 8 байт; строка — одна кэш-линия</div>';
+    var v = $("fsV");
+    if (l === "same") { v.className = "verdict bad"; v.textContent = "A и B в одной линии: потоки на разных ядрах постоянно отбирают её друг у друга. Типичное замедление — в 3–10 раз по сравнению с раздельными линиями."; }
+    else if (l === "pad") { v.className = "verdict warn"; v.textContent = "Ручные отступы работают, но хрупко: JVM переставляет поля (тема 10 пособия «JVM изнутри»), отступы могут оказаться не там; наследование с отступами в родителе — старый приём Disruptor."; }
+    else { v.className = "verdict ok"; v.textContent = "@Contended (внутренняя аннотация JDK; для своих классов нужен -XX:-RestrictContended) окружает поле отступами 128 байт (с учётом предвыборки соседней линии). Так защищены поля Thread (ThreadLocalRandom), ячейки Striped64, счётчики ForkJoinPool и ConcurrentHashMap."; }
+  }
+  $("fsL").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="barriers"><span class="h-num">2.4</span>Барьеры памяти</h2>
+<p>Процессоры и компиляторы переставляют обращения к памяти. Барьер (fence) запрещает определённые перестановки. На x86 (модель TSO) разрешено только одно переупорядочивание — более поздняя загрузка может обогнать более раннюю запись (StoreLoad), поэтому volatile-запись в HotSpot на x86 — это обычная запись + <code>lock addl $0,(%rsp)</code>, а volatile-чтение — обычное чтение. На ARM (слабая модель) нужны инструкции <code>ldar</code>/<code>stlr</code> и <code>dmb</code>. Отсюда практический вывод: код с гонками данных, «работающий» на ноутбуке x86, может ломаться на ARM-серверах.</p>
+<div class="table-wrap"><table>
+<tr><th>Перестановка</th><th>x86 (TSO)</th><th>ARMv8 / POWER</th><th>Что запрещает</th></tr>
+<tr><td>Load → Load</td><td>нет</td><td>да</td><td>acquire (чтение volatile, getAcquire)</td></tr>
+<tr><td>Store → Store</td><td>нет</td><td>да</td><td>release (запись volatile, setRelease)</td></tr>
+<tr><td>Load → Store</td><td>нет</td><td>да</td><td>acquire/release</td></tr>
+<tr><td>Store → Load</td><td><b>да</b></td><td>да</td><td>только полный барьер (volatile-запись + volatile-чтение, fullFence)</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">2.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему 8 потоков, увеличивающих один AtomicLong, могут работать медленнее одного?</p><ul><li>AtomicLong использует блокировку</li><li>Кэш-линия со счётчиком постоянно передаётся между ядрами — операции сериализуются, а передача дорога</li><li>JIT отключается</li><li>Из-за GC</li></ul><div class="why">Решение — распределённые счётчики (LongAdder).</div></div>
+<div class="mcq" data-ok="3"><p>Что такое false sharing?</p><ul><li>Два потока пишут в одну переменную</li><li>Утечка памяти</li><li>Гонка данных</li><li>Разные переменные разных потоков в одной кэш-линии — запись одной инвалидирует линию у другого ядра</li></ul><div class="why">Лечится разнесением по линиям (@Contended).</div></div>
+<div class="mcq" data-ok="0"><p>Какую перестановку разрешает модель памяти x86?</p><ul><li>Только Store → Load (поздняя загрузка обгоняет раннюю запись)</li><li>Все</li><li>Никаких</li><li>Только Load → Load</li></ul><div class="why">Поэтому volatile-запись на x86 требует барьера, а чтение — нет.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем LL/SC отличается от CAS и зачем в Java weakCompareAndSet?</summary><div class="a"><p>LL/SC: загрузка с «резервированием» адреса и условная запись, которая не удаётся, если между ними линию кто-то тронул (или произошло прерывание) — даже если значение не изменилось. Поэтому реализация строгого compareAndSet на LL/SC сама содержит цикл. weakCompareAndSet разрешает ложные неудачи — его можно скомпилировать в одну пару LL/SC без внутреннего цикла; он подходит, когда вы и так повторяете CAS в своём цикле.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

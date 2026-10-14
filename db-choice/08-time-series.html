@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Временные ряды и метрики</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Временные ряды и метрики</h1>
+  <p class="lead">Метрики серверов, показания датчиков, котировки, телеметрия приложений: данные приходят непрерывно, почти никогда не меняются, читаются агрегатами по окнам времени, а старые нужны всё реже. Специализированные хранилища временных рядов сжимают такие данные в 10–20 раз и отвечают на «среднее за 5 минут по 1000 серверов за неделю» за миллисекунды. Разбираем модель, кардинальность — главного врага, сжатие, ретенцию и выбор между Prometheus, VictoriaMetrics, TimescaleDB, InfluxDB и ClickHouse.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">серии и метки</span><span class="tag">кардинальность</span><span class="tag">сжатие Gorilla</span><span class="tag">даунсэмплинг</span><span class="tag">TimescaleDB</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">8.1</span>Модель: серия = метрика + метки</h2>
+<pre data-title="одна серия — уникальный набор меток"><code class="txt">http_requests_total{service="orders", method="GET", status="200", instance="10.0.0.5:8080"}
+  1728550800  10234
+  1728550815  10281
+  1728550830  10330     ← точки: (время, значение) каждые 15 с</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Свойство нагрузки</th><th>Следствие для хранилища</th></tr>
+<tr><td>Только добавление, почти по порядку времени</td><td>append-only блоки по времени, LSM-подобная запись</td></tr>
+<tr><td>Соседние точки похожи</td><td>сильное сжатие: дельты времени и XOR значений</td></tr>
+<tr><td>Запросы — окна и агрегаты</td><td>чтение диапазонов по времени, предагрегаты</td></tr>
+<tr><td>Свежие данные горячие, старые — редко</td><td>ретенция, даунсэмплинг, холодное хранение в объектном хранилище</td></tr>
+<tr><td>Удаление — целыми блоками по времени</td><td>никаких построчных DELETE</td></tr>
+</table></div>
+
+<h2 id="cardinality"><span class="h-num">8.2</span>Кардинальность — главный враг</h2>
+<p>Каждая уникальная комбинация меток — отдельная серия со своим индексом и буферами в памяти. Метка с неограниченными значениями (user_id, request_id, URL с параметрами) взрывает число серий.</p>
+<div class="widget" id="cdW">
+  <div class="widget-title">Сколько серий породит метрика</div>
+  <div id="cdRows"></div>
+  <div class="controls"><label>экземпляров сервиса<input type="number" id="cdI" value="30" min="1"></label></div>
+  <div class="out" id="cdOut"></div>
+  <div class="verdict" id="cdV"></div>
+</div>
+<script>
+(function () {
+  var L = [["method", 5, true], ["status", 8, true], ["route (шаблон /orders/{id})", 40, true], ["path (реальный URL /orders/12345)", 200000, false], ["user_id", 1000000, false], ["region", 3, true]];
+  var $ = function (i) { return document.getElementById(i); };
+  $("cdRows").innerHTML = '<div class="checks col">' + L.map(function (l, i) { return '<label><input type="checkbox" data-i="' + i + '"' + (l[2] ? " checked" : "") + "> " + l[0] + " — " + l[1].toLocaleString("ru") + " значений</label>"; }).join("") + "</div>";
+  function run() {
+    var n = Math.max(1, +$("cdI").value), s = n;
+    $("cdRows").querySelectorAll("input:checked").forEach(function (c) { s *= L[+c.getAttribute("data-i")][1]; });
+    var mem = s * 3 / 1024 / 1024;
+    $("cdOut").textContent = "серий: " + s.toLocaleString("ru") + "  (верхняя оценка — произведение значений меток)\nпамять под активные серии (~3 КБ/серия): " + (mem < 1 ? (mem * 1024).toFixed(0) + " МБ" : mem.toFixed(1) + " ГБ") + "\nточек в сутки при шаге 15 с: " + (s * 5760).toExponential(2);
+    var v = $("cdV");
+    if (s > 1e7) { v.className = "verdict bad"; v.textContent = "Взрыв кардинальности: хранилище метрик упадёт по памяти или будет отклонять серии. Неограниченные значения (id, URL) не должны быть метками — для них логи, трассировки или аналитическая база (ClickHouse)."; }
+    else if (s > 5e5) { v.className = "verdict warn"; v.textContent = "Много серий для одной метрики: проверьте, все ли метки нужны для дашбордов и алертов."; }
+    else { v.className = "verdict ok"; v.textContent = "Нормально: ограниченные наборы значений меток."; }
+  }
+  $("cdRows").addEventListener("change", run); $("cdI").addEventListener("input", run); run();
+})();
+</script>
+
+<h2 id="compression"><span class="h-num">8.3</span>Как сжимаются ряды</h2>
+<p>Классический алгоритм Gorilla (Facebook, 2015), используемый Prometheus и многими TSDB: время кодируется <b>дельтой от дельты</b> (при регулярном шаге — почти всегда 0, один бит), значения — <b>XOR с предыдущим</b> (похожие числа дают много нулевых битов). В среднем ~1,4 байта на точку вместо 16.</p>
+<div class="widget" id="gzW">
+  <div class="widget-title">Дельта-от-дельты для отметок времени</div>
+  <div class="controls"><label>отметки времени (с)<input type="text" id="gzT" value="1000 1015 1030 1045 1060 1076 1090 1105"></label></div>
+  <div class="table-wrap"><table id="gzTbl"></table></div>
+  <div class="verdict" id="gzV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function bits(dd) { if (dd === 0) return 1; var a = Math.abs(dd); return a <= 63 ? 9 : a <= 255 ? 12 : a <= 2047 ? 16 : 36; }
+  function run() {
+    var t = $("gzT").value.split(/[\s,]+/).filter(Boolean).map(Number).filter(function (x) { return !isNaN(x); });
+    var rows = "<tr><th>t</th><th>дельта</th><th>дельта от дельты</th><th>бит</th></tr>", total = 64, pd = null;
+    t.forEach(function (x, i) {
+      if (i === 0) { rows += "<tr><td>" + x + "</td><td>—</td><td>—</td><td>64 (заголовок блока)</td></tr>"; return; }
+      var d = x - t[i - 1], dd = pd === null ? d : d - pd, b = pd === null ? 14 : bits(dd); total += b; pd = d;
+      rows += "<tr><td>" + x + "</td><td>" + d + "</td><td>" + (i === 1 ? "(первая дельта)" : dd) + "</td><td>" + b + "</td></tr>";
+    });
+    $("gzTbl").innerHTML = rows;
+    $("gzV").className = "verdict ok";
+    $("gzV").textContent = "Итого " + total + " бит вместо " + t.length * 64 + " (" + (t.length * 64 / Math.max(1, total)).toFixed(1) + "× меньше). Регулярный шаг сбора даёт нули и почти бесплатные отметки; сбои расписания стоят несколько лишних бит.";
+  }
+  $("gzT").addEventListener("input", run); run();
+})();
+</script>
+
+<h2 id="retention"><span class="h-num">8.4</span>Ретенция и даунсэмплинг</h2>
+<p>Метрики с шагом 15 с нужны за последние дни; за год достаточно 5-минутных или часовых агрегатов. Типовая схема: сырые данные 15–30 дней → агрегаты (min/max/avg/count/sum, не только среднее!) 1 год → архив в объектном хранилище.</p>
+<pre data-title="TimescaleDB: гипертаблица, непрерывный агрегат, сжатие, ретенция"><code class="sql">CREATE TABLE metrics (time timestamptz NOT NULL, device_id int, temperature double precision);
+SELECT create_hypertable('metrics', by_range('time', INTERVAL '1 day'));   -- автопартиции по времени
+
+CREATE MATERIALIZED VIEW metrics_5m WITH (timescaledb.continuous) AS
+SELECT time_bucket('5 minutes', time) AS bucket, device_id,
+       avg(temperature) AS avg_t, max(temperature) AS max_t, count(*) AS n
+FROM metrics GROUP BY bucket, device_id;
+SELECT add_continuous_aggregate_policy('metrics_5m', start_offset => INTERVAL '1 hour',
+       end_offset => INTERVAL '5 minutes', schedule_interval => INTERVAL '5 minutes');
+
+ALTER TABLE metrics SET (timescaledb.compress, timescaledb.compress_segmentby = 'device_id');
+SELECT add_compression_policy('metrics', INTERVAL '7 days');    -- колоночное сжатие старых чанков
+SELECT add_retention_policy('metrics', INTERVAL '30 days');     -- удаление целыми чанками</code></pre>
+
+<h2 id="choose"><span class="h-num">8.5</span>Что выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Система</th><th>Сильные стороны</th><th>Когда</th></tr>
+<tr><td>Prometheus</td><td>стандарт метрик в Kubernetes, PromQL, алертинг, pull-модель</td><td>операционные метрики одного кластера, хранение дни–недели</td></tr>
+<tr><td>VictoriaMetrics / Thanos / Mimir</td><td>долгосрочное хранение и масштабирование Prometheus, высокая кардинальность (VictoriaMetrics экономна)</td><td>метрики многих кластеров, месяцы–годы</td></tr>
+<tr><td>TimescaleDB</td><td>полный SQL и PostgreSQL рядом с рядами, JOIN с бизнес-данными</td><td>IoT и бизнес-метрики, когда уже есть PostgreSQL</td></tr>
+<tr><td>InfluxDB</td><td>специализированная TSDB, простой приём данных (line protocol)</td><td>телеметрия, IoT; учитывайте смены архитектуры между версиями 1/2/3</td></tr>
+<tr><td>ClickHouse</td><td>события с высокой кардинальностью, аналитика по сырым данным</td><td>логи, трейсы, продуктовая аналитика, наблюдаемость (тема 09)</td></tr>
+<tr><td>QuestDB, kdb+</td><td>сверхбыстрая запись и запросы по времени</td><td>финансовые данные, тики</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">8.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Разработчик добавил метку <code>user_id</code> к метрике задержки запросов. Что случится?</p><ul><li>Дашборды станут подробнее, проблем нет</li><li>Метрика перестанет собираться</li><li>Число серий вырастет до миллионов — память и производительность хранилища метрик под угрозой</li><li>Prometheus автоматически агрегирует по пользователям</li></ul><div class="why">Неограниченные значения — в логи и трейсы, не в метки.</div></div>
+<div class="mcq" data-ok="0"><p>Почему при даунсэмплинге хранят не только среднее?</p><ul><li>Среднее скрывает пики: для алертов и анализа нужны max/min и count/sum для корректной переагрегации</li><li>Среднее нельзя вычислить</li><li>Так требует SQL</li><li>Для сжатия</li></ul><div class="why">Среднее от средних неверно без весов (count).</div></div>
+<div class="mcq" data-ok="3"><p>Почему удаление старых точек в TSDB дешёвое?</p><ul><li>Данные не удаляются никогда</li><li>Используется DELETE с индексом</li><li>Точки помечаются надгробиями</li><li>Данные лежат блоками/чанками по времени, и удаляется блок целиком</li></ul><div class="why">Тот же принцип, что DROP PARTITION в реляционных базах.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Метрики, логи и трейсы — одно хранилище или разные?</summary><div class="a"><p>Исторически разные: метрики — TSDB (Prometheus/VictoriaMetrics), логи — Loki/Elasticsearch, трейсы — Tempo/Jaeger. Сейчас популярны колоночные базы (ClickHouse) как единое хранилище для всех трёх с высокой кардинальностью и SQL. Выбор зависит от объёмов, требований к запросам и экосистемы (Grafana, OpenTelemetry).</p></div></details>
+<details class="q"><summary>Датчики шлют 50 тыс. точек в секунду, нужны графики по датчику и сводки по цеху. Ваш выбор?</summary><div class="a"><p>Если есть PostgreSQL и нужен SQL с бизнес-данными (датчики, цеха, оборудование) — TimescaleDB: гипертаблица по времени, segmentby device_id, непрерывные агрегаты 1 мин/1 час, сжатие через 7 дней, ретенция сырых данных. Если объёмы растут к миллионам точек в секунду и много аналитики — ClickHouse. Для чисто операционных метрик — VictoriaMetrics.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

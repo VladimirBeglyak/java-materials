@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Нативный код: JNI и Foreign Function API</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ИСПОЛНЕНИЕ</div>
+  <h1>Нативный код: JNI и Foreign Function API</h1>
+  <p class="lead">JVM постоянно вызывает нативный код — сама стандартная библиотека полна <code>native</code>-методов, а Netty, RocksDB, драйверы GPU, сжатие и криптография работают через нативные библиотеки. Разбираем классический JNI (как устроен переход Java ↔ C, локальные и глобальные ссылки, почему это опасно), новый Foreign Function &amp; Memory API (финальный в Java 22) с арендами памяти и <code>jextract</code>, и судьбу <code>sun.misc.Unsafe</code>.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">JNI</span><span class="tag">локальные/глобальные ссылки</span><span class="tag">FFM API</span><span class="tag">Arena</span><span class="tag">MemorySegment</span><span class="tag">jextract</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="jni"><span class="h-num">19.1</span>JNI: как это устроено</h2>
+<div class="grid-2">
+<pre data-title="Java"><code class="java">public class Native {
+    static { System.loadLibrary("fastzip"); }   // libfastzip.so из java.library.path
+    public static native int compress(byte[] in, byte[] out);
+}
+// javac -h include/ Native.java → генерирует Native.h</code></pre>
+<pre data-title="C"><code class="txt">JNIEXPORT jint JNICALL Java_Native_compress(JNIEnv *env, jclass cls,
+                                            jbyteArray in, jbyteArray out) {
+    jsize n = (*env)-&gt;GetArrayLength(env, in);
+    jbyte *src = (*env)-&gt;GetByteArrayElements(env, in, NULL);   // копия или пиннинг
+    jbyte *dst = (*env)-&gt;GetByteArrayElements(env, out, NULL);
+    int r = do_compress(src, n, dst);
+    (*env)-&gt;ReleaseByteArrayElements(env, in, src, JNI_ABORT);
+    (*env)-&gt;ReleaseByteArrayElements(env, out, dst, 0);         // 0 = скопировать обратно
+    return r;
+}</code></pre>
+</div>
+<ul>
+  <li><b>Переход</b> Java → native: поток меняет состояние на <code>_thread_in_native</code> (теперь он «безопасен» для safepoint), аргументы-объекты передаются как <b>хэндлы</b> (косвенные ссылки), а не адреса — GC может двигать объекты. Возврат: проверка safepoint и отложенных исключений. Стоимость перехода — десятки наносекунд: JNI невыгоден для мелких частых вызовов.</li>
+  <li><b>Локальные ссылки</b> живут до возврата из нативного метода (по умолчанию не больше 16 гарантированно — <code>EnsureLocalCapacity</code>); <b>глобальные</b> (<code>NewGlobalRef</code>) — до явного удаления: забыли <code>DeleteGlobalRef</code> — утечка, невидимая для GC.</li>
+  <li><b>Массивы</b>: <code>GetByteArrayElements</code> может копировать; <code>GetPrimitiveArrayCritical</code> даёт прямой доступ, но блокирует перемещение объекта (GC-locker в старых сборщиках, пиннинг регионов в G1 с JDK 22) — держите критическую секцию минимальной.</li>
+  <li>Ошибка в C — это не исключение, а падение всей JVM (<code>hs_err_pid.log</code>, SIGSEGV). <code>-Xcheck:jni</code> ловит часть ошибок использования API.</li>
+</ul>
+
+<h2 id="ffm"><span class="h-num">19.2</span>Foreign Function &amp; Memory API (Java 22+)</h2>
+<pre data-title="вызвать strlen из libc без строчки C"><code class="java">Linker linker = Linker.nativeLinker();
+MethodHandle strlen = linker.downcallHandle(
+    linker.defaultLookup().find("strlen").orElseThrow(),
+    FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));   // size_t strlen(const char*)
+
+try (Arena arena = Arena.ofConfined()) {
+    MemorySegment cString = arena.allocateFrom("Привет, JVM");           // UTF-8 + '\0' вне кучи
+    long len = (long) strlen.invokeExact(cString);                       // 17: «Привет» — 12 байт в UTF-8 + «, JVM» — 5
+}   // память освобождена здесь, детерминированно</code></pre>
+<pre data-title="структуры и массивы без копирования через ByteBuffer"><code class="java">StructLayout POINT = MemoryLayout.structLayout(
+    ValueLayout.JAVA_INT.withName("x"), ValueLayout.JAVA_INT.withName("y"));
+VarHandle X = POINT.varHandle(MemoryLayout.PathElement.groupElement("x"));
+try (Arena arena = Arena.ofConfined()) {
+    MemorySegment pts = arena.allocate(POINT, 1_000_000);                // массив структур 8 МБ вне кучи
+    X.set(pts, POINT.byteSize() * 42, 7);   // pts[42].x = 7; координаты VarHandle: (сегмент, базовое смещение)
+}
+// jextract --output src -t org.zstd /usr/include/zstd.h  → сгенерированные Java-обёртки для всей библиотеки</code></pre>
+
+<div class="widget" id="arW">
+  <div class="widget-title">Какую Arena выбрать</div>
+  <div class="controls">
+    <label>арена<select id="arA"><option value="confined">Arena.ofConfined()</option><option value="shared">Arena.ofShared()</option><option value="auto">Arena.ofAuto()</option><option value="global">Arena.global()</option></select></label>
+    <label>сценарий<select id="arS"><option value="call">временный буфер для одного вызова</option><option value="threads">буфер, общий для нескольких потоков</option><option value="forever">таблица, нужная всё время работы</option><option value="unknown">время жизни сложно определить</option></select></label>
+  </div>
+  <div class="table-wrap"><table id="arT"></table></div>
+  <div class="verdict" id="arV"></div>
+</div>
+<script>
+(function () {
+  var P = {
+    confined: ["только поток-владелец", "при close() (try-with-resources)", "да", "самая быстрая проверка доступа"],
+    shared: ["любые потоки", "при close() — с handshake всех потоков, чтобы никто не читал освобождённое", "да", "close дороже"],
+    auto: ["любые потоки", "когда GC обнаружит недостижимость (через Cleaner)", "нет", "недетерминированно, как DirectByteBuffer"],
+    global: ["любые потоки", "никогда", "нет", "для данных на всё время жизни процесса"]
+  };
+  var BEST = { call: "confined", threads: "shared", forever: "global", unknown: "auto" };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var a = $("arA").value, s = $("arS").value, p = P[a];
+    $("arT").innerHTML = "<tr><th>Доступ</th><th>Освобождение</th><th>close()</th><th>Заметка</th></tr><tr><td>" + p.join("</td><td>") + "</td></tr>";
+    var ok = BEST[s] === a; $("arV").className = "verdict " + (ok ? "ok" : "warn");
+    $("arV").textContent = ok ? "Подходящий выбор для сценария." : "Для этого сценария лучше " + { confined: "Arena.ofConfined()", shared: "Arena.ofShared()", auto: "Arena.ofAuto()", global: "Arena.global()" }[BEST[s]] + ". Доступ к сегменту закрытой арены даёт IllegalStateException, а не порчу памяти — в этом главное отличие FFM от Unsafe и JNI.";
+  }
+  ["arA", "arS"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="compare"><span class="h-num">19.3</span>JNI, FFM, Unsafe</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>JNI</th><th>FFM API</th><th>sun.misc.Unsafe</th></tr>
+<tr><td>Нужен C-код-обёртка</td><td>да</td><td>нет</td><td>—</td></tr>
+<tr><td>Безопасность памяти</td><td>нет</td><td>границы и время жизни проверяются</td><td>нет</td></tr>
+<tr><td>Производительность вызова</td><td>переход с хэндлами</td><td>сопоставима или лучше; <code>Linker.Option.critical</code> для коротких вызовов</td><td>—</td></tr>
+<tr><td>Статус</td><td>поддерживается; загрузка нативных библиотек будет требовать <code>--enable-native-access</code> (JEP 472, предупреждения с 24)</td><td>финальный с 22; также требует разрешения native access</td><td>методы доступа к памяти устарели к удалению (JEP 471, предупреждения в 24 — JEP 498); замена — VarHandle и FFM</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Integrity by default</span>
+Платформа движется к «целостности по умолчанию»: всё, что может нарушить гарантии JVM (глубокая рефлексия в JDK, динамические агенты, нативный доступ, Unsafe), требует явного разрешения в командной строке. Готовьтесь: <code>--enable-native-access=ALL-UNNAMED</code> для Netty/RocksDB, явный <code>-javaagent</code> для Mockito, обновление библиотек, использующих Unsafe.
+</div>
+
+<h2 id="quiz"><span class="h-num">19.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему JNI передаёт объекты в C как хэндлы, а не как прямые адреса?</p><ul><li>Для экономии памяти</li><li>GC может перемещать объекты; хэндлы остаются валидными</li><li>C не поддерживает указатели</li><li>Для шифрования</li></ul><div class="why">Прямой доступ к массиву — только в «критической» секции, блокирующей перемещение.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт при обращении к MemorySegment после закрытия его арены?</p><ul><li>Порча памяти</li><li>Падение JVM</li><li>Вернутся нули</li><li>IllegalStateException — время жизни проверяется</li></ul><div class="why">Безопасность — главное преимущество FFM.</div></div>
+<div class="mcq" data-ok="0"><p>Чем опасна ошибка в нативной библиотеке, вызываемой через JNI?</p><ul><li>Падением всего процесса JVM (SIGSEGV, hs_err_pid.log), а не исключением</li><li>Только исключением в потоке</li><li>Ничем, JVM изолирует нативный код</li><li>Утечкой одного объекта</li></ul><div class="why">Нативный код работает в том же адресном пространстве.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда оправдан нативный код в Java-сервисе?</summary><div class="a"><p>Когда есть зрелая нативная библиотека без хорошего Java-аналога (кодеки, RocksDB, GPU/CUDA, системные API ОС), когда нужна работа с памятью вне кучи и с отображёнными файлами большого объёма, и для интеграции с платформой. Не ради «скорости» мелких операций: переход стоит десятки наносекунд, а JIT часто не хуже. Предпочтительно — FFM API и jextract вместо JNI.</p></div></details>
+<details class="q"><summary>Что смотреть в hs_err_pid.log после падения JVM?</summary><div class="a"><p>Тип сигнала и проблемный кадр (Problematic frame: C [libx.so+0x…] — нативная библиотека; V [libjvm.so] — ошибка JVM; J — скомпилированный Java-код), стек потока, в котором упало, список потоков, состояние кучи, загруженные библиотеки, флаги JVM и информацию о системе (память, лимиты). Нативная библиотека в кадре — смотреть её версию и вызовы; libjvm — обновлять JDK и искать известный баг.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

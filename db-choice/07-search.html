@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Поисковые движки: OpenSearch, Elasticsearch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Поисковые движки: OpenSearch, Elasticsearch</h1>
+  <p class="lead">Поиск для людей — не <code>WHERE name LIKE '%…%'</code>. Нужно понимать словоформы и опечатки, ранжировать по релевантности, считать фасеты («бренд: 12, цвет: 7») по миллионам документов за десятки миллисекунд. Это делают поисковые движки на основе Lucene. Разбираем инвертированный индекс, анализаторы, BM25, устройство кластера, синхронизацию с основной базой — и когда хватит поиска PostgreSQL.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">инвертированный индекс</span><span class="tag">анализаторы</span><span class="tag">BM25</span><span class="tag">фасеты</span><span class="tag">шарды и сегменты</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="index"><span class="h-num">7.1</span>Инвертированный индекс и анализ текста</h2>
+<p>При индексации текст проходит <b>анализатор</b>: разбиение на слова (tokenizer), приведение к нижнему регистру, удаление стоп-слов, стемминг или лемматизация («ноутбуки» → «ноутбук»), синонимы. Получившиеся термы попадают в инвертированный индекс: <code>терм → список документов (+ частоты, позиции)</code>. Запрос анализируется <b>тем же</b> анализатором и сводится к пересечению/объединению списков.</p>
+
+<div class="widget" id="seW">
+  <div class="widget-title">Мини-поисковик: анализ и ранжирование BM25</div>
+  <div class="controls">
+    <label>запрос<input type="text" id="seQ" value="лёгкие ноутбуки для работы"></label>
+    <label>анализатор<select id="seA"><option value="std">стандартный: только регистр</option><option value="ru" selected>русский: стоп-слова + стемминг</option></select></label>
+  </div>
+  <div class="out" id="seAn"></div>
+  <div class="rows" id="seRes"></div>
+  <div class="hint" id="seHint"></div>
+</div>
+<script>
+(function () {
+  var DOCS = [
+    "Лёгкий ноутбук для работы и учёбы, 1.2 кг",
+    "Игровой ноутбук с мощной видеокартой",
+    "Рюкзак для ноутбука, лёгкий и прочный",
+    "Ноутбуки и планшеты: как выбрать для работы",
+    "Работа с документами на планшете",
+    "Подставка для ноутбуков, алюминий"
+  ];
+  var STOP = { "и": 1, "в": 1, "на": 1, "для": 1, "с": 1, "как": 1, "по": 1, "к": 1 };
+  var END = ["ами", "ями", "ого", "его", "ому", "ему", "ыми", "ими", "ая", "яя", "ое", "ее", "ие", "ые", "ой", "ей", "ий", "ый", "ов", "ев", "ам", "ям", "ах", "ях", "ом", "ем", "ую", "юю", "а", "я", "о", "е", "ы", "и", "у", "ю", "ь"];
+  function stem(w) { for (var i = 0; i < END.length; i++) if (w.length - END[i].length >= 4 && w.slice(-END[i].length) === END[i]) return w.slice(0, -END[i].length); return w; }
+  function analyze(s, mode) {
+    var t = s.toLowerCase().replace(/ё/g, "е").split(/[^0-9a-zа-я.]+/i).filter(Boolean).map(function (w) { return w.replace(/\.$/, ""); }).filter(Boolean);
+    if (mode === "ru") t = t.filter(function (w) { return !STOP[w]; }).map(stem);
+    return t;
+  }
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var mode = $("seA").value, q = analyze($("seQ").value, mode), docs = DOCS.map(function (d) { return analyze(d, mode); });
+    var N = docs.length, avg = docs.reduce(function (s, d) { return s + d.length; }, 0) / N, k1 = 1.2, b = 0.75;
+    $("seAn").textContent = "термы запроса: " + (q.length ? q.map(function (x) { return "«" + x + "»"; }).join(" ") : "—") + "\n" + docs.map(function (d, i) { return "док " + (i + 1) + ": " + d.join(" "); }).join("\n");
+    var res = docs.map(function (d, i) {
+      var sc = 0, why = [];
+      q.forEach(function (t) {
+        var tf = d.filter(function (x) { return x === t; }).length; if (!tf) return;
+        var df = docs.filter(function (x) { return x.indexOf(t) >= 0; }).length, idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+        var s = idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * d.length / avg)); sc += s; why.push(t + ": " + s.toFixed(2));
+      });
+      return [i, sc, why];
+    }).filter(function (r) { return r[1] > 0; }).sort(function (a, b2) { return b2[1] - a[1]; });
+    $("seRes").innerHTML = res.length ? res.map(function (r, j) { return '<div class="row' + (j ? "" : " win") + '"><span>' + (j + 1) + "</span><span>" + DOCS[r[0]] + "<br><small>" + r[2].join(" · ") + '</small></span><span style="font-family:var(--font-mono);text-align:right">' + r[1].toFixed(2) + "</span></div>"; }).join("") : '<div class="verdict warn">Ничего не найдено</div>';
+    $("seHint").textContent = mode === "std" ? "Без стемминга «ноутбуки» не совпадает с «ноутбук», «лёгкие» — с «лёгкий». Переключите анализатор." : "BM25: редкие термы (высокий IDF) весят больше частых; повтор терма даёт убывающую прибавку; короткие документы с тем же термом выше длинных.";
+  }
+  ["seQ", "seA"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="features"><span class="h-num">7.2</span>Что умеет поисковый движок</h2>
+<div class="table-wrap"><table>
+<tr><th>Возможность</th><th>Пример</th></tr>
+<tr><td>Морфология, синонимы, транслитерация</td><td>«ноут» ≈ «ноутбук», «iphone» ≈ «айфон»</td></tr>
+<tr><td>Нечёткий поиск</td><td><code>fuzziness: AUTO</code> — «ноутбк» найдёт «ноутбук» (расстояние Левенштейна)</td></tr>
+<tr><td>Ранжирование с бустами</td><td>совпадение в названии × 3, в описании × 1; свежесть и популярность через function_score</td></tr>
+<tr><td>Фасеты (агрегации)</td><td>счётчики по бренду, цвету, диапазонам цены для текущей выдачи</td></tr>
+<tr><td>Подсказки и автодополнение</td><td>edge n-grams, completion suggester</td></tr>
+<tr><td>Подсветка совпадений</td><td>highlight во фрагментах текста</td></tr>
+<tr><td>Гибридный поиск</td><td>BM25 + векторы (kNN) с объединением рангов (RRF) — тема 11</td></tr>
+</table></div>
+<pre data-title="запрос с фасетами и бустами"><code class="js">POST /products/_search
+{
+  "query": { "bool": {
+    "must":   { "multi_match": { "query": "лёгкий ноутбук", "fields": ["name^3", "description"], "fuzziness": "AUTO" } },
+    "filter": [ { "term": { "in_stock": true } }, { "range": { "price": { "lte": 150000 } } } ]
+  }},
+  "aggs": {
+    "brands": { "terms": { "field": "brand" } },
+    "price":  { "range": { "field": "price", "ranges": [ { "to": 50000 }, { "from": 50000, "to": 100000 }, { "from": 100000 } ] } }
+  },
+  "size": 20
+}</code></pre>
+
+<h2 id="cluster"><span class="h-num">7.3</span>Устройство: шарды, реплики, сегменты</h2>
+<ul>
+  <li>Индекс делится на <b>первичные шарды</b> (число задаётся при создании; поменять — reindex/split), у каждого — реплики. Запрос рассылается на все шарды, результаты сливаются координатором.</li>
+  <li>Каждый шард — индекс Lucene из неизменяемых <b>сегментов</b> (как LSM): новые документы попадают в буфер и становятся видимы после <b>refresh</b> (по умолчанию раз в секунду) — поиск «почти в реальном времени».</li>
+  <li>Обновление документа = удаление старого + добавление нового; сегменты сливаются в фоне (merge).</li>
+  <li>Ориентиры: шард 10–50 ГБ; слишком много мелких шардов — накладные расходы на каждый.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Не основная база</span>
+Нет транзакций, обновления дорогие, видимость с задержкой, исторически были случаи потери данных при разделениях сети, изменение маппинга требует переиндексации. Источник истины — основная база; поисковый индекс должен уметь пересобраться из неё целиком (полная переиндексация через alias: собрать новый индекс, переключить алиас).
+</div>
+
+<h2 id="sync"><span class="h-num">7.4</span>Синхронизация с основной базой</h2>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Плюсы</th><th>Минусы</th></tr>
+<tr><td>Двойная запись из приложения</td><td>просто</td><td>расхождения при сбое между двумя записями, нет упорядочения — <b>избегать</b></td></tr>
+<tr><td>Outbox + обработчик</td><td>гарантированная доставка события, транзакционно с данными</td><td>таблица outbox и воркер</td></tr>
+<tr><td>CDC (Debezium) → Kafka → коннектор</td><td>не трогает код, порядок по ключу, перечитывание</td><td>инфраструктура Kafka/Connect</td></tr>
+<tr><td>Периодическая выгрузка по updated_at</td><td>очень просто</td><td>задержка, удаления теряются без мягкого удаления</td></tr>
+</table></div>
+<p>Подробно о CDC и outbox — тема 16. Идемпотентность: индексируйте документ целиком по id с версией (<code>version_type: external</code>), чтобы старое событие не перезаписало новое.</p>
+
+<h2 id="pgfts"><span class="h-num">7.5</span>Когда хватит PostgreSQL</h2>
+<div class="grid-2">
+  <div class="card"><h4>PostgreSQL FTS + pg_trgm</h4><ul><li>до миллионов документов</li><li>простая релевантность (ts_rank), стемминг, фразы</li><li>поиск по подстроке и опечаткам — триграммы</li><li>согласованность с данными в одной транзакции</li><li>нет второй системы</li></ul></div>
+  <div class="card"><h4>Поисковый движок</h4><ul><li>большие каталоги и высокий QPS поиска</li><li>сложная релевантность, бусты, синонимы, персонализация</li><li>фасеты по многим полям на каждой выдаче</li><li>автодополнение, подсветка</li><li>логи и полнотекстовая аналитика (ELK)</li></ul></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">7.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему поиск «ноутбуки» может не находить «ноутбук» в поисковом движке?</p><ul><li>Индекс повреждён</li><li>Анализатор не делает стемминг (или запрос и поле анализируются разными анализаторами)</li><li>Нужен refresh</li><li>Документ слишком длинный</li></ul><div class="why">Совпадение — на уровне термов после анализа.</div></div>
+<div class="mcq" data-ok="3"><p>Как правильно обновлять поисковый индекс при изменении товара в PostgreSQL?</p><ul><li>Писать в обе системы из контроллера</li><li>Перестраивать индекс при каждом запросе</li><li>Хранить товары только в поисковом движке</li><li>Через outbox или CDC с идемпотентной индексацией документа по id и версии</li></ul><div class="why">Двойная запись без координации даёт расхождения.</div></div>
+<div class="mcq" data-ok="0"><p>Почему документ, только что проиндексированный, может не находиться секунду?</p><ul><li>Видимость появляется после refresh, который по умолчанию раз в секунду</li><li>Репликация синхронная</li><li>Индекс заблокирован</li><li>Документ ещё анализируется вечно</li></ul><div class="why">Near-real-time: компромисс между свежестью и стоимостью создания сегментов.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает IDF в BM25?</p><ul><li>Учитывает длину документа</li><li>Считает число повторов терма</li><li>Даёт больший вес редким в коллекции термам</li><li>Исправляет опечатки</li></ul><div class="why">«Ноутбук» в магазине ноутбуков почти ничего не различает, а «oled» — многое.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как изменить маппинг поля в индексе с данными без простоя?</summary><div class="a"><p>Создать новый индекс с новым маппингом, переиндексировать данные (из основной базы или <code>_reindex</code> из старого индекса), параллельно дописывать новые изменения в оба индекса (или догнать по CDC), переключить алиас, на который смотрит приложение, атомарно на новый индекс, удалить старый.</p></div></details>
+<details class="q"><summary>Что такое гибридный поиск и зачем он?</summary><div class="a"><p>Объединение лексического (BM25: точные слова, артикулы, имена) и семантического поиска (векторы: смысл, перефразирования). Результаты двух поисков сливаются, например, Reciprocal Rank Fusion. Даёт лучшее качество, чем каждый по отдельности: векторы плохо ищут точные коды, BM25 — синонимы и смысл.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

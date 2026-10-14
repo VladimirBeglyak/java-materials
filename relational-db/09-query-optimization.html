@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Оптимизация запросов на практике</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ВНУТРЕННЕЕ УСТРОЙСТВО</div>
+  <h1>Оптимизация запросов на практике</h1>
+  <p class="lead">Набор приёмов, которые закрывают большинство проблем производительности в приложениях: найти, какие запросы действительно тяжёлые, убрать N+1, заменить OFFSET-пагинацию, переписать неудачные конструкции, правильно делать массовые операции. С примерами из Java/Spring.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">pg_stat_statements</span><span class="tag">N+1</span><span class="tag">keyset-пагинация</span><span class="tag">батчи</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="find"><span class="h-num">9.1</span>Сначала найти: pg_stat_statements</h2>
+<p>Оптимизировать «на глаз» бесполезно. Расширение <code>pg_stat_statements</code> собирает статистику по каждому нормализованному запросу (параметры заменены на <code>$1</code>). Сортировка по <b>суммарному</b> времени показывает, что реально грузит базу: часто это не самый медленный запрос, а быстрый, вызываемый миллион раз.</p>
+<pre data-title="топ запросов по суммарному времени"><code class="sql">-- postgresql.conf: shared_preload_libraries = 'pg_stat_statements'
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT round(total_exec_time) AS total_ms, calls,
+       round(mean_exec_time::numeric, 2) AS mean_ms, rows,
+       round(100 * total_exec_time / sum(total_exec_time) OVER (), 1) AS pct,
+       shared_blks_hit + shared_blks_read AS blocks,
+       left(query, 80) AS query
+FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 15;</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Признак N+1</h4><p>Запрос вида <code>SELECT … WHERE order_id = $1</code> с calls в 50 раз больше, чем у запроса списка заказов. Среднее время 0.05 мс, но суммарно — первое место.</p></div>
+  <div class="card"><h4>Признак плохого плана</h4><p>Большое <code>mean_ms</code> и огромные <code>blocks</code> на <code>rows</code> — запрос читает тысячи страниц ради единиц строк. Дальше — EXPLAIN (тема 08).</p></div>
+</div>
+
+<h2 id="n1"><span class="h-num">9.2</span>N+1: главный убийца производительности ORM</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="1 запрос списка + N запросов связей"><code class="java">List&lt;Order&gt; orders = orderRepo.findByStatus("paid"); // 1 запрос
+for (Order o : orders) {
+    o.getItems().size();       // LAZY → +1 запрос на КАЖДЫЙ заказ
+    o.getCustomer().getName(); // ещё +1
+}
+// 100 заказов = 201 запрос, каждый — сетевой круг ~0.3 мс</code></pre>
+<pre class="good-code" data-title="загрузить связи пачкой"><code class="java">@Query("""
+  select distinct o from Order o
+  join fetch o.customer
+  left join fetch o.items
+  where o.status = :status""")
+List&lt;Order&gt; findPaidWithItems(String status);
+
+// или @EntityGraph(attributePaths = {"customer", "items"})
+// или hibernate.default_batch_fetch_size = 100
+//   → связи грузятся WHERE id IN (… 100 id …)</code></pre>
+</div>
+<div class="widget" id="n1W">
+  <div class="widget-title">Цена N+1</div>
+  <div class="controls">
+    <label>строк в списке<input type="number" id="n1N" value="100" min="1"></label>
+    <label>связей на строку (LAZY)<input type="number" id="n1R" value="2" min="0" max="10"></label>
+    <label>время сетевого круга, мс<select id="n1L"><option value="0.2">0.2 (та же зона)</option><option value="1" selected>1 (облако, другой узел)</option><option value="5">5 (другой регион)</option></select></label>
+  </div>
+  <div id="n1Bars"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(1, +$("n1N").value), r = Math.max(0, +$("n1R").value), l = +$("n1L").value;
+    var v = [["N+1: 1 + " + n + "×" + r + " запросов", (1 + n * r) * (l + 0.05)], ["batch fetch (по 100 id)", (1 + r * Math.ceil(n / 100)) * (l + 0.1)], ["JOIN FETCH / EntityGraph", l + 0.05 * Math.max(1, n / 50) + 0.2]];
+    var mx = Math.max.apply(null, v.map(function (x) { return x[1]; }));
+    $("n1Bars").innerHTML = v.map(function (x, i) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px;flex-wrap:wrap"><b>' + x[0] + '</b><span style="font-family:var(--font-mono)">≈ ' + x[1].toFixed(1) + ' мс</span></div><div class="bar ' + (i ? "ok" : "bad") + '"><i style="width:' + Math.max(1, x[1] / mx * 100) + '%"></i></div>'; }).join("");
+  }
+  ["n1N", "n1R", "n1L"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Ловушки JOIN FETCH</span>
+Две коллекции через <code>join fetch</code> дают декартово произведение (Hibernate выдаст <code>MultipleBagFetchException</code> для List). Пагинация с <code>join fetch</code> коллекции происходит <b>в памяти</b> (предупреждение HHH90003004). Решение: сначала страница идентификаторов, затем загрузка связей по <code>id IN (…)</code>, или batch fetch.
+</div>
+
+<h2 id="pagination"><span class="h-num">9.3</span>Пагинация: OFFSET против keyset</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="OFFSET: база читает и выбрасывает"><code class="sql">SELECT * FROM orders
+ORDER BY created_at DESC, id DESC
+LIMIT 20 OFFSET 100000;
+-- прочитать 100 020 строк, отдать 20;
+-- строка вставлена между запросами →
+-- дубли и пропуски на страницах</code></pre>
+<pre class="good-code" data-title="keyset (seek): продолжить с последнего"><code class="sql">SELECT * FROM orders
+WHERE (created_at, id) &lt; (:lastCreated, :lastId)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+-- индекс (created_at, id): всегда ~20 строк,
+-- стабильно при вставках</code></pre>
+</div>
+<div class="widget" id="pgW">
+  <div class="widget-title">Сколько строк читает база для страницы N</div>
+  <div class="controls"><label>номер страницы<input type="number" id="pgN" value="5000" min="1"></label><label>размер страницы<input type="number" id="pgS" value="20" min="1"></label></div>
+  <div id="pgBars"></div>
+  <div class="verdict" id="pgV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(1, +$("pgN").value), s = Math.max(1, +$("pgS").value), off = (n - 1) * s + s, ks = s;
+    $("pgBars").innerHTML = '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>OFFSET ' + ((n - 1) * s).toLocaleString("ru") + '</b><span style="font-family:var(--font-mono)">' + off.toLocaleString("ru") + ' строк</span></div><div class="bar bad"><i style="width:100%"></i></div>' +
+      '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>keyset</b><span style="font-family:var(--font-mono)">' + ks + ' строк</span></div><div class="bar ok"><i style="width:' + Math.max(0.5, ks / off * 100) + '%"></i></div>';
+    $("pgV").className = "verdict " + (off > 10000 ? "bad" : "ok");
+    $("pgV").textContent = "OFFSET в " + Math.round(off / ks).toLocaleString("ru") + " раз дороже. Keyset не умеет «перейти на страницу 5000» — но такой переход людям и не нужен; для лент, бесконечной прокрутки и выгрузок keyset — стандарт. Spring Data: Window<T> и ScrollPosition.keyset().";
+  }
+  ["pgN", "pgS"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<p>Связанная проблема — <code>SELECT count(*)</code> для «всего страниц». На большой таблице это полный просмотр (MVCC не даёт хранить точный счётчик). Варианты: не показывать точное число («более 1000»), запросить <code>LIMIT 1001</code>, оценка из <code>pg_class.reltuples</code> или <code>EXPLAIN</code>, счётчик в отдельной таблице.</p>
+
+<h2 id="rewrites"><span class="h-num">9.4</span>Переписывания, которые стоит знать</h2>
+<div class="table-wrap"><table>
+<tr><th>Было</th><th>Стало</th><th>Почему</th></tr>
+<tr><td><code>WHERE x NOT IN (SELECT y FROM t)</code></td><td><code>WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.y = x)</code></td><td>NULL в подзапросе делает NOT IN пустым; NOT EXISTS ещё и планируется как anti-join</td></tr>
+<tr><td><code>WHERE a = 1 OR b = 2</code> (разные индексы)</td><td>BitmapOr справится; иначе <code>UNION</code> двух запросов</td><td>OR по разным столбцам мешает простому Index Scan</td></tr>
+<tr><td><code>WHERE date_trunc('day', ts) = $1</code></td><td><code>WHERE ts &gt;= $1 AND ts &lt; $1 + 1 day</code></td><td>условие становится «индексируемым»</td></tr>
+<tr><td><code>SELECT DISTINCT …</code> для устранения дублей от JOIN</td><td><code>WHERE EXISTS (…)</code></td><td>не размножать строки, чтобы потом сворачивать</td></tr>
+<tr><td><code>SELECT *</code></td><td>нужные столбцы</td><td>меньше данных, TOAST не читается, возможен Index Only Scan</td></tr>
+<tr><td>«последний заказ каждого клиента» через подзапрос на каждую строку</td><td><code>DISTINCT ON (customer_id) … ORDER BY customer_id, created_at DESC</code> или <code>LATERAL … LIMIT 1</code></td><td>один проход по индексу</td></tr>
+<tr><td><code>WHERE id IN (… 10 000 литералов …)</code></td><td><code>WHERE id = ANY($1::bigint[])</code> или JOIN с <code>unnest</code></td><td>один план для любого числа значений, нет предела параметров</td></tr>
+</table></div>
+
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">Песочница: ловушка NOT IN и её исправление</div>
+  <div class="sql-presets">
+    <button type="button" data-sql="-- город NULL у клиента 4&#10;SELECT id, name, city FROM customers;">клиенты</button>
+    <button type="button" data-sql="-- клиенты НЕ из городов клиентов 1 и 4: ожидаем Москва, Алматы...&#10;SELECT name, city FROM customers&#10;WHERE city NOT IN (SELECT city FROM customers WHERE id IN (1, 4));">NOT IN → пусто!</button>
+    <button type="button" data-sql="SELECT c.name, c.city FROM customers c&#10;WHERE NOT EXISTS (SELECT 1 FROM customers x WHERE x.id IN (1, 4) AND x.city = c.city);">NOT EXISTS</button>
+    <button type="button" data-sql="-- клиенты без заказов: anti-join&#10;SELECT c.name FROM customers c&#10;WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);">без заказов</button>
+    <button type="button" data-sql="-- последний заказ каждого клиента (оконная функция; в PostgreSQL удобнее DISTINCT ON)&#10;SELECT customer_id, id, created_at FROM (&#10;  SELECT o.*, row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) rn FROM orders o)&#10;WHERE rn = 1;">последний заказ</button>
+    <button type="button" data-sql="-- keyset: следующая страница после (created_at, id) = ('2026-07-05', 105)&#10;SELECT id, created_at FROM orders&#10;WHERE (created_at, id) &lt; ('2026-07-05', 105)&#10;ORDER BY created_at DESC, id DESC LIMIT 3;">keyset</button>
+  </div>
+  <textarea>SELECT name, city FROM customers
+WHERE city NOT IN (SELECT city FROM customers WHERE id IN (1, 4));</textarea>
+</div>
+
+<h2 id="bulk"><span class="h-num">9.5</span>Массовые операции</h2>
+<pre data-title="вставка: батчи JDBC и reWriteBatchedInserts"><code class="yaml">spring:
+  datasource:
+    url: jdbc:postgresql://db/app?reWriteBatchedInserts=true   # INSERT … VALUES (…),(…),(…)
+  jpa:
+    properties:
+      hibernate.jdbc.batch_size: 50
+      hibernate.order_inserts: true
+      hibernate.order_updates: true
+# IDENTITY-ключи отключают батч-вставку в Hibernate: используйте SEQUENCE с pooled optimizer (allocationSize = 50)</code></pre>
+<pre data-title="обновление и удаление миллионов строк — порциями"><code class="sql">-- плохо: одна транзакция на 10 млн строк — долгие блокировки, раздувание, огромный WAL, отставание реплик
+-- хорошо: порции по 5–10 тыс. строк, каждая — своя транзакция, пауза между ними
+WITH batch AS (
+  SELECT id FROM events WHERE created_at &lt; now() - interval '90 days'
+  ORDER BY id LIMIT 5000
+)
+DELETE FROM events e USING batch WHERE e.id = batch.id;
+-- повторять, пока удаляется > 0; для регулярной чистки — партиции и DROP PARTITION (тема 17)
+
+-- загрузка больших объёмов: COPY в 10–50 раз быстрее INSERT
+COPY staging_products FROM STDIN WITH (FORMAT csv, HEADER true);   -- в Java: CopyManager драйвера</code></pre>
+
+<h2 id="matview"><span class="h-num">9.6</span>Когда запрос не ускорить — хранить результат</h2>
+<ul>
+  <li><b>Материализованное представление</b>: <code>CREATE MATERIALIZED VIEW sales_daily AS …</code>, обновление <code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code> (нужен уникальный индекс) по расписанию. Данные отстают на период обновления.</li>
+  <li><b>Таблица-агрегат</b>, обновляемая в той же транзакции или асинхронно по событиям: счётчики, балансы, рейтинги.</li>
+  <li><b>Кэш приложения</b> (Redis, Caffeine) — для горячих неизменных данных; цена — инвалидация.</li>
+  <li><b>Отдельное аналитическое хранилище</b> — если тяжёлые отчёты мешают OLTP (пособие по выбору БД, OLAP).</li>
+</ul>
+
+<h2 id="checklist"><span class="h-num">9.7</span>Чек-лист ревью SQL в коде</h2>
+<div class="widget" id="ckW">
+  <div class="widget-title">Отметьте, что верно для вашего запроса</div>
+  <div class="checks col" id="ckList"></div>
+  <div class="verdict" id="ckV"></div>
+</div>
+<script>
+(function () {
+  var items = ["Условия «индексируемы»: нет функций и приведений над столбцом", "Для условий и ORDER BY есть подходящий индекс (проверено EXPLAIN на реальных данных)", "Выбираются только нужные столбцы", "Нет N+1: связи грузятся пачкой", "Пагинация keyset или OFFSET ограничен небольшими значениями", "ORDER BY однозначен (есть уникальный столбец в конце)", "Нет NOT IN по столбцу, который может быть NULL", "Массовые изменения разбиты на порции", "Транзакция не держится открытой во время внешних вызовов", "Запрос проверен на «тяжёлом» значении параметра (крупный клиент)"];
+  var $ = function (i) { return document.getElementById(i); };
+  $("ckList").innerHTML = items.map(function (t, i) { return '<label><input type="checkbox" data-i="' + i + '"> ' + t + "</label>"; }).join("");
+  function run() { var n = $("ckList").querySelectorAll("input:checked").length; $("ckV").className = "verdict " + (n === items.length ? "ok" : n >= 7 ? "warn" : "bad"); $("ckV").textContent = "Выполнено " + n + " из " + items.length + (n === items.length ? " — запрос готов к продакшену." : ". Невыполненные пункты — частые причины инцидентов производительности."); }
+  $("ckList").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">9.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой запрос стоит оптимизировать первым?</p><ul><li>Самый медленный: 8 с, вызывается раз в сутки</li><li>Любой с Seq Scan</li><li>Тот, у которого наибольшее суммарное время в pg_stat_statements (например, 3 мс × 2 млн вызовов)</li><li>Самый длинный по тексту</li></ul><div class="why">Нагрузку на базу определяет суммарное время; редкий тяжёлый отчёт может быть вообще не проблемой.</div></div>
+<div class="mcq" data-ok="0"><p>Почему <code>WHERE city NOT IN (SELECT city FROM …)</code> может вернуть пустой результат?</p><ul><li>Если в подзапросе есть NULL, сравнение даёт UNKNOWN для всех строк</li><li>NOT IN не поддерживается подзапросами</li><li>Из-за отсутствия индекса</li><li>Из-за регистра букв</li></ul><div class="why">x NOT IN (a, NULL) = x&lt;&gt;a AND x&lt;&gt;NULL → никогда не TRUE.</div></div>
+<div class="mcq" data-ok="1"><p>Почему keyset-пагинация быстрее OFFSET на дальних страницах?</p><ul><li>Она кэширует результаты</li><li>Она начинает чтение индекса сразу с нужной позиции, а OFFSET читает и выбрасывает все предыдущие строки</li><li>Она не использует ORDER BY</li><li>Она читает таблицу параллельно</li></ul><div class="why">Стоимость keyset не зависит от номера страницы.</div></div>
+<div class="mcq" data-ok="3"><p>Почему в Hibernate батч-вставки не работают с <code>GenerationType.IDENTITY</code>?</p><ul><li>IDENTITY запрещает транзакции</li><li>PostgreSQL не поддерживает батчи</li><li>Батчи работают только с UUID</li><li>Hibernate должен узнать id сразу после каждой вставки, поэтому выполняет их по одной</li></ul><div class="why">С SEQUENCE и allocationSize Hibernate получает пачку id заранее.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как удалить 50 млн старых строк из живой таблицы?</summary><div class="a"><p>Не одной командой: долгая транзакция держит блокировки строк, мешает VACUUM, генерирует огромный WAL и отставание реплик. Удалять порциями по несколько тысяч строк по индексу, каждая — отдельная транзакция, с паузами и мониторингом отставания реплик; затем VACUUM. Если такое удаление регулярно — перейти на партиционирование по времени и удалять партиции целиком (DROP/DETACH — мгновенно).</p></div></details>
+<details class="q"><summary>Список заказов с позициями и пагинацией в Spring Data JPA — как сделать эффективно?</summary><div class="a"><p>Шаг 1: страница идентификаторов заказов (keyset или Pageable по индексу). Шаг 2: загрузить заказы с позициями по <code>id IN (:ids)</code> через JOIN FETCH или EntityGraph. Либо batch fetch size для коллекций. Для чтения — DTO-проекции вместо сущностей, read-only транзакции. Count-запрос — отдельно, при необходимости приблизительный.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900), (7,'Монитор','электроника',32000);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'), (104,3,'cancelled','2026-07-02'),
+  (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'), (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500), (104,6,3,900),
+  (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800), (107,5,2,600), (108,1,1,93000);
+</script>
+</div></main>
+</div>
+</body>
+</html>

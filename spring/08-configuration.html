@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Внешняя конфигурация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · SPRING BOOT</div>
+  <h1>Внешняя конфигурация и @ConfigurationProperties</h1>
+  <p class="lead">Один и тот же jar запускается локально, в тесте и на проде — отличаются только настройки. Boot читает их из полутора десятков источников в строгом порядке. Нужно точно знать, какой источник побеждает, как имя <code>spring.datasource.hikari.maximum-pool-size</code> превращается в переменную окружения и как получить настройки в код типобезопасно и с валидацией.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">порядок источников</span><span class="tag">relaxed binding</span><span class="tag">Binder</span><span class="tag">2 симулятора</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="order"><span class="h-num">8.1</span>Порядок источников: кто побеждает</h2>
+<p>От низшего приоритета к высшему (поздний перекрывает ранний):</p>
+<ol class="steps">
+  <li>Свойства по умолчанию: <code>SpringApplication.setDefaultProperties</code></li>
+  <li><code>@PropertySource</code> на <code>@Configuration</code> (добавляются в Environment только во время refresh контекста — для <code>logging.*</code> и <code>spring.main.*</code> слишком поздно)</li>
+  <li><b>Файлы конфигурации</b>: application.yml в jar → application-{profile}.yml в jar → application.yml рядом с jar → application-{profile}.yml рядом с jar</li>
+  <li><code>random.*</code></li>
+  <li><b>Переменные окружения ОС</b></li>
+  <li><b>Системные свойства Java</b> (<code>-D</code>)</li>
+  <li>JNDI, параметры ServletContext/ServletConfig</li>
+  <li><code>SPRING_APPLICATION_JSON</code></li>
+  <li><b>Аргументы командной строки</b> (<code>--server.port=9000</code>)</li>
+  <li>В тестах: <code>properties</code> у <code>@SpringBootTest</code> → <code>@DynamicPropertySource</code> → <code>@TestPropertySource</code></li>
+  <li>Глобальные настройки devtools (<code>~/.config/spring-boot</code>)</li>
+</ol>
+
+<div class="widget" id="po">
+  <div class="widget-title">Симулятор: какое значение получит server.port</div>
+  <p class="hint">Профиль <code>prod</code> активен. Включайте источники и меняйте значения. Список отсортирован от высшего приоритета к низшему.</p>
+  <div class="rows" id="poRows"></div>
+  <div class="verdict" id="poOut"></div>
+</div>
+<script>
+(function () {
+  var src = [
+    { n: "Аргумент командной строки --server.port", v: "9090", on: false },
+    { n: "SPRING_APPLICATION_JSON='{\"server\":{\"port\":…}}'", v: "7070", on: false },
+    { n: "Системное свойство -Dserver.port", v: "8888", on: false },
+    { n: "Переменная окружения SERVER_PORT", v: "9000", on: true },
+    { n: "./config/application-prod.yml (рядом с jar)", v: "8084", on: false },
+    { n: "./config/application.yml (рядом с jar)", v: "8082", on: true },
+    { n: "application-prod.yml (внутри jar)", v: "8081", on: true },
+    { n: "application.yml (внутри jar)", v: "8080", on: true },
+    { n: "@PropertySource(\"classpath:defaults.properties\")", v: "8000", on: false },
+    { n: "SpringApplication.setDefaultProperties", v: "80", on: false }
+  ];
+  var rows = document.getElementById("poRows"), out = document.getElementById("poOut");
+  rows.innerHTML = src.map(function (s, i) {
+    return '<div class="row" data-i="' + i + '"><input type="checkbox" id="poC' + i + '"' + (s.on ? " checked" : "") + ' aria-label="включить источник"><span>' + SG.esc(s.n) + '</span><input type="text" id="poV' + i + '" value="' + s.v + '" aria-label="значение"></div>';
+  }).join("");
+  function run() {
+    var win = -1;
+    src.forEach(function (s, i) { s.on = document.getElementById("poC" + i).checked; s.v = document.getElementById("poV" + i).value; if (s.on && win < 0) win = i; });
+    rows.querySelectorAll(".row").forEach(function (r, i) { r.className = "row" + (i === win ? " win" : (src[i].on ? " lost" : "")); });
+    if (win < 0) { out.className = "verdict warn"; out.innerHTML = "Ни один источник не задаёт свойство — используется значение по умолчанию из <code>ServerProperties</code>: <b>8080</b>."; return; }
+    var lost = src.filter(function (s, i) { return s.on && i > win; });
+    out.className = "verdict ok";
+    out.innerHTML = "server.port = <b>" + SG.esc(src[win].v) + "</b> — из источника «" + SG.esc(src[win].n) + "»." + (lost.length ? " Перекрыты: " + lost.map(function (s) { return SG.esc(s.v); }).join(", ") + "." : "");
+  }
+  rows.addEventListener("input", run); rows.addEventListener("change", run);
+  run();
+})();
+</script>
+<div class="callout info">В одном месте <code>.properties</code> перекрывает <code>.yml</code>. Не держите оба формата — это путает. Для отладки «откуда взялось значение» используйте <code>/actuator/env/server.port</code>: он покажет все источники, где ключ задан, и победителя.</div>
+
+<h2 id="files"><span class="h-num">8.2</span>Файлы конфигурации</h2>
+<p>Boot ищет <code>application.*</code> в <code>classpath:/</code>, <code>classpath:/config/</code>, <code>./</code>, <code>./config/</code>, <code>./config/*/</code> — каждое следующее место перекрывает предыдущее. Переопределить: <code>spring.config.location</code> (заменяет) или <code>spring.config.additional-location</code> (добавляет).</p>
+<pre data-title="application.yml: несколько документов и импорт"><code class="yaml">spring:
+  application:
+    name: shop
+  config:
+    import:
+      - optional:file:./secrets.yml            # optional: — не падать, если файла нет
+      - optional:configtree:/run/secrets/      # каждый файл в каталоге = свойство (Kubernetes secrets)
+server:
+  port: 8080
+---
+spring:
+  config:
+    activate:
+      on-profile: prod                         # этот документ — только для prod
+server:
+  port: 80
+shop:
+  payments:
+    timeout: 3s</code></pre>
+<p>Документы внутри файла (<code>---</code>) обрабатываются сверху вниз, нижние перекрывают верхние. <code>spring.profiles.active</code> нельзя задавать в профильном документе — профили определяются до их чтения.</p>
+
+<h2 id="relaxed"><span class="h-num">8.3</span>Relaxed binding: одно свойство — много написаний</h2>
+<p>Каноническая форма имени — kebab-case в нижнем регистре: <code>shop.payments.retry-count</code>. При биндинге к <code>@ConfigurationProperties</code> подходят и <code>shop.payments.retryCount</code>, <code>shop.payments.retry_count</code>, и переменная <code>SHOP_PAYMENTS_RETRYCOUNT</code>. Внутри Boot все источники оборачиваются в <code>ConfigurationPropertySource</code>, который нормализует имена к <code>ConfigurationPropertyName</code>.</p>
+<div class="widget" id="rb">
+  <div class="widget-title">Имя свойства → переменная окружения</div>
+  <div class="controls"><label>свойство<input type="text" id="rbIn" class="wide" value="spring.datasource.hikari.maximum-pool-size"></label></div>
+  <div class="controls"><button class="btn" type="button" data-v="spring.datasource.hikari.maximum-pool-size">hikari</button><button class="btn" type="button" data-v="shop.servers[0].host">список</button><button class="btn" type="button" data-v="logging.level.org.hibernate.SQL">logging.level</button><button class="btn" type="button" data-v="management.endpoints.web.exposure.include">actuator</button></div>
+  <div class="out" id="rbOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("rbIn"), out = document.getElementById("rbOut");
+  function run() {
+    var p = inp.value.trim();
+    var env = p.replace(/\[(\d+)\]/g, "_$1").replace(/\./g, "_").replace(/-/g, "").toUpperCase();
+    var lines = ["Переменная окружения:  " + env, "", "Правила: точки → «_», дефисы удаляются, всё в верхний регистр, индекс [n] → _n_."];
+    if (/[A-Z]/.test(p.split(".").slice(-1)[0]) && /^logging\.level\./.test(p)) lines.push("Внимание: при биндинге переменные окружения приводятся к нижнему регистру: LOGGING_LEVEL_ORG_HIBERNATE_SQL станет логгером org.hibernate.sql, а не org.hibernate.SQL. Так задаются только уровни пакетов; для отдельного класса используйте файл или SPRING_APPLICATION_JSON.");
+    if (/\[\d+\]/.test(p)) lines.push("Через переменные можно задать элемент списка: " + env + "=…; список из файла при этом заменяется целиком, а не дополняется.");
+    lines.push("Аргумент командной строки:  --" + p + "=…", "Системное свойство:  -D" + p + "=…");
+    out.textContent = lines.join("\n");
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#rb [data-v]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.getAttribute("data-v"); run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="props"><span class="h-num">8.4</span>@ConfigurationProperties</h2>
+<pre data-title="Типобезопасные неизменяемые настройки"><code class="java">@ConfigurationProperties("shop.payments")
+@Validated                                              // JSR-380: ошибка — на старте, а не в рантайме
+public record PaymentProperties(
+        @NotNull URI gatewayUrl,
+        @DefaultValue("5s") Duration timeout,           // "5s", "PT5S", "5000ms"
+        @DefaultValue("3") @Min(0) @Max(10) int retryCount,
+        @DefaultValue("1MB") DataSize maxPayload,
+        Map&lt;String, Merchant&gt; merchants,                // shop.payments.merchants.acme.api-key=…
+        List&lt;String&gt; allowedCurrencies) {               // shop.payments.allowed-currencies=RUB,USD
+
+    public record Merchant(String apiKey, @DefaultValue("true") boolean enabled) { }
+}
+
+@SpringBootApplication
+@ConfigurationPropertiesScan                            // или @EnableConfigurationProperties(PaymentProperties.class)
+class ShopApplication { }
+
+@Service
+class PaymentService {
+    PaymentService(PaymentProperties props) { /* обычный бин — внедряется как любой другой */ }
+}</code></pre>
+<h3>Как это работает внутри</h3>
+<ol class="steps">
+  <li><code>@EnableConfigurationProperties</code> (или сканирование) регистрирует описание бина-настроек и инфраструктуру: <code>ConfigurationPropertiesBindingPostProcessor</code>, <code>ConfigurationPropertiesBinder</code>.</li>
+  <li>Для record/класса с одним конструктором с параметрами используется <b>constructor binding</b>: <code>ValueObjectBinder</code> создаёт объект, разрешая каждый параметр по имени. Для JavaBean-класса с сеттерами — <code>JavaBeanBinder</code> в <code>postProcessBeforeInitialization</code>.</li>
+  <li><code>Binder</code> обходит <code>ConfigurationPropertySources</code> (тот же Environment, но с нормализацией имён), конвертирует значения через <code>ApplicationConversionService</code> (единицы для <code>Duration</code>/<code>DataSize</code>, списки из строки через запятую).</li>
+  <li>Если класс помечен <code>@Validated</code>, результат проверяется валидатором; ошибка → <code>BindValidationException</code> и понятный отчёт при старте.</li>
+</ol>
+<div class="table-wrap"><table>
+<tr><th></th><th><code>@Value</code></th><th><code>@ConfigurationProperties</code></th></tr>
+<tr><td>Relaxed binding</td><td>ограниченно (имя в <code>@Value</code> должно быть каноническим)</td><td>полностью</td></tr>
+<tr><td>Структуры, списки, Map</td><td>неудобно</td><td>да, вложенные объекты</td></tr>
+<tr><td>Валидация</td><td>нет</td><td><code>@Validated</code></td></tr>
+<tr><td>SpEL</td><td>да</td><td>нет</td></tr>
+<tr><td>Подсказки IDE, документация</td><td>нет</td><td>через configuration-processor</td></tr>
+<tr><td>Когда</td><td>одно-два значения</td><td>любая группа настроек</td></tr>
+</table></div>
+<pre data-title="Настройки для бина стороннего класса"><code class="java">@Bean
+@ConfigurationProperties("shop.reports.pool")         // spring.datasource.hikari.* работает точно так же
+HikariDataSource reportsDataSource() { return new HikariDataSource(); }   // сеттеры заполнит биндер</code></pre>
+
+<h2 id="secrets"><span class="h-num">8.5</span>Секреты и окружения</h2>
+<div class="grid-2">
+  <div class="card"><h4>Не в git</h4><p>Пароли и ключи — в переменных окружения, Kubernetes Secret (смонтированный как <code>configtree</code>), Vault (<code>spring.config.import=vault://</code> через Spring Cloud Vault). В <code>application.yml</code> оставляйте плейсхолдеры: <code>password: ${DB_PASSWORD}</code>.</p></div>
+  <div class="card"><h4>Сокрытие в Actuator</h4><p><code>/actuator/env</code> и <code>/configprops</code> маскируют значения (<code>management.endpoint.env.show-values=never</code> по умолчанию с Boot 3). Не открывайте эти endpoints наружу.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">8.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>server.port=8080 в application.yml внутри jar, SERVER_PORT=9000 в окружении, запуск с --server.port=7000. Какой порт?</p><ul><li>8080</li><li>9000</li><li>7000</li><li>Ошибка конфликта</li></ul><div class="why">Аргументы командной строки — выше переменных окружения, а те — выше файлов.</div></div>
+<div class="mcq" data-ok="0"><p>Как задать через переменную окружения свойство shop.retry-count?</p><ul><li>SHOP_RETRYCOUNT</li><li>SHOP_RETRY-COUNT</li><li>shop.retry-count</li><li>SHOP__RETRY__COUNT</li></ul><div class="why">Точки → подчёркивания, дефисы удаляются, верхний регистр.</div></div>
+<div class="mcq" data-ok="1"><p>В record с @ConfigurationProperties поле Duration timeout, а в yml timeout: 30. Что получится?</p><ul><li>30 секунд</li><li>30 миллисекунд — единица по умолчанию для Duration</li><li>Ошибка биндинга</li><li>30 минут</li></ul><div class="why">Число без единицы трактуется в миллисекундах, если не указано <code>@DurationUnit</code>. Пишите единицы явно: 30s.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Назовите порядок приоритета основных источников конфигурации Spring Boot.</summary><div class="a"><p>По возрастанию: default properties → @PropertySource → файлы (в jar, профильные в jar, снаружи, профильные снаружи) → random → переменные окружения → системные свойства → SPRING_APPLICATION_JSON → аргументы командной строки → тестовые источники → devtools.</p></div></details>
+<details class="q"><summary>Чем @ConfigurationProperties лучше @Value?</summary><div class="a"><p>Типобезопасная группировка, relaxed binding, вложенные структуры и коллекции, валидация на старте, неизменяемость через record, метаданные для IDE, единое место для настроек вместо разбросанных строк-ключей.</p></div></details>
+<details class="q"><summary>Как Boot сопоставляет SPRING_DATASOURCE_URL и spring.datasource.url?</summary><div class="a"><p>Источник переменных окружения оборачивается в SystemEnvironmentPropertySource/ConfigurationPropertySource, который умеет преобразовывать канонические имена: при поиске spring.datasource.url проверяются варианты SPRING_DATASOURCE_URL и др. Это сопоставление работает для @ConfigurationProperties и Environment.getProperty с каноническими именами.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

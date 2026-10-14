@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · ReentrantReadWriteLock</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.bits32 { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 1px; margin: 8px 0; font: 10px var(--font-mono); }
+.bits32 span { text-align: center; padding: 5px 0; border-radius: 2px; }
+.bits32 span.r { background: var(--info-soft); } .bits32 span.w { background: var(--warn-soft); } .bits32 span.one { font-weight: 700; color: var(--accent); }
+</style>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · LOCKS</div>
+  <h1>ReentrantReadWriteLock</h1>
+  <p class="lead">Пара блокировок над одним AQS: много читателей одновременно или один писатель. Разберём, как в одном <code>int state</code> упакованы счётчики читателей и писателя, почему «повысить» чтение до записи нельзя (взаимная блокировка), а «понизить» запись до чтения — можно, как нечестный режим защищает писателей от голодания — и когда эта блокировка медленнее обычной.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">state 16/16</span><span class="tag">реентерабельность</span><span class="tag">downgrade</span><span class="tag">upgrade deadlock</span><span class="tag">голодание писателя</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="state"><span class="h-num">11.1</span>Два счётчика в одном int</h2>
+<p>Старшие 16 бит state — число захватов чтения (всех потоков вместе), младшие 16 — число повторных захватов записи владельцем. Поэтому предел — 65 535 захватов каждого вида. Сколько раз захватил чтение конкретный поток, хранится отдельно: первый читатель — в полях <code>firstReader/firstReaderHoldCount</code>, последний — в кэше <code>cachedHoldCounter</code>, остальные — в <code>ThreadLocal readHolds</code>.</p>
+<div class="widget" id="rwW">
+  <div class="widget-title">Захваты и state</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="R1">R1: readLock.lock</button><button class="btn primary" type="button" data-a="R2">R2: readLock.lock</button>
+    <button class="btn" type="button" data-a="R1u">R1: unlock</button><button class="btn" type="button" data-a="R2u">R2: unlock</button>
+    <button class="btn primary" type="button" data-a="W">W: writeLock.lock</button><button class="btn" type="button" data-a="Wu">W: unlock</button>
+    <button class="btn" type="button" data-a="R1up">R1: writeLock.lock (upgrade)</button>
+    <button class="btn" type="button" data-a="Wdown">W: readLock.lock (downgrade)</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="bits32" id="rwBits"></div>
+  <div class="out" id="rwOut"></div>
+  <div class="log" id="rwLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, reads, writeHolds, writer, holds, waitQ, log;
+  function reset() { reads = 0; writeHolds = 0; writer = null; holds = { R1: 0, R2: 0, W: 0 }; waitQ = []; log = ["state = 0"]; draw(); }
+  function tryGrant() {
+    var again = true;
+    while (again && waitQ.length) {
+      again = false; var w = waitQ[0];
+      if (w.kind === "w" && reads === 0 && (writeHolds === 0 || writer === w.who)) { waitQ.shift(); writer = w.who; writeHolds++; log.push("  " + w.who + " из очереди получил блокировку записи"); again = true; }
+      else if (w.kind === "r" && writeHolds === 0) { waitQ.shift(); reads++; holds[w.who]++; log.push("  " + w.who + " из очереди получил блокировку чтения (shared — и следующий читатель в очереди тоже)"); again = true; }
+    }
+  }
+  function act(a) {
+    if (a === "R1" || a === "R2" || a === "Wdown") {
+      var who = a === "Wdown" ? "W" : a;
+      if (writeHolds > 0 && writer !== who) { waitQ.push({ who: who, kind: "r" }); log.push(who + ": readLock — запись захвачена другим → в очередь"); }
+      else if (writer !== who && waitQ.length && waitQ[0].kind === "w") { waitQ.push({ who: who, kind: "r" }); log.push(who + ": readLock — в голове очереди ждёт писатель → нечестный режим всё равно пропускает его вперёд (readerShouldBlock), читатель встаёт в очередь"); }
+      else { reads++; holds[who]++; log.push(who + ": readLock — CAS(state, s, s + 65536)" + (a === "Wdown" ? " — даунгрейд: владелец записи может взять чтение" : "")); }
+    } else if (a === "R1u" || a === "R2u") {
+      var r = a.slice(0, 2); if (!holds[r] || writer === r) { log.push(r + ": unlock без захвата чтения → IllegalMonitorStateException"); } else { holds[r]--; reads--; log.push(r + ": readLock.unlock — state − 65536"); tryGrant(); }
+    } else if (a === "W") {
+      if (writer === "W") { writeHolds++; log.push("W: повторный захват записи — state + 1"); }
+      else if (reads > 0 || writeHolds > 0) { waitQ.push({ who: "W", kind: "w" }); log.push("W: writeLock — есть читатели/писатель → в очередь (park)"); }
+      else { writer = "W"; writeHolds = 1; log.push("W: writeLock — CAS(state, 0, 1)"); }
+    } else if (a === "Wu") {
+      if (writer !== "W") log.push("W не владеет записью"); else { writeHolds--; if (!writeHolds) writer = null; log.push("W: writeLock.unlock — state − 1" + (holds.W ? " (держит ещё чтение — даунгрейд завершён: теперь только читатель)" : "")); tryGrant(); }
+    } else if (a === "R1up") {
+      if (!holds.R1) log.push("R1 не держит чтение — обычный захват записи");
+      if (holds.R1) { log.push("R1: writeLock при собственном захвате чтения → ждёт, пока число читателей станет 0, но сам — читатель. ВЗАИМОБЛОКИРОВКА (навсегда). Upgrade не поддерживается: отпустите чтение, затем возьмите запись и перепроверьте состояние."); }
+    }
+    draw();
+  }
+  function draw() {
+    var state = (reads << 16) | writeHolds, b = (state >>> 0).toString(2).padStart(32, "0"), h = "";
+    for (var i = 0; i < 32; i++) h += '<span class="' + (i < 16 ? "r" : "w") + (b[i] === "1" ? " one" : "") + '">' + b[i] + "</span>";
+    $("rwBits").innerHTML = h;
+    $("rwOut").textContent = "state = 0x" + (state >>> 0).toString(16).padStart(8, "0") + "  →  sharedCount (чтения) = state >>> 16 = " + reads + ",  exclusiveCount (запись) = state & 0xFFFF = " + writeHolds + "\nудержания: R1 = " + holds.R1 + ", R2 = " + holds.R2 + ", W (чтение) = " + holds.W + (writer ? ", писатель = " + writer : "") + "\nочередь: [" + waitQ.map(function (w) { return w.who + (w.kind === "w" ? "(запись)" : "(чтение)"); }).join(", ") + "]";
+    $("rwLog").textContent = log.slice(-7).join("\n"); $("rwLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll("#rwW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var a = b.getAttribute("data-a"); if (a === "reset") reset(); else act(a); }); });
+  reset();
+})();
+</script>
+<div class="hint">синие биты — счётчик чтения (старшие 16), жёлтые — счётчик записи (младшие 16)</div>
+
+<h2 id="rules"><span class="h-num">11.2</span>Правила</h2>
+<div class="table-wrap"><table>
+<tr><th>Ситуация</th><th>Результат</th></tr>
+<tr><td>Владелец записи берёт чтение (downgrade)</td><td>разрешено: затем unlock записи — остаётся только чтение, другие читатели могут войти</td></tr>
+<tr><td>Владелец чтения берёт запись (upgrade)</td><td>запрещено фактически: поток будет ждать сам себя вечно</td></tr>
+<tr><td>Повторный захват</td><td>оба вида реентерабельны</td></tr>
+<tr><td>Condition</td><td>только у writeLock; readLock.newCondition → UnsupportedOperationException</td></tr>
+<tr><td>Нечестный режим и писатели</td><td>новый читатель блокируется, если в голове очереди ждёт писатель (эвристика против голодания писателей)</td></tr>
+</table></div>
+<pre data-title="кэш с даунгрейдом (пример из Javadoc)"><code class="java">rwl.readLock().lock();
+if (!cacheValid) {
+    rwl.readLock().unlock();               // upgrade невозможен — сначала отпустить чтение
+    rwl.writeLock().lock();
+    try {
+        if (!cacheValid) { data = load(); cacheValid = true; }   // перепроверка: кто-то мог успеть
+        rwl.readLock().lock();             // downgrade: взять чтение, пока держим запись
+    } finally { rwl.writeLock().unlock(); }   // остаёмся с чтением
+}
+try { use(data); } finally { rwl.readLock().unlock(); }</code></pre>
+
+<h2 id="when"><span class="h-num">11.3</span>Когда RWLock не стоит брать</h2>
+<ul>
+  <li><b>Короткие чтения</b>: захват чтения — это CAS по общему state; при множестве читателей кэш-линия state становится горячей, и RWLock оказывается медленнее обычного ReentrantLock. Выигрыш — при длинных чтениях.</li>
+  <li><b>Чтений не намного больше записей</b> — накладные расходы без выгоды.</li>
+  <li>Альтернативы: <code>StampedLock</code> с оптимистичным чтением (тема 12), неизменяемые снимки в <code>volatile</code>/<code>AtomicReference</code> (copy-on-write), <code>ConcurrentHashMap</code>.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">11.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что произойдёт, если поток с захваченным readLock вызовет writeLock().lock()?</p><ul><li>Блокировка повысится до записи</li><li>IllegalStateException</li><li>Поток будет ждать вечно: запись ждёт ухода всех читателей, включая его самого</li><li>Чтение будет автоматически отпущено</li></ul><div class="why">Upgrade не поддерживается — это классическая ловушка.</div></div>
+<div class="mcq" data-ok="0"><p>Как упакован state в ReentrantReadWriteLock?</p><ul><li>Старшие 16 бит — счётчик чтения, младшие 16 — счётчик записи</li><li>Два отдельных AQS</li><li>Знак — запись, модуль — чтения</li><li>Отдельные поля readers и writers</li></ul><div class="why">Один CAS меняет согласованное состояние обеих блокировок.</div></div>
+<div class="mcq" data-ok="1"><p>Почему RWLock может быть медленнее ReentrantLock при коротких чтениях?</p><ul><li>Чтения сериализуются</li><li>Каждый захват чтения — CAS по общему state: горячая кэш-линия при многих читателях, плюс учёт удержаний</li><li>Он всегда честный</li><li>Он использует synchronized</li></ul><div class="why">Выигрыш — при длинных операциях чтения.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как реализовать «читать часто, обновлять редко» без RWLock?</summary><div class="a"><p>Copy-on-write: состояние — неизменяемый объект в volatile-поле или AtomicReference; читатели просто читают ссылку (без блокировок и записи в общую память), писатель строит новую копию и атомарно заменяет ссылку (под блокировкой или CAS, если писателей несколько). Подходит, когда копирование недорого относительно частоты записей: конфигурации, маршруты, справочники.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

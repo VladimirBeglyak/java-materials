@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Kafka: потребители</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · СООБЩЕНИЯ И KAFKA</div>
+  <h1>Kafka: потребители</h1>
+  <p class="lead">Большинство проблем с Kafka в продакшене — на стороне потребителя: кто какую партицию читает, что происходит, когда состав группы меняется, и почему одно и то же сообщение приходит дважды. Три конспекта отвечают на эти вопросы по порядку.</p>
+  <div class="meta"><span class="tag">3 конспекта</span><span class="tag">~3 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="assignment"><span class="h-num">13.1</span>Распределение партиций<span class="sk-num">#32</span></h2>
+<p>Потребители одной группы делят партиции топика между собой: каждая партиция достаётся <b>ровно одному</b> потребителю группы. Это и есть механизм масштабирования чтения в Kafka — и его предел.</p>
+<figure class="sketch"><a href="img/32-kafka-partition-assignment.jpg"><img src="img/32-kafka-partition-assignment.jpg" width="1024" height="1536" loading="lazy" alt="Распределение партиций в Kafka: пример, стратегии, триггеры перебалансировки, настройки"></a><figcaption><b>Конспект #32.</b> Partition Assignment in Kafka <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="callout ok"><span class="c-title">Правило, из которого следует всё остальное</span>
+<b>Параллелизм группы ≤ числу партиций.</b> Шесть партиций и три потребителя — по две на каждого. Шесть партиций и восемь потребителей — двое простаивают в резерве. Нужно обрабатывать быстрее, а потребителей уже столько же, сколько партиций, — добавлять экземпляры бесполезно, нужно больше партиций или ускорение самой обработки.
+</div>
+<div class="table-wrap"><table>
+<tr><th>Стратегия</th><th>Как распределяет</th><th>Особенность</th></tr>
+<tr><td><b>RangeAssignor</b></td><td>По каждому топику отдельно: непрерывные диапазоны партиций</td><td>При подписке на несколько топиков первые потребители получают больше — перекос. Зато одноимённые партиции разных топиков у одного потребителя (удобно для соединений)</td></tr>
+<tr><td><b>RoundRobinAssignor</b></td><td>Все партиции по кругу</td><td>Равномерно, но при любой перебалансировке почти все партиции меняют владельца</td></tr>
+<tr><td><b>StickyAssignor</b></td><td>Равномерно, сохраняя прежние назначения насколько возможно</td><td>Меньше перемещений — меньше потерянных локальных кэшей и состояния</td></tr>
+<tr><td><b>CooperativeStickyAssignor</b></td><td>То же, но перебалансировка инкрементальная</td><td>Потребители не останавливаются целиком — рекомендуемый выбор сегодня</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Уточнения к конспекту</span>
+<ul>
+  <li><b>Четвёртой стратегии на конспекте нет</b>, а она важнее остальных: <code>CooperativeStickyAssignor</code> устраняет полную остановку группы при перебалансировке (см. <a href="#rebalance">13.2</a>). Конспект рекомендует <code>StickyAssignor</code> — сегодня рекомендуют его кооперативный вариант.</li>
+  <li><b>Пример «Initial Assignment» (C1: P0, P3; C2: P1, P4; C3: P2, P5) соответствует round-robin</b>, а не стратегии Range, подписанной как «по умолчанию». Range дал бы C1: P0, P1; C2: P2, P3; C3: P4, P5.</li>
+  <li><b>Новый протокол групп</b> (KIP-848, доступен с Kafka 4.0) переносит распределение на брокер: потребители получают назначения постепенно, без общей остановки, а клиентская настройка стратегии становится не нужна.</li>
+</ul>
+</div>
+
+<h2 id="rebalance"><span class="h-num">13.2</span>Перебалансировка группы<span class="sk-num">#33</span></h2>
+<p>Перебалансировка (rebalance) — перераспределение партиций при изменении состава группы или подписки. Она необходима для отказоустойчивости: партиции упавшего потребителя должен кто-то подхватить. Но пока она идёт, обработка стоит.</p>
+<figure class="sketch"><a href="img/33-kafka-consumer-rebalancing.jpg"><img src="img/33-kafka-consumer-rebalancing.jpg" width="1024" height="1536" loading="lazy" alt="Перебалансировка потребителей Kafka: когда происходит, пример, внутренний процесс, настройки"></a><figcaption><b>Конспект #33.</b> Consumer Rebalancing in Kafka <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<p><b>Что её вызывает</b>: потребитель присоединился (запуск, масштабирование), вышел штатно или упал, перестал отправлять heartbeat, слишком долго не вызывал <code>poll()</code>, изменилось число партиций или подписка.</p>
+<div class="vs">
+  <div class="card"><h4>Eager — «остановить мир»</h4><ul><li>Процесс с конспекта: <b>все</b> потребители отдают <b>все</b> партиции.</li><li>Координатор пересчитывает распределение.</li><li>Партиции выдаются заново.</li><li>Группа простаивает целиком, даже если переехать должна была одна партиция.</li></ul></div>
+  <div class="card"><h4>Cooperative — инкрементальная</h4><ul><li>Потребители продолжают читать свои партиции.</li><li>Отзываются только те, что меняют владельца.</li><li>Два коротких раунда вместо одной полной остановки.</li><li>Включается стратегией <code>CooperativeStickyAssignor</code>.</li></ul></div>
+</div>
+<h3>Три таймаута, которые путают чаще всего</h3>
+<div class="table-wrap"><table>
+<tr><th>Настройка</th><th>По умолчанию</th><th>Что контролирует</th></tr>
+<tr><td><code>heartbeat.interval.ms</code></td><td>3 с</td><td>Как часто фоновый поток сообщает координатору «я жив»</td></tr>
+<tr><td><code>session.timeout.ms</code></td><td>45 с</td><td>Сколько координатор ждёт heartbeat, прежде чем считать потребителя мёртвым. Ловит <b>падение процесса</b></td></tr>
+<tr><td><code>max.poll.interval.ms</code></td><td>5 мин</td><td>Максимальная пауза между вызовами <code>poll()</code>. Ловит <b>зависшую обработку</b></td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Самая частая причина «бесконечных перебалансировок»</span>
+Конспект объединяет две причины в строке «consumer takes too long (session timeout)», но это разные механизмы. Heartbeat отправляет отдельный поток, поэтому долгая обработка <code>session.timeout.ms</code> не нарушает. Её ловит <code>max.poll.interval.ms</code>: потребитель получил 500 записей, обрабатывал их дольше 5 минут — исключён из группы. Его партиции переданы другому, который получает те же записи, тоже не успевает — и так по кругу, с дубликатами на каждом витке. Лечение: уменьшить <code>max.poll.records</code>, ускорить обработку или вынести её из потока опроса, увеличить <code>max.poll.interval.ms</code> под реальное время пакета.
+</div>
+<ul>
+  <li><b>Статическое членство</b> (<code>group.instance.id</code>): потребитель с постоянным идентификатором при перезапуске возвращается на свои партиции без перебалансировки, если успел до истечения <code>session.timeout.ms</code>. Незаменимо при поочерёдном перезапуске подов в Kubernetes.</li>
+  <li><b>Зафиксируйте смещения перед отдачей партиций</b>: иначе новый владелец начнёт с последнего зафиксированного и повторит обработанное. В Spring Kafka это делает контейнер; в «сыром» клиенте — <code>ConsumerRebalanceListener.onPartitionsRevoked</code>.</li>
+  <li><b>Наблюдайте</b> частоту перебалансировок и consumer lag — рост отставания при стабильном потоке записи означает, что потребители не справляются или постоянно перебалансируются.</li>
+</ul>
+
+<h2 id="idempotency"><span class="h-num">13.3</span>Идемпотентность обработки<span class="sk-num">#36</span></h2>
+<p>По умолчанию Kafka даёт гарантию <b>at-least-once</b>: сообщение будет доставлено, но, возможно, не один раз. Повторы — не редкая авария, а нормальное следствие сбоев, повторных отправок и перебалансировок. Значит, обработка должна быть идемпотентной: повтор не меняет результат.</p>
+<figure class="sketch"><a href="img/36-kafka-idempotency.jpg"><img src="img/36-kafka-idempotency.jpg" width="1024" height="1536" loading="lazy" alt="Идемпотентность в Kafka: сценарий дубликата, идемпотентный продюсер и потребитель, пример"></a><figcaption><b>Конспект #36.</b> Idempotency in Kafka <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<h3>Откуда берутся дубликаты</h3>
+<div class="table-wrap"><table>
+<tr><th>Где</th><th>Сценарий</th><th>Чем закрывается</th></tr>
+<tr><td>Продюсер → брокер</td><td>Запись сохранена, подтверждение потерялось, продюсер отправил повторно</td><td>Идемпотентный продюсер</td></tr>
+<tr><td>Брокер → потребитель</td><td>Обработка выполнена, потребитель упал до фиксации смещения; после перезапуска запись читается снова</td><td>Идемпотентный потребитель</td></tr>
+<tr><td>Перебалансировка</td><td>Партиция перешла к другому потребителю раньше, чем прежний зафиксировал смещение</td><td>Идемпотентный потребитель</td></tr>
+<tr><td>Приложение-отправитель</td><td>Сервис сам отправил одно событие дважды (повтор запроса, ретрай задачи)</td><td>Идемпотентный потребитель по бизнес-ключу</td></tr>
+</table></div>
+<p><b>Идемпотентный продюсер</b> (<code>enable.idempotence=true</code>, включён по умолчанию с Kafka 3.0): брокер выдаёт продюсеру идентификатор, а каждая запись получает порядковый номер в рамках партиции. Повторную отправку с уже виденным номером брокер отбрасывает. Это закрывает только первую строку таблицы: защита действует в пределах одной сессии продюсера и ничего не знает о дубликатах, созданных самим приложением.</p>
+<h3>Идемпотентный потребитель</h3>
+<ol class="steps">
+  <li>Извлечь из сообщения уникальный идентификатор: <code>eventId</code> или бизнес-ключ (<code>paymentId</code>).</li>
+  <li>Проверить, обработано ли оно уже.</li>
+  <li>Если нет — выполнить операцию и запомнить идентификатор.</li>
+  <li>Если да — пропустить и зафиксировать смещение.</li>
+</ol>
+<div class="callout bad"><span class="c-title">Что на схеме опущено: проверка и запись должны быть одной транзакцией</span>
+«Проверить в Redis → обновить базу → записать ключ в Redis» — три отдельных шага, между которыми возможен сбой или параллельная обработка того же сообщения другим потребителем (после перебалансировки). Надёжный вариант — таблица обработанных событий <b>в той же базе</b>, что и бизнес-данные, с уникальным ограничением, и вставка в неё <b>в одной транзакции</b> с бизнес-изменением:
+<pre data-title="в одной транзакции БД"><code class="txt">INSERT INTO processed_events (event_id) VALUES ('evt-123');   -- дубликат => нарушение UNIQUE => откат, пропуск
+UPDATE wallets SET balance = balance + 5000 WHERE user_id = 'u1001';
+COMMIT;
+</code></pre>
+Тогда либо зафиксированы оба изменения, либо ни одного — независимо от того, сколько раз придёт сообщение.
+</div>
+<div class="callout info"><span class="c-title">Ещё два способа, часто более простых</span>
+<ul>
+  <li><b>Естественно идемпотентная операция.</b> «Установить статус = PAID» безопасно повторять; «увеличить баланс на 5000» — нет. Иногда достаточно переформулировать событие: передавать итоговое состояние вместо изменения.</li>
+  <li><b>Условное обновление по версии.</b> <code>UPDATE … WHERE id = ? AND version &lt; :eventVersion</code> — устаревшие и повторные события просто не изменят строку.</li>
+</ul>
+Срок хранения ключей дедупликации должен превышать максимальное время, за которое может прийти повтор, — включая повторное чтение топика после сбоя.
+</div>
+<p>Как от «не менее одного раза» перейти к «ровно один раз» средствами самой Kafka — в <a href="14-kafka-reliability.html">следующей теме</a>. Та же идея для HTTP-запросов — в <a href="04-api.html#idempotency">теме 04</a>.</p>
+
+<h2 id="sim"><span class="h-num">13.4</span>Интерактив: группа потребителей и перебалансировка</h2>
+<div class="widget" id="cgW">
+  <div class="widget-title">Симулятор: 6 партиций и меняющийся состав группы</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="add">добавить потребителя</button>
+    <button class="btn" type="button" data-a="rem">потребитель упал</button>
+    <button class="btn" type="button" data-a="slow">потребитель завис в обработке дольше max.poll.interval.ms</button>
+    <label>стратегия<select id="cgStrat"><option value="eager">eager (Range / RoundRobin): отдать всё, получить заново</option><option value="coop">cooperative sticky: двигать только нужное</option></select></label>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="lanes" id="cgLanes"></div>
+  <div class="log" id="cgLog"></div>
+</div>
+<script>
+(function () {
+  var P = 6, cons, assign, nextId, log, $ = function (i) { return document.getElementById(i); };
+  function reset() { cons = ["C1"]; nextId = 2; assign = { C1: [0, 1, 2, 3, 4, 5] }; log = ["Группа billing: один потребитель читает все 6 партиций."]; }
+  function target(list, old) {
+    var res = {}, coop = $("cgStrat").value === "coop", per = Math.floor(P / list.length), extra = P % list.length;
+    list.forEach(function (c, i) { res[c] = []; });
+    if (!coop) { var p = 0; list.forEach(function (c, i) { var n = per + (i < extra ? 1 : 0); for (var k = 0; k < n; k++) res[c].push(p++); }); return res; }
+    var free = [], quota = {};
+    list.forEach(function (c, i) { quota[c] = per + (i < extra ? 1 : 0); });
+    list.forEach(function (c) { var mine = (old[c] || []).slice(0, quota[c]); res[c] = mine; });
+    for (var q = 0; q < P; q++) { var owned = list.some(function (c) { return res[c].indexOf(q) >= 0; }); if (!owned) free.push(q); }
+    list.forEach(function (c) { while (res[c].length < quota[c] && free.length) res[c].push(free.shift()); res[c].sort(); });
+    return res;
+  }
+  function rebalance(reason) {
+    if (cons.length > P) { log.unshift("Потребителей больше, чем партиций: лишний простаивает как горячий резерв."); }
+    var old = assign, list = cons.slice(0, Math.max(1, cons.length)), neu = target(list, old), moved = 0, coop = $("cgStrat").value === "coop";
+    for (var p = 0; p < P; p++) { var a = Object.keys(old).filter(function (c) { return old[c].indexOf(p) >= 0; })[0], b = list.filter(function (c) { return neu[c].indexOf(p) >= 0; })[0]; if (a !== b) moved++; }
+    assign = neu;
+    log.unshift(reason + " → перебалансировка. Сменили владельца " + moved + " из " + P + " партиций. " + (coop ? "Cooperative: остальные " + (P - moved) + " партиций продолжали обрабатываться без остановки." : "Eager: на время перебалансировки ВСЕ потребители отдали ВСЕ партиции — обработка всей группы остановлена («stop the world»), даже там, где владелец не изменился."));
+  }
+  function act(a) {
+    if (a === "reset") { reset(); return render(); }
+    if (a === "add") { cons.push("C" + (nextId++)); rebalance(cons[cons.length - 1] + " присоединился (JoinGroup)"); }
+    else if (a === "rem") { if (cons.length < 2) { log.unshift("В группе один потребитель — если он упадёт, читать будет некому, lag будет расти."); return render(); } var d = cons.pop(); rebalance(d + " перестал слать heartbeat; через session.timeout.ms координатор исключил его"); }
+    else if (a === "slow") { if (cons.length < 2) { log.unshift("Нужен хотя бы ещё один потребитель, чтобы показать сценарий."); return render(); } var s = cons.pop(); rebalance(s + " не вызвал poll() в течение max.poll.interval.ms: координатор считает его мёртвым"); log.unshift("  ⚠ Но " + s + " жив и продолжает обрабатывать старую пачку! Его партиции уже у других — те же сообщения обработаются ДВАЖДЫ, а коммит offset от " + s + " будет отклонён (CommitFailedException). Затем он вернётся в группу — ещё одна перебалансировка. Лечение: меньше max.poll.records, быстрее обработка, идемпотентность."); }
+    render();
+  }
+  function render() {
+    $("cgLanes").innerHTML = cons.map(function (c) { var ps = assign[c] || []; return '<div class="lane"><h5>' + c + '</h5><div class="items">' + (ps.map(function (p) { return '<span class="chip ok">P' + p + "</span>"; }).join("") || '<span class="chip warn">без партиций</span>') + "</div></div>"; }).join("");
+    $("cgLog").textContent = log.slice(0, 7).join("\n");
+  }
+  document.querySelectorAll("#cgW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  reset(); render();
+})();
+</script>
+<p><b>Попробуйте:</b> добавьте двух потребителей в режиме eager и посмотрите, сколько партиций сменили владельца; повторите в режиме cooperative. Затем добавьте седьмого потребителя.</p>
+
+<h2 id="quiz"><span class="h-num">13.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>В топике 4 партиции, в группе 6 потребителей. Сколько из них получают сообщения?</p><ul><li>6</li><li>1</li><li>4 — партицию в группе читает ровно один потребитель; двое простаивают</li><li>Ни один</li></ul><div class="why">Параллелизм группы ограничен числом партиций.</div></div>
+<div class="mcq" data-ok="1"><p>Потребитель обработал сообщение и упал до коммита offset. Что произойдёт после перезапуска?</p><ul><li>Сообщение потеряется</li><li>Сообщение будет прочитано и обработано повторно — at-least-once</li><li>Kafka удалит партицию</li><li>Offset закоммитится автоматически</li></ul><div class="why">Поэтому обработчик должен быть идемпотентным.</div></div>
+<div class="mcq" data-ok="0"><p>Как сделать обработку идемпотентной?</p><ul><li>Хранить идентификаторы обработанных сообщений (уникальный ключ) в одной транзакции с результатом, либо делать операцию естественно идемпотентной (upsert)</li><li>Увеличить число партиций</li><li>Включить автокоммит</li><li>Использовать acks = 0</li></ul><div class="why">Дубли неизбежны; задача — сделать так, чтобы повтор не менял результат.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>В топике 4 партиции, в группе 6 потребителей. Как распределится работа?</summary><div class="a"><p>Четыре потребителя получат по одной партиции, двое останутся без работы — в горячем резерве на случай отказа. Увеличить скорость обработки добавлением потребителей сверх числа партиций нельзя.</p></div></details>
+<details class="q"><summary>Чем <code>session.timeout.ms</code> отличается от <code>max.poll.interval.ms</code>?</summary><div class="a"><p>Первый следит за heartbeat из фонового потока и обнаруживает умерший процесс или потерю сети. Второй следит за интервалом между вызовами <code>poll()</code> и обнаруживает живой процесс, у которого зависла или затянулась обработка. Раздельные механизмы нужны, чтобы долгая обработка не выглядела как смерть, а зависший обработчик не удерживал партиции вечно.</p></div></details>
+<details class="q"><summary>После каждого деплоя сервис-потребитель несколько минут ничего не обрабатывает. Что происходит и как уменьшить эффект?</summary><div class="a"><p>Каждый перезапускаемый экземпляр вызывает перебалансировку — сначала при выходе, затем при входе; при eager-протоколе на это время останавливается вся группа. Меры: <code>CooperativeStickyAssignor</code> (останавливаются только перемещаемые партиции), статическое членство <code>group.instance.id</code> (быстрый перезапуск не вызывает перебалансировку вовсе), корректное завершение потребителя.</p></div></details>
+<details class="q"><summary>Идемпотентный продюсер включён. Почему потребитель всё равно может получить сообщение дважды?</summary><div class="a"><p>Идемпотентный продюсер устраняет дубликаты только от повторной отправки в рамках одной сессии продюсера. Повторная доставка возникает на стороне потребителя: обработал, упал до фиксации смещения, после перезапуска или перебалансировки прочитал ту же запись. Кроме того, приложение-отправитель могло само отправить событие дважды — для брокера это два разных сообщения.</p></div></details>
+<details class="q"><summary>Почему хранить признак «обработано» в Redis, а данные в PostgreSQL — ненадёжно?</summary><div class="a"><p>Нет общей транзакции. Обновили базу и упали до записи в Redis — повтор выполнит операцию второй раз. Записали в Redis и упали до обновления базы — повтор будет пропущен, операция потеряна. Запись признака в ту же базу в одной транзакции с бизнес-изменением делает оба шага атомарными.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

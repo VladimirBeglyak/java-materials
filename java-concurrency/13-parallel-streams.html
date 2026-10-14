@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Параллельные стримы и ForkJoin на практике</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · КОНКУРЕНТНОСТЬ В СИСТЕМЕ</div>
+  <h1>Параллельные стримы и ForkJoin на практике</h1>
+  <p class="lead"><code>.parallel()</code> — самая дешёвая в написании и самая дорогая в последствиях строка в Java. Она может ускорить расчёт в восемь раз, замедлить его втрое или тихо выдать неправильный результат. Разберём, как параллельный стрим делит работу, от чего зависит выигрыш и какие три правила делают его корректным.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">Spliterator</span><span class="tag">commonPool</span><span class="tag">модель NQ</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="how"><span class="h-num">13.1</span>Как работает параллельный стрим</h2>
+<div class="flow">
+  <div class="node info"><b>Источник</b><small>Spliterator</small></div><span class="to">→ trySplit →</span>
+  <div class="node"><b>Дерево задач</b><small>делим пополам до порога</small></div><span class="to">→ fork →</span>
+  <div class="node acc"><b>ForkJoinPool.commonPool</b><small>ядра − 1 потоков + вызывающий</small></div><span class="to">→ join →</span>
+  <div class="node ok"><b>Слияние результатов</b><small>combiner</small></div>
+</div>
+<ol class="steps">
+  <li><b>Разделение.</b> <code>Spliterator.trySplit()</code> делит источник на две части, те — ещё на две, пока часть не станет меньше порога (примерно размер / (4 × число потоков)).</li>
+  <li><b>Выполнение.</b> Каждая часть — задача ForkJoin. Потоки берут свои задачи с головы очереди и крадут чужие с хвоста (work-stealing, тема 08). Вызывающий поток тоже участвует.</li>
+  <li><b>Слияние.</b> Результаты частей объединяются вверх по дереву: для <code>reduce</code> — тем же оператором, для <code>collect</code> — функцией combiner.</li>
+</ol>
+<p>Отсюда три фактора выигрыша: насколько дёшево и ровно источник <b>делится</b>, сколько <b>работы</b> приходится на элемент и насколько дёшево результаты <b>сливаются</b>.</p>
+
+<h2 id="worth"><span class="h-num">13.2</span>Стоит ли распараллеливать</h2>
+<div class="widget" id="nqW">
+  <div class="widget-title">Оценка выигрыша</div>
+  <div class="controls">
+    <label>элементов (N)<input type="number" id="nqN" value="1000000" min="1" style="width:120px"></label>
+    <label>работа на элемент (Q), нс<input type="number" id="nqQ" value="50" min="1" style="width:100px"></label>
+    <label>ядер<input type="number" id="nqC" value="8" min="1"></label>
+    <label>источник<select id="nqSrc"><option value="arr">ArrayList / массив / IntStream.range</option><option value="hash">HashSet / TreeMap</option><option value="linked">LinkedList</option><option value="iter">Stream.iterate / BufferedReader.lines</option></select></label>
+    <label>операция<select id="nqOp" style="max-width:100%"><option value="map">map/filter + sum/count/reduce</option><option value="collect">collect(toList())</option><option value="group">collect(groupingBy(...))</option><option value="sorted">sorted()</option><option value="limit">limit(n) / findFirst на упорядоченном стриме</option><option value="io">блокирующий вызов (HTTP, JDBC) в map</option></select></label>
+  </div>
+  <div class="out" id="nqOut"></div>
+  <div class="verdict" id="nqV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var n = Math.max(1, +$("nqN").value), q = Math.max(1, +$("nqQ").value), c = Math.max(1, +$("nqC").value), src = $("nqSrc").value, op = $("nqOp").value;
+    var seqMs = n * q / 1e6, split = { arr: 0.95, hash: 0.7, linked: 0.15, iter: 0.1 }[src], merge = { map: 1, collect: 0.8, group: 0.45, sorted: 0.6, limit: 0.3, io: 1 }[op];
+    var p = split * merge, speed = 1 / ((1 - p) + p / c), overheadMs = 0.05 + c * 0.01, parMs = seqMs / speed + overheadMs;
+    var L = ["Последовательно:  N × Q = " + n.toLocaleString("ru-RU") + " × " + q + " нс ≈ " + seqMs.toFixed(2) + " мс",
+      "Параллелизуемая доля ≈ " + Math.round(p * 100) + "%  (делимость источника " + Math.round(split * 100) + "% × цена слияния " + Math.round(merge * 100) + "%)",
+      "Параллельно на " + c + " ядрах ≈ " + parMs.toFixed(2) + " мс   (ускорение ×" + (seqMs / parMs).toFixed(1) + " из возможных ×" + c + ")"];
+    $("nqOut").textContent = L.join("\n");
+    var v = $("nqV"), cls = "ok", msg;
+    if (op === "io") { cls = "bad"; msg = "Не делайте этого. Блокирующие вызовы займут общий commonPool (всего " + (c - 1) + " потоков на всю JVM) — замрут все параллельные стримы и CompletableFuture приложения. Для I/O — executor с нужной конкурентностью или виртуальные потоки."; }
+    else if (n * q < 100000) { cls = "bad"; msg = "N × Q меньше ~100 000 нс: накладные расходы на разделение, передачу задач и слияние больше самой работы. Параллельный вариант будет медленнее. Правило Дага Ли: распараллеливать от N × Q ≈ 10 000 «условных операций»."; }
+    else if (src === "linked" || src === "iter") { cls = "bad"; msg = "Источник делится плохо: чтобы найти середину, нужно пройти половину элементов, и части получаются неравными. Сначала соберите данные в массив или ArrayList."; }
+    else if (seqMs / parMs < 1.5) { cls = "warn"; msg = "Выигрыш небольшой. Дорогое слияние (HashMap при groupingBy) или операция с состоянием съедают параллелизм. Попробуйте groupingByConcurrent или unordered()."; }
+    else msg = "Параллелизм оправдан: хорошо делимый источник, достаточно работы, дешёвое слияние. Проверьте измерением (JMH, тема 15) и убедитесь, что лямбды не имеют побочных эффектов.";
+    if (op === "limit" && cls === "ok") { cls = "warn"; msg = "limit и findFirst на упорядоченном стриме требуют координации между потоками: нужно найти именно ПЕРВЫЕ элементы. Часто медленнее последовательного. Если порядок не важен — unordered() или findAny()."; }
+    v.className = "verdict " + cls; v.textContent = msg;
+  }
+  document.querySelectorAll("#nqW input, #nqW select").forEach(function (e) { e.addEventListener("input", run); e.addEventListener("change", run); });
+  run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Источник</th><th>Делимость</th><th>Почему</th></tr>
+<tr><td><code>ArrayList</code>, массивы, <code>IntStream.range</code></td><td>отличная</td><td>середина вычисляется за O(1), части равные, данные лежат подряд — дружат с кэшем</td></tr>
+<tr><td><code>HashSet</code>, <code>HashMap</code>, <code>TreeMap</code></td><td>хорошая</td><td>делится таблица или дерево, но части неравномерны</td></tr>
+<tr><td><code>LinkedList</code></td><td>плохая</td><td>до середины нужно дойти по ссылкам</td></tr>
+<tr><td><code>Stream.iterate</code>, <code>lines()</code>, генераторы</td><td>очень плохая</td><td>размер неизвестен, элементы порождаются последовательно</td></tr>
+</table></div>
+
+<h2 id="rules"><span class="h-num">13.3</span>Три правила корректности</h2>
+<h3>1. Никакого общего изменяемого состояния</h3>
+<pre class="bad-code"><code class="java">List&lt;String&gt; result = new ArrayList&lt;&gt;();
+names.parallelStream().map(String::toUpperCase).forEach(result::add);    // гонка: теряются элементы, null, AIOOBE
+
+Map&lt;String, Integer&gt; counts = new HashMap&lt;&gt;();
+words.parallelStream().forEach(w -&gt; counts.merge(w, 1, Integer::sum));   // HashMap разрушается</code></pre>
+<pre class="good-code"><code class="java">List&lt;String&gt; result = names.parallelStream().map(String::toUpperCase).toList();          // сборку делает стрим: у каждого потока свой контейнер
+Map&lt;String, Long&gt; counts = words.parallelStream().collect(groupingByConcurrent(w -&gt; w, counting()));</code></pre>
+<h3>2. Ассоциативность операции свёртки</h3>
+<pre><code class="java">IntStream.rangeClosed(1, 100).parallel().reduce(0, Integer::sum);          // 5050 — сложение ассоциативно: (a+b)+c == a+(b+c)
+IntStream.rangeClosed(1, 100).parallel().reduce(0, (a, b) -&gt; a - b);       // результат зависит от того, как разделили!
+Stream.of("a", "b", "c").parallel().reduce("&gt;", String::concat);           // "&gt;a&gt;b&gt;c": identity подставился в каждую часть — "&gt;" не нейтральный элемент</code></pre>
+<p>Требования к <code>reduce(identity, op)</code>: <code>op</code> ассоциативна, а <code>identity</code> — действительно нейтральный элемент (<code>op(identity, x) == x</code>). В последовательном стриме нарушение незаметно.</p>
+<h3>3. Невмешательство и отсутствие зависимости от порядка</h3>
+<pre><code class="java">list.parallelStream().forEach(System.out::println);           // порядок произвольный
+list.parallelStream().forEachOrdered(System.out::println);    // порядок источника, но параллелизм в конце теряется
+list.parallelStream().map(this::slow).toList();               // порядок результата СОХРАНЯЕТСЯ: collect учитывает порядок источника
+// Нельзя менять источник во время выполнения стрима и полагаться на то, в каком потоке выполнится лямбда</code></pre>
+
+<h2 id="pool"><span class="h-num">13.4</span>Общий пул и его последствия</h2>
+<div class="grid-2">
+  <div class="card"><h4>commonPool один на JVM</h4><p>Его делят все параллельные стримы, <code>CompletableFuture.*Async</code> без executor, <code>Arrays.parallelSort</code>. Размер — <code>availableProcessors() − 1</code>; в контейнере с лимитом 1 CPU — <b>ноль</b> рабочих потоков: «параллельный» стрим выполняется в вызывающем потоке.</p></div>
+  <div class="card"><h4>В веб-приложении</h4><p>200 потоков запросов одновременно запускают параллельные стримы на пуле из 7 потоков: параллелизма нет, только очередь и переключения. В серверном коде параллельные стримы уместны для редких тяжёлых расчётов, а не в обработке каждого запроса.</p></div>
+</div>
+<pre data-title="Свой пул для параллельного стрима — работает, но это особенность реализации"><code class="java">try (ForkJoinPool pool = new ForkJoinPool(4)) {
+    long sum = pool.submit(() -&gt; data.parallelStream().mapToLong(this::heavy).sum()).get();
+}   // стрим, запущенный из задачи ForkJoinPool, использует этот пул, а не commonPool; документацией не гарантировано</code></pre>
+<p>Когда нужен точный контроль (свой пул, приоритеты, отмена, таймауты), честнее написать <code>RecursiveTask</code> или разбить работу на задачи <code>ExecutorService</code>.</p>
+
+<h2 id="quiz"><span class="h-num">13.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой источник хуже всего подходит для параллельного стрима?</p><ul><li>int[]</li><li>ArrayList</li><li>LinkedList</li><li>IntStream.range</li></ul><div class="why">Чтобы разделить связный список пополам, нужно пройти половину узлов; части неравные.</div></div>
+<div class="mcq" data-ok="1"><p><code>Stream.of(1,2,3,4).parallel().reduce(10, Integer::sum)</code> — что может получиться?</p><ul><li>Всегда 20</li><li>Больше 20: identity 10 прибавляется в каждой части, а 10 — не нейтральный элемент для сложения</li><li>Всегда 10</li><li>Исключение</li></ul><div class="why">Нейтральный элемент для суммы — 0. Начальное значение добавляйте отдельно после свёртки.</div></div>
+<div class="mcq" data-ok="0"><p>Сохраняет ли <code>list.parallelStream().map(f).toList()</code> порядок элементов?</p><ul><li>Да: для упорядоченного источника collect собирает результат в порядке источника</li><li>Нет, порядок случайный</li><li>Только если добавить sorted()</li><li>Только для массивов</li></ul><div class="why">Порядок выполнения произвольный, порядок результата — нет. Это стоит производительности; unordered() её возвращает, когда порядок не нужен.</div></div>
+<div class="mcq" data-ok="3"><p>Приложение в контейнере с лимитом 1 CPU. Как выполнится parallelStream()?</p><ul><li>На 8 потоках хоста</li><li>Упадёт с ошибкой</li><li>На двух потоках</li><li>Фактически последовательно в вызывающем потоке: параллелизм commonPool равен нулю</li></ul><div class="why">JVM учитывает лимиты cgroup: availableProcessors() = 1 → commonPool без рабочих потоков.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>От чего зависит, ускорит ли parallel() обработку?</summary><div class="a"><p>Объём работы N × Q (нужно много элементов или дорогая операция), делимость источника (массивы — да, связные списки и итераторы — нет), стоимость слияния (сумма дёшево, HashMap дорого), наличие операций с состоянием и требований порядка (sorted, limit), число свободных ядер и загрузка commonPool.</p></div></details>
+<details class="q"><summary>Какие требования к лямбдам в параллельном стриме?</summary><div class="a"><p>Без побочных эффектов и общего изменяемого состояния, невмешательство в источник, ассоциативность операций свёртки и корректный нейтральный элемент, отсутствие блокирующих вызовов.</p></div></details>
+<details class="q"><summary>Почему параллельные стримы редко уместны в обработчике HTTP-запроса?</summary><div class="a"><p>Параллелизм уже обеспечен потоками запросов; общий commonPool мал и разделяется всеми запросами, поэтому вместо ускорения получается конкуренция. Блокирующие операции в нём недопустимы. Уместны для фоновых пакетных расчётов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

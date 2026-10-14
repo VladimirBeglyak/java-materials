@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Стриминг: SSE, NDJSON, WebSocket</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · WEBFLUX</div>
+  <h1>Стриминг: SSE, NDJSON, WebSocket</h1>
+  <p class="lead">Ради потоковой передачи WebFlux часто и выбирают: бесконечный <code>Flux</code> превращается в поток событий для браузера, построчный JSON между сервисами или двунаправленный WebSocket. Держать тысячи таких соединений дёшево — поток на каждое не нужен. Разбираем три протокола, heartbeat, переподключение с Last-Event-ID и то, что происходит при уходе клиента.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">ServerSentEvent</span><span class="tag">text/event-stream</span><span class="tag">application/x-ndjson</span><span class="tag">WebSocketHandler</span><span class="tag">heartbeat</span><span class="tag">Last-Event-ID</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="compare"><span class="h-num">14.1</span>Что выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>SSE</th><th>NDJSON</th><th>WebSocket</th></tr>
+<tr><td>Направление</td><td>сервер → клиент</td><td>в обе стороны, но по запросу</td><td>полный дуплекс</td></tr>
+<tr><td>Протокол</td><td>обычный HTTP, text/event-stream</td><td>обычный HTTP, chunked</td><td>Upgrade, свой фрейминг</td></tr>
+<tr><td>Клиент в браузере</td><td>EventSource, автопереподключение</td><td>fetch + ReadableStream</td><td>WebSocket API</td></tr>
+<tr><td>Возобновление</td><td>id + Last-Event-ID встроены</td><td>своими средствами</td><td>своими средствами</td></tr>
+<tr><td>Типичное применение</td><td>уведомления, прогресс, ленты</td><td>выгрузки, стриминг между сервисами, LLM-ответы</td><td>чаты, игры, совместное редактирование</td></tr>
+</table></div>
+
+<h2 id="sse"><span class="h-num">14.2</span>Server-Sent Events</h2>
+<pre data-title="Поток событий заказа с heartbeat" class="good-code"><code class="java">@GetMapping(path = "/api/orders/{id}/events", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+Flux&lt;ServerSentEvent&lt;OrderEvent&gt;&gt; events(@PathVariable long id,
+        @RequestHeader(name = "Last-Event-ID", required = false) Long lastId) {
+    Flux&lt;ServerSentEvent&lt;OrderEvent&gt;&gt; data = orderEvents.since(id, lastId)   // догоняем пропущенное
+        .map(e -&gt; ServerSentEvent.builder(e)
+                .id(String.valueOf(e.seq()))
+                .event(e.type())                 // имя события для addEventListener
+                .build());
+    Flux&lt;ServerSentEvent&lt;OrderEvent&gt;&gt; heartbeat = Flux.interval(Duration.ofSeconds(15))
+        .map(i -&gt; ServerSentEvent.&lt;OrderEvent&gt;builder().comment("ping").build());
+    return Flux.merge(data, heartbeat)
+        .doOnCancel(() -&gt; log.info("client left order {}", id));
+}</code></pre>
+<pre data-title="Что уходит по сети"><code class="txt">id:41
+event:PAID
+data:{"orderId":7,"seq":41,"type":"PAID"}
+
+:ping
+
+id:42
+event:SHIPPED
+data:{"orderId":7,"seq":42,"type":"SHIPPED"}
+</code></pre>
+
+<h2 id="sim"><span class="h-num">14.3</span>Переподключение и Last-Event-ID</h2>
+<div class="widget" id="ssW">
+  <div class="widget-title">Сервер выдаёт событие каждый тик; EventSource переподключается через 2 тика (retry)</div>
+  <div class="controls">
+    <button class="btn primary" id="ssPlay">▶ запустить</button>
+    <button class="btn" id="ssStep">шаг</button>
+    <button class="btn" id="ssDrop">обрыв сети</button>
+    <button class="btn" id="ssReset">сброс</button>
+    <label><input type="checkbox" id="ssReplay" checked> сервер учитывает Last-Event-ID</label>
+  </div>
+  <div class="grid-2">
+    <div class="card"><h4>Сервер</h4><div class="log" id="ssSrv"></div></div>
+    <div class="card"><h4>Браузер (EventSource)</h4><div class="log" id="ssCli"></div></div>
+  </div>
+  <div class="verdict" id="ssV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var st, timer = null;
+  function reset() { st = { seq: 0, conn: true, wait: 0, lastId: 0, got: [], srv: ["GET /events → Flux подписан"], cli: ["open"], missed: 0 }; stop(); draw(); }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } $("ssPlay").textContent = "▶ запустить"; }
+  function step() {
+    st.seq++;
+    if (st.conn) { st.srv.push("emit id:" + st.seq); st.cli.push("message id:" + st.seq); st.got.push(st.seq); st.lastId = st.seq; }
+    else {
+      st.srv.push("событие " + st.seq + " (клиента нет)");
+      st.wait--;
+      if (st.wait <= 0) {
+        st.conn = true;
+        var replay = $("ssReplay").checked;
+        st.cli.push("reconnect, Last-Event-ID: " + st.lastId);
+        st.srv.push("GET /events, Last-Event-ID: " + st.lastId + (replay ? " → since(" + st.lastId + ")" : " → заголовок проигнорирован"));
+        if (replay) { for (var k = st.lastId + 1; k <= st.seq; k++) { st.cli.push("message id:" + k + " (догнали)"); st.got.push(k); } st.lastId = st.seq; }
+        else { st.missed += st.seq - st.lastId; st.lastId = st.seq; }
+      }
+    }
+    draw();
+  }
+  function draw() {
+    $("ssSrv").textContent = st.srv.slice(-9).join("\n");
+    $("ssCli").textContent = st.cli.slice(-9).join("\n");
+    var v = $("ssV");
+    if (!st.conn) { v.className = "verdict warn"; v.textContent = "Соединение потеряно: сервер получил cancel (doOnCancel), подписка на источник снята. Браузер ждёт retry и переподключится сам."; }
+    else if (st.missed) { v.className = "verdict bad"; v.textContent = "Пропущено событий: " + st.missed + ". Без поддержки Last-Event-ID события, выданные во время обрыва, потеряны навсегда."; }
+    else { v.className = "verdict ok"; v.textContent = "Получено событий: " + st.got.length + ", без пропусков." + (st.got.length > st.cli.filter(function (l) { return /^message/.test(l) && !/догнали/.test(l); }).length ? " Пропущенное во время обрыва сервер дослал по Last-Event-ID." : ""); }
+  }
+  $("ssPlay").addEventListener("click", function () { if (timer) stop(); else { timer = setInterval(step, 700); $("ssPlay").textContent = "❚❚ пауза"; } });
+  $("ssStep").addEventListener("click", step);
+  $("ssDrop").addEventListener("click", function () { if (!st.conn) return; st.conn = false; st.wait = 3; st.srv.push("канал закрыт → cancel()"); st.cli.push("error → readyState=CONNECTING"); draw(); });
+  $("ssReset").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Прокси и балансировщики</span>
+Nginx по умолчанию буферизует ответы и рвёт соединение после 60 с тишины (<code>proxy_read_timeout</code>). Для SSE: <code>proxy_buffering off</code> (или заголовок <code>X-Accel-Buffering: no</code>), heartbeat-комментарий чаще таймаута, HTTP/1.1 к upstream. HTTP/1.1-браузер держит не больше 6 соединений на домен — несколько вкладок с SSE исчерпают лимит; HTTP/2 снимает проблему.
+</div>
+
+<h2 id="ndjson"><span class="h-num">14.4</span>NDJSON между сервисами</h2>
+<pre data-title="Сервер и клиент потоковой выгрузки"><code class="java">@GetMapping(path = "/export", produces = MediaType.APPLICATION_NDJSON_VALUE)
+Flux&lt;Order&gt; export() { return repo.findAll(); }          // R2DBC: строки идут по мере чтения
+
+// клиент: обрабатывает по одной строке, не собирая всё в память
+webClient.get().uri("/export").accept(MediaType.APPLICATION_NDJSON)
+    .retrieve().bodyToFlux(Order.class)
+    .buffer(500).concatMap(warehouse::saveBatch)
+    .then();</code></pre>
+<p>Противодавление работает сквозь сеть: если клиент пишет медленно, он не запрашивает новые элементы, Reactor Netty перестаёт читать сокет, окно TCP закрывается, запись на сервере приостанавливается, и R2DBC перестаёт запрашивать строки у базы.</p>
+
+<h2 id="ws"><span class="h-num">14.5</span>WebSocket</h2>
+<pre data-title="Эхо-чат на WebSocketHandler"><code class="java">@Bean
+HandlerMapping wsMapping(ChatHandler h) {
+    return new SimpleUrlHandlerMapping(Map.of("/ws/chat", h), -1);
+}
+
+@Component
+class ChatHandler implements WebSocketHandler {
+    private final Sinks.Many&lt;String&gt; room = Sinks.many().multicast().directBestEffort();
+
+    public Mono&lt;Void&gt; handle(WebSocketSession session) {
+        Mono&lt;Void&gt; in = session.receive()                          // входящие фреймы
+            .map(WebSocketMessage::getPayloadAsText)
+            .doOnNext(msg -&gt; room.tryEmitNext(session.getId() + ": " + msg))
+            .then();
+        Mono&lt;Void&gt; out = session.send(room.asFlux()
+            .onBackpressureDrop()                                  // медленный клиент теряет, а не тормозит
+            .map(session::textMessage));
+        return Mono.zip(in, out).then();                           // сессия живёт, пока живы оба направления
+    }
+}</code></pre>
+<div class="callout info"><span class="c-title">STOMP</span>
+Реактивный WebFlux не поддерживает STOMP-брокер (@MessageMapping поверх STOMP есть только в стеке Servlet). Для сообщений поверх WebSocket с маршрутизацией в реактивном мире используют RSocket (<code>spring-boot-starter-rsocket</code>, @MessageMapping, request-stream с настоящим request(n) по сети).
+</div>
+
+<h2 id="quiz"><span class="h-num">14.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает браузерный EventSource после обрыва соединения?</p><ul><li>Ничего, нужно перезагрузить страницу</li><li>Переподключается сам через retry и отправляет Last-Event-ID</li><li>Переходит на WebSocket</li><li>Повторяет все события с начала</li></ul><div class="why">Возобновление встроено в протокол; сервер должен его поддержать.</div></div>
+<div class="mcq" data-ok="3"><p>Зачем heartbeat в SSE-потоке?</p><ul><li>Для противодавления</li><li>Чтобы браузер не закрыл вкладку</li><li>Для сжатия</li><li>Чтобы прокси и балансировщики не закрыли «молчащее» соединение и чтобы быстрее обнаружить ушедшего клиента</li></ul><div class="why">Запись в закрытый сокет сразу выявляет отключение.</div></div>
+<div class="mcq" data-ok="0"><p>Что произойдёт с Flux SSE, когда клиент закроет вкладку?</p><ul><li>Подписка отменится (cancel), источник остановится</li><li>Flux продолжит выдавать в никуда</li><li>Ошибка в логах сервера</li><li>Сервер перезапустится</li></ul><div class="why">Отмена распространяется вверх: doOnCancel, doFinally.</div></div>
+<div class="mcq" data-ok="2"><p>Какой медиатип даёт построчную потоковую выдачу JSON между сервисами?</p><ul><li>application/json</li><li>text/html</li><li>application/x-ndjson</li><li>multipart/mixed</li></ul><div class="why">application/json для Flux — массив без поэлементного flush.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сколько SSE-соединений выдержит один инстанс WebFlux?</summary><div class="a"><p>Ограничивает не число потоков, а память и файловые дескрипторы: каждое соединение — канал Netty с буферами (единицы-десятки КБ) плюс объекты подписки. Десятки тысяч соединений на инстанс реальны при достаточном <code>ulimit -n</code> и памяти. Узкие места: общие ресурсы на каждое соединение (подписка на БД на каждого клиента вместо общего multicast-источника), неограниченные буферы медленных клиентов, балансировщики с лимитами соединений.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

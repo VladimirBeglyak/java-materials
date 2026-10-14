@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Condition: очереди ожидания</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.buf { display: flex; gap: 4px; margin: 10px 0; }
+.buf span { width: 54px; text-align: center; font: 13px var(--font-mono); padding: 12px 0; border: 1.5px solid var(--line); border-radius: 6px; background: var(--bg-sunk); }
+.buf span.f { background: var(--info-soft); border-color: var(--info); }
+</style>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · LOCKS</div>
+  <h1>Condition: очереди ожидания</h1>
+  <p class="lead"><code>Condition</code> — аналог <code>wait/notify</code> для <code>Lock</code>, но с главным отличием: у одной блокировки может быть несколько условий, и производители ждут «место есть», а потребители — «есть данные» в разных очередях. Разбираем, как <code>await</code> отпускает блокировку и переносит поток между очередью условия и очередью блокировки, почему условие всегда проверяют в цикле, и строим ограниченный буфер с симулятором.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">await/signal</span><span class="tag">две очереди AQS</span><span class="tag">signal vs signalAll</span><span class="tag">ограниченный буфер</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="mech"><span class="h-num">10.1</span>Механика await и signal</h2>
+<div class="widget stepper" id="cvSim">
+  <div class="widget-title">Потребитель ждёт данных, производитель их кладёт</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Блокировка</h5><div class="items"><span class="chip" id="cvL">владелец: C</span></div></div>
+    <div class="lane"><h5>Очередь условия notEmpty</h5><div class="items"><span class="chip off" id="cvCQ">C</span></div></div>
+    <div class="lane"><h5>Очередь блокировки (AQS)</h5><div class="items"><span class="chip off" id="cvSQ">C</span></div></div>
+    <div class="lane"><h5>Производитель P</h5><div class="items"><span class="chip off" id="cvP">put + signal</span></div></div>
+  </div>
+  <section class="st-step" data-t="C проверяет условие" data-hl="cvL" data-log="C: lock(); while (count == 0) notEmpty.await();"><p>Потребитель C взял блокировку и видит пустой буфер.</p></section>
+  <section class="st-step" data-t="await" data-hl="cvCQ cvL" data-log="await: узел C в очередь условия; fullyRelease — освободить блокировку ПОЛНОСТЬЮ (запомнив holdCount); park"><p><code>await()</code>: создаёт узел в очереди условия, <b>полностью</b> отпускает блокировку (даже при повторных захватах — запоминает счётчик) и паркуется. Отпускание блокировки и постановка в очередь атомарны относительно signal — потерянного сигнала не будет.</p></section>
+  <section class="st-step" data-t="P захватывает и кладёт" data-hl="cvP cvL" data-log="P: lock() — свободна; items[putIndex] = x; count++"><p>Производитель P захватывает свободную блокировку и кладёт элемент.</p></section>
+  <section class="st-step" data-t="signal" data-hl="cvCQ cvSQ cvP" data-log="P: notEmpty.signal() — первый узел очереди условия ПЕРЕНОСИТСЯ в очередь блокировки; C ещё не работает!"><p><code>signal()</code> не будит C немедленно — он переносит его узел из очереди условия в очередь блокировки. C сможет продолжить только после того, как захватит блокировку снова. Вызывать signal можно только владея блокировкой (иначе IllegalMonitorStateException).</p></section>
+  <section class="st-step" data-t="P отпускает" data-hl="cvL cvSQ" data-log="P: unlock() → release → unpark C"><p>P выходит из критической секции — блокировка будит C из очереди блокировки.</p></section>
+  <section class="st-step" data-t="C возвращается из await" data-hl="cvL" data-log="C: захватывает блокировку с прежним holdCount, возврат из await → снова проверяет while (count == 0) → данные есть → take"><p>C заново захватывает блокировку (с прежним числом захватов) и возвращается из <code>await</code> — и <b>снова проверяет условие в цикле</b>: между signal и захватом другой потребитель мог забрать элемент, а пробуждение могло быть ложным.</p></section>
+</div>
+
+<h2 id="buffer"><span class="h-num">10.2</span>Ограниченный буфер</h2>
+<pre data-title="так устроен ArrayBlockingQueue"><code class="java">final Lock lock = new ReentrantLock();
+final Condition notFull = lock.newCondition(), notEmpty = lock.newCondition();
+final Object[] items = new Object[3]; int putIndex, takeIndex, count;
+
+public void put(Object x) throws InterruptedException {
+    lock.lockInterruptibly();
+    try {
+        while (count == items.length) notFull.await();       // производители ждут «есть место»
+        items[putIndex] = x; putIndex = (putIndex + 1) % items.length; count++;
+        notEmpty.signal();                                    // разбудить ОДНОГО потребителя
+    } finally { lock.unlock(); }
+}
+public Object take() throws InterruptedException {
+    lock.lockInterruptibly();
+    try {
+        while (count == 0) notEmpty.await();                  // потребители ждут «есть данные»
+        Object x = items[takeIndex]; items[takeIndex] = null; takeIndex = (takeIndex + 1) % items.length; count--;
+        notFull.signal();
+        return x;
+    } finally { lock.unlock(); }
+}</code></pre>
+<div class="widget" id="bbW">
+  <div class="widget-title">Буфер на 3 элемента: два производителя, два потребителя</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="P1">P1: put</button><button class="btn primary" type="button" data-a="P2">P2: put</button>
+    <button class="btn" type="button" data-a="C1">C1: take</button><button class="btn" type="button" data-a="C2">C2: take</button>
+    <label>при освобождении будить<select id="bbS"><option value="signal">signal (одного)</option><option value="all">signalAll (всех)</option></select></label>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="buf" id="bbBuf"></div>
+  <div class="out" id="bbQ"></div>
+  <div class="log" id="bbLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, buf, nf, ne, log, n, wakeups;
+  function reset() { buf = []; nf = []; ne = []; log = ["буфер пуст; очереди условий пусты"]; n = 1; wakeups = 0; draw(); }
+  function wake(q, name) {
+    if (!q.length) return; var all = $("bbS").value === "all", list = all ? q.splice(0) : [q.shift()]; wakeups += list.length;
+    log.push("  " + name + "." + (all ? "signalAll()" : "signal()") + " → в очередь блокировки: " + list.join(", ") + (all && list.length > 1 ? " (все проснутся, перепроверят условие, лишние снова заснут)" : ""));
+    list.forEach(function (w) { act(w, true); });
+  }
+  function act(who, retry) {
+    if (nf.indexOf(who) >= 0 || ne.indexOf(who) >= 0) { if (!retry) { log.push(who + " уже ждёт"); draw(); } return; }
+    if (who[0] === "P") {
+      if (buf.length === 3) { nf.push(who); log.push(who + (retry ? " (проснулся)" : "") + ": буфер полон → notFull.await()"); }
+      else { buf.push("x" + n++); log.push(who + (retry ? " (проснулся)" : "") + ": put " + buf[buf.length - 1]); wake(ne, "notEmpty"); }
+    } else {
+      if (!buf.length) { ne.push(who); log.push(who + (retry ? " (проснулся)" : "") + ": буфер пуст → notEmpty.await()"); }
+      else { var x = buf.shift(); log.push(who + (retry ? " (проснулся)" : "") + ": take " + x); wake(nf, "notFull"); }
+    }
+    if (!retry) draw();
+  }
+  function draw() {
+    var h = ""; for (var i = 0; i < 3; i++) h += '<span class="' + (buf[i] ? "f" : "") + '">' + (buf[i] || "·") + "</span>";
+    $("bbBuf").innerHTML = h;
+    $("bbQ").textContent = "ждут notFull (место): [" + nf.join(", ") + "]   ждут notEmpty (данные): [" + ne.join(", ") + "]   пробуждений всего: " + wakeups;
+    $("bbLog").textContent = log.slice(-8).join("\n"); $("bbLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll("#bbW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var a = b.getAttribute("data-a"); if (a === "reset") reset(); else act(a, false); draw(); }); });
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Почему два условия лучше одного</span>
+С одним монитором (wait/notifyAll) производители и потребители ждут в одной очереди: <code>notify()</code> может разбудить «не того» (производителя, когда нужен потребитель) — отсюда вынужденный <code>notifyAll</code> и «стадо» лишних пробуждений. С двумя Condition сигнал адресный, и достаточно <code>signal()</code>.
+</div>
+
+<h2 id="api"><span class="h-num">10.3</span>Варианты await</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Особенность</th></tr>
+<tr><td><code>await()</code></td><td>прерываемый: InterruptedException, блокировка при выходе снова захвачена</td></tr>
+<tr><td><code>awaitUninterruptibly()</code></td><td>игнорирует прерывание (восстанавливает флаг по выходу)</td></tr>
+<tr><td><code>awaitNanos(n)</code></td><td>возвращает оставшееся время — для корректного цикла с общим дедлайном</td></tr>
+<tr><td><code>await(time, unit)</code>, <code>awaitUntil(deadline)</code></td><td>false, если время вышло</td></tr>
+</table></div>
+<pre data-title="цикл с общим таймаутом"><code class="java">long nanos = unit.toNanos(timeout);
+while (count == 0) {
+    if (nanos &lt;= 0L) return null;          // время вышло
+    nanos = notEmpty.awaitNanos(nanos);    // учитывает и ложные пробуждения
+}</code></pre>
+
+<h2 id="quiz"><span class="h-num">10.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает signal() с ожидающим потоком?</p><ul><li>Немедленно продолжает его выполнение</li><li>Переносит его из очереди условия в очередь блокировки; он продолжит, когда снова захватит блокировку</li><li>Освобождает блокировку</li><li>Бросает в нём InterruptedException</li></ul><div class="why">Сигнализирующий поток продолжает владеть блокировкой до unlock.</div></div>
+<div class="mcq" data-ok="3"><p>Почему условие проверяют в while, а не в if?</p><ul><li>Так быстрее</li><li>if не компилируется с await</li><li>Чтобы не терять сигнал</li><li>Из-за ложных пробуждений и потому, что между signal и повторным захватом другой поток мог изменить состояние</li></ul><div class="why">Правило без исключений для wait, await и park.</div></div>
+<div class="mcq" data-ok="0"><p>Что произойдёт при await(), если поток захватил блокировку трижды?</p><ul><li>Блокировка отпускается полностью, а при возврате восстанавливается счётчик 3</li><li>Отпускается один уровень</li><li>IllegalMonitorStateException</li><li>Deadlock</li></ul><div class="why">fullyRelease запоминает и восстанавливает holdCount.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда signalAll всё-таки нужен?</summary><div class="a"><p>Когда изменение состояния может сделать выполнимыми условия нескольких ожидающих (например, освобождено сразу много места, закрытие очереди — все ждущие должны увидеть «закрыто»), или ожидающие в одном условии ждут разного (тогда signal может разбудить того, чьё условие всё ещё ложно, а нужный останется спать). Если все ожидающие в условии эквивалентны и одно изменение позволяет продолжить ровно одному — достаточно signal.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · BeanDefinition и refresh()</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · КОНТЕЙНЕР</div>
+  <h1>BeanDefinition и запуск контекста: refresh()</h1>
+  <p class="lead">Контекст стартует в две фазы. Сначала собираются <b>описания</b> бинов (BeanDefinition) и правятся пост-процессорами фабрики — ни одного вашего объекта ещё нет. Потом по описаниям создаются экземпляры. Весь запуск — это 12 шагов метода <code>AbstractApplicationContext.refresh()</code>. Эту последовательность спрашивают на Senior-собеседованиях и по ней читают любой стектрейс старта.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">BeanFactoryPostProcessor</span><span class="tag">ConfigurationClassPostProcessor</span><span class="tag">@Configuration CGLIB</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="bd"><span class="h-num">2.1</span>BeanDefinition — рецепт бина</h2>
+<p>Контейнер никогда не работает напрямую с вашими аннотациями при создании объекта. Аннотации, <code>@Bean</code>-методы и XML сначала превращаются в объекты <code>BeanDefinition</code>, и дальше контейнер работает только с ними. Поэтому одинаково работают бины из любого источника, а пост-процессоры могут менять описания до создания объектов.</p>
+<div class="table-wrap"><table>
+<tr><th>Свойство BeanDefinition</th><th>Что задаёт</th><th>Откуда берётся</th></tr>
+<tr><td><code>beanClassName</code></td><td>класс экземпляра</td><td>класс с <code>@Component</code>; для <code>@Bean</code> — пусто, вместо этого фабричный метод</td></tr>
+<tr><td><code>factoryBeanName</code> + <code>factoryMethodName</code></td><td>создавать вызовом метода другого бина</td><td><code>@Bean</code>-метод в конфигурации</td></tr>
+<tr><td><code>scope</code></td><td>singleton / prototype / request / session…</td><td><code>@Scope</code></td></tr>
+<tr><td><code>lazyInit</code>, <code>primary</code>, <code>autowireCandidate</code></td><td>ленивое создание, приоритет, участие в автосвязывании</td><td><code>@Lazy</code>, <code>@Primary</code>, <code>@Bean(autowireCandidate=false)</code></td></tr>
+<tr><td><code>dependsOn</code></td><td>создать указанные бины раньше</td><td><code>@DependsOn</code></td></tr>
+<tr><td><code>constructorArgumentValues</code>, <code>propertyValues</code></td><td>явные аргументы и свойства</td><td>XML, программная регистрация</td></tr>
+<tr><td><code>initMethodName</code>, <code>destroyMethodName</code></td><td>колбэки жизненного цикла</td><td><code>@Bean(initMethod, destroyMethod)</code>; для <code>@Bean</code> по умолчанию «inferred»: <code>close()</code>/<code>shutdown()</code></td></tr>
+<tr><td><code>role</code></td><td>APPLICATION / INFRASTRUCTURE</td><td><code>@Role</code> — инфраструктурные бины Spring помечены INFRASTRUCTURE</td></tr>
+</table></div>
+<p>Реализации: <code>ScannedGenericBeanDefinition</code> (найдено сканером), <code>AnnotatedGenericBeanDefinition</code> (зарегистрировано классом), <code>ConfigurationClassBeanDefinition</code> (из <code>@Bean</code>), <code>RootBeanDefinition</code> — «слитое» итоговое описание, по которому реально создаётся бин (<code>getMergedBeanDefinition</code> объединяет его с родительским описанием, если оно есть).</p>
+<pre data-title="Описания можно посмотреть в работающем приложении"><code class="java">@Component
+class DefinitionsDump implements ApplicationRunner {
+    private final ConfigurableListableBeanFactory bf;
+    DefinitionsDump(ConfigurableListableBeanFactory bf) { this.bf = bf; }
+
+    public void run(ApplicationArguments args) {
+        for (String name : bf.getBeanDefinitionNames()) {
+            BeanDefinition bd = bf.getBeanDefinition(name);
+            if (bd.getRole() == BeanDefinition.ROLE_APPLICATION)
+                System.out.printf("%s → %s scope=%s factory=%s%n",
+                    name, bd.getBeanClassName(), bd.getScope(), bd.getFactoryMethodName());
+        }
+    }
+}</code></pre>
+
+<h2 id="pp"><span class="h-num">2.2</span>Две точки расширения: пост-процессоры фабрики и бинов</h2>
+<div class="vs neutral">
+  <div class="card"><h4>BeanFactoryPostProcessor</h4><p>Работает с <b>описаниями</b>, до создания обычных бинов. Может менять и добавлять BeanDefinition.</p><p><code>BeanDefinitionRegistryPostProcessor</code> — расширение, которое запускается раньше и может регистрировать новые описания.</p><p>Примеры: <code>ConfigurationClassPostProcessor</code> (парсит всю аннотационную конфигурацию), <code>PropertySourcesPlaceholderConfigurer</code> (подставляет <code>${...}</code>), регистратор репозиториев Spring Data.</p></div>
+  <div class="card"><h4>BeanPostProcessor</h4><p>Работает с <b>экземплярами</b>: вызывается для каждого создаваемого бина до и после инициализации. Может вернуть другой объект — например, прокси.</p><p>Примеры: <code>AutowiredAnnotationBeanPostProcessor</code> (<code>@Autowired</code>, <code>@Value</code>), <code>CommonAnnotationBeanPostProcessor</code> (<code>@PostConstruct</code>, <code>@Resource</code>), <code>AnnotationAwareAspectJAutoProxyCreator</code> (AOP-прокси), <code>ConfigurationPropertiesBindingPostProcessor</code>.</p></div>
+</div>
+<p>Порядок вызова внутри каждой группы: сначала реализующие <code>PriorityOrdered</code>, потом <code>Ordered</code>, потом остальные. Все эти пост-процессоры — тоже бины, поэтому контексту приходится создавать их заранее, до остальных.</p>
+<div class="callout bad"><span class="c-title">Ловушка: BFPP из @Bean-метода</span>
+Чтобы вызвать нестатический <code>@Bean</code>-метод, нужен экземпляр конфигурации. Если метод возвращает <code>BeanFactoryPostProcessor</code>, конфигурация создаётся слишком рано, и <code>@Autowired</code>/<code>@Value</code> в ней не обработаются (в логе INFO-сообщение «@Bean method X.y is non-static and returns an object assignable to Spring's BeanFactoryPostProcessor interface…»). Решение — <code>static @Bean</code>.
+</div>
+<div class="callout warn"><span class="c-title">«Bean 'x' is not eligible for getting processed by all BeanPostProcessors»</span>
+Это WARN-сообщение («Bean 'x' of type [...] is not eligible for getting processed by all BeanPostProcessors (for example: not eligible for auto-proxying)») значит: бин <code>x</code> понадобился какому-то <code>BeanPostProcessor</code> (например, через его зависимость) и был создан до того, как зарегистрировались все BPP. На нём могут не сработать прокси (транзакции, кэш, @Async). Лечится тем, что зависимости BPP делают ленивыми (<code>ObjectProvider</code>, <code>@Lazy</code>) или инфраструктурными.
+</div>
+
+<h2 id="refresh"><span class="h-num">2.3</span>refresh(): 12 шагов</h2>
+<pre data-title="AbstractApplicationContext.refresh() — сокращённо"><code class="java">public void refresh() {
+    synchronized (startupShutdownMonitor) {             // в 6.x — ReentrantLock
+        prepareRefresh();                                     // 1
+        ConfigurableListableBeanFactory bf = obtainFreshBeanFactory(); // 2
+        prepareBeanFactory(bf);                               // 3
+        try {
+            postProcessBeanFactory(bf);                       // 4  хук для подклассов
+            invokeBeanFactoryPostProcessors(bf);              // 5  ← здесь появляются описания ваших бинов
+            registerBeanPostProcessors(bf);                   // 6
+            initMessageSource();                              // 7
+            initApplicationEventMulticaster();                // 8
+            onRefresh();                                      // 9  Boot: создаёт веб-сервер
+            registerListeners();                              // 10
+            finishBeanFactoryInitialization(bf);              // 11 ← здесь создаются ваши singleton-бины
+            finishRefresh();                                  // 12 старт SmartLifecycle, ContextRefreshedEvent
+        } catch (RuntimeException | Error ex) {               // до 6.2 — BeansException
+            // 7.0: сначала останавливаются уже запущенные Lifecycle-бины
+            destroyBeans();                                   // уже созданные бины уничтожаются
+            cancelRefresh(ex);
+            throw ex;
+        }
+    }
+}</code></pre>
+
+<div class="widget stepper" id="rf">
+  <div class="widget-title">Пошагово: что происходит внутри refresh()</div>
+  <p class="hint">Пример — Spring Boot веб-приложение с <code>OrderService</code>, <code>OrderRepository</code> и <code>@Bean DataSource</code>. Следите, как наполняются реестр описаний, списки пост-процессоров и кэш singleton-объектов.</p>
+  <div class="lanes st-stage">
+    <div class="lane node" id="lnDefs"><h5>BeanDefinitionRegistry</h5><div class="items">
+      <span class="chip info">internal: ConfigurationClassPostProcessor</span><span class="chip info">internal: AutowiredAnnotationBPP</span><span class="chip">shopApplication</span>
+      <span class="chip ok" data-from="5">orderService</span><span class="chip ok" data-from="5">orderRepository</span><span class="chip ok" data-from="5">dataSource (@Bean)</span><span class="chip ok" data-from="5">+ ~300 из автоконфигурации</span></div></div>
+    <div class="lane node" id="lnBfpp"><h5>BeanFactoryPostProcessors</h5><div class="items">
+      <span class="chip acc" data-from="5">ConfigurationClassPostProcessor</span><span class="chip acc" data-from="5">PropertySourcesPlaceholderConfigurer</span></div></div>
+    <div class="lane node" id="lnBpp"><h5>BeanPostProcessors</h5><div class="items">
+      <span class="chip" data-from="3">ApplicationContextAwareProcessor</span><span class="chip" data-from="3">ApplicationListenerDetector</span>
+      <span class="chip acc" data-from="6">AutowiredAnnotationBPP</span><span class="chip acc" data-from="6">CommonAnnotationBPP</span><span class="chip acc" data-from="6">AspectJAutoProxyCreator</span><span class="chip acc" data-from="6">ConfigurationPropertiesBindingPP</span></div></div>
+    <div class="lane node" id="lnSing"><h5>singletonObjects</h5><div class="items">
+      <span class="chip" data-from="3">environment</span><span class="chip" data-from="3">systemProperties</span><span class="chip" data-from="7">messageSource</span><span class="chip" data-from="8">applicationEventMulticaster</span><span class="chip warn" data-from="9">webServerFactory → Tomcat (не принимает запросы)</span>
+      <span class="chip ok" data-from="11">dataSource</span><span class="chip ok" data-from="11">orderRepository</span><span class="chip ok" data-from="11">orderService (прокси)</span></div></div>
+    <div class="lane node" id="lnLife"><h5>Lifecycle и события</h5><div class="items">
+      <span class="chip" data-from="10">listeners зарегистрированы</span><span class="chip ok" data-from="12">Tomcat.start() → порт 8080</span><span class="chip ok" data-from="12">ContextRefreshedEvent</span></div></div>
+  </div>
+  <section class="st-step" data-t="prepareRefresh()" data-hl="lnDefs">
+    <h4>1. prepareRefresh()</h4>
+    <p>Запоминает время старта, ставит флаг <code>active</code>, вызывает <code>initPropertySources()</code> (веб-контексты подменяют заглушки servlet-параметров) и <code>getEnvironment().validateRequiredProperties()</code> — если обязательное свойство не задано, старт падает здесь.</p>
+    <p>В реестре уже есть описания, зарегистрированные <b>до</b> refresh: главный класс приложения и внутренние процессоры, которые добавил <code>AnnotatedBeanDefinitionReader</code> (через <code>AnnotationConfigUtils.registerAnnotationConfigProcessors</code>).</p>
+  </section>
+  <section class="st-step" data-t="obtainFreshBeanFactory()">
+    <h4>2. obtainFreshBeanFactory()</h4>
+    <p>Для <code>GenericApplicationContext</code> (на нём построены аннотационные контексты и все контексты Boot) фабрика <code>DefaultListableBeanFactory</code> уже создана в конструкторе — метод лишь проверяет, что refresh вызывается впервые. Повторный <code>refresh()</code> → <code>IllegalStateException: GenericApplicationContext does not support multiple refresh attempts</code>.</p>
+    <p>Классические XML-контексты (<code>AbstractRefreshableApplicationContext</code>) здесь уничтожают старую фабрику, создают новую и загружают в неё XML.</p>
+  </section>
+  <section class="st-step" data-t="prepareBeanFactory()" data-hl="lnBpp lnSing">
+    <h4>3. prepareBeanFactory(bf)</h4>
+    <ul>
+      <li>ClassLoader, SpEL-резолвер (<code>#{...}</code>), редакторы ресурсов.</li>
+      <li>BPP <code>ApplicationContextAwareProcessor</code> — будет вызывать <code>EnvironmentAware</code>, <code>ApplicationContextAware</code> и другие *Aware.</li>
+      <li><code>registerResolvableDependency</code>: <code>BeanFactory</code>, <code>ApplicationContext</code>, <code>ResourceLoader</code>, <code>ApplicationEventPublisher</code> можно внедрять, хотя это не бины.</li>
+      <li>BPP <code>ApplicationListenerDetector</code> — находит бины-слушатели.</li>
+      <li>Регистрирует готовые singleton-объекты <code>environment</code>, <code>systemProperties</code>, <code>systemEnvironment</code>.</li>
+    </ul>
+  </section>
+  <section class="st-step" data-t="postProcessBeanFactory()">
+    <h4>4. postProcessBeanFactory(bf)</h4>
+    <p>Пустой хук для подклассов. Веб-контексты регистрируют здесь scopes <code>request</code> и <code>session</code> и BPP <code>WebApplicationContextServletContextAwareProcessor</code>.</p>
+  </section>
+  <section class="st-step" data-t="invokeBeanFactoryPostProcessors()" data-hl="lnBfpp lnDefs">
+    <h4>5. invokeBeanFactoryPostProcessors(bf) — главный шаг первой фазы</h4>
+    <p><code>PostProcessorRegistrationDelegate</code> вызывает сначала все <code>BeanDefinitionRegistryPostProcessor</code> (PriorityOrdered → Ordered → остальные, повторяя, пока появляются новые), затем обычные <code>BeanFactoryPostProcessor</code>.</p>
+    <p><b>ConfigurationClassPostProcessor</b> разбирает главный класс: <code>@ComponentScan</code> → находит <code>orderService</code>, <code>orderRepository</code>; <code>@Import</code>, <code>@Bean</code>-методы → <code>dataSource</code>; в конце — <code>DeferredImportSelector</code> автоконфигурации Boot, которые добавляют сотни описаний. Затем он же подменяет классы <code>@Configuration</code> CGLIB-подклассами.</p>
+    <p><b>PropertySourcesPlaceholderConfigurer</b> подставляет <code>${...}</code> в значения описаний.</p>
+  </section>
+  <section class="st-step" data-t="registerBeanPostProcessors()" data-hl="lnBpp">
+    <h4>6. registerBeanPostProcessors(bf)</h4>
+    <p>Создаёт все бины-<code>BeanPostProcessor</code> (в порядке PriorityOrdered → Ordered → остальные) и добавляет их в список фабрики. С этого момента каждый создаваемый бин будет проходить через них. Бины, созданные раньше (зависимости самих BPP), — «not eligible for getting processed by all BeanPostProcessors».</p>
+  </section>
+  <section class="st-step" data-t="initMessageSource()" data-hl="lnSing">
+    <h4>7. initMessageSource()</h4>
+    <p>Берёт бин с именем <code>messageSource</code> (Boot создаёт <code>ResourceBundleMessageSource</code>, если есть <code>messages.properties</code>) или ставит пустой <code>DelegatingMessageSource</code>. Нужен для i18n и сообщений валидации.</p>
+  </section>
+  <section class="st-step" data-t="initApplicationEventMulticaster()" data-hl="lnSing">
+    <h4>8. initApplicationEventMulticaster()</h4>
+    <p>Бин <code>applicationEventMulticaster</code> или <code>SimpleApplicationEventMulticaster</code> по умолчанию — он рассылает события слушателям. Без executor'а — синхронно, в потоке публикующего (тема 05).</p>
+  </section>
+  <section class="st-step" data-t="onRefresh() — веб-сервер" data-hl="lnSing">
+    <h4>9. onRefresh()</h4>
+    <p>Хук для подклассов. <code>ServletWebServerApplicationContext</code> в Spring Boot создаёт здесь встроенный сервер: получает бин <code>ServletWebServerFactory</code> (Tomcat/Jetty), создаёт и инициализирует Tomcat, регистрирует <code>DispatcherServlet</code> и фильтры через <code>ServletContextInitializer</code>-ы. Коннектор ещё не открыт: порт начнёт принимать запросы на шаге 12, когда контекст полностью готов.</p>
+  </section>
+  <section class="st-step" data-t="registerListeners()" data-hl="lnLife">
+    <h4>10. registerListeners()</h4>
+    <p>Добавляет в мультикастер статически заданных слушателей и <b>имена</b> бинов-<code>ApplicationListener</code> (сами бины не создаются, чтобы не инициализировать их раньше времени). Рассылает «ранние» события, накопленные до появления мультикастера.</p>
+  </section>
+  <section class="st-step" data-t="finishBeanFactoryInitialization()" data-hl="lnSing">
+    <h4>11. finishBeanFactoryInitialization(bf) — главный шаг второй фазы</h4>
+    <p>Регистрирует <code>ConversionService</code>, замораживает конфигурацию (<code>freezeConfiguration</code>: описания больше не меняются, их можно кэшировать) и вызывает <code>preInstantiateSingletons()</code>: для каждого не-абстрактного, singleton, не-ленивого описания — <code>getBean(name)</code>. Каждый вызов запускает полный жизненный цикл: создание → внедрение → BPP → init (тема 03). <code>orderService</code> выходит из цикла уже обёрнутым в прокси, если на нём есть <code>@Transactional</code>.</p>
+    <p>После создания всех singleton-бинов вызывается <code>SmartInitializingSingleton.afterSingletonsInstantiated()</code> — так, например, <code>EventListenerMethodProcessor</code> регистрирует методы с <code>@EventListener</code>.</p>
+  </section>
+  <section class="st-step" data-t="finishRefresh()" data-hl="lnLife">
+    <h4>12. finishRefresh()</h4>
+    <p>Создаёт <code>LifecycleProcessor</code> и вызывает <code>onRefresh()</code>: стартуют все <code>SmartLifecycle</code>-бины с <code>isAutoStartup()=true</code> по возрастанию phase. Среди них — <code>WebServerStartStopLifecycle</code> (Tomcat открывает порт), контейнеры слушателей Kafka/RabbitMQ. Затем публикуется <code>ContextRefreshedEvent</code>.</p>
+    <p>Если на любом шаге вылетело исключение — <code>destroyBeans()</code> уничтожает уже созданные бины (их <code>@PreDestroy</code> вызовутся), и исключение пробрасывается: контекст не поднялся.</p>
+  </section>
+</div>
+
+<h2 id="ccpp"><span class="h-num">2.4</span>ConfigurationClassPostProcessor: как разбирается конфигурация</h2>
+<p><code>ConfigurationClassParser</code> обходит класс конфигурации в фиксированном порядке и рекурсивно применяет то же самое к найденным классам:</p>
+<ol class="steps">
+  <li><b>Условия</b>: <code>@Conditional</code> на классе (фаза <code>PARSE_CONFIGURATION</code>) — не прошло, класс пропускается целиком.</li>
+  <li>Вложенные классы-конфигурации (member classes).</li>
+  <li><code>@PropertySource</code> — файлы добавляются в <code>Environment</code>.</li>
+  <li><code>@ComponentScan</code> — сканирование, найденные классы-конфигурации сразу разбираются рекурсивно.</li>
+  <li><code>@Import</code>: обычный класс → как конфигурация; <code>ImportSelector</code> → возвращает имена классов; <code>ImportBeanDefinitionRegistrar</code> → регистрирует описания программно (так работают <code>@EnableJpaRepositories</code>, <code>@EnableConfigurationProperties</code>); <code>DeferredImportSelector</code> → откладывается до конца разбора всего остального.</li>
+  <li><code>@ImportResource</code> (XML), затем <code>@Bean</code>-методы, default-методы интерфейсов, суперкласс.</li>
+</ol>
+<p>Затем <code>ConfigurationClassBeanDefinitionReader</code> превращает результат в BeanDefinition, проверяя условия ещё раз в фазе <code>REGISTER_BEAN</code> (так работает <code>@ConditionalOnMissingBean</code> — тема 07).</p>
+<div class="callout interview"><span class="c-title">Почему автоконфигурации Boot не перебивают ваши бины</span>
+Автоконфигурацию подключает <code>AutoConfigurationImportSelector</code> — это <code>DeferredImportSelector</code>. Он обрабатывается <b>после</b> всей пользовательской конфигурации. К моменту проверки <code>@ConditionalOnMissingBean(DataSource.class)</code> ваш <code>DataSource</code> уже зарегистрирован, и автоконфигурация отступает.
+</div>
+
+<h2 id="full-lite"><span class="h-num">2.5</span>@Configuration: режимы full и lite</h2>
+<pre data-title="Межбиновый вызов внутри @Configuration"><code class="java">@Configuration                          // proxyBeanMethods = true по умолчанию → режим full
+class PersistenceConfig {
+    @Bean DataSource dataSource() { return new HikariDataSource(); }
+
+    @Bean JdbcTemplate jdbc()        { return new JdbcTemplate(dataSource()); }  // тот же бин
+    @Bean TransactionManager txm()   { return new DataSourceTransactionManager(dataSource()); }
+}</code></pre>
+<p>Как <code>dataSource()</code>, вызванный дважды, возвращает один объект? На шаге 5 <code>ConfigurationClassPostProcessor.enhanceConfigurationClasses</code> заменяет класс в описании на CGLIB-подкласс <code>PersistenceConfig$$SpringCGLIB$$0</code>. Его <code>BeanMethodInterceptor</code> перехватывает каждый вызов <code>@Bean</code>-метода:</p>
+<ul>
+  <li>если этот метод сейчас вызывается самим контейнером для создания бина — выполняется оригинальный код;</li>
+  <li>иначе — вместо вызова возвращается <code>beanFactory.getBean("dataSource")</code>, то есть существующий singleton.</li>
+</ul>
+<div class="vs">
+  <div class="card"><h4>full: @Configuration</h4><p>Вызовы <code>@Bean</code>-методов друг из друга безопасны: возвращаются бины из контекста. Цена — генерация CGLIB-класса на старте; класс и <code>@Bean</code>-методы не могут быть <code>final</code>/<code>private</code>.</p></div>
+  <div class="card"><h4>lite: @Component с @Bean или proxyBeanMethods=false</h4><p>Подкласса нет. <code>dataSource()</code> — обычный вызов Java: каждый раз <b>новый</b> HikariDataSource, мимо контейнера (без пост-процессоров и закрытия при остановке). Правильный стиль — получать зависимости параметрами: <code>@Bean JdbcTemplate jdbc(DataSource ds)</code>.</p></div>
+</div>
+<p>Все автоконфигурации Spring Boot объявлены как <code>@AutoConfiguration</code>, а она включает <code>@Configuration(proxyBeanMethods = false)</code>: так быстрее старт и проще AOT/GraalVM. Для своего кода годятся оба режима, но параметры <code>@Bean</code>-методов вместо вызовов работают в любом.</p>
+
+<h2 id="observe"><span class="h-num">2.6</span>Как наблюдать за стартом</h2>
+<div class="grid-2">
+  <div class="card"><h4>Логи</h4><p><code>logging.level.org.springframework.beans.factory=DEBUG</code> — «Creating shared instance of singleton bean …» для каждого бина в порядке создания. Ключ <code>--debug</code> в Boot печатает отчёт условий автоконфигурации.</p></div>
+  <div class="card"><h4>ApplicationStartup</h4><p><code>app.setApplicationStartup(new BufferingApplicationStartup(4096))</code> записывает шаги <code>spring.context.refresh</code>, <code>spring.beans.instantiate</code> с длительностью; endpoint Actuator <code>/actuator/startup</code> показывает самые медленные бины. <code>FlightRecorderApplicationStartup</code> пишет то же в JFR.</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">2.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>На каком шаге refresh() регистрируются описания классов, найденных @ComponentScan?</p><ul><li>finishBeanFactoryInitialization</li><li>invokeBeanFactoryPostProcessors — их регистрирует ConfigurationClassPostProcessor</li><li>registerBeanPostProcessors</li><li>prepareRefresh</li></ul><div class="why">Сканирование выполняет <code>ConfigurationClassPostProcessor</code> — <code>BeanDefinitionRegistryPostProcessor</code>, который вызывается на шаге 5. Экземпляры будут созданы позже, на шаге 11.</div></div>
+<div class="mcq" data-ok="2"><p>Класс помечен @Component (не @Configuration), в нём @Bean a() и @Bean b() { return new B(a()); }. Что получит B?</p><ul><li>Бин a из контекста</li><li>Ошибку старта</li><li>Новый экземпляр A, созданный мимо контейнера</li><li>null</li></ul><div class="why">Это lite-режим: CGLIB-подкласса нет, <code>a()</code> — обычный вызов метода. Получится второй объект A, о котором контейнер не знает.</div></div>
+<div class="mcq" data-ok="0"><p>Когда Tomcat в Spring Boot начинает принимать соединения?</p><ul><li>На finishRefresh, когда стартуют SmartLifecycle-бины</li><li>На onRefresh, сразу после создания</li><li>До refresh, в SpringApplication.run</li><li>После ApplicationReadyEvent</li></ul><div class="why">Сервер создаётся в <code>onRefresh()</code>, но порт открывает <code>WebServerStartStopLifecycle.start()</code> на шаге 12, когда все бины уже созданы. Так запросы не приходят в недособранное приложение.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Перечислите шаги refresh() и скажите, где создаются ваши бины.</summary><div class="a"><p>prepareRefresh → obtainFreshBeanFactory → prepareBeanFactory → postProcessBeanFactory → <b>invokeBeanFactoryPostProcessors</b> (описания: сканирование, @Import, @Bean, автоконфигурация) → registerBeanPostProcessors → initMessageSource → initApplicationEventMulticaster → onRefresh (веб-сервер в Boot) → registerListeners → <b>finishBeanFactoryInitialization</b> (создание всех не-ленивых singleton) → finishRefresh (SmartLifecycle, ContextRefreshedEvent).</p></div></details>
+<details class="q"><summary>Чем BeanFactoryPostProcessor отличается от BeanPostProcessor? Приведите примеры.</summary><div class="a"><p>BFPP работает с описаниями до создания бинов (ConfigurationClassPostProcessor, PropertySourcesPlaceholderConfigurer). BPP — с экземплярами при их инициализации и может подменить объект (AutowiredAnnotationBeanPostProcessor, AOP auto-proxy creator). BFPP не должен получать бины через getBean — это создаст их преждевременно.</p></div></details>
+<details class="q"><summary>Зачем static у @Bean-метода, возвращающего BeanFactoryPostProcessor?</summary><div class="a"><p>BFPP нужен на шаге 5, когда обычные бины ещё не создаются. Нестатический метод требует экземпляр конфигурационного класса — его пришлось бы создать слишком рано, без обработки @Autowired/@Value и без всех BPP. Статический метод вызывается без экземпляра.</p></div></details>
+<details class="q"><summary>Как работает ImportBeanDefinitionRegistrar и где он используется?</summary><div class="a"><p>Класс, указанный в <code>@Import</code>, получает <code>BeanDefinitionRegistry</code> и метаданные аннотированного класса и регистрирует описания программно. Так устроены <code>@EnableJpaRepositories</code> (по описанию на каждый интерфейс-репозиторий), <code>@EnableConfigurationProperties</code>, <code>@EnableFeignClients</code>, <code>@ImportHttpServices</code>.</p></div></details>
+<details class="q"><summary>Что происходит с уже созданными бинами, если на шаге 11 один бин бросил исключение?</summary><div class="a"><p>refresh ловит <code>RuntimeException | Error</code> (до 6.2 — только <code>BeansException</code>), в 7.0 сначала останавливает уже запущенные Lifecycle-бины, затем вызывает <code>destroyBeans()</code> — для созданных singleton выполняются destroy-колбэки (@PreDestroy, DisposableBean, close), затем <code>cancelRefresh</code>, и исключение пробрасывается. В Boot его разбирают <code>FailureAnalyzer</code>-ы и печатают блок «APPLICATION FAILED TO START» с описанием и советом.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

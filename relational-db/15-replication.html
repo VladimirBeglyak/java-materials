@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Репликация и отказоустойчивость</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ЭКСПЛУАТАЦИЯ И МАСШТАБ</div>
+  <h1>Репликация и отказоустойчивость</h1>
+  <p class="lead">Одна база — одна точка отказа и один предел чтения. Репликация даёт копии для переключения при аварии и для разгрузки чтения. Разбираем физическую и логическую репликацию, синхронный и асинхронный режим (сколько данных можно потерять), отставание реплик и «чтение своих записей», автоматическое переключение (Patroni) и что должно уметь приложение.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">streaming replication</span><span class="tag">sync/async</span><span class="tag">лаг</span><span class="tag">failover</span><span class="tag">Patroni</span><span class="tag">логическая репликация</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="physical"><span class="h-num">15.1</span>Физическая (потоковая) репликация</h2>
+<div class="flow">
+  <div class="node acc"><b>Primary</b><small>пишет WAL</small></div><span class="to">→ walsender</span>
+  <div class="node"><b>сеть</b><small>поток записей WAL</small></div><span class="to">→ walreceiver</span>
+  <div class="node info"><b>Standby (hot standby)</b><small>пишет WAL на свой диск, startup-процесс применяет его; доступна для чтения</small></div>
+</div>
+<p>Реплика — побайтовая копия всего кластера, получающая тот же WAL (тема 10). Применяет всё: таблицы, индексы, DDL. Поэтому одна версия PostgreSQL и одна архитектура, нельзя реплицировать отдельную таблицу, а на реплике нельзя ничего писать.</p>
+<pre data-title="создание реплики и проверка"><code class="sql">-- на реплике: копия с primary + настройки подключения и слот
+-- pg_basebackup -h primary -U replicator -D /var/lib/postgresql/data -R -X stream -S replica1 -C
+
+-- на primary: состояние реплик
+SELECT application_name, state, sync_state,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)) AS replay_lag_bytes,
+       write_lag, flush_lag, replay_lag
+FROM pg_stat_replication;
+
+-- на реплике
+SELECT pg_is_in_recovery(), now() - pg_last_xact_replay_timestamp() AS lag;</code></pre>
+<div class="callout warn"><span class="c-title">Слоты репликации — защита и угроза</span>
+Слот гарантирует, что primary не удалит WAL, пока реплика его не получила. Но если реплику выключили навсегда и забыли удалить слот, WAL копится на primary до заполнения диска, а горизонт (тема 11) не двигается. Ограничьте: <code>max_slot_wal_keep_size</code>, мониторинг <code>pg_replication_slots</code> (неактивные слоты).
+</div>
+
+<h2 id="sync"><span class="h-num">15.2</span>Синхронно или асинхронно: RPO и задержка</h2>
+<div class="widget stepper" id="rpSim">
+  <div class="widget-title">Симулятор: primary сгорел сразу после COMMIT</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Клиент</h5><div class="items"><span class="chip" id="rpC">COMMIT заказа 9001</span><span class="chip off" id="rpOk">«OK»</span></div></div>
+    <div class="lane"><h5>Primary</h5><div class="items"><span class="chip" id="rpP">WAL fsync ✔</span><span class="chip off" id="rpDead">💥 сервер потерян</span></div></div>
+    <div class="lane"><h5>Реплика</h5><div class="items"><span class="chip off" id="rpR">WAL получен?</span><span class="chip off" id="rpPromo">promote → новый primary</span></div></div>
+  </div>
+  <section class="st-step" data-t="Асинхронно: COMMIT" data-hl="rpC rpP rpOk" data-log="async: primary сбросил WAL локально → «OK» клиенту сразу, отправка реплике идёт в фоне"><p>По умолчанию репликация асинхронная: primary подтверждает COMMIT после локального fsync. Реплика получит WAL через миллисекунды — или позже, при нагрузке и проблемах сети.</p></section>
+  <section class="st-step" data-t="Асинхронно: авария" data-hl="rpDead rpR" data-log="primary потерян до отправки WAL → на реплике заказа 9001 нет"><p>Primary физически потерян (диск, зона доступности) раньше, чем WAL ушёл на реплику. Клиенту сказали «OK», а на реплике заказа нет.</p></section>
+  <section class="st-step" data-t="Асинхронно: итог" data-hl="rpPromo" data-log="promote: реплика стала primary без последних транзакций — RPO = отставание (обычно мс…с)"><p>Реплику повышают до primary. Потеряны транзакции, подтверждённые за время отставания: <b>RPO</b> (сколько данных можно потерять) = лаг. Обычно миллисекунды, но при пиковой нагрузке — секунды и минуты.</p></section>
+  <section class="st-step" data-t="Синхронно: COMMIT ждёт" data-hl="rpC rpP rpR" data-log="sync: synchronous_standby_names = 'ANY 1 (r1, r2)'; COMMIT ждёт подтверждения записи от реплики"><p>В синхронном режиме COMMIT ждёт, пока хотя бы одна синхронная реплика подтвердит получение и сброс WAL на диск (<code>synchronous_commit = on</code>) или применение (<code>remote_apply</code>).</p></section>
+  <section class="st-step" data-t="Синхронно: итог" data-hl="rpOk rpDead rpPromo" data-log="авария после «OK» → реплика уже имеет заказ 9001 → RPO = 0; цена — +RTT в каждом COMMIT"><p>«OK» получен только после записи на реплику, поэтому авария primary ничего не теряет: RPO = 0. Цена — сетевая задержка в каждом коммите (в той же зоне ~0.5 мс, между регионами — десятки мс) и риск остановки записи, если синхронных реплик не осталось. Поэтому — <code>ANY 1 (r1, r2)</code>: хватит любой из двух.</p></section>
+</div>
+<div class="table-wrap"><table>
+<tr><th>synchronous_commit</th><th>COMMIT ждёт</th><th>Защищает от</th></tr>
+<tr><td><code>off</code></td><td>ничего (локальный WAL в фоне)</td><td>—</td></tr>
+<tr><td><code>local</code></td><td>локальный fsync</td><td>сбоя процесса/ОС primary</td></tr>
+<tr><td><code>remote_write</code></td><td>реплика получила WAL (в память ОС)</td><td>потери primary, но не одновременного сбоя ОС реплики</td></tr>
+<tr><td><code>on</code> (с синхронной репликой)</td><td>реплика сбросила WAL на диск</td><td>потери primary целиком</td></tr>
+<tr><td><code>remote_apply</code></td><td>реплика применила WAL</td><td>+ чтение с реплики сразу видит коммит</td></tr>
+</table></div>
+
+<h2 id="lag"><span class="h-num">15.3</span>Чтение с реплик и отставание</h2>
+<p>Разгрузка чтения на реплики работает, но приложение должно мириться с тем, что реплика отстаёт. Классическая ошибка — «прочитать свою запись»:</p>
+<div class="widget" id="lgW">
+  <div class="widget-title">Пользователь сохранил профиль и сразу открыл его</div>
+  <div class="controls">
+    <label>лаг реплики, мс<input type="number" id="lgL" value="300" min="0"></label>
+    <label>пауза до чтения, мс<input type="number" id="lgD" value="80" min="0"></label>
+    <label>стратегия<select id="lgS">
+      <option value="replica">все чтения — с реплики</option>
+      <option value="sticky">после записи — с primary N секунд (sticky)</option>
+      <option value="lsn">ждать LSN записи на реплике</option>
+      <option value="primary">критичные чтения — всегда primary</option>
+    </select></label>
+  </div>
+  <div class="verdict" id="lgV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var l = Math.max(0, +$("lgL").value), d = Math.max(0, +$("lgD").value), s = $("lgS").value, v = $("lgV");
+    if (s === "replica") {
+      if (d >= l) { v.className = "verdict ok"; v.textContent = "Повезло: реплика успела (" + d + " мс ≥ лаг " + l + " мс). Но при росте лага до секунд пользователь увидит старые данные."; }
+      else { v.className = "verdict bad"; v.textContent = "Пользователь видит СТАРЫЙ профиль: чтение через " + d + " мс, а реплика отстаёт на " + l + " мс. Повторное сохранение «на всякий случай», жалобы в поддержку."; }
+    } else if (s === "sticky") { v.className = "verdict ok"; v.textContent = "После записи запросы этого пользователя N секунд идут на primary (метка в сессии/cookie). Просто и надёжно, если N больше типичного лага; при аномальном лаге всё равно возможна устаревшая картинка."; }
+    else if (s === "lsn") { v.className = "verdict ok"; v.textContent = "После записи запоминаем pg_current_wal_lsn() primary, перед чтением с реплики проверяем pg_last_wal_replay_lsn() ≥ сохранённого (или ждём до " + l + " мс). Точно, но сложнее; так устроены некоторые прокси и фреймворки."; }
+    else { v.className = "verdict ok"; v.textContent = "Чтения сразу после записи и всё, что влияет на решения (баланс, остатки), — с primary. На реплики — списки, поиск, отчёты, где отставание в секунды допустимо. Самая частая схема на практике."; }
+  }
+  ["lgL", "lgD", "lgS"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<pre data-title="маршрутизация чтения в Spring: read-only транзакции → реплика"><code class="java">public class RoutingDataSource extends AbstractRoutingDataSource {
+    @Override protected Object determineCurrentLookupKey() {
+        return TransactionSynchronizationManager.isCurrentTransactionReadOnly() ? "replica" : "primary";
+    }
+}
+// Оберните в LazyConnectionDataSourceProxy — иначе соединение берётся ДО того, как известен readOnly.
+// @Transactional(readOnly = true) → реплика; обычные транзакции → primary.</code></pre>
+<div class="callout info"><span class="c-title">Конфликты на реплике</span>
+Долгий запрос на реплике может мешать применению WAL (VACUUM на primary удалил версии, которые запрос ещё читает). Тогда запрос отменяется: «canceling statement due to conflict with recovery», или применение WAL ждёт до <code>max_standby_streaming_delay</code>, и лаг растёт. <code>hot_standby_feedback = on</code> убирает отмены, но держит горизонт primary (раздувание). Для тяжёлой аналитики — отдельная реплика с большой задержкой или отдельное хранилище.
+</div>
+
+<h2 id="failover"><span class="h-num">15.4</span>Автоматическое переключение</h2>
+<p>PostgreSQL сам не переключается. Это делает внешний менеджер кластера: <b>Patroni</b> (стандарт де-факто), pg_auto_failover, операторы Kubernetes (CloudNativePG, Zalando, Crunchy), управляемые сервисы (RDS, Cloud SQL).</p>
+<div class="flow col">
+  <div class="node"><b>DCS: etcd / Consul / Kubernetes API</b><small>хранит «кто лидер»; ключ лидера с TTL продлевает только живой primary</small></div><span class="to">↓</span>
+  <div class="node acc"><b>Patroni на каждом узле</b><small>управляет своим PostgreSQL: продлевает лидерство или следит за лидером; при истечении ключа — выборы среди реплик с наименьшим отставанием</small></div><span class="to">↓</span>
+  <div class="node info"><b>Точка подключения</b><small>HAProxy/pgBouncer по REST-проверкам Patroni, VIP, DNS или Kubernetes Service — приложение всегда идёт на текущего primary</small></div>
+</div>
+<div class="grid-2">
+  <div class="card"><h4>Split brain</h4><p>Главная опасность — два primary одновременно (старый «ожил» после сетевого разделения). Защита: лидерство только с ключом в DCS, старый primary сам понижается, не продлив ключ; fencing/watchdog.</p></div>
+  <div class="card"><h4>RTO</h4><p>Время переключения: обнаружение (TTL 30 с по умолчанию) + повышение + переподключение клиентов. Типично 10–60 с. Приложение должно переживать это: повторы, таймауты, пул, который сбрасывает мёртвые соединения.</p></div>
+</div>
+<pre data-title="JDBC: несколько хостов и выбор primary"><code class="yaml">spring:
+  datasource:
+    url: jdbc:postgresql://pg1:5432,pg2:5432,pg3:5432/app?targetServerType=primary&amp;connectTimeout=3&amp;socketTimeout=30
+    hikari:
+      max-lifetime: 600000        # периодически обновлять соединения
+      connection-timeout: 5000
+      validation-timeout: 2000</code></pre>
+
+<h2 id="logical"><span class="h-num">15.5</span>Логическая репликация</h2>
+<p>Передаёт не байты страниц, а изменения строк (INSERT/UPDATE/DELETE), декодированные из WAL. Можно выбрать таблицы, строки и столбцы, реплицировать между разными версиями PostgreSQL, писать на получателе.</p>
+<pre data-title="публикация и подписка"><code class="sql">-- источник (wal_level = logical)
+CREATE PUBLICATION shop_pub FOR TABLE orders, order_items;
+-- получатель (схема таблиц создаётся заранее — DDL не реплицируется!)
+CREATE SUBSCRIPTION shop_sub
+  CONNECTION 'host=old-db dbname=shop user=repl'
+  PUBLICATION shop_pub;</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Физическая</th><th>Логическая</th></tr>
+<tr><td>Отказоустойчивость (HA)</td><td>✔ основной способ</td><td>✘ не реплицирует DDL, последовательности, большие объекты</td></tr>
+<tr><td>Обновление мажорной версии почти без простоя</td><td>✘</td><td>✔ подписать новый кластер, переключить приложение</td></tr>
+<tr><td>Часть таблиц в другую базу / консолидация</td><td>✘</td><td>✔</td></tr>
+<tr><td>Поток изменений в Kafka (CDC)</td><td>✘</td><td>✔ через тот же механизм: Debezium читает логический слот</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">15.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сколько подтверждённых транзакций можно потерять при асинхронной репликации и внезапной потере primary?</p><ul><li>Ничего</li><li>Те, что подтверждены за время отставания реплики</li><li>Все транзакции за последние сутки</li><li>Только незафиксированные</li></ul><div class="why">RPO асинхронной репликации = лаг.</div></div>
+<div class="mcq" data-ok="3"><p>Пользователь обновил данные и сразу увидел старые. Чтения идут с реплики. Что сделать?</p><ul><li>Отключить репликацию</li><li>Увеличить shared_buffers на реплике</li><li>Сделать репликацию логической</li><li>Чтения сразу после записи направлять на primary (или ждать LSN на реплике)</li></ul><div class="why">Read-your-writes — свойство, которое обеспечивает маршрутизация.</div></div>
+<div class="mcq" data-ok="0"><p>Почему с одной синхронной репликой запись может полностью остановиться?</p><ul><li>Если она недоступна, COMMIT ждёт её подтверждения бесконечно</li><li>Синхронная реплика блокирует таблицы</li><li>Из-за нехватки WAL</li><li>Не может</li></ul><div class="why">Используйте ANY 1 (r1, r2) и мониторинг.</div></div>
+<div class="mcq" data-ok="2"><p>Для чего логическая репликация подходит, а физическая — нет?</p><ul><li>Для автоматического failover</li><li>Для копирования индексов</li><li>Для обновления мажорной версии PostgreSQL почти без простоя и репликации отдельных таблиц</li><li>Для ускорения записи</li></ul><div class="why">Физическая требует одинаковой версии и копирует весь кластер.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Спроектируйте отказоустойчивый PostgreSQL для сервиса платежей.</summary><div class="a"><p>Три узла в разных зонах доступности под Patroni (или оператор Kubernetes / управляемый сервис), etcd из трёх узлов. Синхронная репликация <code>ANY 1</code> на две реплики — RPO = 0 при потере одной зоны. Точка подключения через HAProxy/Service по проверкам Patroni. Архив WAL и базовые копии в объектное хранилище для PITR (тема 19). В приложении — таймауты, повторы идемпотентных операций, пул с ограниченным временем жизни соединений. Регулярные учения по переключению.</p></div></details>
+<details class="q"><summary>Чем репликация не является?</summary><div class="a"><p>Резервной копией: ошибочный DELETE или DROP мгновенно реплицируется на все копии. Нужны отдельные бэкапы с PITR (или отложенная реплика с <code>recovery_min_apply_delay</code> как дополнительная страховка). И не масштабированием записи: все записи идут через один primary — для этого шардинг или распределённые SQL-базы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

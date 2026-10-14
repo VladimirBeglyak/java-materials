@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · ThreadPoolExecutor изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.bits32 { display: grid; grid-template-columns: repeat(32, minmax(0, 1fr)); gap: 1px; margin: 8px 0; font: 10px var(--font-mono); }
+.bits32 span { text-align: center; padding: 5px 0; border-radius: 2px; }
+.bits32 span.rs { background: var(--accent-soft); } .bits32 span.wc { background: var(--info-soft); } .bits32 span.one { font-weight: 700; }
+.pool { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin: 10px 0; }
+.pool .box { border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 70px; }
+.pool .box h5 { margin: 0 0 6px; font-size: 12px; color: var(--fg-muted); text-transform: uppercase; }
+.pool .box span { display: inline-block; font: 12px var(--font-mono); padding: 4px 7px; margin: 2px; border-radius: 5px; border: 1.5px solid var(--line); }
+.pool .core { background: var(--ok-soft); border-color: var(--ok); } .pool .extra { background: var(--warn-soft); border-color: var(--warn); } .pool .q { background: var(--info-soft); } .pool .rej { background: var(--bad-soft); border-color: var(--bad); }
+@media (max-width: 640px) { .pool { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ИСПОЛНИТЕЛИ</div>
+  <h1>ThreadPoolExecutor изнутри</h1>
+  <p class="lead">Самый используемый класс пакета. Разберём устройство по исходникам: как состояние пула и число потоков упакованы в один <code>AtomicInteger ctl</code>, точный алгоритм <code>execute()</code> (с симулятором, который показывает, куда попадает каждая задача), почему рабочий поток — это AQS, что происходит с исключениями задач, чем <code>shutdown</code> отличается от <code>shutdownNow</code> и какие ловушки в фабриках <code>Executors</code>.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">ctl</span><span class="tag">алгоритм execute</span><span class="tag">Worker = AQS</span><span class="tag">runWorker</span><span class="tag">исключения задач</span><span class="tag">shutdown</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="ctl"><span class="h-num">15.1</span>ctl: состояние и число потоков в одном int</h2>
+<pre data-title="ThreadPoolExecutor"><code class="java">private final AtomicInteger ctl = new AtomicInteger(ctlOf(RUNNING, 0));
+private static final int COUNT_BITS = Integer.SIZE - 3;          // 29 бит под число потоков (до ~536 млн)
+private static final int RUNNING    = -1 &lt;&lt; COUNT_BITS;           // 111
+private static final int SHUTDOWN   =  0 &lt;&lt; COUNT_BITS;           // 000
+private static final int STOP       =  1 &lt;&lt; COUNT_BITS;           // 001
+private static final int TIDYING    =  2 &lt;&lt; COUNT_BITS;           // 010
+private static final int TERMINATED =  3 &lt;&lt; COUNT_BITS;           // 011
+// один CAS атомарно проверяет состояние и меняет число рабочих — без блокировки</code></pre>
+<div class="widget" id="ctW">
+  <div class="widget-title">Декодер ctl</div>
+  <div class="controls">
+    <label>состояние<select id="ctS"><option value="-1">RUNNING</option><option value="0">SHUTDOWN</option><option value="1">STOP</option><option value="2">TIDYING</option><option value="3">TERMINATED</option></select></label>
+    <label>рабочих потоков<input type="number" id="ctN" value="5" min="0" max="1000"></label>
+  </div>
+  <div class="bits32" id="ctBits"></div>
+  <div class="out" id="ctOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, NAMES = { "-1": "RUNNING: принимает и выполняет задачи", "0": "SHUTDOWN: новые не принимает, очередь дорабатывается", "1": "STOP: новые не принимает, очередь выброшена, рабочие прерваны", "2": "TIDYING: все рабочие завершены, вызывается terminated()", "3": "TERMINATED: terminated() выполнен" };
+  function run() {
+    var rs = +$("ctS").value, n = Math.max(0, Math.min(1000, +$("ctN").value)), c = ((rs << 29) | n) | 0, b = (c >>> 0).toString(2).padStart(32, "0"), h = "";
+    for (var i = 0; i < 32; i++) h += '<span class="' + (i < 3 ? "rs" : "wc") + (b[i] === "1" ? " one" : "") + '">' + b[i] + "</span>";
+    $("ctBits").innerHTML = h;
+    $("ctOut").textContent = "ctl = " + c + "  (0x" + (c >>> 0).toString(16) + ")\nrunStateOf(c)    = c & ~CAPACITY → " + NAMES[rs] + "\nworkerCountOf(c) = c & CAPACITY  → " + n + "\nisRunning(c) = c < SHUTDOWN → " + (c < 0) + "   (RUNNING — единственное отрицательное состояние: проверка одной операцией сравнения)";
+  }
+  ["ctS", "ctN"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="execute"><span class="h-num">15.2</span>Алгоритм execute()</h2>
+<pre data-title="ThreadPoolExecutor.execute (сокращённо)"><code class="java">public void execute(Runnable command) {
+    int c = ctl.get();
+    if (workerCountOf(c) &lt; corePoolSize) {                 // 1. меньше core — новый поток, задача — его первая
+        if (addWorker(command, true)) return;
+        c = ctl.get();
+    }
+    if (isRunning(c) &amp;&amp; workQueue.offer(command)) {        // 2. иначе — в очередь
+        int recheck = ctl.get();
+        if (!isRunning(recheck) &amp;&amp; remove(command)) reject(command);
+        else if (workerCountOf(recheck) == 0) addWorker(null, false);   // ни одного потока — завести
+    }
+    else if (!addWorker(command, false))                    // 3. очередь полна — поток сверх core до max
+        reject(command);                                    // 4. и это не удалось — отказ
+}</code></pre>
+<div class="widget" id="exW">
+  <div class="widget-title">Куда попадёт задача</div>
+  <div class="controls">
+    <label>core<input type="number" id="exC" value="2" min="0" max="8"></label>
+    <label>max<input type="number" id="exM" value="4" min="1" max="10"></label>
+    <label>очередь<select id="exQ"><option value="3">ArrayBlockingQueue(3)</option><option value="inf">LinkedBlockingQueue() — без предела</option><option value="0">SynchronousQueue (ёмкость 0)</option></select></label>
+    <label>политика отказа<select id="exP"><option value="abort">AbortPolicy</option><option value="caller">CallerRunsPolicy</option><option value="discard">DiscardPolicy</option><option value="oldest">DiscardOldestPolicy</option></select></label>
+    <button class="btn primary" type="button" id="exAdd">submit задачу</button>
+    <button class="btn" type="button" id="exDone">одна задача завершилась</button>
+    <button class="btn" type="button" id="exR">↺</button>
+  </div>
+  <div class="pool">
+    <div class="box"><h5>Рабочие потоки</h5><div id="exWk"></div></div>
+    <div class="box"><h5>Очередь</h5><div id="exQu"></div></div>
+  </div>
+  <div class="log" id="exLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, workers, queue, n, log, rej;
+  function reset() { workers = []; queue = []; n = 1; rej = []; log = ["пул создан: потоков 0 (создаются лениво; prestartAllCoreThreads() — заранее)"]; draw(); }
+  function qcap() { var v = $("exQ").value; return v === "inf" ? Infinity : +v; }
+  function submit() {
+    var core = +$("exC").value, max = Math.max(+$("exM").value, core), id = "t" + n++, busy = workers.length;
+    if (busy < core) { workers.push({ id: id, core: true }); log.push(id + ": потоков " + busy + " < core " + core + " → addWorker(core): новый поток с этой задачей (даже если другие свободны!)"); }
+    else if (queue.length < qcap()) { queue.push(id); log.push(id + ": core заняты → offer в очередь (" + queue.length + "/" + (qcap() === Infinity ? "∞" : qcap()) + ")" + (qcap() === Infinity ? " — с неограниченной очередью потоки сверх core НИКОГДА не создаются" : "")); }
+    else if (busy < max) { workers.push({ id: id, core: false }); log.push(id + ": очередь " + (qcap() === 0 ? "SynchronousQueue — некому передать" : "полна") + " → addWorker(non-core): поток " + (busy + 1) + "/" + max + " (умрёт после keepAliveTime простоя)"); }
+    else {
+      var p = $("exP").value;
+      if (p === "abort") { rej.push(id); log.push(id + ": очередь полна и потоков max → RejectedExecutionException бросается в вызывающий код"); }
+      else if (p === "caller") log.push(id + ": CallerRunsPolicy → задача выполняется В ПОТОКЕ, вызвавшем submit — естественное противодавление (вызывающий замедляется)");
+      else if (p === "discard") { rej.push(id); log.push(id + ": DiscardPolicy → задача молча выброшена (опасно: тихая потеря)"); }
+      else { var old = queue.shift(); queue.push(id); rej.push(old); log.push(id + ": DiscardOldestPolicy → выброшена старейшая задача из очереди " + old + ", " + id + " в очередь"); }
+    }
+    draw();
+  }
+  function done() {
+    if (!workers.length) return;
+    var w = workers[0];
+    if (queue.length) { var t = queue.shift(); log.push(w.id + " завершилась; поток взял из очереди " + t + " (getTask: workQueue.take() для core, poll(keepAlive) для остальных)"); w.id = t; workers.push(workers.shift()); }
+    else { var core = +$("exC").value; log.push(w.id + " завершилась; очередь пуста → поток ждёт в getTask()" + (workers.length > core ? " — он сверх core: после keepAliveTime без задач завершится" : "")); workers.shift(); }
+    draw();
+  }
+  function draw() {
+    var core = +$("exC").value;
+    $("exWk").innerHTML = workers.length ? workers.map(function (w, i) { return '<span class="' + (i < core ? "core" : "extra") + '">' + w.id + "</span>"; }).join("") : '<i style="opacity:.6">нет</i>';
+    $("exQu").innerHTML = (queue.length ? queue.map(function (t) { return '<span class="q">' + t + "</span>"; }).join("") : '<i style="opacity:.6">пусто</i>') + (rej.length ? '<div>отклонены: ' + rej.map(function (t) { return '<span class="rej">' + t + "</span>"; }).join("") + "</div>" : "");
+    $("exLog").textContent = log.slice(-7).join("\n"); $("exLog").scrollTop = 1e6;
+  }
+  $("exAdd").addEventListener("click", submit); $("exDone").addEventListener("click", done); $("exR").addEventListener("click", reset);
+  ["exC", "exM", "exQ", "exP"].forEach(function (i) { $(i).addEventListener("change", reset); });
+  reset();
+})();
+</script>
+
+<h2 id="worker"><span class="h-num">15.3</span>Рабочий поток и жизненный цикл задачи</h2>
+<pre data-title="Worker extends AbstractQueuedSynchronizer implements Runnable"><code class="java">final void runWorker(Worker w) {
+    Runnable task = w.firstTask; w.firstTask = null;
+    w.unlock();                                       // разрешить прерывания
+    boolean completedAbruptly = true;
+    try {
+        while (task != null || (task = getTask()) != null) {   // getTask: take()/poll(keepAlive); null — поток должен умереть
+            w.lock();                                  // Worker сам — нереентерабельная блокировка на AQS:
+                                                       // shutdown() прерывает только НЕ захваченных (простаивающих) рабочих
+            try {
+                beforeExecute(w.thread, task);         // хук для наследников (MDC, метрики)
+                task.run();
+                afterExecute(task, null);
+            } catch (Throwable ex) { afterExecute(task, ex); throw ex; }   // исключение убивает поток → будет создан новый
+            finally { task = null; w.completedTasks++; w.unlock(); }
+        }
+        completedAbruptly = false;
+    } finally { processWorkerExit(w, completedAbruptly); }
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Как отправили</th><th>Куда девается исключение задачи</th></tr>
+<tr><td><code>execute(runnable)</code></td><td>вылетает из run → поток умирает (UncaughtExceptionHandler, по умолчанию печать в stderr) → пул создаёт замену</td></tr>
+<tr><td><code>submit(...)</code></td><td>ловится FutureTask и сохраняется в Future — <b>без get() исключение никто не увидит</b></td></tr>
+<tr><td>Через CompletableFuture.runAsync</td><td>в CompletableFuture (нужен exceptionally/handle/whenComplete)</td></tr>
+</table></div>
+
+<h2 id="shutdown"><span class="h-num">15.4</span>Остановка</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th></tr>
+<tr><td><code>shutdown()</code></td><td>RUNNING → SHUTDOWN: новые задачи отклоняются, очередь дорабатывается, простаивающие потоки прерываются</td></tr>
+<tr><td><code>shutdownNow()</code></td><td>→ STOP: прерывает все потоки, возвращает список невыполненных задач из очереди; задачи, игнорирующие прерывание, продолжат работать</td></tr>
+<tr><td><code>awaitTermination(t)</code></td><td>ждать TERMINATED</td></tr>
+<tr><td><code>close()</code> (Java 19+)</td><td>shutdown + ожидание завершения; ExecutorService — AutoCloseable, можно в try-with-resources</td></tr>
+</table></div>
+<pre data-title="корректная остановка (паттерн из Javadoc ExecutorService)"><code class="java">pool.shutdown();
+try {
+    if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+        pool.shutdownNow();
+        if (!pool.awaitTermination(10, TimeUnit.SECONDS)) log.error("пул не завершился");
+    }
+} catch (InterruptedException e) { pool.shutdownNow(); Thread.currentThread().interrupt(); }</code></pre>
+<div class="callout warn"><span class="c-title">Ловушки Executors</span>
+<code>newFixedThreadPool</code> и <code>newSingleThreadExecutor</code> — неограниченная <code>LinkedBlockingQueue</code>: при перегрузке очередь растёт до OOM. <code>newCachedThreadPool</code> — <code>SynchronousQueue</code> и max = Integer.MAX_VALUE: тысячи потоков. В продакшене создавайте <code>ThreadPoolExecutor</code> явно: ограниченная очередь, политика отказа, именованная ThreadFactory, метрики (Micrometer ExecutorServiceMetrics).
+</div>
+
+<h2 id="quiz"><span class="h-num">15.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>core = 2, max = 10, очередь LinkedBlockingQueue без предела. Сколько потоков будет при 1000 одновременных задачах?</p><ul><li>10</li><li>1000</li><li>2 — потоки сверх core создаются только при заполненной очереди, а она не заполняется</li><li>0</li></ul><div class="why">Классическая ошибка конфигурации.</div></div>
+<div class="mcq" data-ok="0"><p>Что хранит ctl?</p><ul><li>3 старших бита — состояние пула, 29 младших — число рабочих потоков</li><li>Число задач в очереди</li><li>Ссылку на очередь</li><li>Флаг shutdown</li></ul><div class="why">Один CAS меняет согласованно оба значения.</div></div>
+<div class="mcq" data-ok="3"><p>Задача, отправленная через submit, бросила исключение. Где оно?</p><ul><li>В логе пула</li><li>Поток умер, исключение в stderr</li><li>Потеряно бесследно</li><li>В Future: его увидит только тот, кто вызовет get()</li></ul><div class="why">Не забывайте получать результат или обрабатывать ошибки.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем Worker наследует AQS?</p><ul><li>Для честности очереди</li><li>Как нереентерабельная блокировка «занят задачей»: shutdown прерывает только простаивающие (не захваченные) потоки</li><li>Для подсчёта задач</li><li>Для связи с ForkJoinPool</li></ul><div class="why">Задача не будет прервана shutdown-ом посреди выполнения.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как настроить пул для HTTP-обработчиков, обращающихся к БД?</summary><div class="a"><p>Явный ThreadPoolExecutor: core = max = число, согласованное с пулом соединений БД (больше потоков, чем соединений, бессмысленно); ограниченная ArrayBlockingQueue (например, несколько сотен) — защита от перегрузки; политика отказа — AbortPolicy с ответом 503 или CallerRunsPolicy для противодавления; именованная ThreadFactory; метрики очереди и активных потоков; таймауты задач. С Java 21 для I/O-задач рассмотрите виртуальные потоки + Semaphore на ресурс.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

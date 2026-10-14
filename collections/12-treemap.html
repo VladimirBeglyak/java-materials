@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · TreeMap: красно-чёрное дерево и NavigableMap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+#rbSvg { width: 100%; display: block; margin: 8px 0; }
+#rbSvg line { stroke: var(--fg-muted); stroke-width: 1.5; }
+#rbSvg circle.R { fill: #d9534f; stroke: #a33; } #rbSvg circle.B { fill: #2b2b2b; stroke: #000; }
+#rbSvg circle.cur { stroke: var(--accent); stroke-width: 4; }
+#rbSvg text { font: bold 12px var(--font-mono); fill: #fff; }
+.nv { display: flex; flex-wrap: wrap; gap: 3px; margin: 10px 0; }
+.nv span { min-width: 34px; text-align: center; font: 12px var(--font-mono); padding: 7px 2px; border: 1.5px solid var(--line); border-radius: 4px; }
+.nv span.in { background: var(--ok-soft); border-color: var(--ok); } .nv span.pt { background: var(--accent-soft); border-color: var(--accent); }
+</style>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · УПОРЯДОЧЕННЫЕ СТРУКТУРЫ</div>
+  <h1>TreeMap: красно-чёрное дерево и NavigableMap</h1>
+  <p class="lead"><code>TreeMap</code> и <code>TreeSet</code> хранят ключи в красно-чёрном дереве — самобалансирующемся двоичном дереве поиска, где высота не превышает 2·log₂(n+1). Отсюда гарантированные O(log n) на поиск, вставку и удаление и мощный навигационный API: ближайший больший/меньший ключ, диапазоны, обратный порядок. Вставляйте ключи в живое дерево и смотрите на перекраски и повороты.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">BST</span><span class="tag">красно-чёрные свойства</span><span class="tag">повороты</span><span class="tag">floor/ceiling</span><span class="tag">subMap-представления</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="props"><span class="h-num">12.1</span>Красно-чёрные свойства</h2>
+<ol>
+  <li>Каждый узел красный или чёрный; корень чёрный.</li>
+  <li>У красного узла оба ребёнка чёрные (нет двух красных подряд).</li>
+  <li>Любой путь от узла до листьев (null) содержит одинаковое число чёрных узлов.</li>
+</ol>
+<p>Из 2 и 3 следует, что самый длинный путь не более чем вдвое длиннее самого короткого — дерево сбалансировано. Вставка нового (красного) узла может нарушить свойство 2; оно восстанавливается перекрасками и не более чем двумя поворотами.</p>
+
+<h2 id="sim"><span class="h-num">12.2</span>Вставка в красно-чёрное дерево</h2>
+<div class="widget" id="rbW">
+  <div class="widget-title">TreeMap: put(key)</div>
+  <div class="controls">
+    <label>ключ<input type="number" id="rbK" value="25"></label>
+    <button class="btn primary" type="button" id="rbPut">put</button>
+    <button class="btn" type="button" id="rbSeq">+1..10 по порядку</button>
+    <button class="btn" type="button" id="rbRnd">+5 случайных</button>
+    <button class="btn" type="button" id="rbR">↺</button>
+  </div>
+  <svg id="rbSvg" viewBox="0 0 700 260" role="img" aria-label="Красно-чёрное дерево"></svg>
+  <div class="out" id="rbOut"></div>
+  <div class="log" id="rbLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, root, log, hl, cnt;
+  function N(k) { return { k: k, c: "R", l: null, r: null, p: null }; }
+  function rotL(x) { var y = x.r; x.r = y.l; if (y.l) y.l.p = x; y.p = x.p; if (!x.p) root = y; else if (x === x.p.l) x.p.l = y; else x.p.r = y; y.l = x; x.p = y; }
+  function rotR(x) { var y = x.l; x.l = y.r; if (y.r) y.r.p = x; y.p = x.p; if (!x.p) root = y; else if (x === x.p.r) x.p.r = y; else x.p.l = y; y.r = x; x.p = y; }
+  function put(k) {
+    var y = null, x = root, path = [];
+    while (x) { y = x; path.push(x.k); if (k === x.k) { log.push("put(" + k + "): ключ есть (compare == 0) → значение заменено, дерево не меняется"); hl = k; return; } x = k < x.k ? x.l : x.r; }
+    var z = N(k); z.p = y; if (!y) root = z; else if (k < y.k) y.l = z; else y.r = z; cnt++;
+    log.push("put(" + k + "): спуск " + (path.length ? path.join(" → ") : "(пустое дерево)") + ", новый узел красный");
+    while (z.p && z.p.c === "R") {
+      var g = z.p.p;
+      if (z.p === g.l) {
+        var u = g.r;
+        if (u && u.c === "R") { z.p.c = "B"; u.c = "B"; g.c = "R"; log.push("  случай 1: родитель " + z.p.k + " и дядя " + u.k + " красные → перекраска, нарушение поднимается к деду " + g.k); z = g; }
+        else { if (z === z.p.r) { z = z.p; rotL(z); log.push("  случай 2: «излом» → левый поворот вокруг " + z.k); } z.p.c = "B"; g.c = "R"; rotR(g); log.push("  случай 3: правый поворот вокруг деда " + g.k + ", перекраска"); }
+      } else {
+        var u2 = g.l;
+        if (u2 && u2.c === "R") { z.p.c = "B"; u2.c = "B"; g.c = "R"; log.push("  случай 1: родитель " + z.p.k + " и дядя " + u2.k + " красные → перекраска, нарушение поднимается к деду " + g.k); z = g; }
+        else { if (z === z.p.l) { z = z.p; rotR(z); log.push("  случай 2 (зеркально): правый поворот вокруг " + z.k); } z.p.c = "B"; g.c = "R"; rotL(g); log.push("  случай 3 (зеркально): левый поворот вокруг деда " + g.k + ", перекраска"); }
+      }
+    }
+    if (root.c === "R") log.push("  корень перекрашен в чёрный");
+    root.c = "B"; hl = k;
+  }
+  function height(n) { return n ? 1 + Math.max(height(n.l), height(n.r)) : 0; }
+  function bh(n) { var h = 0; while (n) { if (n.c === "B") h++; n = n.l; } return h; }
+  function draw() {
+    var nodes = [], i = 0, maxD = 0;
+    (function walk(n, d) { if (!n) return; walk(n.l, d + 1); nodes.push({ n: n, x: i++, d: d }); maxD = Math.max(maxD, d); walk(n.r, d + 1); })(root, 0);
+    var W = 700, gap = W / (nodes.length + 1), pos = new Map();
+    nodes.forEach(function (o) { pos.set(o.n, [gap * (o.x + 1), 24 + o.d * Math.min(46, 230 / (maxD + 1))]); });
+    var s = "";
+    nodes.forEach(function (o) { var p = pos.get(o.n); [o.n.l, o.n.r].forEach(function (c) { if (c) { var q = pos.get(c); s += '<line x1="' + p[0] + '" y1="' + p[1] + '" x2="' + q[0] + '" y2="' + q[1] + '"/>'; } }); });
+    nodes.forEach(function (o) { var p = pos.get(o.n); s += '<circle class="' + o.n.c + (o.n.k === hl ? " cur" : "") + '" cx="' + p[0] + '" cy="' + p[1] + '" r="15"/><text x="' + p[0] + '" y="' + (p[1] + 4) + '" text-anchor="middle">' + o.n.k + "</text>"; });
+    $("rbSvg").innerHTML = s;
+    var h = height(root);
+    $("rbOut").textContent = "узлов: " + cnt + ", высота: " + h + " (предел 2·log₂(n+1) = " + (cnt ? (2 * Math.log2(cnt + 1)).toFixed(1) : 0) + "; у обычного BST при вставке по порядку было бы " + cnt + "), чёрная высота: " + bh(root);
+    $("rbLog").textContent = log.slice(-8).join("\n"); $("rbLog").scrollTop = 1e6;
+  }
+  function reset() { root = null; log = ["пустой TreeMap: root == null"]; hl = null; cnt = 0; [40, 20, 60, 10, 30].forEach(put); log.push("— начальные ключи 40, 20, 60, 10, 30 —"); draw(); }
+  $("rbPut").addEventListener("click", function () { put(+$("rbK").value); draw(); });
+  $("rbSeq").addEventListener("click", function () { root = null; cnt = 0; log = ["вставка 1..10 по возрастанию — худший случай для несбалансированного BST"]; for (var i = 1; i <= 10; i++) put(i); draw(); });
+  $("rbRnd").addEventListener("click", function () { for (var i = 0; i < 5; i++) put(1 + Math.floor(Math.random() * 99)); draw(); });
+  $("rbR").addEventListener("click", reset);
+  reset();
+})();
+</script>
+<p>В JDK узел <code>TreeMap.Entry</code> хранит ключ, значение, ссылки на левого и правого ребёнка и <b>родителя</b>, плюс цвет — ~40 байт. Ссылка на родителя позволяет итератору переходить к следующему узлу без стека (successor). Сравнения — через <code>compareTo</code> или компаратор; <code>equals</code> не вызывается вовсе (тема 04). Ключ <code>null</code> недопустим с естественным порядком.</p>
+
+<h2 id="nav"><span class="h-num">12.3</span>NavigableMap: поиск ближайших и диапазоны</h2>
+<div class="widget" id="nvW">
+  <div class="widget-title">TreeMap ключей {5, 12, 18, 23, 31, 40, 47, 56}</div>
+  <div class="controls">
+    <label>операция<select id="nvO"><option value="floor">floorKey(x) — ≤ x</option><option value="ceiling">ceilingKey(x) — ≥ x</option><option value="lower">lowerKey(x) — &lt; x</option><option value="higher">higherKey(x) — &gt; x</option><option value="head">headMap(x) — &lt; x</option><option value="tail">tailMap(x) — ≥ x</option><option value="sub">subMap(x, x + 20) — [x, x+20)</option><option value="desc">descendingMap()</option></select></label>
+    <label>x<input type="number" id="nvX" value="20"></label>
+  </div>
+  <div class="nv" id="nvA"></div>
+  <div class="verdict" id="nvV"></div>
+</div>
+<script>
+(function () {
+  var K = [5, 12, 18, 23, 31, 40, 47, 56], $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var o = $("nvO").value, x = +$("nvX").value, pt = null, inR = function () { return false; }, t;
+    if (o === "floor") { pt = K.filter(function (k) { return k <= x; }).pop(); t = "floorKey(" + x + ") = " + (pt === undefined ? "null" : pt); }
+    else if (o === "ceiling") { pt = K.filter(function (k) { return k >= x; })[0]; t = "ceilingKey(" + x + ") = " + (pt === undefined ? "null" : pt); }
+    else if (o === "lower") { pt = K.filter(function (k) { return k < x; }).pop(); t = "lowerKey(" + x + ") = " + (pt === undefined ? "null" : pt); }
+    else if (o === "higher") { pt = K.filter(function (k) { return k > x; })[0]; t = "higherKey(" + x + ") = " + (pt === undefined ? "null" : pt); }
+    else if (o === "head") { inR = function (k) { return k < x; }; t = "headMap(" + x + ") — представление ключей < " + x + "; headMap(x, true) включит x"; }
+    else if (o === "tail") { inR = function (k) { return k >= x; }; t = "tailMap(" + x + ") — ключи ≥ " + x; }
+    else if (o === "sub") { inR = function (k) { return k >= x && k < x + 20; }; t = "subMap(" + x + ", " + (x + 20) + ") — полуоткрытый интервал; put вне диапазона в представление → IllegalArgumentException"; }
+    else { inR = function () { return true; }; t = "descendingMap() — представление в обратном порядке, без копирования: " + K.slice().reverse().join(", "); }
+    $("nvA").innerHTML = K.map(function (k) { return '<span class="' + (k === pt ? "pt" : inR(k) ? "in" : "") + '">' + k + "</span>"; }).join("");
+    $("nvV").className = "verdict ok"; $("nvV").textContent = t + ". Сложность O(log n) — один спуск по дереву." + (/head|tail|sub|desc/.test(o) ? " Это представление: изменения видны в обе стороны." : "");
+  }
+  ["nvO", "nvX"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<pre data-title="типичные задачи на TreeMap"><code class="java">// тарифная сетка: найти ставку для суммы
+NavigableMap&lt;Integer, Double&gt; rates = new TreeMap&lt;&gt;(Map.of(0, 0.13, 2_400_000, 0.15, 5_000_000, 0.18));
+double rate = rates.floorEntry(3_100_000).getValue();     // 0.15
+
+// события за интервал времени
+NavigableMap&lt;Instant, Event&gt; log = new TreeMap&lt;&gt;();
+log.subMap(from, true, to, false).values();               // O(log n + k)
+
+// ближайший сервер на кольце консистентного хэширования
+SortedMap&lt;Integer, Node&gt; tail = ring.tailMap(hash);
+Node node = tail.isEmpty() ? ring.firstEntry().getValue() : ring.get(tail.firstKey());</code></pre>
+
+<h2 id="vs"><span class="h-num">12.4</span>TreeMap против HashMap</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>HashMap</th><th>TreeMap</th></tr>
+<tr><td>get/put</td><td>O(1) в среднем</td><td>O(log n) гарантированно</td></tr>
+<tr><td>Порядок итерации</td><td>не определён</td><td>по ключам</td></tr>
+<tr><td>Диапазоны, ближайший ключ</td><td>нет (полный перебор)</td><td>да</td></tr>
+<tr><td>Требования к ключу</td><td>equals + hashCode</td><td>Comparable или компаратор (согласованный с equals)</td></tr>
+<tr><td>Память</td><td>~32 Б узел + слот таблицы</td><td>~40 Б узел</td></tr>
+<tr><td>Многопоточный аналог</td><td>ConcurrentHashMap</td><td>ConcurrentSkipListMap (список с пропусками, не дерево)</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">12.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что вернёт <code>floorKey(20)</code> для ключей {5, 12, 18, 23}?</p><ul><li>23</li><li>18</li><li>20</li><li>null</li></ul><div class="why">Наибольший ключ ≤ 20.</div></div>
+<div class="mcq" data-ok="3"><p>Почему вставка 1..1000 по порядку не делает TreeMap списком?</p><ul><li>TreeMap сортирует ключи после вставки</li><li>TreeMap перемешивает ключи хэшем</li><li>TreeMap перестраивается раз в 100 вставок</li><li>Красно-чёрная балансировка поворотами держит высоту ≤ 2·log₂(n+1)</li></ul><div class="why">Обычное BST превратилось бы в цепочку высотой 1000.</div></div>
+<div class="mcq" data-ok="0"><p>Какой метод TreeMap использует для определения равенства ключей?</p><ul><li>compareTo/compare == 0</li><li>equals</li><li>hashCode</li><li>==</li></ul><div class="why">Поэтому важна согласованность сравнения с equals.</div></div>
+<div class="mcq" data-ok="2"><p>Что вернёт <code>map.headMap(30)</code>?</p><ul><li>Копию записей с ключами &lt; 30</li><li>Первые 30 записей</li><li>Представление записей с ключами &lt; 30, отражающее изменения исходной карты</li><li>Запись с ключом 30</li></ul><div class="why">Представления диапазонов не копируют данные.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему в Java выбрано красно-чёрное дерево, а не AVL?</summary><div class="a"><p>AVL сбалансировано строже (высота ≤ 1,44·log n) — поиск чуть быстрее, но вставка и удаление требуют больше поворотов (до O(log n) при удалении). Красно-чёрное делает не более 2 поворотов при вставке и 3 при удалении — лучше для смешанной нагрузки с частыми изменениями; это стандартный выбор библиотек (C++ std::map, Linux kernel, Java TreeMap и деревья в корзинах HashMap).</p></div></details>
+<details class="q"><summary>Как найти все события за последние 5 минут в потоке, отсортированном по времени?</summary><div class="a"><p>TreeMap&lt;Instant, Event&gt; (или ConcurrentSkipListMap при конкурентной записи): <code>tailMap(now.minus(5, MINUTES), true)</code> — представление за O(log n), обход O(k). Старые события удалять <code>headMap(cutoff).clear()</code>. Если ключи времени могут совпадать — составной ключ (время, id) или Map&lt;Instant, List&lt;Event&gt;&gt;.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

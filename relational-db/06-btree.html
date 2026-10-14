@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Индекс B-tree изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.bt-level { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin: 8px 0; }
+.bt-node { font: 12.5px var(--font-mono); border: 1.5px solid var(--line); border-radius: 6px; background: var(--bg-sunk); padding: 3px 6px; display: inline-flex; gap: 4px; transition: background .2s, border-color .2s; }
+.bt-node.leaf { background: var(--bg); }
+.bt-node i { font-style: normal; padding: 0 2px; border-radius: 3px; }
+.bt-node i.hit { background: var(--ok-soft); outline: 1px solid var(--ok); }
+.bt-node.path { border-color: var(--accent); background: var(--accent-soft); }
+.bt-node.range { border-color: var(--ok); background: var(--ok-soft); }
+.bt-tag { font: 11px var(--font-mono); color: var(--fg-muted); text-align: center; }
+</style>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ВНУТРЕННЕЕ УСТРОЙСТВО</div>
+  <h1>Индекс B-tree изнутри</h1>
+  <p class="lead">99% индексов в OLTP-базах — B-деревья. Почему поиск среди миллиарда строк стоит 4 чтения страниц, что происходит при вставке, почему порядок столбцов в составном индексе решает всё и когда индекс не может помочь. С живым B+-деревом, в которое можно вставлять ключи.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">B+-дерево</span><span class="tag">split</span><span class="tag">составные индексы</span><span class="tag">INCLUDE</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">6.1</span>Почему дерево и почему «широкое»</h2>
+<p>Без индекса поиск строки — чтение всей таблицы. Двоичное дерево дало бы log₂(10⁹) ≈ 30 уровней, то есть 30 случайных чтений. B-дерево хранит в узле не один ключ, а сотни: узел = страница 8 КБ. При ветвлении (fanout) 300 высота дерева на миллиард ключей — 4, а верхние два-три уровня всегда в кэше. Итог: поиск = 1–2 реальных чтения с диска.</p>
+
+<div class="widget" id="bhW">
+  <div class="widget-title">Калькулятор высоты B-дерева</div>
+  <div class="controls">
+    <label>строк, млн<input type="number" id="bhRows" value="1000" min="1"></label>
+    <label>размер ключа, байт<select id="bhKey"><option value="8">8 (bigint)</option><option value="16">16 (uuid)</option><option value="40">40 (text ~30 символов)</option><option value="100">100 (составной/длинный)</option></select></label>
+  </div>
+  <div class="out" id="bhOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(1, +$("bhRows").value) * 1e6, k = +$("bhKey").value;
+    var leafF = Math.floor(8150 * 0.9 / (k + 8 + 4)), innF = Math.floor(8150 / (k + 8 + 4)), lev = 1, cap = leafF, leaves = Math.ceil(n / leafF);
+    while (cap < n) { cap *= innF; lev++; }
+    var size = leaves * 8192 / Math.pow(1024, 3);
+    $("bhOut").textContent = "записей в листе ≈ " + leafF + ", ветвление внутреннего узла ≈ " + innF +
+      "\nвысота дерева: " + lev + " уровня → поиск = " + lev + " страницы (+1 страница таблицы)" +
+      "\nлистовых страниц ≈ " + leaves.toLocaleString("ru") + ", размер индекса ≈ " + size.toFixed(1) + " ГБ" +
+      "\nвнутренних страниц ≈ " + Math.ceil(leaves / innF * 1.01).toLocaleString("ru") + " — " + (Math.ceil(leaves / innF) * 8192 / 1048576).toFixed(0) + " МБ, обычно целиком в памяти";
+  }
+  ["bhRows", "bhKey"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="structure"><span class="h-num">6.2</span>Устройство B+-дерева</h2>
+<div class="flow col">
+  <div class="node acc"><b>Корень (metapage указывает на него)</b><small>разделители: [ 40 | 80 ] — ключи &lt; 40 налево, 40–79 в середину, ≥ 80 направо</small></div><span class="to">↓</span>
+  <div class="node info"><b>Внутренние узлы</b><small>только разделители и ссылки на дочерние страницы</small></div><span class="to">↓</span>
+  <div class="node ok"><b>Листья: ключ → ctid строки, упорядочены</b><small>связаны в двусвязный список — диапазон читается последовательным проходом вправо (или влево для ORDER BY … DESC)</small></div>
+</div>
+<p>Особенность PostgreSQL — алгоритм Лемана–Яо: у каждой страницы есть «high key» (верхняя граница) и ссылка на правого соседа. Если страницу разделили, пока читатель спускался, он увидит, что ключ больше high key, и перейдёт вправо. Поэтому поиск не блокирует дерево на время разделений.</p>
+
+<h2 id="sim"><span class="h-num">6.3</span>Живое дерево: поиск, диапазон, вставка</h2>
+<div class="widget" id="btW">
+  <div class="widget-title">B+-дерево: вставляйте ключи и ищите</div>
+  <div class="controls">
+    <label>ключей в узле, макс.<select id="btCap"><option>3</option><option selected>4</option><option>6</option></select></label>
+    <label>ключ<input type="number" id="btKey" value="42"></label>
+    <button class="btn primary" type="button" id="btIns">Вставить</button>
+    <button class="btn" type="button" id="btFind">Найти</button>
+    <label>до<input type="number" id="btTo" value="60"></label>
+    <button class="btn" type="button" id="btRange">Диапазон</button>
+  </div>
+  <div class="controls">
+    <button class="btn" type="button" id="btSeq">+20 последовательных</button>
+    <button class="btn" type="button" id="btRnd">+20 случайных</button>
+    <button class="btn" type="button" id="btClr">Очистить</button>
+  </div>
+  <div id="btTree"></div>
+  <div class="log" id="btLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var C, root, next = 1, lastPath = [], hit = null, rangeLeaves = [], log = [];
+  function leaf() { return { leaf: true, keys: [], kids: [], next: null }; }
+  function reset() { C = +$("btCap").value; root = leaf(); next = 1; lastPath = []; hit = null; rangeLeaves = []; log = ["пустое дерево: корень = единственный лист"]; draw(); }
+  function idx(keys, k) { var i = 0; while (i < keys.length && k >= keys[i]) i++; return i; }
+  function ins(n, k, rightmost) {
+    if (n.leaf) {
+      var p = 0; while (p < n.keys.length && n.keys[p] < k) p++;
+      if (n.keys[p] === k) return "dup";
+      n.keys.splice(p, 0, k);
+      if (n.keys.length <= C) return null;
+      var seq = rightmost && p === n.keys.length - 1, cut = seq ? C : Math.ceil(n.keys.length / 2);
+      var r = leaf(); r.keys = n.keys.splice(cut); r.next = n.next; n.next = r;
+      log.push("  лист переполнен → split " + (seq ? "у правого края: левый остаётся полным (вставки по возрастанию)" : "пополам") + ", разделитель " + r.keys[0]);
+      return { key: r.keys[0], node: r };
+    }
+    var i = idx(n.keys, k), s = ins(n.kids[i], k, rightmost && i === n.kids.length - 1);
+    if (!s || s === "dup") return s;
+    n.keys.splice(i, 0, s.key); n.kids.splice(i + 1, 0, s.node);
+    if (n.keys.length <= C) return null;
+    var m = Math.floor(n.keys.length / 2), up = n.keys[m], r2 = { leaf: false, keys: n.keys.splice(m + 1), kids: n.kids.splice(m + 1), next: null };
+    n.keys.pop();
+    log.push("  внутренний узел переполнен → split, " + up + " поднимается выше");
+    return { key: up, node: r2 };
+  }
+  function insert(k) {
+    if (isNaN(k)) return;
+    var s = ins(root, k, true);
+    if (s === "dup") { log.push("ключ " + k + " уже есть (уникальный индекс → ошибка 23505)"); return; }
+    log.push("вставлен " + k);
+    if (s) { root = { leaf: false, keys: [s.key], kids: [root, s.node], next: null }; log.push("  корень разделён → высота дерева +1"); }
+  }
+  function find(k) {
+    var n = root, path = [n], reads = 1;
+    while (!n.leaf) { n = n.kids[idx(n.keys, k)]; path.push(n); reads++; }
+    lastPath = path; rangeLeaves = []; hit = n.keys.indexOf(k) >= 0 ? k : null;
+    log.push("поиск " + k + ": прочитано страниц " + reads + " → " + (hit !== null ? "найден, дальше чтение строки по ctid" : "нет такого ключа"));
+    return n;
+  }
+  function range(a, b) {
+    var n = find(a), cnt = 0, pages = 0; rangeLeaves = []; hit = null;
+    while (n) { pages++; rangeLeaves.push(n); var stop = false; n.keys.forEach(function (x) { if (x >= a && x <= b) cnt++; if (x > b) stop = true; }); if (stop) break; n = n.next; }
+    log.push("диапазон " + a + "…" + b + ": спуск " + (lastPath.length) + " стр., затем по листьям вправо: " + pages + " лист., найдено ключей " + cnt);
+    rangeA = a; rangeB = b;
+  }
+  var rangeA = null, rangeB = null;
+  function draw() {
+    var levels = [], q = [root];
+    while (q.length) { levels.push(q); var nx = []; q.forEach(function (n) { if (!n.leaf) nx = nx.concat(n.kids); }); q = nx; }
+    var leaves = levels[levels.length - 1], keys = 0; leaves.forEach(function (l) { keys += l.keys.length; });
+    $("btTree").innerHTML = levels.map(function (lv, d) {
+      return '<div class="bt-tag">' + (d === 0 ? "корень" : d === levels.length - 1 ? "листья" : "уровень " + d) + '</div><div class="bt-level">' + lv.map(function (n) {
+        var cls = "bt-node" + (n.leaf ? " leaf" : "") + (rangeLeaves.indexOf(n) >= 0 ? " range" : lastPath.indexOf(n) >= 0 ? " path" : "");
+        return '<span class="' + cls + '">' + (n.keys.length ? n.keys.map(function (k) { var h = (hit === k && n.leaf) || (rangeLeaves.indexOf(n) >= 0 && k >= rangeA && k <= rangeB); return "<i" + (h ? ' class="hit"' : "") + ">" + k + "</i>"; }).join("│") : "∅") + (n.leaf && n.next ? " →" : "") + "</span>";
+      }).join("") + "</div>";
+    }).join("") + '<div class="bt-tag">высота ' + levels.length + " · листьев " + leaves.length + " · ключей " + keys + " · заполнение листьев " + (leaves.length ? Math.round(100 * keys / (leaves.length * C)) : 0) + "%</div>";
+    $("btLog").textContent = log.slice(-12).join("\n");
+    $("btLog").scrollTop = 1e6;
+  }
+  $("btIns").addEventListener("click", function () { lastPath = []; rangeLeaves = []; insert(+$("btKey").value); draw(); });
+  $("btFind").addEventListener("click", function () { find(+$("btKey").value); draw(); });
+  $("btRange").addEventListener("click", function () { var a = +$("btKey").value, b = +$("btTo").value; range(Math.min(a, b), Math.max(a, b)); draw(); });
+  $("btSeq").addEventListener("click", function () { lastPath = []; rangeLeaves = []; var m = 0; (function walk(n) { n.keys.forEach(function (k) { if (n.leaf) m = Math.max(m, k); }); n.kids.forEach(walk); })(root); for (var i = 1; i <= 20; i++) insert(m + i * 2); draw(); });
+  $("btRnd").addEventListener("click", function () { lastPath = []; rangeLeaves = []; for (var i = 0; i < 20; i++) insert(1 + Math.floor(Math.random() * 199)); draw(); });
+  $("btClr").addEventListener("click", reset);
+  $("btCap").addEventListener("change", reset);
+  reset(); [10, 20, 30, 40, 50, 60, 70, 80, 25, 35, 45, 55].forEach(insert); log.push("— начальные ключи вставлены —"); draw();
+})();
+</script>
+<div class="callout info"><span class="c-title">Что попробовать</span>
+Очистите дерево и нажмите «+20 последовательных» — листья заполнены почти на 100%: PostgreSQL при вставке в правый край делит страницу не пополам, а оставляет левую полной. Затем очистите и нажмите «+20 случайных» — заполнение около 60–70%, листьев больше. Это и есть цена случайных ключей (UUID v4) из темы 02.
+</div>
+
+<h2 id="composite"><span class="h-num">6.4</span>Составные индексы: правило левого префикса</h2>
+<p>Индекс <code>(customer_id, created_at)</code> упорядочен сначала по клиенту, внутри клиента — по дате, как телефонная книга «фамилия, имя». Отсюда, что он может:</p>
+<div class="table-wrap"><table>
+<tr><th>Условие</th><th>Индекс (customer_id, created_at)</th></tr>
+<tr><td><code>WHERE customer_id = 7</code></td><td>✔ левый префикс</td></tr>
+<tr><td><code>WHERE customer_id = 7 AND created_at &gt;= '2026-01-01'</code></td><td>✔ равенство + диапазон — идеальный случай</td></tr>
+<tr><td><code>WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 20</code></td><td>✔ без сортировки: читает 20 записей с конца диапазона</td></tr>
+<tr><td><code>WHERE created_at &gt;= '2026-01-01'</code></td><td>✘ нет первого столбца (в PostgreSQL 18 возможен skip scan при малом числе клиентов, но не рассчитывайте)</td></tr>
+<tr><td><code>WHERE customer_id IN (1,2,3) ORDER BY created_at</code></td><td>частично: найдёт строки, но сортировать придётся</td></tr>
+<tr><td><code>WHERE customer_id &gt; 7 AND created_at = '2026-05-01'</code></td><td>частично: диапазон по первому столбцу — второй уже только фильтр</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Правило порядка столбцов</span>
+Сначала столбцы с <b>равенством</b>, затем один столбец с <b>диапазоном</b> или <b>сортировкой</b>. Столбцы после диапазонного для поиска уже не работают — только как фильтр внутри индекса. «Селективность первым» — миф: важнее, какие условия реально встречаются в запросах.
+</div>
+
+<h2 id="limits"><span class="h-num">6.5</span>Когда B-tree не помогает</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="индекс по email не используется"><code class="sql">WHERE lower(email) = 'a@b.c'     -- функция над столбцом
+WHERE email LIKE '%@gmail.com'   -- шаблон с начальным %
+WHERE id::text = '42'            -- приведение типа столбца
+WHERE amount + 0 &gt; 100
+WHERE created_at::date = '2026-05-01'</code></pre>
+<pre class="good-code" data-title="как сделать «индексируемым» (sargable)"><code class="sql">CREATE INDEX ON users (lower(email));      -- индекс по выражению
+-- LIKE '%x' → триграммный GIN (тема 07)
+WHERE id = 42                              -- приводите параметр
+WHERE amount &gt; 100
+WHERE created_at &gt;= '2026-05-01'
+  AND created_at &lt;  '2026-05-02'</code></pre>
+</div>
+<p>Ещё: <code>LIKE 'abc%'</code> использует B-tree только при сортировке (collation) <code>C</code> или с классом операторов <code>text_pattern_ops</code>. Низкоселективное условие (<code>status = 'active'</code> у 90% строк) индекс не использует сознательно: полный просмотр дешевле — тема 08.</p>
+
+<h2 id="covering"><span class="h-num">6.6</span>Index Only Scan, INCLUDE, частичные индексы</h2>
+<pre data-title="три приёма, которые часто дают ×10"><code class="sql">-- 1. Покрывающий индекс: запрос берёт всё из индекса, таблицу не читает
+CREATE INDEX orders_cust_created ON orders (customer_id, created_at) INCLUDE (status, total);
+SELECT created_at, status, total FROM orders WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 20;
+-- работает, только если страницы помечены all-visible в visibility map (после VACUUM)
+
+-- 2. Частичный индекс: индексируем только нужные строки
+CREATE INDEX orders_unpaid ON orders (created_at) WHERE status = 'new';
+-- крошечный, быстрый; запрос должен содержать то же условие status = 'new'
+
+-- 3. Частичный уникальный индекс: «один активный адрес на клиента»
+CREATE UNIQUE INDEX one_default_addr ON addresses (customer_id) WHERE is_default;</code></pre>
+
+<h2 id="maintenance"><span class="h-num">6.7</span>Удаление, раздувание, обслуживание</h2>
+<ul>
+  <li>DELETE и UPDATE не удаляют записи из индекса сразу — их убирает VACUUM (или «bottom-up deletion» при вставке в PostgreSQL 14+). Опустевшие страницы переиспользуются, но индекс сам не сжимается.</li>
+  <li>С PostgreSQL 13 дубликаты ключа хранятся сжато (deduplication) — индекс по <code>status</code> или внешнему ключу стал в разы меньше.</li>
+  <li>Пересоздать раздутый индекс без блокировки записи: <code>REINDEX INDEX CONCURRENTLY orders_cust_created;</code></li>
+  <li>Создавать индексы на живой таблице — только <code>CREATE INDEX CONCURRENTLY</code> (тема 18): обычный блокирует запись на всё время построения.</li>
+  <li>Неиспользуемые индексы ищите по <code>pg_stat_user_indexes.idx_scan = 0</code> (с учётом реплик!) — каждый стоит места, записи и HOT-обновлений.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">6.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сколько примерно страниц читается при поиске одного ключа в B-дереве на 1 млрд bigint-ключей?</p><ul><li>около 30</li><li>около 4 (высота дерева) + 1 страница таблицы</li><li>1</li><li>около 1000</li></ul><div class="why">Ветвление в сотни ключей делает дерево очень низким.</div></div>
+<div class="mcq" data-ok="2"><p>Индекс <code>(status, created_at)</code>. Какой запрос использует его эффективнее всего?</p><ul><li><code>WHERE created_at &gt; now() - interval '1 day'</code></li><li><code>WHERE status &gt; 'a' AND created_at = '2026-01-01'</code></li><li><code>WHERE status = 'new' ORDER BY created_at LIMIT 50</code></li><li><code>WHERE lower(status) = 'new'</code></li></ul><div class="why">Равенство по первому столбцу и сортировка по второму — индекс отдаёт строки уже в нужном порядке.</div></div>
+<div class="mcq" data-ok="3"><p>Почему <code>WHERE created_at::date = '2026-05-01'</code> не использует индекс по <code>created_at</code>?</p><ul><li>Даты нельзя индексировать</li><li>Индекс используется только для первичного ключа</li><li>Нужен hash-индекс</li><li>Функция (приведение) применена к столбцу — индекс построен по исходным значениям; нужно условие-диапазон или индекс по выражению</li></ul><div class="why">Перепишите как диапазон <code>&gt;= '2026-05-01' AND &lt; '2026-05-02'</code>.</div></div>
+<div class="mcq" data-ok="0"><p>Чем INCLUDE-столбцы отличаются от столбцов ключа индекса?</p><ul><li>Хранятся только в листьях и не участвуют в поиске и порядке — нужны, чтобы запрос обошёлся без чтения таблицы</li><li>Ничем</li><li>По ним проверяется уникальность</li><li>Они сжимаются TOAST</li></ul><div class="why">INCLUDE делает индекс покрывающим, не раздувая внутренние узлы.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как выбрать порядок столбцов в составном индексе?</summary><div class="a"><p>Смотреть на реальные запросы: сначала столбцы, сравниваемые на равенство, затем один столбец с диапазоном или ORDER BY. Учитывать, что левый префикс может обслужить другие запросы (индекс (a, b) заменяет индекс (a)). Не добавлять столбцы «на всякий случай»: каждый увеличивает индекс и стоимость записи.</p></div></details>
+<details class="q"><summary>Почему случайные UUID плохи для B-tree?</summary><div class="a"><p>Каждая вставка попадает в случайный лист: при большом индексе это чтение «холодной» страницы с диска, разделения страниц посередине оставляют их заполненными наполовину, после контрольной точки первое изменение каждой страницы пишет её целиком в WAL. Последовательные ключи (bigint, UUID v7) пишут в один горячий правый лист.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

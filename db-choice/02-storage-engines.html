@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Движки хранения: B-tree, LSM, колонки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.lsm { display: grid; gap: 8px; margin: 10px 0; }
+.lsm-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.lsm-row > b { font: 12px var(--font-mono); color: var(--fg-muted); width: 92px; flex: none; }
+.sst { font: 12px var(--font-mono); border: 1.5px solid var(--line); border-radius: 6px; padding: 3px 7px; background: var(--bg-sunk); }
+.sst.mem { border-color: var(--accent); background: var(--accent-soft); }
+.sst.hit { border-color: var(--ok); background: var(--ok-soft); }
+.sst.skip { opacity: .4; }
+.sst.read { border-color: var(--warn); background: var(--warn-soft); }
+</style>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · КАК ВЫБИРАТЬ</div>
+  <h1>Движки хранения: B-tree, LSM, колонки</h1>
+  <p class="lead">Под любым хранилищем — одна из немногих структур данных на диске. Поняв B-дерево, LSM-дерево и колоночное хранение, вы предскажете, почему Cassandra пишет быстрее PostgreSQL, почему ClickHouse не любит UPDATE, а RocksDB тратит диск на компакции, — и не будете удивляться в продакшене.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">B-tree</span><span class="tag">LSM</span><span class="tag">компакция</span><span class="tag">Bloom-фильтр</span><span class="tag">колоночное хранение</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="rum"><span class="h-num">2.1</span>Три усиления: нельзя оптимизировать всё</h2>
+<p>Любая структура хранения торгуется между тремя «усилениями» (RUM-гипотеза):</p>
+<div class="grid-3">
+  <div class="card"><h4>Чтение (Read amp.)</h4><p>Сколько страниц или файлов прочитать, чтобы найти одну запись.</p></div>
+  <div class="card"><h4>Запись (Write amp.)</h4><p>Сколько байт реально пишется на диск на один байт данных (журнал, перезапись страниц, компакции).</p></div>
+  <div class="card"><h4>Место (Space amp.)</h4><p>Во сколько раз занятое место больше полезных данных (незаполненные страницы, старые версии, дубликаты до компакции).</p></div>
+</div>
+<p>Улучшение двух неизбежно ухудшает третье. Выбор движка — это выбор, какое усиление вы готовы терпеть.</p>
+
+<h2 id="btree"><span class="h-num">2.2</span>B-tree: обновление на месте</h2>
+<p>Данные и индексы — в страницах фиксированного размера, упорядоченных в дерево (подробно — в пособии по реляционным БД). Запись: найти страницу, изменить, записать журнал и позже саму страницу.</p>
+<ul>
+  <li><b>Чтение</b>: отлично — 3–4 страницы, верхние уровни в памяти; диапазоны — последовательно по листьям.</li>
+  <li><b>Запись</b>: каждое изменение — случайная запись страницы (8–16 КБ ради одной строки) + журнал; при случайных ключах — разделения страниц.</li>
+  <li><b>Место</b>: страницы заполнены на 50–90%.</li>
+</ul>
+<p>Где: PostgreSQL, MySQL InnoDB, Oracle, SQL Server, MongoDB WiredTiger (B-tree с элементами LSM), большинство OLTP-баз.</p>
+
+<h2 id="lsm"><span class="h-num">2.3</span>LSM-tree: только дописывать</h2>
+<p>Log-Structured Merge-tree превращает любую запись в последовательную: новые записи копятся в памяти (memtable) и журнале, затем сбрасываются на диск неизменяемыми отсортированными файлами (SSTable). Файлы периодически сливаются (компакция). Удаление — запись-«надгробие» (tombstone).</p>
+<div class="widget" id="lsmW">
+  <div class="widget-title">LSM-дерево: записывайте, сбрасывайте, сливайте, ищите</div>
+  <div class="controls">
+    <label>ключ<input type="number" id="lsK" value="17"></label>
+    <button class="btn primary" type="button" id="lsPut">PUT</button>
+    <button class="btn" type="button" id="lsDel">DELETE</button>
+    <button class="btn" type="button" id="lsGet">GET</button>
+    <button class="btn" type="button" id="lsRnd">+8 случайных PUT</button>
+    <button class="btn" type="button" id="lsFlush">Сбросить memtable</button>
+    <button class="btn" type="button" id="lsComp">Компакция</button>
+    <button class="btn" type="button" id="lsBloom">Bloom: вкл</button>
+  </div>
+  <div class="lsm" id="lsView"></div>
+  <div class="out" id="lsStat"></div>
+  <div class="log" id="lsLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var mem = {}, l0 = [], l1 = [], ver = 0, bloom = true, log = [], written = 0, user = 0, last = null;
+  function bf(keys) { var b = {}; keys.forEach(function (k) { b[k % 13] = 1; b[(k * 7 + 3) % 13] = 1; }); return b; }
+  function mayHave(t, k) { return !bloom || (t.bf[k % 13] && t.bf[(k * 7 + 3) % 13]); }
+  function mk(obj) { var keys = Object.keys(obj).map(Number).sort(function (a, b) { return a - b; }); return { keys: keys, data: obj, bf: bf(keys) }; }
+  function put(k, v) { mem[k] = v; user++; written++; if (Object.keys(mem).length >= 6) flush(true); }
+  function flush(auto) {
+    if (!Object.keys(mem).length) { log.push("memtable пуст"); return; }
+    var t = mk(mem); l0.unshift(t); written += t.keys.length; mem = {};
+    log.push((auto ? "memtable заполнен → " : "") + "сброс: новый SSTable в L0 [" + t.keys.join(",") + "] — последовательная запись");
+    if (l0.length >= 4) compact(true);
+  }
+  function compact(auto) {
+    if (!l0.length && l1.length < 2) { log.push("нечего сливать"); return; }
+    var all = {}; l1.concat([]).reverse().forEach(function (t) { for (var k in t.data) all[k] = t.data[k]; });
+    l0.slice().reverse().forEach(function (t) { for (var k in t.data) all[k] = t.data[k]; });
+    var before = 0; l0.concat(l1).forEach(function (t) { before += t.keys.length; });
+    var tomb = 0; for (var k in all) if (all[k] === "✝") { delete all[k]; tomb++; }
+    var keys = Object.keys(all).map(Number).sort(function (a, b) { return a - b; }), parts = [];
+    for (var i = 0; i < keys.length; i += 8) { var o = {}; keys.slice(i, i + 8).forEach(function (x) { o[x] = all[x]; }); parts.push(mk(o)); }
+    l0 = []; l1 = parts; written += keys.length;
+    log.push((auto ? "в L0 4 файла → " : "") + "компакция: прочитано " + before + " записей, записано " + keys.length + " (дубликаты и " + tomb + " надгробий выброшены), L1 без пересечений диапазонов");
+  }
+  function get(k) {
+    last = { k: k, read: [], skip: [], hit: null };
+    if (k in mem) { last.hit = "mem"; log.push("GET " + k + ": найден в memtable → " + mem[k]); return; }
+    var lv = l0.map(function (t, i) { return ["L0#" + i, t]; }).concat(l1.filter(function (t) { return k >= t.keys[0] && k <= t.keys[t.keys.length - 1]; }).map(function (t) { return ["L1#" + l1.indexOf(t), t]; }));
+    for (var i = 0; i < lv.length; i++) {
+      var id = lv[i][0], t = lv[i][1];
+      if (!mayHave(t, k)) { last.skip.push(id); continue; }
+      last.read.push(id);
+      if (k in t.data) { last.hit = id; log.push("GET " + k + ": прочитано файлов " + last.read.length + ", пропущено Bloom-фильтром " + last.skip.length + " → " + (t.data[k] === "✝" ? "удалён (надгробие)" : t.data[k])); return; }
+    }
+    log.push("GET " + k + ": нет. Прочитано файлов " + last.read.length + (bloom ? ", пропущено Bloom-фильтром " + last.skip.length + " (ложные срабатывания возможны)" : " — без Bloom-фильтров читаем каждый подходящий файл"));
+  }
+  function chip(t, id) {
+    var c = "sst"; if (last) { if (last.hit === id) c += " hit"; else if (last.read.indexOf(id) >= 0) c += " read"; else if (last.skip.indexOf(id) >= 0) c += " skip"; }
+    return '<span class="' + c + '">' + t.keys.map(function (k) { return t.data[k] === "✝" ? k + "✝" : k; }).join(" ") + "</span>";
+  }
+  function draw() {
+    var mk2 = Object.keys(mem).map(Number).sort(function (a, b) { return a - b; });
+    $("lsView").innerHTML = '<div class="lsm-row"><b>memtable</b><span class="sst mem' + (last && last.hit === "mem" ? " hit" : "") + '">' + (mk2.length ? mk2.map(function (k) { return mem[k] === "✝" ? k + "✝" : k; }).join(" ") : "пусто") + "</span></div>" +
+      '<div class="lsm-row"><b>L0 (новые)</b>' + (l0.length ? l0.map(function (t, i) { return chip(t, "L0#" + i); }).join("") : '<span class="hint">—</span>') + "</div>" +
+      '<div class="lsm-row"><b>L1</b>' + (l1.length ? l1.map(function (t, i) { return chip(t, "L1#" + i); }).join("") : '<span class="hint">—</span>') + "</div>";
+    var stored = 0; l0.concat(l1).forEach(function (t) { stored += t.keys.length; }); var uniq = {}; l0.concat(l1).forEach(function (t) { t.keys.forEach(function (k) { uniq[k] = 1; }); });
+    $("lsStat").textContent = "операций записи пользователя: " + user + ", записано на «диск» (WAL + сбросы + компакции): " + written + " → усиление записи ×" + (user ? (written / user).toFixed(1) : "0") +
+      "\nзаписей в файлах: " + stored + ", уникальных ключей: " + Object.keys(uniq).length + " → усиление места ×" + (Object.keys(uniq).length ? (stored / Object.keys(uniq).length).toFixed(2) : "1");
+    $("lsLog").textContent = log.slice(-10).join("\n"); $("lsLog").scrollTop = 1e6;
+  }
+  $("lsPut").addEventListener("click", function () { last = null; var k = +$("lsK").value; put(k, "v" + (++ver)); log.push("PUT " + k + " → в WAL и memtable (память), без чтения диска"); draw(); });
+  $("lsDel").addEventListener("click", function () { last = null; var k = +$("lsK").value; put(k, "✝"); log.push("DELETE " + k + " → записано надгробие; старые значения удалятся при компакции"); draw(); });
+  $("lsGet").addEventListener("click", function () { get(+$("lsK").value); draw(); });
+  $("lsRnd").addEventListener("click", function () { last = null; for (var i = 0; i < 8; i++) put(1 + Math.floor(Math.random() * 40), "v" + (++ver)); log.push("8 случайных PUT"); draw(); });
+  $("lsFlush").addEventListener("click", function () { last = null; flush(false); draw(); });
+  $("lsComp").addEventListener("click", function () { last = null; compact(false); draw(); });
+  $("lsBloom").addEventListener("click", function () { bloom = !bloom; $("lsBloom").textContent = "Bloom: " + (bloom ? "вкл" : "выкл"); log.push("Bloom-фильтры " + (bloom ? "включены" : "выключены")); draw(); });
+  [5, 12, 17, 23, 30, 8, 41, 2, 17, 33, 9, 14].forEach(function (k) { put(k, "v" + (++ver)); }); log.push("начальные данные: 12 PUT (17 записан дважды)"); draw();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th></th><th>B-tree</th><th>LSM</th></tr>
+<tr><td>Запись</td><td>случайная, на место; дороже при большой нагрузке</td><td>последовательная, очень быстрая; цена переносится в фоновые компакции</td></tr>
+<tr><td>Точечное чтение</td><td>предсказуемое, 1 путь по дереву</td><td>несколько уровней; Bloom-фильтры отсекают лишние файлы</td></tr>
+<tr><td>Диапазоны</td><td>отлично</td><td>хорошо, но нужно сливать данные нескольких уровней</td></tr>
+<tr><td>Удаление</td><td>сразу (или VACUUM)</td><td>надгробие живёт до компакции — «очереди» на LSM страдают от тысяч надгробий</td></tr>
+<tr><td>Задержки</td><td>ровные</td><td>всплески при отставании компакций (write stall)</td></tr>
+<tr><td>Сжатие</td><td>умеренное</td><td>отличное: файлы неизменяемы и плотно упакованы</td></tr>
+<tr><td>Где</td><td>PostgreSQL, InnoDB, Oracle</td><td>RocksDB, Cassandra, ScyllaDB, HBase, LevelDB, ClickHouse MergeTree (родственно), CockroachDB/TiKV (на Pebble/RocksDB)</td></tr>
+</table></div>
+
+<h2 id="columns"><span class="h-num">2.4</span>Строки против колонок</h2>
+<p>Строковое хранение кладёт все поля записи рядом: идеально «достать заказ целиком». Колоночное — все значения одного столбца рядом: идеально «посчитать сумму по одному столбцу у миллиарда строк». Плюс соседние значения одного типа отлично сжимаются (словари, RLE, дельты) и обрабатываются векторно (SIMD).</p>
+<div class="widget" id="rcW">
+  <div class="widget-title">Сколько данных прочитает аналитический запрос</div>
+  <div class="controls">
+    <label>строк, млн<input type="number" id="rcN" value="1000" min="1"></label>
+    <label>столбцов в таблице<input type="number" id="rcC" value="60" min="1"></label>
+    <label>столбцов в запросе<input type="number" id="rcQ" value="3" min="1"></label>
+    <label>байт на значение (в среднем)<input type="number" id="rcB" value="8" min="1"></label>
+    <label>сжатие колонок, ×<input type="number" id="rcZ" value="8" min="1"></label>
+  </div>
+  <div id="rcBars"></div>
+  <div class="verdict" id="rcV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(1, +$("rcN").value) * 1e6, c = Math.max(1, +$("rcC").value), q = Math.min(c, Math.max(1, +$("rcQ").value)), b = Math.max(1, +$("rcB").value), z = Math.max(1, +$("rcZ").value);
+    var row = n * (c * b + 24), col = n * q * b / z, G = Math.pow(1024, 3);
+    function bar(l, v, cls) { return '<div style="display:flex;justify-content:space-between;font-size:13.5px;gap:8px"><b>' + l + '</b><span style="font-family:var(--font-mono)">' + (v / G).toFixed(1) + ' ГБ · ' + (v / G / 2).toFixed(1) + ' с при 2 ГБ/с</span></div><div class="bar ' + cls + '"><i style="width:' + Math.max(0.5, v / row * 100) + '%"></i></div>'; }
+    $("rcBars").innerHTML = bar("Строковое хранение (читаем строки целиком)", row, "bad") + bar("Колоночное (только " + q + " столбца, сжатые)", col, "ok");
+    $("rcV").className = "verdict ok"; $("rcV").textContent = "Колоночное хранение читает в " + Math.round(row / col).toLocaleString("ru") + " раз меньше. Поэтому ClickHouse, BigQuery, Snowflake, Parquet — колоночные. Обратная сторона: достать одну строку целиком — собрать её из " + c + " файлов, а UPDATE отдельных строк — переписать куски столбцов.";
+  }
+  ["rcN", "rcC", "rcQ", "rcB", "rcZ"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+
+<h2 id="memory"><span class="h-num">2.5</span>В памяти и гибриды</h2>
+<ul>
+  <li><b>In-memory</b> (Redis, Memcached, Tarantool, VoltDB): структуры данных целиком в ОЗУ, долговечность — снимками и журналом. Микросекунды, но объём ограничен памятью и стоимостью.</li>
+  <li><b>HTAP</b> (TiDB с TiFlash, SingleStore, AlloyDB columnar engine): строковое хранение для транзакций + колоночная копия для аналитики в одной системе.</li>
+  <li><b>Hash-индексы на диске</b> (Bitcask): ключи в памяти, значения в журнале — максимально просто для key-value.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">2.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему LSM-движки пишут быстрее B-tree?</p><ul><li>Они не пишут журнал</li><li>Запись превращается в последовательную: memtable в памяти, затем сброс целого отсортированного файла</li><li>Они не поддерживают чтение</li><li>Они хранят данные только в памяти</li></ul><div class="why">Цена — компакции в фоне и чтение по нескольким уровням.</div></div>
+<div class="mcq" data-ok="3"><p>Зачем LSM-движку Bloom-фильтры?</p><ul><li>Для сжатия</li><li>Для сортировки ключей</li><li>Для шифрования</li><li>Чтобы не читать SSTable, в котором ключа точно нет</li></ul><div class="why">Фильтр отвечает «точно нет» или «возможно есть».</div></div>
+<div class="mcq" data-ok="0"><p>Почему очередь задач (вставка и быстрое удаление) плохо работает на Cassandra?</p><ul><li>Удаления оставляют надгробия, и чтение «головы очереди» проходит через тысячи надгробий до компакции</li><li>Cassandra не умеет удалять</li><li>Нет индексов</li><li>Запись слишком медленная</li></ul><div class="why">Известный антипаттерн «queue on Cassandra».</div></div>
+<div class="mcq" data-ok="2"><p>Почему колоночная база неудачна для «показать заказ со всеми полями по id»?</p><ul><li>Она не поддерживает фильтр по id</li><li>Она не сжимает данные</li><li>Строку нужно собрать из множества столбцовых файлов, а гранулы чтения рассчитаны на тысячи строк</li><li>Она хранит только числа</li></ul><div class="why">Колонки — для сканов и агрегатов, строки — для точечного доступа.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните усиление записи у B-tree и LSM.</summary><div class="a"><p>B-tree: запись в журнал + перезапись целой страницы (8–16 КБ) ради маленького изменения, полные образы страниц после контрольной точки, разделения страниц. LSM: запись в журнал + сброс memtable + многократная перезапись тех же данных при компакциях между уровнями (в leveled-компакции — порядка 10–30×). LSM выигрывает за счёт последовательности записи и сжатия, но суммарно может писать больше байт.</p></div></details>
+<details class="q"><summary>Как структура хранения влияет на выбор базы для журнала событий на 200 тыс. записей в секунду?</summary><div class="a"><p>Нужна дешёвая последовательная запись и, вероятно, агрегаты по времени: LSM-подобные или append-only структуры (Kafka для журнала, ClickHouse MergeTree для аналитики, Cassandra для чтения по ключу) подходят лучше B-tree OLTP-базы, где каждая вставка обновляет страницы всех индексов. Удаление старого — через TTL/партиции целиком, а не построчно.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

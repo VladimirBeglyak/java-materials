@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · REST, HTTP-клиенты, WebFlux</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · WEB</div>
+  <h1>HTTP-клиенты, модели потоков, WebFlux и виртуальные потоки</h1>
+  <p class="lead">Сервис не только принимает запросы, но и сам ходит в другие сервисы. Как он это делает — блокируя поток, через event loop или на виртуальных потоках — определяет, сколько нагрузки он выдержит и где у него узкое место. Разберём клиенты Spring, три модели исполнения и посчитаем пропускную способность.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">RestClient</span><span class="tag">@HttpExchange</span><span class="tag">Reactor</span><span class="tag">Virtual Threads</span><span class="tag">калькулятор</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="clients"><span class="h-num">10.1</span>HTTP-клиенты Spring</h2>
+<div class="table-wrap"><table>
+<tr><th>Клиент</th><th>Стиль</th><th>Статус</th></tr>
+<tr><td><code>RestTemplate</code></td><td>синхронный, шаблонные методы</td><td>устарел: в Spring Framework 7.0 объявлен deprecated в пользу RestClient, формально <code>@Deprecated(forRemoval = true)</code> с 7.1, удаление — в 8.0</td></tr>
+<tr><td><code>RestClient</code> (6.1+)</td><td>синхронный, fluent API</td><td>выбор по умолчанию для MVC-приложений</td></tr>
+<tr><td><code>WebClient</code></td><td>реактивный, неблокирующий</td><td>для WebFlux и потоковой обработки</td></tr>
+<tr><td>HTTP Interface (<code>@HttpExchange</code>)</td><td>декларативный интерфейс, реализацию генерирует прокси</td><td>поверх RestClient или WebClient; в Spring 7 — групповая регистрация <code>@ImportHttpServices</code></td></tr>
+</table></div>
+<pre data-title="RestClient: всегда берите builder из контекста"><code class="java">@Configuration
+class ClientsConfig {
+    @Bean
+    RestClient inventoryClient(RestClient.Builder builder, InventoryProperties p) {   // builder от Boot: метрики, трейсинг, конвертеры
+        HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(1)).build();
+        var factory = new JdkClientHttpRequestFactory(http);
+        factory.setReadTimeout(Duration.ofSeconds(2));                         // таймауты ОБЯЗАТЕЛЬНЫ
+        return builder.baseUrl(p.url())
+                .requestFactory(factory)
+                .defaultHeader("X-Client", "shop")
+                .build();
+    }
+}
+
+@Service
+class InventoryGateway {
+    private final RestClient client;
+    InventoryGateway(RestClient inventoryClient) { this.client = inventoryClient; }
+
+    Stock stock(String sku) {
+        return client.get().uri("/stock/{sku}", sku)
+                .retrieve()
+                .onStatus(s -&gt; s.value() == 404, (req, res) -&gt; { throw new SkuNotFound(sku); })
+                .body(Stock.class);                          // 4xx/5xx иначе → RestClientResponseException
+    }
+}</code></pre>
+<pre data-title="Декларативный клиент"><code class="java">@HttpExchange("/stock")
+interface InventoryApi {
+    @GetExchange("/{sku}") Stock stock(@PathVariable String sku);
+    @PostExchange("/reserve") Reservation reserve(@RequestBody ReserveRequest r);
+}
+
+@Bean
+InventoryApi inventoryApi(RestClient inventoryClient) {
+    return HttpServiceProxyFactory.builderFor(RestClientAdapter.create(inventoryClient))
+            .build().createClient(InventoryApi.class);       // JDK-прокси: метод → HTTP-запрос
+}</code></pre>
+<div class="callout bad"><span class="c-title">Таймауты по умолчанию — бесконечность или близко к ней</span>
+Клиент без read timeout при зависшем downstream держит поток навсегда. 200 зависших вызовов — и пул Tomcat исчерпан, сервис «лёг», хотя сам он здоров. Каскадный отказ начинается именно так. Минимум: connect и read timeout на каждом клиенте; лучше — ещё circuit breaker (Resilience4j) и ограничение конкурентности.
+</div>
+<p>Spring Framework 7 добавил в ядро <code>@Retryable</code> и <code>@ConcurrencyLimit</code> (включаются <code>@EnableResilientMethods</code>). Ретраи — только для идемпотентных операций и с экспоненциальной задержкой и джиттером, иначе вы добиваете уже перегруженный сервис.</p>
+
+<h2 id="models"><span class="h-num">10.2</span>Три модели исполнения</h2>
+<div class="grid-3">
+  <div class="card"><h4>Поток на запрос (MVC)</h4><p>Платформенный поток на весь запрос, блокируется на I/O. Простой код, понятные стектрейсы, ThreadLocal работает. Предел — число потоков: 200 по умолчанию, каждый ≈1 МБ стека и переключения контекста ОС.</p></div>
+  <div class="card"><h4>Event loop (WebFlux)</h4><p>Несколько потоков Netty (≈ числу ядер) обслуживают тысячи соединений. Код не блокирует поток — описывает конвейер, который продолжится, когда придут данные. Высокая конкурентность, но сложнее код, отладка и контекст (нет ThreadLocal).</p></div>
+  <div class="card"><h4>Виртуальные потоки (MVC + JDK 21)</h4><p>Блокирующий код, но блокировка виртуального потока лишь отмонтирует его от carrier-потока. Миллионы потоков дёшевы. Код как в MVC, масштабируемость близка к WebFlux для I/O-нагрузки.</p></div>
+</div>
+
+<h2 id="calc"><span class="h-num">10.3</span>Сколько выдержит сервис: закон Литтла</h2>
+<p>Одновременно выполняющихся запросов в среднем <b>L = λ × W</b>: поступление в секунду × время обработки. Если запрос 10 мс считает и 190 мс ждёт базу, то при 1000 RPS одновременно идут 200 запросов, и каждый держит поток. Посчитайте сами:</p>
+<div class="widget" id="cap">
+  <div class="widget-title">Калькулятор пропускной способности</div>
+  <div class="controls">
+    <label>RPS на входе<input type="number" id="capRps" value="1500" min="1"></label>
+    <label>ожидание I/O, мс<input type="number" id="capIo" value="190" min="0"></label>
+    <label>CPU на запрос, мс<input type="number" id="capCpu" value="10" min="1"></label>
+    <label>ядер<input type="number" id="capCores" value="8" min="1"></label>
+    <label>потоков Tomcat<input type="number" id="capThr" value="200" min="1"></label>
+    <label>соединений к БД<input type="number" id="capDb" value="50" min="1"></label>
+  </div>
+  <p class="hint">Предполагается, что всё время ожидания запрос держит соединение с БД.</p>
+  <div id="capOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function bar(label, cap, rps, note) {
+    var pct = Math.max(2, Math.min(100, cap / rps * 100)), ok = cap >= rps;
+    return '<div style="display:flex;justify-content:space-between;gap:10px;font-size:14px;flex-wrap:wrap"><span><b>' + label + "</b> " + note + '</span><span style="font-family:var(--font-mono)">' + Math.round(cap).toLocaleString("ru-RU") + " RPS</span></div>" +
+      '<div class="bar ' + (ok ? "ok" : "bad") + '"><i style="width:' + pct + '%"></i></div>';
+  }
+  function run() {
+    var rps = Math.max(1, +$("capRps").value), io = Math.max(0, +$("capIo").value), cpu = Math.max(1, +$("capCpu").value),
+        cores = Math.max(1, +$("capCores").value), thr = Math.max(1, +$("capThr").value), db = Math.max(1, +$("capDb").value);
+    var w = io + cpu, L = rps * w / 1000;
+    var cpuCap = cores * 1000 / cpu, thrCap = thr * 1000 / w, dbCap = io > 0 ? db * 1000 / io : Infinity;
+    var plat = Math.min(cpuCap, thrCap, dbCap), virt = Math.min(cpuCap, dbCap);
+    function limiter(c) { return c === cpuCap ? "CPU" : (c === thrCap ? "потоки Tomcat" : "пул соединений БД"); }
+    var h = '<div class="out">Одновременно в работе: L = ' + rps + " × " + w + " мс = " + L.toFixed(0) + " запросов\nCPU загружен на " + Math.min(999, rps * cpu / (cores * 1000) * 100).toFixed(0) + "%</div>";
+    h += bar("Потолок CPU", cpuCap, rps, "(ядра × 1000 / CPU-мс)");
+    h += bar("Потолок потоков", thrCap, rps, "(потоки × 1000 / время запроса)");
+    h += bar("Потолок пула БД", dbCap === Infinity ? rps * 10 : dbCap, rps, "(соединения × 1000 / I/O-мс)");
+    var v = '<div class="verdict ' + (plat >= rps ? "ok" : "bad") + '"><b>Платформенные потоки:</b> до ' + Math.round(plat) + " RPS, ограничивает " + limiter(plat) + ". ";
+    v += plat >= rps ? "Нагрузку выдерживает." : "Перегрузка: запросы копятся в accept-очереди, растёт задержка, затем отказы.";
+    v += "<br><b>Виртуальные потоки:</b> до " + Math.round(virt) + " RPS, ограничивает " + limiter(virt) + ". ";
+    if (virt > plat && limiter(plat) === "потоки Tomcat") v += "Снимают ограничение по потокам — выигрыш есть.";
+    else if (limiter(virt) === "пул соединений БД") v += "Узкое место переезжает в пул БД: потоков сколько угодно, но они ждут соединения (Hikari connectionTimeout → ошибки).";
+    else v += "Упор в CPU — виртуальные потоки не помогут, нужны ядра или оптимизация.";
+    $("capOut").innerHTML = h + v + "</div>";
+  }
+  ["capRps", "capIo", "capCpu", "capCores", "capThr", "capDb"].forEach(function (id) { $(id).addEventListener("input", run); });
+  run();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) Поднимите соединения БД до 400 — виртуальные потоки выдержат 1500 RPS, платформенные нет. (2) Сделайте CPU 100 мс — обе модели упрутся в процессор. (3) Ожидание 20 мс — 200 потоков хватает и без виртуальных.</p>
+
+<h2 id="webflux"><span class="h-num">10.4</span>WebFlux изнутри</h2>
+<pre data-title="Реактивный контроллер: ничего не выполняется до подписки"><code class="java">@RestController
+class PriceController {
+    private final WebClient rates;
+    private final PriceRepository repo;          // R2DBC: реактивный драйвер БД
+
+    @GetMapping("/prices/{sku}")
+    Mono&lt;PriceDto&gt; price(@PathVariable String sku) {
+        Mono&lt;Price&gt; base = repo.findBySku(sku);                            // запрос ещё НЕ отправлен
+        Mono&lt;Rate&gt; rate = rates.get().uri("/rates/RUB").retrieve().bodyToMono(Rate.class)
+                .timeout(Duration.ofSeconds(1))
+                .onErrorResume(e -&gt; Mono.just(Rate.FALLBACK));
+        return Mono.zip(base, rate, PriceDto::convert);                     // оба запроса пойдут параллельно
+    }   // фреймворк подпишется на Mono и запишет результат, когда он будет готов
+}</code></pre>
+<div class="flow">
+  <div class="node info"><b>Netty event loop</b><small>reactor-http-nio-1..N</small></div><span class="to">→</span>
+  <div class="node"><b>HttpHandler</b></div><span class="to">→</span>
+  <div class="node"><b>WebFilter chain</b></div><span class="to">→</span>
+  <div class="node acc"><b>DispatcherHandler</b><small>HandlerMapping → HandlerAdapter → ResultHandler</small></div><span class="to">→</span>
+  <div class="node ok"><b>Mono / Flux</b><small>подписка, сигналы onNext/onComplete</small></div>
+</div>
+<ul>
+  <li><b>Ленивость</b>: <code>Mono</code>/<code>Flux</code> — описание конвейера; работа начинается при <code>subscribe()</code>, которое делает фреймворк.</li>
+  <li><b>Никаких блокировок в event loop</b>: <code>block()</code>, JDBC, <code>Thread.sleep</code> в потоке Netty останавливают обслуживание тысяч соединений. Блокирующий вызов — в <code>Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic())</code> (publishOn переключает только операторы ниже по цепочке). BlockHound ловит такие ошибки в тестах.</li>
+  <li><b>Backpressure</b>: подписчик запрашивает <code>request(n)</code> элементов — производитель не заваливает медленного потребителя.</li>
+  <li><b>Контекст</b>: вместо ThreadLocal — Reactor <code>Context</code>; Micrometer context-propagation переносит MDC и трейсы между ними.</li>
+</ul>
+
+<h2 id="virtual"><span class="h-num">10.5</span>Виртуальные потоки в Spring Boot</h2>
+<p><code>spring.threads.virtual.enabled=true</code> (JDK 21+) переключает: рабочие потоки Tomcat/Jetty на виртуальные, <code>applicationTaskExecutor</code> (для <code>@Async</code>) — на <code>SimpleAsyncTaskExecutor</code> с виртуальными потоками, планировщик <code>@Scheduled</code>, контейнеры слушателей Kafka/RabbitMQ.</p>
+<div class="grid-2">
+  <div class="card"><h4>Где выигрыш</h4><p>Много одновременных запросов, большая часть времени — ожидание I/O (HTTP-вызовы, БД, очереди). Код остаётся простым блокирующим.</p></div>
+  <div class="card"><h4>Где ловушки</h4><p><b>Pinning</b>: до JDK 24 блокировка внутри <code>synchronized</code> «пришпиливала» виртуальный поток к carrier (JEP 491 исправил). <b>Пулы ресурсов</b> становятся узким местом — ограничивайте конкурентность семафором. <b>ThreadLocal-кэши</b> на миллион потоков съедают память. CPU-нагрузку виртуальные потоки не ускоряют.</p></div>
+</div>
+<div class="callout interview"><span class="c-title">Что выбрать для нового сервиса</span>
+По умолчанию — Spring MVC + виртуальные потоки: простота блокирующего кода и высокая конкурентность. WebFlux — когда нужна потоковая обработка (SSE, WebSocket с большим числом клиентов, стриминг данных), backpressure или весь стек уже реактивный (R2DBC, реактивные драйверы).
+</div>
+
+<h2 id="versioning"><span class="h-num">10.6</span>Версионирование API (Spring 7)</h2>
+<pre><code class="java">@Configuration
+class ApiConfig implements WebMvcConfigurer {
+    public void configureApiVersioning(ApiVersionConfigurer c) {
+        c.useRequestHeader("API-Version");       // или путь, параметр, media type
+    }
+}
+
+@RestController
+class OrderApi {
+    @GetMapping(path = "/orders/{id}", version = "1")   OrderV1 v1(@PathVariable long id) { /* ... */ }
+    @GetMapping(path = "/orders/{id}", version = "2+")  OrderV2 v2(@PathVariable long id) { /* ... */ }
+}</code></pre>
+<p>Версия становится ещё одним условием <code>RequestMappingInfo</code>, наряду с путём и методом. Раньше то же делали руками: версия в пути <code>/v2/orders</code> или своё условие маппинга.</p>
+
+<h2 id="quiz"><span class="h-num">10.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="3"><p>Сервис на MVC, 200 потоков Tomcat, downstream перестал отвечать, у RestClient нет read timeout. Что произойдёт?</p><ul><li>Spring сам прервёт вызов через 30 секунд</li><li>Запросы переключатся на другие потоки</li><li>Ничего страшного: Tomcat создаст новые потоки</li><li>Потоки по одному повиснут в ожидании, пул исчерпается, сервис перестанет отвечать на любые запросы</li></ul><div class="why">Классический каскадный отказ. Нужны таймауты, circuit breaker и изоляция (bulkhead).</div></div>
+<div class="mcq" data-ok="1"><p>Что произойдёт, если в контроллере WebFlux вызвать JDBC-репозиторий напрямую?</p><ul><li>Spring автоматически вынесет вызов в пул</li><li>Поток event loop заблокируется и перестанет обслуживать другие соединения</li><li>Ошибка компиляции</li><li>Вызов станет неблокирующим</li></ul><div class="why">Event loop потоков мало. Блокирующие вызовы — только через Schedulers.boundedElastic или реактивные драйверы (R2DBC).</div></div>
+<div class="mcq" data-ok="0"><p>После включения виртуальных потоков сервис начал сыпать ошибками «Connection is not available, request timed out». Почему?</p><ul><li>Ограничение по потокам снято, и пул соединений БД стал узким местом</li><li>Виртуальные потоки не поддерживают JDBC</li><li>Hikari несовместим с JDK 21</li><li>Утечка памяти</li></ul><div class="why">Раньше 200 потоков естественно ограничивали конкурентность. Теперь тысячи потоков одновременно ждут соединения. Ограничьте конкурентность явно или пересмотрите размер пула.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>RestTemplate, RestClient, WebClient — когда что?</summary><div class="a"><p>RestClient — синхронный клиент для MVC и виртуальных потоков, современный fluent API. WebClient — для реактивного стека и потоковой обработки. RestTemplate (deprecated с Spring 7) — только поддержка существующего кода. Для внешних API удобно описывать интерфейс @HttpExchange поверх любого из них.</p></div></details>
+<details class="q"><summary>Почему нужно внедрять RestClient.Builder, а не вызывать RestClient.create()?</summary><div class="a"><p>Builder из контекста настроен автоконфигурацией: конвертеры сообщений с вашим ObjectMapper, наблюдаемость (метрики http.client.requests, распространение трейса), кастомайзеры. create() даёт голый клиент без всего этого.</p></div></details>
+<details class="q"><summary>Объясните, как работает WebFlux и чем он отличается от MVC.</summary><div class="a"><p>Неблокирующий стек на Reactor и Netty: малое число потоков event loop, обработка через асинхронные конвейеры Mono/Flux, ленивое выполнение по подписке, backpressure. DispatcherHandler аналогичен DispatcherServlet. Отличия: нет ThreadLocal-контекста, нельзя блокировать, сложнее отладка, нужны реактивные драйверы.</p></div></details>
+<details class="q"><summary>Как оценить нужное число потоков или соединений?</summary><div class="a"><p>Закон Литтла: L = RPS × среднее время удержания ресурса. Добавить запас на пики и проверить нагрузочным тестом с метриками (активные потоки, ожидание соединения из пула, p99). Ресурс за пулом (лимиты БД, downstream) задаёт верхнюю границу.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

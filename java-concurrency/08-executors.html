@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Executors и ThreadPoolExecutor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .tpe-area { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; margin-top: 10px; }
+  .tpe-box { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--bg); min-height: 92px; }
+  .tpe-box h5 { margin: 0 0 8px; font-size: 13px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: .05em; }
+  .slots { display: flex; flex-wrap: wrap; gap: 6px; }
+  .slot { width: 46px; height: 46px; border-radius: 8px; display: grid; place-items: center; font: 600 12px var(--font-mono); border: 1.5px solid var(--line); background: var(--bg-sunk); color: var(--fg-muted); }
+  .slot.core { border-color: var(--ok); }
+  .slot.extra { border-color: var(--info); border-style: dashed; }
+  .slot.busy { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .slot.q { background: var(--warn-soft); border-color: var(--warn); color: var(--fg); }
+  .slot.empty { opacity: .45; }
+  .tpe-stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 14px; margin-top: 8px; }
+  .tpe-stats b { font-family: var(--font-mono); font-size: 18px; }
+  @media (max-width: 700px) { .tpe-area { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ИСПОЛНЕНИЕ ЗАДАЧ</div>
+  <h1>Executors и ThreadPoolExecutor</h1>
+  <p class="lead">В продакшене потоки почти никогда не создают руками. Задачи отдают пулу, а пул решает, на каком потоке и когда их выполнить, сколько их держать в очереди и что делать при перегрузке. Неправильно настроенный пул — одна из самых частых причин падений под нагрузкой.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">ThreadPoolExecutor</span><span class="tag">ForkJoinPool</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">8.1</span>Зачем пулы</h2>
+<div class="grid-3">
+  <div class="card"><h4>Цена создания</h4><p>Платформенный поток — системный вызов и ~1 МБ стека. Пул переиспользует потоки.</p></div>
+  <div class="card"><h4>Ограничение ресурсов</h4><p>«Поток на запрос» под пиком создаст 10 000 потоков → OOM или трэшинг планировщика. Пул ограничивает конкурентность.</p></div>
+  <div class="card"><h4>Управление</h4><p>Отмена, таймауты, graceful shutdown, метрики, политика перегрузки — в одном месте.</p></div>
+</div>
+
+<h2 id="api"><span class="h-num">8.2</span>Иерархия и жизненный цикл</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 210" role="img" aria-label="Иерархия Executor">
+  <defs><marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="270" y="10" width="260" height="38" rx="7" class="box"/><text x="400" y="34" text-anchor="middle" class="mono" font-size="13">Executor.execute(Runnable)</text>
+  <rect x="210" y="74" width="380" height="38" rx="7" class="box-info"/><text x="400" y="98" text-anchor="middle" class="mono" font-size="13">ExecutorService: submit, invokeAll, shutdown</text>
+  <rect x="20" y="146" width="230" height="44" rx="7" class="box-acc"/><text x="135" y="173" text-anchor="middle" class="mono" font-size="13">ThreadPoolExecutor</text>
+  <rect x="285" y="146" width="230" height="44" rx="7" class="box-ok"/><text x="400" y="173" text-anchor="middle" class="mono" font-size="13">ForkJoinPool</text>
+  <rect x="550" y="146" width="230" height="44" rx="7" class="box-warn"/><text x="665" y="166" text-anchor="middle" class="mono" font-size="12.5">ScheduledThreadPool-</text><text x="665" y="182" text-anchor="middle" class="mono" font-size="12.5">Executor</text>
+  <path d="M400 74 V52" class="ln" marker-end="url(#h1)"/>
+  <path d="M135 146 L330 116" class="ln" marker-end="url(#h1)"/><path d="M400 146 V116" class="ln" marker-end="url(#h1)"/><path d="M665 146 L470 116" class="ln" marker-end="url(#h1)"/>
+</svg>
+</figure>
+
+<p>Состояния пула: <b>RUNNING</b> → <code>shutdown()</code> → <b>SHUTDOWN</b> (новые задачи отклоняются, очередь дорабатывается) → <b>TIDYING</b> → <b>TERMINATED</b>. <code>shutdownNow()</code> → <b>STOP</b>: прерывает работающие потоки, возвращает невыполненные задачи из очереди. Внутри состояние и число потоков упакованы в одно <code>AtomicInteger ctl</code> (старшие 3 бита — runState, младшие 29 — workerCount), чтобы менять их одним CAS.</p>
+
+<pre data-title="Graceful shutdown — шаблон из javadoc" class="good-code"><code class="java">void shutdownAndAwait(ExecutorService pool) {
+    pool.shutdown();                                       // больше не принимаем задачи
+    try {
+        if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+            List&lt;Runnable&gt; dropped = pool.shutdownNow();    // прерываем зависшие
+            log.warn("Dropped {} tasks", dropped.size());
+            if (!pool.awaitTermination(10, TimeUnit.SECONDS))
+                log.error("Pool did not terminate");
+        }
+    } catch (InterruptedException e) {
+        pool.shutdownNow();
+        Thread.currentThread().interrupt();
+    }
+}
+// JDK 19+: ExecutorService реализует AutoCloseable — close() делает shutdown + ожидание.
+try (var exec = Executors.newVirtualThreadPerTaskExecutor()) { /* ... */ }</code></pre>
+
+<h2 id="algo"><span class="h-num">8.3</span>Алгоритм execute() — выучить наизусть</h2>
+<p>Конструктор: <code>ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory, handler)</code>.</p>
+<ol class="steps">
+  <li>Потоков меньше <b>corePoolSize</b> → создать новый поток с этой задачей (даже если есть простаивающие).</li>
+  <li>Иначе → <b>положить в очередь</b> (<code>workQueue.offer</code>).</li>
+  <li>Очередь полна и потоков меньше <b>maximumPoolSize</b> → создать дополнительный поток с этой задачей.</li>
+  <li>Иначе → <b>RejectedExecutionHandler</b>.</li>
+</ol>
+<div class="callout bad"><span class="c-title">Контринтуитивное следствие</span>
+Пул растёт сверх core, <b>только когда очередь переполнена</b>. С неограниченной очередью (<code>LinkedBlockingQueue()</code>) <code>maximumPoolSize</code> не имеет никакого смысла — дополнительных потоков никогда не будет, а очередь будет расти до OOM. Это и есть ловушка <code>Executors.newFixedThreadPool</code>.
+</div>
+
+<div class="widget" id="tpe">
+  <div class="widget-title">Симулятор ThreadPoolExecutor</div>
+  <div class="controls">
+    <label>core <input type="number" id="tCore" value="2" min="0" max="8"></label>
+    <label>max <input type="number" id="tMax" value="4" min="1" max="8"></label>
+    <label>очередь <input type="number" id="tQ" value="3" min="0" max="10"></label>
+    <label>политика <select id="tPol" style="width:auto"><option value="abort">AbortPolicy</option><option value="caller">CallerRunsPolicy</option><option value="discard">DiscardPolicy</option><option value="oldest">DiscardOldestPolicy</option></select></label>
+    <button class="btn" id="tApply">Применить и сбросить</button>
+  </div>
+  <div class="controls">
+    <button class="btn primary" id="tSubmit">execute(задача)</button>
+    <button class="btn primary" id="tSubmit5">execute ×5</button>
+    <button class="btn" id="tFinish">Одна задача завершилась</button>
+    <button class="btn" id="tKeep">Прошёл keepAliveTime</button>
+  </div>
+  <div class="tpe-area">
+    <div class="tpe-box"><h5>Потоки (сплошная рамка — core, пунктир — сверх core)</h5><div class="slots" id="tWorkers"></div></div>
+    <div class="tpe-box"><h5>workQueue</h5><div class="slots" id="tQueue"></div></div>
+  </div>
+  <div class="tpe-stats"><span>выполнено: <b id="sDone">0</b></span><span>отклонено: <b id="sRej">0</b></span><span>выполнено вызывающим: <b id="sCaller">0</b></span><span>потеряно: <b id="sLost">0</b></span></div>
+  <div class="log" id="tLog" style="margin-top:10px"></div>
+</div>
+<script>
+(function(){
+  var cfg, workers, queue, seq, stats, log;
+  function $(id){return document.getElementById(id);}
+  function reset(){
+    cfg={core:+$("tCore").value,max:Math.max(+$("tMax").value,+$("tCore").value,1),q:+$("tQ").value,pol:$("tPol").value};
+    workers=[];queue=[];seq=0;stats={done:0,rej:0,caller:0,lost:0};log=[];
+    add("Пул создан: core="+cfg.core+", max="+cfg.max+", queue="+cfg.q+", "+$("tPol").selectedOptions[0].text);
+    render();
+  }
+  function add(m){log.unshift(m);}
+  function execute(){
+    var id="T"+(++seq);
+    if(workers.length<cfg.core){workers.push({task:id,core:true});add(id+": потоков ("+(workers.length-1)+") < core → новый core-поток");}
+    else if(workers.find(function(w){return !w.task;})){
+      var idle=workers.find(function(w){return !w.task;});
+      idle.task=id;add(id+": offer в очередь → простаивающий поток сразу забрал её (poll/take)");
+    }
+    else if(queue.length<cfg.q){queue.push(id);add(id+": все потоки заняты → в очередь ("+queue.length+"/"+cfg.q+")");}
+    else if(workers.length<cfg.max){workers.push({task:id,core:false});add(id+": очередь полна, потоков < max → новый поток сверх core");}
+    else{
+      if(cfg.pol==="abort"){stats.rej++;add(id+": ✘ RejectedExecutionException (AbortPolicy)");}
+      else if(cfg.pol==="caller"){stats.caller++;stats.done++;add(id+": ⟲ выполнена в потоке вызывающего (CallerRuns) — producer притормозил");}
+      else if(cfg.pol==="discard"){stats.lost++;add(id+": задача молча выброшена (DiscardPolicy)");}
+      else{var old=queue.shift();queue.push(id);stats.lost++;add(id+": выброшена самая старая "+old+", "+id+" в очередь (DiscardOldest)");}
+    }
+  }
+  function finish(){
+    var busy=workers.filter(function(w){return w.task;});
+    if(!busy.length){add("Нет выполняющихся задач");return;}
+    var w=busy[0];stats.done++;add(w.task+" завершена");
+    if(queue.length){w.task=queue.shift();add("  поток взял "+w.task+" из очереди (take/poll)");}
+    else w.task=null;
+  }
+  function keepAlive(){
+    var before=workers.length, count=workers.length;
+    workers=workers.filter(function(w){ if(!w.task && count>cfg.core){count--;return false;} return true;});
+    workers.forEach(function(w,i){w.core=i<cfg.core;});
+    var removed=before-workers.length;
+    add(removed?"keepAlive истёк: остановлено "+removed+" простаивающих потоков сверх core":"keepAlive истёк: лишних простаивающих потоков нет (core-потоки живут, если не allowCoreThreadTimeOut)");
+  }
+  function render(){
+    var wh="";workers.forEach(function(w){wh+='<div class="slot '+(w.core?"core":"extra")+(w.task?" busy":"")+'">'+(w.task||"idle")+"</div>";});
+    for(var i=workers.length;i<cfg.max;i++) wh+='<div class="slot empty '+(i<cfg.core?"core":"extra")+'">—</div>';
+    $("tWorkers").innerHTML=wh;
+    var qh="";for(var j=0;j<cfg.q;j++) qh+=queue[j]?'<div class="slot q">'+queue[j]+"</div>":'<div class="slot empty">·</div>';
+    if(cfg.q===0) qh='<span style="font-size:13px;color:var(--fg-muted)">ёмкость 0 — как SynchronousQueue</span>';
+    $("tQueue").innerHTML=qh;
+    $("sDone").textContent=stats.done;$("sRej").textContent=stats.rej;$("sCaller").textContent=stats.caller;$("sLost").textContent=stats.lost;
+    $("tLog").textContent=log.slice(0,40).join("\n");
+  }
+  document.addEventListener("DOMContentLoaded",function(){
+    $("tApply").onclick=reset;
+    $("tSubmit").onclick=function(){execute();render();};
+    $("tSubmit5").onclick=function(){for(var i=0;i<5;i++)execute();render();};
+    $("tFinish").onclick=function(){finish();render();};
+    $("tKeep").onclick=function(){keepAlive();render();};
+    reset();
+  });
+})();
+</script>
+<p><b>Попробуйте:</b> (1) core=2, max=4, очередь=3 — отправьте 9 задач и посмотрите, на какой задаче появится 3-й поток. (2) Очередь=10, max=8 — дополнительные потоки не появятся, пока очередь не заполнится. (3) Очередь=0 — так работает <code>newCachedThreadPool</code>.</p>
+
+<h2 id="factories"><span class="h-num">8.4</span>Фабрики Executors и их ловушки</h2>
+<div class="table-wrap"><table>
+<tr><th>Фабрика</th><th>core / max</th><th>Очередь</th><th>Риск</th></tr>
+<tr><td><code>newFixedThreadPool(n)</code></td><td>n / n</td><td><code>LinkedBlockingQueue</code> без лимита</td><td>очередь растёт до OOM под перегрузкой; задержка неограничена</td></tr>
+<tr><td><code>newSingleThreadExecutor()</code></td><td>1 / 1</td><td>без лимита</td><td>то же; зато порядок FIFO гарантирован</td></tr>
+<tr><td><code>newCachedThreadPool()</code></td><td>0 / ∞</td><td><code>SynchronousQueue</code></td><td>неограниченное число потоков → OOM «unable to create native thread»</td></tr>
+<tr><td><code>newScheduledThreadPool(n)</code></td><td>n / ∞*</td><td><code>DelayedWorkQueue</code> без лимита</td><td>как у fixed</td></tr>
+<tr><td><code>newWorkStealingPool()</code></td><td>ForkJoinPool</td><td>деки</td><td>для CPU-задач, не для блокирующего I/O</td></tr>
+<tr><td><code>newVirtualThreadPerTaskExecutor()</code></td><td>VT на задачу</td><td>нет</td><td>нет лимита конкурентности — ограничивайте ресурс семафором (тема 10)</td></tr>
+</table></div>
+
+<pre data-title="Продакшен-пул: всё явно" class="good-code"><code class="java">ThreadFactory tf = Thread.ofPlatform()
+        .name("payment-worker-", 0)          // имена — для thread dump и логов
+        .daemon(false)
+        .uncaughtExceptionHandler((t, e) -&gt; log.error("Uncaught in {}", t.getName(), e))
+        .factory();
+
+ThreadPoolExecutor pool = new ThreadPoolExecutor(
+        8,                                   // core
+        16,                                  // max
+        60, TimeUnit.SECONDS,                // keepAlive для потоков сверх core
+        new ArrayBlockingQueue&lt;&gt;(500),       // ограниченная очередь = backpressure
+        tf,
+        new ThreadPoolExecutor.CallerRunsPolicy());  // перегрузка тормозит producer'а
+pool.prestartAllCoreThreads();               // прогрев перед трафиком (опционально)
+// Метрики: pool.getActiveCount(), getQueue().size(), getCompletedTaskCount() → Micrometer</code></pre>
+
+<h2 id="reject"><span class="h-num">8.5</span>Политики отказа</h2>
+<div class="table-wrap"><table>
+<tr><th>Политика</th><th>Поведение</th><th>Когда</th></tr>
+<tr><td><code>AbortPolicy</code> (по умолчанию)</td><td><code>RejectedExecutionException</code></td><td>вызывающий умеет обработать (вернуть 503, retry позже)</td></tr>
+<tr><td><code>CallerRunsPolicy</code></td><td>задача выполняется в потоке, вызвавшем <code>execute</code></td><td>естественный backpressure: producer занят и не шлёт новые. Не для потоков event loop (Netty) — их блокировать нельзя</td></tr>
+<tr><td><code>DiscardPolicy</code></td><td>молча выбросить</td><td>только для заведомо необязательных задач (метрики)</td></tr>
+<tr><td><code>DiscardOldestPolicy</code></td><td>выбросить голову очереди и повторить</td><td>важнее свежие данные (котировки)</td></tr>
+<tr><td>Своя</td><td>лог + метрика + запись в DLQ/Kafka</td><td>платёжные и прочие задачи, которые нельзя терять</td></tr>
+</table></div>
+
+<h2 id="sizing"><span class="h-num">8.6</span>Размер пула</h2>
+<p>Формула Гётца: <code>N_threads = N_cpu × U_cpu × (1 + W / C)</code>, где <i>U</i> — целевая загрузка CPU (0..1), <i>W/C</i> — отношение времени ожидания (I/O) к времени вычислений.</p>
+<div class="grid-2">
+  <div class="card"><h4>CPU-bound</h4><p>W/C ≈ 0 → <code>N_cpu</code> или <code>N_cpu + 1</code>. Больше потоков — только переключения контекста и вытеснение кэша.</p></div>
+  <div class="card"><h4>I/O-bound</h4><p>8 ядер, запрос ждёт БД 90 мс и считает 10 мс: 8 × 1 × (1 + 9) = <b>80</b>. Но верхнюю границу задаёт <b>ресурс за пулом</b>: если пул соединений с БД — 20, то 80 потоков будут ждать соединения.</p></div>
+</div>
+<p><b>Закон Литтла</b>: L = λ × W. Нужно обслуживать 400 RPS при 50 мс на запрос → в среднем 400 × 0,05 = 20 одновременно выполняющихся запросов; с запасом на пики — 30–40 потоков. Ёмкость очереди выбирайте из допустимой задержки: если терпим 200 мс ожидания при пропускной способности 400 RPS → очередь не больше ~80.</p>
+<div class="callout warn">Формулы дают начальную точку. Финальное значение — нагрузочным тестом с метриками: загрузка CPU, длина очереди, p99 задержки, время ожидания соединения из пула БД.</div>
+
+<h2 id="exceptions"><span class="h-num">8.7</span>Исключения и задачи</h2>
+<div class="table-wrap"><table>
+<tr><th>Как отправили</th><th>Что с исключением</th></tr>
+<tr><td><code>execute(Runnable)</code></td><td>поток пула умирает (пул заменит его новым), вызывается UncaughtExceptionHandler — видно в логах</td></tr>
+<tr><td><code>submit(...)</code></td><td>сохраняется в <code>Future</code>; без <code>get()</code> — <b>потеряно молча</b></td></tr>
+<tr><td><code>scheduleAtFixedRate</code></td><td>исключение <b>отменяет все будущие запуски</b> задачи, тоже молча. Оборачивайте тело в try/catch</td></tr>
+</table></div>
+<pre class="good-code"><code class="java">scheduler.scheduleAtFixedRate(() -&gt; {
+    try {
+        refreshRates();
+    } catch (Exception e) {          // иначе первое же исключение остановит расписание навсегда
+        log.error("refresh failed", e);
+    }
+}, 0, 30, TimeUnit.SECONDS);
+// fixedRate — от начала к началу (запуски не накладываются, догоняют при задержке);
+// fixedDelay — пауза от конца одного запуска до начала следующего.</code></pre>
+
+<h2 id="fj"><span class="h-num">8.8</span>ForkJoinPool и work-stealing</h2>
+<p>Пул для задач «разделяй и властвуй». У каждого потока своя <b>двусторонняя очередь (deque)</b>: свои задачи поток берёт с головы (LIFO — горячий кэш), а простаивающий поток <b>крадёт</b> с хвоста чужой очереди (FIFO — там крупные, ещё не разделённые задачи).</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 220" role="img" aria-label="Work stealing">
+  <defs><marker id="h2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="40" y="30" font-weight="700">Worker 1 (загружен)</text>
+  <rect x="40" y="44" width="70" height="44" rx="6" class="box-acc"/><text x="75" y="71" text-anchor="middle" class="mono" font-size="12">t8</text>
+  <rect x="114" y="44" width="70" height="44" rx="6" class="box"/><text x="149" y="71" text-anchor="middle" class="mono" font-size="12">t7</text>
+  <rect x="188" y="44" width="70" height="44" rx="6" class="box"/><text x="223" y="71" text-anchor="middle" class="mono" font-size="12">t4</text>
+  <rect x="262" y="44" width="90" height="44" rx="6" class="box-warn"/><text x="307" y="71" text-anchor="middle" class="mono" font-size="12">t1 (большая)</text>
+  <text x="75" y="106" text-anchor="middle" font-size="12">push/pop (LIFO)</text>
+  <text x="285" y="106" text-anchor="middle" font-size="12">tail →</text>
+  <text x="480" y="30" font-weight="700">Worker 2 (без работы)</text>
+  <rect x="480" y="44" width="280" height="44" rx="6" class="box" stroke-dasharray="5 4"/><text x="620" y="71" text-anchor="middle" font-size="13" class="muted">пусто</text>
+  <path d="M480 120 C 430 170, 350 170, 336 94" class="ln-acc" marker-end="url(#h2)"/>
+  <text x="440" y="190" text-anchor="middle" font-size="13">steal: забирает с хвоста (FIFO) — самую крупную задачу</text>
+</svg>
+</figure>
+<pre data-title="RecursiveTask: параллельная сумма"><code class="java">final class SumTask extends RecursiveTask&lt;Long&gt; {
+    private static final int THRESHOLD = 10_000;
+    private final long[] a; private final int from, to;
+    SumTask(long[] a, int from, int to) { this.a = a; this.from = from; this.to = to; }
+
+    @Override protected Long compute() {
+        if (to - from &lt;= THRESHOLD) {                  // достаточно мелко — считаем сами
+            long s = 0; for (int i = from; i &lt; to; i++) s += a[i]; return s;
+        }
+        int mid = (from + to) &gt;&gt;&gt; 1;
+        SumTask left = new SumTask(a, from, mid);
+        left.fork();                                   // в свою deque, могут украсть
+        long right = new SumTask(a, mid, to).compute(); // правую половину считаем сами
+        return right + left.join();                     // join может выполнить left сам, если не украли
+    }
+}
+long total = ForkJoinPool.commonPool().invoke(new SumTask(data, 0, data.length));</code></pre>
+<div class="callout bad"><span class="c-title">commonPool — общий для всей JVM</span>
+На нём работают <code>parallelStream()</code>, <code>CompletableFuture.*Async</code> без executor'а, bulk-операции CHM. Размер ≈ <code>N_cpu − 1</code>. Блокирующий вызов (JDBC, HTTP) внутри parallel stream или <code>supplyAsync</code> без своего пула занимает этот маленький пул и тормозит всё приложение. Для I/O всегда передавайте собственный executor.
+</div>
+
+<h2 id="sim"><span class="h-num">8.9</span>Интерактив: расчёт размера пула и очереди</h2>
+<div class="widget" id="psW">
+  <div class="widget-title">Калькулятор пула потоков</div>
+  <div class="controls">
+    <label>ядер CPU<input type="number" id="psCores" value="8" min="1"></label>
+    <label>ожидание I/O, мс<input type="number" id="psWait" value="90" min="0"></label>
+    <label>вычисления, мс<input type="number" id="psCpu" value="10" min="1"></label>
+    <label>целевая загрузка CPU, %<input type="number" id="psU" value="80" min="1" max="100"></label>
+    <label>нагрузка, RPS<input type="number" id="psRps" value="400" min="1"></label>
+    <label>допустимое ожидание в очереди, мс<input type="number" id="psQ" value="200" min="0"></label>
+    <label>лимит ресурса за пулом (соединений БД)<input type="number" id="psLim" value="30" min="1"></label>
+  </div>
+  <div class="out" id="psOut"></div>
+  <div class="verdict" id="psV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var n = Math.max(1, +$("psCores").value), w = Math.max(0, +$("psWait").value), c = Math.max(1, +$("psCpu").value), u = Math.min(100, Math.max(1, +$("psU").value)) / 100, rps = Math.max(1, +$("psRps").value), qms = Math.max(0, +$("psQ").value), lim = Math.max(1, +$("psLim").value);
+    var goetz = Math.max(1, Math.round(n * u * (1 + w / c))), little = rps * (w + c) / 1000, cpuCap = n * 1000 / c;
+    var need = Math.ceil(little * 1.3), size = Math.min(goetz, Math.max(need, 1)), capped = w > 0 && size > lim;
+    var finalSize = capped ? lim : size, thr = finalSize * 1000 / (w + c), queue = Math.max(0, Math.floor(thr * qms / 1000));
+    var L = [
+      "Формула Гётца:  N = ядра × U × (1 + W/C) = " + n + " × " + u.toFixed(2) + " × (1 + " + w + "/" + c + ") = " + goetz + "  — верхняя граница, при которой CPU загружен на " + Math.round(u * 100) + "%",
+      "Закон Литтла:   L = RPS × время = " + rps + " × " + (w + c) + " мс = " + little.toFixed(1) + " задач одновременно;  с запасом 30% → " + need,
+      "Потолок по CPU: " + n + " ядер × 1000 / " + c + " мс = " + Math.round(cpuCap) + " RPS",
+      "",
+      "Рекомендация:   corePoolSize = maximumPoolSize = " + finalSize + (capped ? "   (ограничено ресурсом за пулом: " + lim + ")" : ""),
+      "Пропускная способность пула: " + Math.round(thr) + " RPS",
+      "Очередь:        ArrayBlockingQueue(" + queue + ")  — столько задач пул разберёт за " + qms + " мс"
+    ];
+    $("psOut").textContent = L.join("\n");
+    var v = $("psV"), msg, cls = "ok";
+    if (rps > cpuCap) { cls = "bad"; msg = "Нагрузка выше потолка CPU: никакой размер пула не поможет — нужны ядра, оптимизация или масштабирование по экземплярам."; }
+    else if (thr < rps) { cls = "bad"; msg = "Пул с учётом ограничения ресурса обрабатывает " + Math.round(thr) + " RPS при входящих " + rps + ": очередь будет расти, пока не начнутся отказы. Увеличивайте лимит ресурса, сокращайте время его удержания или отклоняйте лишнее (rejection policy)."; }
+    else if (need > goetz) { cls = "warn"; msg = "Для нагрузки нужно " + need + " потоков, а CPU комфортно выдержит " + goetz + ". Сервис будет работать на пределе процессора."; }
+    else msg = "Запас есть. Это стартовая точка: окончательные значения — нагрузочным тестом с метриками активных потоков, длины очереди и p99. Очередь всегда ограниченная, политика отказа — осознанная.";
+    v.className = "verdict " + cls; v.textContent = msg;
+  }
+  document.querySelectorAll("#psW input").forEach(function (i) { i.addEventListener("input", run); });
+  run();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) ожидание 0 мс — CPU-задача: пул равен числу ядер, больше потоков только мешают. (2) Лимит соединений 10 при ожидании 90 мс — узкое место уходит в БД. (3) RPS 1000 — упор в процессор.</p>
+
+<h2 id="quiz"><span class="h-num">8.10</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>ThreadPoolExecutor(core = 4, max = 16, очередь LinkedBlockingQueue без лимита). Сколько потоков будет под нагрузкой в 100 одновременных задач?</p><ul><li>16</li><li>100</li><li>4 — дополнительные потоки создаются только при заполненной очереди, а она бесконечная</li><li>20</li></ul><div class="why">Порядок execute(): core → очередь → max → отказ. С неограниченной очередью max не работает.</div></div>
+<div class="mcq" data-ok="1"><p>Что делает CallerRunsPolicy при переполнении?</p><ul><li>Бросает исключение</li><li>Выполняет задачу в потоке, вызвавшем execute, — отправитель замедляется (backpressure)</li><li>Молча выбрасывает задачу</li><li>Создаёт новый поток</li></ul><div class="why">Естественное обратное давление. Не годится, если отправитель — поток event loop.</div></div>
+<div class="mcq" data-ok="0"><p>Задачу отправили через submit(), внутри неё NullPointerException. Где его увидеть?</p><ul><li>Только при вызове future.get() — как ExecutionException</li><li>В логе через UncaughtExceptionHandler</li><li>Пул остановится</li><li>В System.err автоматически</li></ul><div class="why">submit сохраняет исключение в Future. Никто не вызвал get() — ошибка потеряна молча. Для execute() сработал бы UncaughtExceptionHandler.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>core=10, max=50, очередь LinkedBlockingQueue без ограничения. Сколько потоков будет при 1000 одновременных задачах?</summary><div class="a"><p>10. Новые потоки сверх core создаются, только когда <code>offer</code> в очередь вернул false, а неограниченная очередь всегда принимает. 990 задач будут ждать в очереди; max=50 бесполезен.</p></div></details>
+<details class="q"><summary>Почему newCachedThreadPool опасен под нагрузкой?</summary><div class="a"><p>max = Integer.MAX_VALUE и SynchronousQueue: если свободного потока нет, на каждую задачу создаётся новый. При всплеске медленных задач — тысячи потоков, исчерпание памяти/лимитов ОС (<code>OutOfMemoryError: unable to create native thread</code>).</p></div></details>
+<details class="q"><summary>Задачу отправили через submit, внутри NPE. Где мы её увидим?</summary><div class="a"><p>Нигде, пока не вызовем <code>future.get()</code> — тогда <code>ExecutionException</code> с NPE в причине. UncaughtExceptionHandler не сработает. Можно переопределить <code>afterExecute(Runnable, Throwable)</code> у ThreadPoolExecutor, но для <code>submit</code> там <code>t == null</code> — исключение нужно доставать из FutureTask.</p></div></details>
+<details class="q"><summary>Как работает CallerRunsPolicy как механизм backpressure?</summary><div class="a"><p>При переполнении задача выполняется в потоке-отправителе. Пока он выполняет её, он не может отправлять новые задачи — поток поступления естественно замедляется до скорости обработки, а пул тем временем разгребает очередь. Если отправитель — поток приёма HTTP-запросов, начинают расти очереди уже на уровне сервера/TCP, что даёт давление дальше вверх.</p></div></details>
+<details class="q"><summary>Почему в ForkJoinPool свои задачи берутся LIFO, а крадутся FIFO?</summary><div class="a"><p>LIFO для владельца: последняя созданная подзадача — самая мелкая и её данные горячие в кэше. FIFO для вора: в хвосте лежат самые ранние, самые крупные задачи — одна кража даёт много работы и сокращает число краж (а владелец и вор работают с разных концов deque, меньше конфликтов).</p></div></details>
+<details class="q"><summary>Как вы выберете размер пула для сервиса, который ходит в БД?</summary><div class="a"><p>Оценка по формуле N_cpu × U × (1 + W/C) и закону Литтла (RPS × время обработки), затем ограничение сверху ресурсом за пулом — размером пула соединений БД (больше потоков, чем соединений, бесполезно), лимитами downstream. Ограниченная очередь по допустимой задержке, политика отказа. Финально — нагрузочный тест с метриками активных потоков, длины очереди, p99 и времени ожидания соединения.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Разборы: 8 систем от требований до схемы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · АРХИТЕКТУРА</div>
+  <h1>Разборы: 8 систем от требований до схемы</h1>
+  <p class="lead">Практика выбора: для восьми типичных систем — требования, ваше решение и эталонный разбор с обоснованием, что где хранится, как синхронизируется и какие варианты отвергнуты. Сначала выберите хранилища сами, затем сравните. Эталон — не единственно верный ответ, а аргументированный вариант для указанного масштаба.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">e-commerce</span><span class="tag">мессенджер</span><span class="tag">платежи</span><span class="tag">IoT</span><span class="tag">аналитика</span><span class="tag">лента</span><span class="tag">RAG</span><span class="tag">SaaS</span><span class="tag">тренажёр</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="trainer"><span class="h-num">17.1</span>Тренажёр</h2>
+<div class="widget" id="csW">
+  <div class="widget-title">Выберите систему, отметьте хранилища, сравните с разбором</div>
+  <div class="controls"><label>система<select id="csSel" class="wide"></select></label></div>
+  <div class="verdict" id="csReq"></div>
+  <div class="checks" id="csPick"></div>
+  <div class="controls"><button class="btn primary" type="button" id="csShow">Показать разбор</button></div>
+  <div id="csOut"></div>
+</div>
+<script>
+(function () {
+  var S = { pg: "PostgreSQL/MySQL", redis: "Redis", mongo: "MongoDB", cass: "Cassandra/DynamoDB", search: "OpenSearch", ts: "TSDB (Timescale/VictoriaMetrics)", ch: "ClickHouse/DWH", graph: "Графовая БД", vec: "Векторы (pgvector/Qdrant)", kafka: "Kafka", s3: "S3/объектное", dsql: "Распределённый SQL" };
+  var C = [
+    { t: "Интернет-магазин: 2 млн товаров, 50 тыс. заказов/сутки", req: "Каталог с фасетным поиском, корзина, оформление заказа с резервированием остатков, личный кабинет, отчёты для менеджеров.", ref: ["pg", "search", "redis", "s3"], opt: ["kafka", "ch"],
+      why: [["pg", "Заказы, остатки, платежи, каталог как источник истины: транзакции резервирования (атомарный UPDATE остатка), ограничения."], ["search", "Поиск с морфологией, опечатками и фасетами по 2 млн товаров; наполняется из PostgreSQL через outbox/CDC."], ["redis", "Сессии, корзины гостей, кэш карточек товаров и главной, rate limiting."], ["s3", "Изображения товаров за CDN."], ["kafka", "Опционально: шина событий для поиска, рекомендаций, уведомлений, когда сервисов становится много."], ["ch", "Позже: аналитика по заказам и поведению, когда отчёты начнут мешать OLTP."]],
+      no: "MongoDB для каталога не обязательна: общие поля столбцами + jsonb для атрибутов. Cassandra — избыточна по масштабу и не даёт транзакций для остатков." },
+    { t: "Мессенджер: 20 млн пользователей, 1 млрд сообщений/сутки", req: "Личные и групповые чаты, история с прокруткой, статус «онлайн», доставка на несколько устройств, медиа, поиск по своим сообщениям.", ref: ["cass", "pg", "redis", "kafka", "s3"], opt: ["search"],
+      why: [["cass", "Сообщения: ((chat_id, bucket), message_id) — огромная запись, чтение диапазона одной партиции, мультирегион."], ["pg", "Пользователи, чаты, участники, настройки — связанные данные умеренного объёма."], ["redis", "Присутствие онлайн, маршрутизация «пользователь → шлюз WebSocket», счётчики непрочитанного."], ["kafka", "Доставка и fan-out событий по устройствам и сервисам (пуши, модерация)."], ["s3", "Фото, видео, голосовые; в сообщении — ссылка."], ["search", "Поиск по истории — отдельный индекс, часто по партициям пользователей."]],
+      no: "Одна PostgreSQL не выдержит 1 млрд вставок в сутки с ретенцией годами без шардинга; MongoDB возможна, но wide-column естественнее для «журнала по чату»." },
+    { t: "Платёжный сервис / кошелёк", req: "Балансы, переводы, идемпотентные платёжные запросы, аудит каждого движения денег, отчётность регулятору, RPO = 0.", ref: ["pg", "kafka", "ch"], opt: ["dsql", "s3"],
+      why: [["pg", "Двухзаписная бухгалтерия (ledger): неизменяемые проводки, баланс как сумма или с атомарным обновлением, CHECK (balance >= 0), ключи идемпотентности с UNIQUE, синхронная реплика в другой зоне."], ["kafka", "События о движениях через outbox: уведомления, антифрод, учёт."], ["ch", "Отчётность и аналитика по проводкам без нагрузки на OLTP."], ["dsql", "При мультирегиональной записи и требовании RPO 0 между регионами — Spanner/CockroachDB/YugabyteDB."], ["s3", "Архив выписок и документов с Object Lock."]],
+      no: "Никаких eventual-consistent хранилищ для балансов (Cassandra LWW, Redis как источник истины). Кэш балансов — только для отображения." },
+    { t: "IoT: 100 тыс. устройств, точка каждые 5 с", req: "Приём 20 тыс. точек/с, графики по устройству, агрегаты по площадке, алерты по порогам, хранение сырых данных 90 дней, агрегатов — 5 лет.", ref: ["kafka", "ts", "pg", "s3"], opt: ["ch", "redis"],
+      why: [["kafka", "Буфер приёма (часто за MQTT-брокером): сглаживает пики, несколько потребителей (запись, алерты)."], ["ts", "TimescaleDB/VictoriaMetrics: сжатие, непрерывные агрегаты, ретенция чанками."], ["pg", "Реестр устройств, площадок, пользователей и правил алертов (в случае TimescaleDB — та же база)."], ["s3", "Сырые данные старше 90 дней в Parquet для редкого анализа."], ["ch", "Если нужна произвольная аналитика по сырым данным с высокой кардинальностью."], ["redis", "Последнее значение каждого устройства для онлайн-панели."]],
+      no: "Обычная таблица PostgreSQL с построчным удалением старых данных утонет в VACUUM; Cassandra без агрегатов по времени неудобна для графиков." },
+    { t: "Продуктовая аналитика: 500 млн событий/сутки", req: "Сбор событий с веба и мобильных, дашборды DAU/воронки/когорты, запросы аналитиков с произвольными фильтрами, хранение 2 года.", ref: ["kafka", "ch", "s3"], opt: ["pg"],
+      why: [["kafka", "Приём событий с буферизацией и повторной обработкой."], ["ch", "Сырые события в MergeTree с ORDER BY (event_type, date, user_id), материализованные представления для дашбордов."], ["s3", "Долгосрочное хранение в Parquet/Iceberg, дешёвая ретенция."], ["pg", "Метаданные: проекты, пользователи, сохранённые отчёты."]],
+      no: "OLTP-база и Elasticsearch для такой аналитики слишком дороги; Cassandra не умеет агрегаты." },
+    { t: "Соцсеть: лента новостей", req: "Посты, подписки (у некоторых — миллионы подписчиков), лента «от тех, на кого подписан» за <100 мс, лайки, рекомендации «кого добавить».", ref: ["pg", "redis", "kafka", "s3"], opt: ["cass", "graph", "search"],
+      why: [["pg", "Пользователи, посты, подписки — источник истины (на масштабе — шардирование по user_id)."], ["redis", "Предвычисленные ленты (fan-out on write в списки/sorted set на пользователя), счётчики лайков."], ["kafka", "Событие «новый пост» → воркеры раскладывают по лентам подписчиков."], ["s3", "Медиа за CDN."], ["cass", "Хранение лент и активности при росте за пределы памяти Redis."], ["graph", "Рекомендации друзей и связей (или пакетный расчёт в Spark)."], ["search", "Поиск людей и постов."]],
+      no: "Суперузлы: посты знаменитостей не раскладывают по миллионам лент, а подмешивают при чтении (гибрид fan-out on write/read)." },
+    { t: "Корпоративный RAG / база знаний", req: "200 тыс. документов (Confluence, PDF), 3 млн фрагментов, ответы с источниками, учёт прав доступа, ежедневное обновление.", ref: ["pg", "vec", "s3"], opt: ["search", "redis"],
+      why: [["pg", "Документы, фрагменты, права, версии — метаданные с транзакционным обновлением."], ["vec", "pgvector (HNSW) в той же базе: 3 млн векторов умещаются в память, фильтр по правам в одном запросе."], ["s3", "Оригиналы файлов."], ["search", "Гибридный поиск BM25 + векторы, если важны точные термины и коды; в PostgreSQL можно начать с tsvector."], ["redis", "Кэш ответов на частые вопросы и эмбеддингов запросов."]],
+      no: "Отдельная векторная база на таком объёме добавляет синхронизацию прав без выигрыша." },
+    { t: "B2B SaaS (CRM): 5 тыс. клиентов-компаний", req: "Изоляция данных клиентов, настраиваемые поля, поиск по контактам, отчёты по каждому клиенту, крупные клиенты в 1000 раз больше мелких.", ref: ["pg", "search", "redis", "s3"], opt: ["ch", "dsql"],
+      why: [["pg", "tenant_id во всех таблицах + RLS, настраиваемые поля в jsonb; рост — Citus по tenant_id, крупные клиенты — отдельные узлы/базы."], ["search", "Поиск по контактам и сделкам с фильтром по tenant_id."], ["redis", "Кэш, ограничения частоты по клиенту."], ["s3", "Вложения."], ["ch", "Отчёты и аналитика по клиентам, когда они тяжелеют."], ["dsql", "Если клиентам нужна резидентность данных в разных регионах."]],
+      no: "База на каждого клиента при 5 тыс. клиентов — тяжёлые миграции и тысячи соединений; общая схема без RLS — риск утечек." }
+  ];
+  var $ = function (i) { return document.getElementById(i); };
+  $("csSel").innerHTML = C.map(function (c, i) { return '<option value="' + i + '">' + (i + 1) + ". " + c.t + "</option>"; }).join("");
+  $("csPick").innerHTML = Object.keys(S).map(function (k) { return '<label><input type="checkbox" value="' + k + '"> ' + S[k] + "</label>"; }).join("");
+  function load() { var c = C[+$("csSel").value]; $("csReq").textContent = "Требования: " + c.req; $("csPick").querySelectorAll("input").forEach(function (b) { b.checked = false; }); $("csOut").innerHTML = ""; }
+  function show() {
+    var c = C[+$("csSel").value], mine = [].map.call($("csPick").querySelectorAll("input:checked"), function (b) { return b.value; });
+    var hit = c.ref.filter(function (k) { return mine.indexOf(k) >= 0; }), miss = c.ref.filter(function (k) { return mine.indexOf(k) < 0; }), extra = mine.filter(function (k) { return c.ref.indexOf(k) < 0 && c.opt.indexOf(k) < 0; });
+    var h = '<div class="verdict ' + (!miss.length && !extra.length ? "ok" : "warn") + '">Совпало обязательных: ' + hit.length + " из " + c.ref.length + (miss.length ? ". Не хватает: " + miss.map(function (k) { return S[k]; }).join(", ") : "") + (extra.length ? ". Лишнее для этого масштаба: " + extra.map(function (k) { return S[k]; }).join(", ") : "") + ".</div>";
+    h += '<div class="rows">' + c.why.map(function (w) { var req = c.ref.indexOf(w[0]) >= 0; return '<div class="row' + (req ? " win" : "") + '"><span>' + (mine.indexOf(w[0]) >= 0 ? "✔" : "·") + "</span><span><b>" + S[w[0]] + "</b>" + (req ? "" : " <small>(по мере роста)</small>") + "<br><small>" + w[1] + '</small></span><span></span></div>'; }).join("") + "</div>";
+    h += '<div class="callout info"><span class="c-title">Что отвергнуто и почему</span>' + c.no + "</div>";
+    $("csOut").innerHTML = h;
+  }
+  $("csSel").addEventListener("change", load); $("csShow").addEventListener("click", show); load();
+})();
+</script>
+
+<h2 id="ecommerce"><span class="h-num">17.2</span>Подробно: интернет-магазин</h2>
+<div class="flow col">
+  <div class="node acc"><b>PostgreSQL — источник истины</b><small>products (общие поля + jsonb attrs), stock, orders, order_items, payments, outbox</small></div><span class="to">↓ outbox → Debezium → Kafka (или прямой poller)</span>
+  <div class="grid-3" style="margin:0">
+    <div class="node info"><b>OpenSearch</b><small>документ товара: название, атрибуты, цена, наличие; фасеты</small></div>
+    <div class="node ok"><b>Redis</b><small>корзины, сессии, кэш карточек (инвалидация по событию)</small></div>
+    <div class="node"><b>ClickHouse (позже)</b><small>события заказов и поведения для отчётов</small></div>
+  </div>
+</div>
+<pre data-title="резервирование остатка без гонок"><code class="sql">BEGIN;
+UPDATE stock SET reserved = reserved + :qty
+WHERE product_id = :pid AND available - reserved &gt;= :qty;     -- 0 строк → нет в наличии
+INSERT INTO orders (...) VALUES (...);
+INSERT INTO outbox (aggregate_id, type, payload) VALUES (:orderId, 'OrderPlaced', :json);
+COMMIT;</code></pre>
+
+<h2 id="messenger"><span class="h-num">17.3</span>Подробно: мессенджер</h2>
+<pre data-title="сообщения и «непрочитанное»"><code class="sql">-- Cassandra/ScyllaDB
+CREATE TABLE messages (
+  chat_id uuid, bucket int, message_id timeuuid, sender_id uuid, body text, attachments list&lt;text&gt;,
+  PRIMARY KEY ((chat_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+-- bucket = номер «окна» (например, 10 дней) — партиции ограничены по размеру
+
+-- Redis: непрочитанное и присутствие
+-- HINCRBY unread:{user} {chat} 1   /  HDEL при прочтении
+-- SET presence:{user} gateway-7 EX 60  (продлевается heartbeat-ом)</code></pre>
+<p>Путь сообщения: шлюз WebSocket → сервис чатов пишет в Cassandra (QUORUM в локальном ДЦ) → событие в Kafka → доставка онлайн-участникам через их шлюзы (адрес из Redis), офлайн — пуш. Порядок в чате — по timeuuid; дубликаты при повторной отправке отсекаются клиентским id сообщения.</p>
+
+<h2 id="payments"><span class="h-num">17.4</span>Подробно: платежи</h2>
+<pre data-title="двухзаписная бухгалтерия в PostgreSQL"><code class="sql">CREATE TABLE accounts (id bigint PRIMARY KEY, currency char(3) NOT NULL, balance numeric(20,2) NOT NULL CHECK (balance &gt;= 0));
+CREATE TABLE transfers (id uuid PRIMARY KEY, idempotency_key text UNIQUE NOT NULL, created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE entries (                     -- неизменяемые проводки; сумма по transfer_id = 0
+  transfer_id uuid REFERENCES transfers, account_id bigint REFERENCES accounts, amount numeric(20,2) NOT NULL,
+  PRIMARY KEY (transfer_id, account_id)
+);
+-- перевод: блокировать счета в порядке id (SELECT … ORDER BY id FOR UPDATE), вставить transfer (повтор с тем же
+-- idempotency_key → конфликт → вернуть прежний результат), две проводки, обновить балансы, outbox — одна транзакция</code></pre>
+
+<h2 id="principles"><span class="h-num">17.5</span>Общие закономерности</h2>
+<ul>
+  <li>Почти везде есть <b>реляционная база как источник истины</b>; специализированные хранилища — производные и пересобираемые.</li>
+  <li>Связующее звено — <b>outbox/CDC + журнал событий</b>; двойной записи нет нигде.</li>
+  <li>Байты — в <b>объектном хранилище</b>, в базе — метаданные.</li>
+  <li>Аналитика — <b>отдельно</b> от OLTP, как только становится тяжёлой.</li>
+  <li>Специализированное хранилище появляется, когда <b>масштаб или тип запросов</b> этого требует, а не «на вырост».</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">17.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Где хранить баланс кошелька в платёжной системе?</p><ul><li>В Redis — быстро</li><li>В Cassandra — масштабируемо</li><li>В реляционной базе (или распределённом SQL) с транзакциями, ограничениями и синхронной репликацией</li><li>В Kafka как в журнале</li></ul><div class="why">Деньги требуют ACID и RPO = 0.</div></div>
+<div class="mcq" data-ok="0"><p>Почему посты знаменитостей не раскладывают по лентам всех подписчиков при публикации?</p><ul><li>Миллионы записей на один пост — дорого и медленно; их подмешивают при чтении ленты</li><li>Знаменитостям нельзя публиковать</li><li>Redis не поддерживает списки</li><li>Из-за прав доступа</li></ul><div class="why">Гибрид fan-out on write/read — классика систем лент.</div></div>
+<div class="mcq" data-ok="1"><p>IoT-проект: зачем Kafka перед хранилищем временных рядов?</p><ul><li>Kafka хранит агрегаты</li><li>Буферизует приём при пиках и сбоях хранилища, позволяет нескольким потребителям (запись, алерты) читать один поток</li><li>Kafka быстрее TSDB в запросах</li><li>Без Kafka TSDB не принимает данные</li></ul><div class="why">Развязка производителей и потребителей.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Спроектируйте хранение для сервиса бронирования отелей.</summary><div class="a"><p>PostgreSQL: отели, номера, тарифы, бронирования; отсутствие пересечений — EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;) или инвентарь по датам с атомарным уменьшением. Поиск по городу/датам/цене/удобствам — OpenSearch с данными о доступности (обновляется событиями, финальная проверка — в PostgreSQL при бронировании). Redis — кэш цен и сессии. Фото — S3 + CDN. Аналитика спроса — ClickHouse.</p></div></details>
+<details class="q"><summary>Как обосновать отказ от «модной» базы на архитектурном ревью?</summary><div class="a"><p>Показать, что все ключевые запросы и объёмы закрываются текущей базой с запасом (прототип, расчёт), что новая база не даёт нужных гарантий (транзакции, ограничения) или требует перепроектирования под запросы, и оценить стоимость эксплуатации: мониторинг, бэкапы, обновления, дежурства, обучение. Зафиксировать в ADR условия, при которых решение пересматривается (рост до X, новый тип запросов).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

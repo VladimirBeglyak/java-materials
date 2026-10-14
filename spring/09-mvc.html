@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Spring MVC: путь запроса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · WEB</div>
+  <h1>Spring MVC: путь HTTP-запроса</h1>
+  <p class="lead">От байтов в сокете до вызова метода контроллера и обратно — около десятка компонентов: Tomcat, цепочка фильтров, <code>DispatcherServlet</code>, <code>HandlerMapping</code>, <code>HandlerAdapter</code>, резолверы аргументов, конвертеры сообщений, обработчики исключений. Каждый — точка расширения. Зная маршрут, вы понимаете, где добавить логирование, почему ошибка из фильтра не попадает в <code>@ControllerAdvice</code> и откуда берётся 415.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">DispatcherServlet</span><span class="tag">HttpMessageConverter</span><span class="tag">@ControllerAdvice</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="controller"><span class="h-num">9.1</span>Контроллер, который будем разбирать</h2>
+<pre data-title="OrderController.java"><code class="java">@RestController
+@RequestMapping("/api/orders")
+class OrderController {
+    private final OrderService orders;
+    OrderController(OrderService orders) { this.orders = orders; }
+
+    @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
+    ResponseEntity&lt;OrderDto&gt; create(@Valid @RequestBody CreateOrderRequest req,
+                                    @RequestHeader("Idempotency-Key") UUID key,
+                                    @AuthenticationPrincipal Jwt jwt,
+                                    UriComponentsBuilder uri) {
+        OrderDto dto = orders.create(req, key, jwt.getSubject());
+        return ResponseEntity.created(uri.path("/api/orders/{id}").build(dto.id())).body(dto);
+    }
+
+    @GetMapping("/{id}")
+    OrderDto get(@PathVariable long id) { return orders.get(id); }
+}
+
+record CreateOrderRequest(@NotEmpty List&lt;@Valid Item&gt; items, @NotBlank String address) {
+    record Item(@NotBlank String sku, @Positive int qty) { }
+}</code></pre>
+
+<h2 id="journey"><span class="h-num">9.2</span>Путь запроса POST /api/orders</h2>
+<div class="widget stepper" id="mv">
+  <div class="widget-title">Пошагово: от сокета до ответа 201</div>
+  <div class="flow st-stage">
+    <div class="node" id="mvTomcat"><b>Tomcat</b><small>NIO + пул потоков</small></div><span class="to">→</span>
+    <div class="node" id="mvFilters"><b>Filters</b><small>Security, Observation…</small></div><span class="to">→</span>
+    <div class="node" id="mvDS"><b>DispatcherServlet</b></div><span class="to">→</span>
+    <div class="node" id="mvHM"><b>HandlerMapping</b></div><span class="to">→</span>
+    <div class="node" id="mvInt"><b>Interceptors</b></div><span class="to">→</span>
+    <div class="node" id="mvArgs"><b>ArgumentResolvers</b><small>+ MessageConverter</small></div><span class="to">→</span>
+    <div class="node" id="mvCtl"><b>Controller</b></div><span class="to">→</span>
+    <div class="node" id="mvRet"><b>ReturnValueHandler</b><small>+ MessageConverter</small></div>
+  </div>
+  <section class="st-step" data-t="Tomcat принимает соединение" data-hl="mvTomcat">
+    <h4>Коннектор Tomcat (NIO)</h4>
+    <p>Поток <b>Acceptor</b> принимает TCP-соединение и регистрирует сокет в <b>Poller</b> (селектор NIO). Когда в сокете появились данные, Poller отдаёт его рабочему потоку из пула <code>http-nio-8080-exec-N</code> (по умолчанию до 200). Этот поток будет держать запрос до конца — модель «поток на запрос».</p>
+    <p><code>Http11Processor</code> разбирает HTTP, <code>CoyoteAdapter</code> создаёт <code>HttpServletRequest</code>/<code>Response</code> и передаёт их в конвейер контейнера (Engine → Host → Context → Wrapper), который вызывает цепочку фильтров.</p>
+  </section>
+  <section class="st-step" data-t="Цепочка фильтров" data-hl="mvFilters">
+    <h4>ApplicationFilterChain</h4>
+    <p>Фильтры Servlet API (Boot регистрирует бины-<code>Filter</code> автоматически, порядок по <code>@Order</code>): <code>CharacterEncodingFilter</code>, <code>ServerHttpObservationFilter</code> (метрика <code>http.server.requests</code> и трейс), <code>DelegatingFilterProxy</code> → <code>FilterChainProxy</code> Spring Security (тема 13), <code>RequestContextFilter</code>.</p>
+    <p>Фильтры работают <b>до</b> DispatcherServlet: исключение здесь не увидит <code>@ControllerAdvice</code> — его обработает контейнер через страницу ошибки <code>/error</code>.</p>
+  </section>
+  <section class="st-step" data-t="DispatcherServlet.doDispatch" data-hl="mvDS">
+    <h4>FrameworkServlet.processRequest → doDispatch</h4>
+    <p>Привязывает к потоку <code>LocaleContextHolder</code> и <code>RequestContextHolder</code> (ThreadLocal), затем <code>doDispatch</code> — сердце MVC:</p>
+<pre><code class="java">HandlerExecutionChain chain = getHandler(request);          // 1. кто обработает
+HandlerAdapter ha = getHandlerAdapter(chain.getHandler());  // 2. как вызвать
+if (!chain.applyPreHandle(request, response)) return;       // 3. интерцепторы
+ModelAndView mv = ha.handle(request, response, handler);    // 4. вызов
+chain.applyPostHandle(request, response, mv);
+processDispatchResult(request, response, chain, mv, ex);    // 5. исключения / view
+// finally: triggerAfterCompletion</code></pre>
+  </section>
+  <section class="st-step" data-t="Поиск обработчика" data-hl="mvHM">
+    <h4>RequestMappingHandlerMapping</h4>
+    <p>Карта маршрутов построена <b>на старте</b>: в <code>afterPropertiesSet</code> маппинг перебрал бины с <code>@Controller</code>, для каждого метода с <code>@RequestMapping</code> создал <code>RequestMappingInfo</code> (путь, HTTP-метод, consumes, produces, params, headers) и сохранил в <code>MappingRegistry</code> → <code>HandlerMethod</code>.</p>
+    <p>Сейчас по запросу отбираются подходящие условия и выбирается самое специфичное (<code>/api/orders/{id}</code> проигрывает <code>/api/orders/latest</code>). Пути разбираются <code>PathPatternParser</code>. Результат — <code>HandlerExecutionChain</code>: <code>HandlerMethod</code> + интерцепторы.</p>
+    <p>Не нашли — следующий <code>HandlerMapping</code> (функциональные роуты, статические ресурсы); никто не подошёл — <code>NoResourceFoundException</code> → 404. Путь есть, но метод не тот — 405; не тот <code>Content-Type</code> — 415.</p>
+  </section>
+  <section class="st-step" data-t="Интерцепторы preHandle" data-hl="mvInt">
+    <h4>HandlerInterceptor.preHandle</h4>
+    <p>Интерцепторы Spring MVC знают обработчик (<code>HandlerMethod</code>) — можно читать аннотации метода. <code>preHandle</code> вернул <code>false</code> → обработка прекращается (интерцептор сам пишет ответ). Регистрируются через <code>WebMvcConfigurer.addInterceptors</code>.</p>
+  </section>
+  <section class="st-step" data-t="Разрешение аргументов" data-hl="mvArgs">
+    <h4>HandlerMethodArgumentResolver</h4>
+    <p><code>RequestMappingHandlerAdapter</code> создаёт <code>ServletInvocableHandlerMethod</code> и для каждого параметра ищет резолвер (список ~30, результат кэшируется):</p>
+    <ul>
+      <li><code>@RequestBody</code> → <code>RequestResponseBodyMethodProcessor</code>: по <code>Content-Type: application/json</code> выбирает <code>HttpMessageConverter</code> (Jackson), читает тело в <code>CreateOrderRequest</code>; <code>@Valid</code> → валидатор, ошибки → <code>MethodArgumentNotValidException</code> (400);</li>
+      <li><code>@RequestHeader UUID</code> → строка из заголовка + конвертация через <code>ConversionService</code>;</li>
+      <li><code>@AuthenticationPrincipal</code> → резолвер Spring Security достаёт principal из <code>SecurityContextHolder</code>;</li>
+      <li><code>UriComponentsBuilder</code> → создаётся из текущего запроса.</li>
+    </ul>
+  </section>
+  <section class="st-step" data-t="Вызов метода" data-hl="mvCtl">
+    <h4>InvocableHandlerMethod.doInvoke</h4>
+    <p>Метод вызывается рефлексией. <code>orders.create(...)</code> идёт через прокси сервиса: транзакция открывается здесь, в рабочем потоке Tomcat, и закрывается до возврата в контроллер.</p>
+  </section>
+  <section class="st-step" data-t="Обработка результата" data-hl="mvRet">
+    <h4>HandlerMethodReturnValueHandler</h4>
+    <p><code>ResponseEntity</code> → <code>HttpEntityMethodProcessor</code>: статус 201, заголовок <code>Location</code>. Тело: <b>content negotiation</b> — пересечение <code>Accept</code> клиента и типов, которые могут записать конвертеры (и <code>produces</code>). Перед записью вызываются <code>ResponseBodyAdvice</code>. Jackson сериализует <code>OrderDto</code> прямо в выходной поток ответа.</p>
+    <p>Тело записано, значит <code>ModelAndView</code> не нужен (<code>requestHandled=true</code>) — view не рендерится.</p>
+  </section>
+  <section class="st-step" data-t="Завершение" data-hl="mvDS mvFilters mvTomcat">
+    <h4>afterCompletion → фильтры → Tomcat</h4>
+    <p><code>postHandle</code> и <code>afterCompletion</code> интерцепторов (последний — даже при исключении), очистка ThreadLocal, фильтры завершаются в обратном порядке (Observation фиксирует длительность и статус). Tomcat дописывает ответ; при keep-alive сокет возвращается в Poller, рабочий поток — в пул.</p>
+  </section>
+</div>
+
+<h2 id="errors"><span class="h-num">9.3</span>Обработка исключений</h2>
+<p>Исключение из контроллера ловит <code>doDispatch</code> и передаёт в <code>processHandlerException</code> — по очереди в <code>HandlerExceptionResolver</code>-ы:</p>
+<ol class="steps">
+  <li><code>ExceptionHandlerExceptionResolver</code>: <code>@ExceptionHandler</code> в самом контроллере, затем в бинах <code>@ControllerAdvice</code> (по <code>@Order</code>); внутри одного класса выбирается обработчик с ближайшим типом исключения, а между несколькими advice побеждает первый по <code>@Order</code>, в котором нашёлся подходящий обработчик — даже если в менее приоритетном совпадение точнее.</li>
+  <li><code>ResponseStatusExceptionResolver</code>: <code>ResponseStatusException</code> и исключения с <code>@ResponseStatus</code>.</li>
+  <li><code>DefaultHandlerExceptionResolver</code>: стандартные исключения MVC → коды (<code>HttpMediaTypeNotSupportedException</code> → 415, <code>MissingServletRequestParameterException</code> → 400…).</li>
+  <li>Никто не обработал → исключение уходит в контейнер → forward на <code>/error</code> → <code>BasicErrorController</code> Boot.</li>
+</ol>
+<pre data-title="Единый формат ошибок — ProblemDetail (RFC 9457)"><code class="java">@RestControllerAdvice
+class ApiErrors extends ResponseEntityExceptionHandler {     // уже обрабатывает стандартные исключения MVC в ProblemDetail
+
+    @ExceptionHandler(OrderNotFoundException.class)
+    ProblemDetail notFound(OrderNotFoundException e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+        pd.setType(URI.create("https://api.shop.ru/errors/order-not-found"));
+        pd.setProperty("orderId", e.orderId());
+        return pd;
+    }
+
+    @Override   // ошибки @Valid → 400 со списком полей
+    protected ResponseEntity&lt;Object&gt; handleMethodArgumentNotValid(MethodArgumentNotValidException ex,
+            HttpHeaders headers, HttpStatusCode status, WebRequest request) {
+        ProblemDetail pd = ex.getBody();
+        pd.setProperty("errors", ex.getFieldErrors().stream()
+                .map(f -&gt; Map.of("field", f.getField(), "message", f.getDefaultMessage())).toList());
+        return ResponseEntity.badRequest().body(pd);
+    }
+}</code></pre>
+<div class="callout info">В Boot достаточно <code>spring.mvc.problemdetails.enabled=true</code>, чтобы стандартные исключения MVC отдавались как <code>application/problem+json</code>. Свой <code>@ControllerAdvice</code> нужен для доменных исключений.</div>
+
+<h2 id="validation"><span class="h-num">9.4</span>Валидация</h2>
+<div class="grid-2">
+  <div class="card"><h4>Тело запроса</h4><p><code>@Valid @RequestBody</code> — валидация объекта Bean Validation (Hibernate Validator). Ошибка → <code>MethodArgumentNotValidException</code>. Каскад во вложенные объекты — через <code>@Valid</code> на поле или элементе списка.</p></div>
+  <div class="card"><h4>Параметры метода (6.1+)</h4><p>Ограничения прямо на <code>@PathVariable</code>/<code>@RequestParam</code> (<code>@Min(1) long id</code>) MVC проверяет встроенной валидацией методов → <code>HandlerMethodValidationException</code>. Раньше требовался <code>@Validated</code> на классе и AOP-прокси.</p></div>
+</div>
+
+<h2 id="extension"><span class="h-num">9.5</span>Filter, Interceptor или AOP</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Servlet Filter</th><th>HandlerInterceptor</th><th>@Aspect / @ControllerAdvice</th></tr>
+<tr><td>Уровень</td><td>контейнер, до Spring MVC</td><td>внутри DispatcherServlet</td><td>вызов метода бина</td></tr>
+<tr><td>Видит</td><td>сырой запрос/ответ, может обернуть их</td><td>запрос + выбранный HandlerMethod</td><td>аргументы и результат метода</td></tr>
+<tr><td>Подходит для</td><td>безопасность, CORS, сжатие, логирование тела, correlation id</td><td>проверки по аннотациям метода, локаль, тайминг обработчика</td><td>бизнес-сквозная логика, обработка исключений</td></tr>
+<tr><td>Статические ресурсы, 404</td><td>да</td><td>частично</td><td>нет</td></tr>
+</table></div>
+<pre data-title="Correlation id: фильтр + MDC"><code class="java">@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+class CorrelationIdFilter extends OncePerRequestFilter {      // гарантирует один вызов на запрос (в т.ч. при forward/error)
+    @Override
+    protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
+            throws ServletException, IOException {
+        String id = Optional.ofNullable(req.getHeader("X-Request-Id")).orElseGet(() -&gt; UUID.randomUUID().toString());
+        MDC.put("requestId", id);                               // MDC — ThreadLocal: попадёт во все логи этого потока
+        res.setHeader("X-Request-Id", id);
+        try { chain.doFilter(req, res); }
+        finally { MDC.remove("requestId"); }                    // поток вернётся в пул — чистим обязательно
+    }
+}</code></pre>
+
+<h2 id="threads"><span class="h-num">9.6</span>Потоки и асинхронная обработка</h2>
+<p>Весь путь выполняется в одном рабочем потоке Tomcat, поэтому Spring хранит контекст в ThreadLocal: <code>RequestContextHolder</code>, <code>SecurityContextHolder</code>, <code>LocaleContextHolder</code>, транзакционные ресурсы, MDC. Если внутри запроса уйти в другой поток (свой пул, <code>CompletableFuture</code>), этот контекст не переедет сам.</p>
+<p>Возврат <code>Callable</code>, <code>DeferredResult</code>, <code>CompletableFuture</code>, <code>SseEmitter</code>, <code>ResponseBodyEmitter</code> включает асинхронную обработку Servlet 3: рабочий поток Tomcat освобождается, ответ дописывается позже из другого потока. При 200 медленных запросах одновременно это спасает пул Tomcat, но с JDK 21 ту же задачу проще решают виртуальные потоки (тема 10).</p>
+
+<h2 id="quiz"><span class="h-num">9.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Фильтр бросил исключение до DispatcherServlet. Обработает ли его @RestControllerAdvice?</p><ul><li>Да, всегда</li><li>Да, если у него @Order(HIGHEST_PRECEDENCE)</li><li>Нет: резолверы исключений работают внутри DispatcherServlet; ошибка уйдёт в контейнер и на /error</li><li>Нет, приложение упадёт</li></ul><div class="why">@ControllerAdvice обслуживается ExceptionHandlerExceptionResolver внутри doDispatch. Для фильтров — обработка в самом фильтре или HandlerExceptionResolver, вызванный вручную.</div></div>
+<div class="mcq" data-ok="1"><p>Клиент отправил POST с Content-Type: text/plain, а метод объявлен с consumes = application/json. Ответ?</p><ul><li>400 Bad Request</li><li>415 Unsupported Media Type</li><li>406 Not Acceptable</li><li>500</li></ul><div class="why">Условие consumes не совпало при выборе обработчика → HttpMediaTypeNotSupportedException → 415. 406 бывает, когда нельзя произвести тип из Accept.</div></div>
+<div class="mcq" data-ok="0"><p>Кто превращает JSON-тело в объект параметра @RequestBody?</p><ul><li>RequestResponseBodyMethodProcessor с подходящим HttpMessageConverter (Jackson)</li><li>DispatcherServlet напрямую</li><li>Фильтр Jackson</li><li>HandlerInterceptor</li></ul><div class="why">Резолвер аргумента выбирает конвертер по Content-Type и целевому типу и вызывает его read().</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите путь HTTP-запроса в Spring MVC.</summary><div class="a"><p>Tomcat (Acceptor → Poller → рабочий поток) → цепочка Servlet-фильтров (в т.ч. Spring Security) → DispatcherServlet.doDispatch: HandlerMapping находит HandlerMethod и интерцепторы → HandlerAdapter → preHandle → резолверы аргументов (конвертеры сообщений, валидация) → вызов метода → обработчики результата (content negotiation, конвертер пишет тело) → postHandle → обработка исключений резолверами → afterCompletion → фильтры в обратном порядке → ответ.</p></div></details>
+<details class="q"><summary>Когда регистрируются маршруты @RequestMapping?</summary><div class="a"><p>На старте: RequestMappingHandlerMapping — бин с InitializingBean; в afterPropertiesSet он перебирает бины, помеченные @Controller (с Spring 6.0 одного @RequestMapping на классе недостаточно), собирает RequestMappingInfo для методов и регистрирует в MappingRegistry. Конфликтующие маршруты дают ошибку старта «Ambiguous mapping».</p></div></details>
+<details class="q"><summary>Чем Filter отличается от HandlerInterceptor?</summary><div class="a"><p>Filter — компонент Servlet API, вызывается контейнером до DispatcherServlet, видит любой запрос, может обернуть request/response. Interceptor — механизм Spring MVC, вызывается внутри DispatcherServlet после выбора обработчика, знает HandlerMethod, имеет preHandle/postHandle/afterCompletion.</p></div></details>
+<details class="q"><summary>Как реализовать единый формат ошибок API?</summary><div class="a"><p>@RestControllerAdvice, наследующий ResponseEntityExceptionHandler, с @ExceptionHandler для доменных исключений, возвращающими ProblemDetail (RFC 9457). Плюс обработка ошибок вне MVC (фильтры, Security) — через их собственные обработчики (AuthenticationEntryPoint, AccessDeniedHandler) в том же формате, и настройка /error.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Lock, Condition, AQS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ИНСТРУМЕНТЫ</div>
+  <h1>Lock, Condition и AQS</h1>
+  <p class="lead">Явные локи из <code>java.util.concurrent.locks</code> дают то, чего нет у <code>synchronized</code>: таймауты, прерываемость, несколько условий, разделение чтения и записи. Все они построены на одном фундаменте — <b>AbstractQueuedSynchronizer</b>. Поняв AQS, вы понимаете половину пакета.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">ReentrantLock</span><span class="tag">StampedLock</span><span class="tag">CLH-очередь</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="lock"><span class="h-num">4.1</span>Интерфейс Lock и обязательная идиома</h2>
+<pre data-title="Единственно правильная форма" class="good-code"><code class="java">private final ReentrantLock lock = new ReentrantLock();
+
+public void transfer(Account to, long amount) {
+    lock.lock();            // ДО try: если lock() бросит, unlock вызывать нельзя
+    try {
+        // критическая секция
+    } finally {
+        lock.unlock();      // всегда, иначе лок утечёт навсегда
+    }
+}</code></pre>
+
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Поведение</th><th>Когда нужен</th></tr>
+<tr><td><code>lock()</code></td><td>ждать бесконечно, interrupt игнорируется (флаг сохраняется)</td><td>эквивалент synchronized</td></tr>
+<tr><td><code>lockInterruptibly()</code></td><td>ждать, но выйти с <code>InterruptedException</code></td><td>отменяемые операции, shutdown</td></tr>
+<tr><td><code>tryLock()</code></td><td>захватить, если свободен, иначе сразу <code>false</code>. <b>Игнорирует fairness</b>.</td><td>«не получилось — делаем что-то другое»</td></tr>
+<tr><td><code>tryLock(t, unit)</code></td><td>ждать не дольше t, прерываемо</td><td>избежание deadlock, SLA по задержке</td></tr>
+<tr><td><code>newCondition()</code></td><td>условная переменная, связанная с локом</td><td>несколько условий ожидания</td></tr>
+</table></div>
+
+<pre data-title="Перевод без deadlock через tryLock с откатом"><code class="java">public boolean transfer(Account from, Account to, long amount, long timeoutMs)
+        throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+    while (true) {
+        if (from.lock.tryLock()) {
+            try {
+                if (to.lock.tryLock()) {
+                    try {
+                        if (from.balance &lt; amount) return false;
+                        from.balance -= amount;
+                        to.balance += amount;
+                        return true;
+                    } finally { to.lock.unlock(); }
+                }
+            } finally { from.lock.unlock(); }
+        }
+        if (System.nanoTime() &gt; deadline) return false;
+        Thread.sleep(ThreadLocalRandom.current().nextInt(1, 5)); // случайная пауза против livelock
+    }
+}</code></pre>
+<p>Альтернатива проще — <b>глобальный порядок захвата</b> (например, по id счёта), см. тему 11. tryLock полезен, когда порядок задать нельзя.</p>
+
+<h3>Справедливость (fairness)</h3>
+<p><code>new ReentrantLock(true)</code> — потоки получают лок в порядке очереди. По умолчанию — <b>несправедливый</b>: пришедший поток может «перехватить» (barging) лок у того, кто ждёт в очереди. Это кажется нечестным, но даёт в разы большую пропускную способность: разбудить припаркованный поток — микросекунды, а пришедший уже на CPU. Fair-лок нужен редко: когда голодание недопустимо и важнее предсказуемость задержек.</p>
+
+<h2 id="condition"><span class="h-num">4.2</span>Condition: несколько очередей ожидания</h2>
+<p><code>Condition</code> — аналог <code>wait/notify</code>, но у одного лока их может быть сколько угодно. Producer'ы ждут <code>notFull</code>, consumer'ы — <code>notEmpty</code>, и <code>signal()</code> будит ровно того, кого нужно.</p>
+<pre data-title="BoundedBuffer на двух Condition — так устроен ArrayBlockingQueue" class="good-code"><code class="java">public final class BoundedBuffer&lt;T&gt; {
+    private final Object[] items;
+    private int head, tail, count;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition notFull  = lock.newCondition();
+    private final Condition notEmpty = lock.newCondition();
+
+    public BoundedBuffer(int capacity) { items = new Object[capacity]; }
+
+    public void put(T x) throws InterruptedException {
+        lock.lockInterruptibly();
+        try {
+            while (count == items.length) notFull.await();
+            items[tail] = x;
+            if (++tail == items.length) tail = 0;
+            count++;
+            notEmpty.signal();          // signal, а не signalAll: ждут однородные consumer'ы
+        } finally { lock.unlock(); }
+    }
+
+    @SuppressWarnings("unchecked")
+    public T take() throws InterruptedException {
+        lock.lockInterruptibly();
+        try {
+            while (count == 0) notEmpty.await();
+            T x = (T) items[head];
+            items[head] = null;
+            if (++head == items.length) head = 0;
+            count--;
+            notFull.signal();
+            return x;
+        } finally { lock.unlock(); }
+    }
+
+    public boolean offer(T x, long timeout, TimeUnit unit) throws InterruptedException {
+        long nanos = unit.toNanos(timeout);
+        lock.lockInterruptibly();
+        try {
+            while (count == items.length) {
+                if (nanos &lt;= 0) return false;
+                nanos = notFull.awaitNanos(nanos);  // возвращает остаток времени
+            }
+            items[tail] = x;
+            if (++tail == items.length) tail = 0;
+            count++;
+            notEmpty.signal();
+            return true;
+        } finally { lock.unlock(); }
+    }
+}</code></pre>
+<div class="callout warn">Правила те же, что для wait: <code>await</code>/<code>signal</code> только под локом-владельцем, условие в <code>while</code>. Не перепутайте <code>condition.await()</code> с унаследованным от Object <code>condition.wait()</code> — второе бросит <code>IllegalMonitorStateException</code>.</div>
+
+<h2 id="rw"><span class="h-num">4.3</span>ReentrantReadWriteLock</h2>
+<p>Много читателей одновременно ИЛИ один писатель. Выгоден, когда чтений намного больше, чем записей, и критическая секция чтения не микроскопическая (иначе накладные расходы съедят выигрыш).</p>
+<pre><code class="java">public final class RateCache {
+    private final Map&lt;String, BigDecimal&gt; rates = new HashMap&lt;&gt;();
+    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+
+    public BigDecimal get(String ccy) {
+        rw.readLock().lock();
+        try { return rates.get(ccy); } finally { rw.readLock().unlock(); }
+    }
+    public void putAll(Map&lt;String, BigDecimal&gt; fresh) {
+        rw.writeLock().lock();
+        try { rates.clear(); rates.putAll(fresh); } finally { rw.writeLock().unlock(); }
+    }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Downgrade — можно</h4><p>Держа write, взять read, затем отпустить write. Так вы публикуете изменение и продолжаете читать без окна, в которое вклинится другой писатель.</p></div>
+  <div class="card"><h4>Upgrade — deadlock</h4><p>Держа read, вызвать <code>writeLock().lock()</code> — поток ждёт, пока все читатели уйдут, включая его самого. Вечное ожидание. Если два потока так сделают — тем более.</p></div>
+</div>
+<p>Для примера выше в реальном коде проще и быстрее: <code>volatile Map</code> с подменой неизменяемого снимка (<code>Map.copyOf</code>) — читатели вообще без локов. RW-лок нужен, когда состояние нельзя дёшево скопировать.</p>
+
+<h2 id="stamped"><span class="h-num">4.4</span>StampedLock: оптимистичное чтение</h2>
+<p>JDK 8. Три режима: write, read и <b>optimistic read</b> — вообще без захвата: берём «штамп» (версию), читаем поля в локальные переменные, затем проверяем, не было ли записи. Читатели не пишут в общую память → нет cache-line ping-pong.</p>
+<pre data-title="Канонический шаблон из javadoc" class="good-code"><code class="java">public final class Point {
+    private double x, y;
+    private final StampedLock sl = new StampedLock();
+
+    public void move(double dx, double dy) {
+        long stamp = sl.writeLock();
+        try { x += dx; y += dy; } finally { sl.unlockWrite(stamp); }
+    }
+
+    public double distanceFromOrigin() {
+        long stamp = sl.tryOptimisticRead();     // 0, если сейчас держат write
+        double cx = x, cy = y;                   // копируем в локальные!
+        if (!sl.validate(stamp)) {               // была запись — данные могли быть несогласованны
+            stamp = sl.readLock();               // откат на пессимистичное чтение
+            try { cx = x; cy = y; } finally { sl.unlockRead(stamp); }
+        }
+        return Math.hypot(cx, cy);               // работаем только с копиями
+    }
+}</code></pre>
+<div class="callout bad"><span class="c-title">Ограничения StampedLock</span>
+<b>Не реентерабелен</b> (повторный writeLock в том же потоке — самоблокировка), нет <code>Condition</code>, нет владельца (unlock по штампу из любого потока). В оптимистичной ветке нельзя делать ничего, что сломается на несогласованных данных (разыменовать ссылку, которая может быть null, индексировать массив) — до <code>validate</code> данные считаются мусором.
+</div>
+
+<h2 id="aqs"><span class="h-num">4.5</span>AQS изнутри</h2>
+<p><code>AbstractQueuedSynchronizer</code> — каркас для синхронизаторов. Он хранит:</p>
+<ul>
+  <li><code>volatile int state</code> — смысл задаёт подкласс: у <code>ReentrantLock</code> — счётчик захватов (0 = свободен), у <code>Semaphore</code> — число разрешений, у <code>CountDownLatch</code> — оставшийся счёт, у <code>ReentrantReadWriteLock</code> — старшие 16 бит читатели, младшие 16 — писатель.</li>
+  <li><b>FIFO-очередь ожидающих</b> — вариант CLH-очереди: двусвязный список узлов с <code>head</code>/<code>tail</code>, вставка через CAS в tail.</li>
+  <li>Владельца в эксклюзивном режиме (<code>exclusiveOwnerThread</code>).</li>
+</ul>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="AQS: state и очередь ожидания">
+  <defs><marker id="d1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="20" y="20" width="250" height="90" rx="10" class="box-acc"/>
+  <text x="40" y="46" font-weight="700">AQS</text>
+  <text x="40" y="70" class="mono" font-size="13">volatile int state = 1</text>
+  <text x="40" y="92" class="mono" font-size="13">owner = T1</text>
+  <text x="290" y="56" class="muted" font-size="13">T1 захватил лок: CAS(state, 0 → 1) успешен</text>
+
+  <rect x="20" y="160" width="130" height="70" rx="9" class="box"/>
+  <text x="85" y="188" text-anchor="middle" font-weight="700">head</text>
+  <text x="85" y="210" text-anchor="middle" class="mono muted" font-size="12">dummy</text>
+  <rect x="210" y="160" width="130" height="70" rx="9" class="box-warn"/>
+  <text x="275" y="188" text-anchor="middle" font-weight="700">Node T2</text>
+  <text x="275" y="210" text-anchor="middle" class="mono" font-size="12">parked</text>
+  <rect x="400" y="160" width="130" height="70" rx="9" class="box-warn"/>
+  <text x="465" y="188" text-anchor="middle" font-weight="700">Node T3</text>
+  <text x="465" y="210" text-anchor="middle" class="mono" font-size="12">parked</text>
+  <rect x="590" y="160" width="130" height="70" rx="9" class="box-warn"/>
+  <text x="655" y="188" text-anchor="middle" font-weight="700">Node T4 = tail</text>
+  <text x="655" y="210" text-anchor="middle" class="mono" font-size="12">parked</text>
+  <path d="M150 188 H206" class="ln" marker-end="url(#d1)"/><path d="M340 188 H396" class="ln" marker-end="url(#d1)"/><path d="M530 188 H586" class="ln" marker-end="url(#d1)"/>
+  <path d="M206 206 H154" class="ln-dash" marker-end="url(#d1)"/><path d="M396 206 H344" class="ln-dash" marker-end="url(#d1)"/><path d="M586 206 H534" class="ln-dash" marker-end="url(#d1)"/>
+  <text x="400" y="270" text-anchor="middle" font-size="13">unlock(): state → 0, затем LockSupport.unpark(первый за head) → T2 пробует CAS снова</text>
+  <text x="400" y="290" text-anchor="middle" font-size="12.5" class="muted">Несправедливый режим: пришедший T5 может выиграть CAS раньше T2 (barging)</text>
+</svg>
+</figure>
+
+<h3>Алгоритм acquire (упрощённо)</h3>
+<ol class="steps">
+  <li><code>tryAcquire(arg)</code> — метод подкласса: попытка CAS на <code>state</code>. Успех → вошли, очередь не трогаем (быстрый путь без конкуренции).</li>
+  <li>Неудача → создать узел, CAS-ом прицепить к <code>tail</code>.</li>
+  <li>Если узел — первый после <code>head</code>, ещё раз попробовать <code>tryAcquire</code> (лок мог освободиться).</li>
+  <li>Иначе пометить предшественника «разбуди меня» и <code>LockSupport.park(this)</code>.</li>
+  <li>После <code>unpark</code> — повторить с шага 3. Успех → наш узел становится новым <code>head</code>.</li>
+</ol>
+<p>Release: <code>tryRelease(arg)</code> подкласса уменьшает <code>state</code>; если лок полностью свободен — разбудить преемника <code>head</code>. Shared-режим (<code>acquireShared</code>, используют Semaphore, CountDownLatch, read-lock) отличается тем, что пробуждение распространяется по цепочке: проснувшийся будит следующего, если ресурса хватает.</p>
+
+<h3>LockSupport: park / unpark</h3>
+<p>Примитив под AQS. У каждого потока есть один <b>«пропуск» (permit)</b>, максимум 1. <code>unpark(t)</code> выдаёт пропуск; <code>park()</code> поглощает его и возвращается сразу, если он есть, иначе блокирует поток. Поэтому <code>unpark</code> до <code>park</code> не теряется — в отличие от <code>notify</code> до <code>wait</code>. <code>park</code> может вернуться и без причины (spurious) — вызывающий обязан перепроверить условие в цикле.</p>
+
+<h2 id="own"><span class="h-num">4.6</span>Пишем свой синхронизатор на AQS</h2>
+<p>Подкласс переопределяет только <code>tryAcquire/tryRelease</code> (эксклюзивный режим) или <code>tryAcquireShared/tryReleaseShared</code> (разделяемый). Очередь, парковка, таймауты и прерывания — бесплатно.</p>
+<div class="grid-2">
+<pre data-title="Нереентерабельный мьютекс"><code class="java">public final class Mutex {
+  private static final class Sync
+      extends AbstractQueuedSynchronizer {
+    @Override protected boolean tryAcquire(int a) {
+      if (compareAndSetState(0, 1)) {
+        setExclusiveOwnerThread(
+            Thread.currentThread());
+        return true;
+      }
+      return false;
+    }
+    @Override protected boolean tryRelease(int a) {
+      if (getState() == 0)
+        throw new IllegalMonitorStateException();
+      setExclusiveOwnerThread(null);
+      setState(0);   // volatile write = release
+      return true;
+    }
+  }
+  private final Sync sync = new Sync();
+  public void lock()   { sync.acquire(1); }
+  public void unlock() { sync.release(1); }
+  public boolean tryLock(long t, TimeUnit u)
+      throws InterruptedException {
+    return sync.tryAcquireNanos(1, u.toNanos(t));
+  }
+}</code></pre>
+<pre data-title="Одноразовая защёлка (shared)"><code class="java">public final class OneShotLatch {
+  private static final class Sync
+      extends AbstractQueuedSynchronizer {
+    // &gt;= 0 — пропускаем, &lt; 0 — в очередь
+    @Override protected int tryAcquireShared(int a) {
+      return getState() == 1 ? 1 : -1;
+    }
+    @Override protected boolean tryReleaseShared(int a) {
+      setState(1);    // открыто навсегда
+      return true;    // разбудить всех
+    }
+  }
+  private final Sync sync = new Sync();
+
+  public void signal() {
+    sync.releaseShared(0);
+  }
+  public void await() throws InterruptedException {
+    sync.acquireSharedInterruptibly(0);
+  }
+}</code></pre>
+</div>
+<p>Сравните с <code>CountDownLatch</code>: это та же схема, только <code>state</code> = счётчик, а <code>tryReleaseShared</code> делает CAS-декремент и возвращает <code>true</code>, когда дошли до нуля.</p>
+
+<h2 id="compare"><span class="h-num">4.7</span>Сравнение</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>synchronized</th><th>ReentrantLock</th><th>RW Lock</th><th>StampedLock</th></tr>
+<tr><td>Реентерабельность</td><td>да</td><td>да</td><td>да</td><td><b>нет</b></td></tr>
+<tr><td>Таймаут / прерывание</td><td>нет</td><td>да</td><td>да</td><td>да</td></tr>
+<tr><td>Условия</td><td>1 (wait set)</td><td>N</td><td>N (только write)</td><td>нет</td></tr>
+<tr><td>Параллельное чтение</td><td>нет</td><td>нет</td><td>да</td><td>да + оптимистичное</td></tr>
+<tr><td>Авто-unlock</td><td>да</td><td>нет (finally)</td><td>нет</td><td>нет</td></tr>
+<tr><td>Мониторинг</td><td>thread dump</td><td><code>getQueueLength</code>, <code>isHeldByCurrentThread</code></td><td>то же</td><td>минимальный</td></tr>
+</table></div>
+
+<h2 id="sim"><span class="h-num">4.8</span>Интерактив: очередь AQS внутри ReentrantLock</h2>
+<div class="widget" id="aqW">
+  <div class="widget-title">Симулятор ReentrantLock</div>
+  <p class="hint"><code>state</code> — счётчик захватов (0 — свободен), <code>owner</code> — поток-владелец, очередь — узлы AQS со спящими (<code>park</code>) потоками.</p>
+  <div class="checks"><label><input type="checkbox" id="aqFair">new ReentrantLock(true) — честный режим</label></div>
+  <div class="lanes">
+    <div class="lane"><h5>state / owner</h5><div class="items" id="aqState"></div></div>
+    <div class="lane"><h5>Очередь AQS (head → tail)</h5><div class="items" id="aqQueue"></div></div>
+  </div>
+  <div class="controls" id="aqBtns"></div>
+  <div class="log" id="aqLog"></div>
+</div>
+<script>
+(function () {
+  var state = 0, owner = null, queue = [], woken = null, names = ["T1", "T2", "T3", "T4"], log = ["state = 0 — лок свободен."];
+  var $ = function (id) { return document.getElementById(id); };
+  function fair() { return $("aqFair").checked; }
+  function act(t, a) {
+    if (a === "lock") {
+      if (owner === t) { state++; log.unshift(t + ".lock(): уже владелец → state = " + state + " (реентерабельность)."); }
+      else if (state === 0 && (!fair() || queue.length === 0 || queue[0] === t)) {
+        var barged = queue.length && queue[0] !== t;
+        state = 1; owner = t; if (queue[0] === t) { queue.shift(); woken = null; }
+        log.unshift(t + ".lock(): CAS(state, 0 → 1) успешен." + (barged ? " ⚠ barging: " + t + " обогнал " + queue[0] + ", который давно стоит в очереди и уже разбужен. Нечестный режим это разрешает — выше пропускная способность, возможна длительная задержка ожидающих." : ""));
+      } else if (queue.indexOf(t) < 0) {
+        queue.push(t);
+        log.unshift(t + ".lock(): " + (state === 0 ? "лок свободен, но в честном режиме есть очередь (hasQueuedPredecessors)" : "CAS не удался") + " → узел в хвост очереди, LockSupport.park().");
+      }
+    } else if (a === "unlock") {
+      state--;
+      if (state === 0) { owner = null; woken = queue[0] || null; log.unshift(t + ".unlock(): state = 0." + (woken ? " unparkSuccessor: разбужен " + woken + " — он должен сам повторить CAS." : " Очередь пуста.")); }
+      else log.unshift(t + ".unlock(): state = " + state + " — лок ещё удерживается (нужно столько же unlock, сколько lock).");
+    } else if (a === "try") { if (state === 0) { state = 1; owner = t; log.unshift(t + ".tryLock(): успех. tryLock() без таймаута всегда игнорирует очередь, даже в честном режиме."); } else log.unshift(t + ".tryLock(): false — лок занят, поток НЕ блокируется и может заняться другим делом."); }
+    render();
+  }
+  function render() {
+    $("aqState").innerHTML = '<span class="chip ' + (state ? "warn" : "ok") + '">state = ' + state + '</span><span class="chip">owner = ' + (owner || "null") + "</span>";
+    $("aqQueue").innerHTML = queue.map(function (t) { return '<span class="chip ' + (t === woken ? "acc" : "info") + '">' + t + (t === woken ? " (разбужен)" : " (park)") + "</span>"; }).join("") || '<span class="chip">пусто</span>';
+    var box = $("aqBtns"); box.innerHTML = "";
+    function add(t, label, a) { var b = document.createElement("button"); b.type = "button"; b.className = "btn"; b.textContent = t + "." + label; b.addEventListener("click", function () { act(t, a); }); box.appendChild(b); }
+    names.forEach(function (t) {
+      if (t === owner) { add(t, "lock()", "lock"); add(t, "unlock()", "unlock"); }
+      else if (queue.indexOf(t) < 0) { add(t, "lock()", "lock"); add(t, "tryLock()", "try"); }
+      else if (t === woken && state === 0) add(t, "повторить CAS", "lock");
+    });
+    $("aqLog").textContent = log.slice(0, 9).join("\n");
+  }
+  $("aqFair").addEventListener("change", function () { log.unshift(fair() ? "Честный режим: перед CAS проверяется очередь." : "Нечестный режим (по умолчанию): сначала CAS, очередь — только при неудаче."); render(); });
+  render();
+})();
+</script>
+<p><b>Сценарий barging:</b> T1 берёт лок, T2 встаёт в очередь, T1 делает <code>unlock()</code> (T2 разбужен), и в этот момент T3 вызывает <code>lock()</code>. В нечестном режиме T3 выигрывает CAS, пока T2 ещё просыпается. Включите честный режим и повторите — T3 встанет в очередь.</p>
+
+<h2 id="quiz"><span class="h-num">4.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему <code>lock.unlock()</code> пишут в <code>finally</code>?</p><ul><li>Это требование компилятора</li><li>В отличие от synchronized, Lock не освобождается автоматически при исключении — лок останется захваченным навсегда</li><li>Так быстрее</li><li>Чтобы избежать реентерабельности</li></ul><div class="why">Идиома: <code>lock.lock(); try { … } finally { lock.unlock(); }</code> — и lock() ДО try.</div></div>
+<div class="mcq" data-ok="2"><p>Чем ReentrantLock лучше synchronized?</p><ul><li>Он всегда быстрее</li><li>Он не может вызвать deadlock</li><li>tryLock с таймаутом, прерываемое ожидание, честность, несколько Condition</li><li>Он не требует unlock</li></ul><div class="why">Если эти возможности не нужны, synchronized проще и безопаснее от ошибок.</div></div>
+<div class="mcq" data-ok="0"><p>Что хранит поле state в AQS для ReentrantLock и Semaphore?</p><ul><li>Число повторных захватов владельцем / число оставшихся разрешений</li><li>Идентификатор потока</li><li>Длину очереди</li><li>Время захвата</li></ul><div class="why">AQS даёт очередь и park/unpark, а смысл state определяет конкретный синхронизатор в tryAcquire/tryRelease.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему lock.lock() пишут до try, а не внутри?</summary><div class="a"><p>Если <code>lock()</code> внутри <code>try</code> бросит исключение (например, <code>lockInterruptibly</code> — <code>InterruptedException</code>), выполнится <code>finally { unlock(); }</code> для лока, который мы не захватили → <code>IllegalMonitorStateException</code>, маскирующий исходную ошибку (или, хуже, освобождение чужого захвата при реентерабельности).</p></div></details>
+<details class="q"><summary>Почему несправедливый лок быстрее справедливого?</summary><div class="a"><p>При освобождении fair-лок обязан отдать его первому в очереди, а тот припаркован: пока ОС его разбудит и он попадёт на CPU (микросекунды), лок простаивает. Unfair позволяет уже работающему потоку захватить лок немедленно (barging), используя это «мёртвое» время. Цена — возможное голодание отдельных потоков.</p></div></details>
+<details class="q"><summary>Что хранит state в AQS у ReentrantLock, Semaphore, CountDownLatch и ReentrantReadWriteLock?</summary><div class="a"><p>ReentrantLock — число повторных захватов владельцем (0 = свободен). Semaphore — доступные разрешения. CountDownLatch — оставшийся счёт до нуля. RRWL — int поделён: старшие 16 бит — число read-захватов, младшие 16 — write-захватов (реентерабельных).</p></div></details>
+<details class="q"><summary>Чем park/unpark лучше wait/notify для построения синхронизаторов?</summary><div class="a"><p>Не нужен монитор; можно будить конкретный поток; permit «запоминает» unpark, сделанный раньше park, поэтому нет гонки lost wake-up между проверкой условия и засыпанием. Вся логика очереди — в обычных объектах с CAS.</p></div></details>
+<details class="q"><summary>Как реализовать кэш с редкой полной перезагрузкой и частым чтением? Предложите 3 варианта и сравните.</summary><div class="a"><p>(1) <code>volatile</code>-ссылка на неизменяемую <code>Map.copyOf</code>, перезагрузка подменяет ссылку — чтения без локов, самый быстрый вариант, цена — копия при обновлении. (2) <code>ReentrantReadWriteLock</code> — подходит, если данные огромные и меняются частично. (3) <code>ConcurrentHashMap</code> с поэлементным обновлением — но читатель может увидеть смесь старых и новых курсов (нет атомарности снимка). Для курсов валют в финтехе обычно (1): снимок должен быть согласованным.</p></div></details>
+<details class="q"><summary>Почему в optimistic read нужно копировать поля в локальные переменные до validate?</summary><div class="a"><p><code>validate(stamp)</code> проверяет, что с момента выдачи штампа не было записи. Если читать поля после проверки, запись может произойти уже после неё. Поэтому: прочитать всё в локальные → validate → работать только с копиями. Кроме того, между чтениями x и y могла вклиниться запись — validate отловит и эту несогласованность.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

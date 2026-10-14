@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Транзакции и блокировки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ДАННЫЕ</div>
+  <h1>Транзакции и блокировки</h1>
+  <p class="lead">Что именно обещает база данных словом «транзакция», какие аномалии возможны при одновременной работе и двумя какими способами — пессимистичным и оптимистичным — приложение защищает данные от потерянных обновлений.</p>
+  <div class="meta"><span class="tag">3 конспекта</span><span class="tag">~2,5 часа</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="acid"><span class="h-num">7.1</span>ACID<span class="sk-num">#17</span></h2>
+<p>Четыре свойства, которые делают транзакцию надёжной: изменения применяются целиком или не применяются вовсе, данные остаются корректными, параллельные транзакции не мешают друг другу, а зафиксированное переживает сбой.</p>
+<figure class="sketch"><a href="img/17-acid.jpg"><img src="img/17-acid.jpg" width="1122" height="1402" loading="lazy" alt="ACID: атомарность, согласованность, изоляция, долговечность, уровни изоляции"></a><figcaption><b>Конспект #17.</b> ACID Properties <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th></th><th>Свойство</th><th>Смысл</th><th>Чем обеспечивается</th></tr>
+<tr><td><b>A</b></td><td>Atomicity</td><td>Всё или ничего: при ошибке — откат всех операций</td><td>Журнал отмены (undo), <code>ROLLBACK</code></td></tr>
+<tr><td><b>C</b></td><td>Consistency</td><td>Транзакция переводит базу из одного корректного состояния в другое</td><td>Ограничения (PK, FK, CHECK, UNIQUE) и <b>код приложения</b></td></tr>
+<tr><td><b>I</b></td><td>Isolation</td><td>Параллельные транзакции ведут себя так, будто выполняются по очереди</td><td>Блокировки и/или MVCC</td></tr>
+<tr><td><b>D</b></td><td>Durability</td><td>После <code>COMMIT</code> данные не пропадут при сбое</td><td>Журнал упреждающей записи (WAL), <code>fsync</code>, репликация</td></tr>
+</table></div>
+<p><b>C — единственное свойство, за которое отвечает не только база.</b> «Сумма по счетам не меняется при переводе» — инвариант приложения; база лишь гарантирует, что ваши ограничения не будут нарушены, а A, I и D дают инструменты, чтобы вы сами его не нарушили.</p>
+<h3>Уровни изоляции и аномалии</h3>
+<p>Полная изоляция дорогая, поэтому базы предлагают уровни послабее. Таблица на конспекте перечисляет уровни; ниже — какие аномалии каждый из них допускает.</p>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom read</th><th>По умолчанию в</th></tr>
+<tr><td>Read Uncommitted</td><td>возможно</td><td>возможно</td><td>возможно</td><td>—</td></tr>
+<tr><td>Read Committed</td><td>нет</td><td>возможно</td><td>возможно</td><td>PostgreSQL, Oracle, SQL Server</td></tr>
+<tr><td>Repeatable Read</td><td>нет</td><td>нет</td><td>возможно по стандарту</td><td>MySQL (InnoDB)</td></tr>
+<tr><td>Serializable</td><td>нет</td><td>нет</td><td>нет</td><td>—</td></tr>
+</table></div>
+<ul>
+  <li><b>Dirty read</b> — прочитали незафиксированные данные другой транзакции, которая потом откатилась.</li>
+  <li><b>Non-repeatable read</b> — одна и та же строка, прочитанная дважды в одной транзакции, вернула разные значения.</li>
+  <li><b>Phantom read</b> — повторный запрос по условию вернул другой <i>набор</i> строк: кто-то вставил подходящую.</li>
+  <li><b>Lost update</b> — две транзакции прочитали значение, обе изменили и записали; одно изменение пропало. Этой аномалии нет в стандарте, но именно она чаще всего ломает балансы и остатки — ей посвящены разделы <a href="#locking">7.2</a> и <a href="#optimistic">7.3</a>.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Уточнения к конспекту</span>
+<ul>
+  <li><b>Serializable не выполняет транзакции «одну за другой»</b> буквально — он гарантирует результат, <i>эквивалентный</i> некоторому последовательному порядку. PostgreSQL добивается этого оптимистично (SSI): транзакции идут параллельно, а при обнаружении опасной зависимости одна получает ошибку сериализации и должна быть повторена.</li>
+  <li><b>Одинаковые названия уровней значат разное в разных СУБД.</b> Repeatable Read в PostgreSQL — это изоляция снимков (фантомов нет, зато возможен write skew); в MySQL — снимок для обычных чтений плюс gap-блокировки для блокирующих. Проверяйте документацию своей базы.</li>
+  <li>В Spring уровень задаётся как <code>@Transactional(isolation = Isolation.REPEATABLE_READ)</code>; по умолчанию используется уровень базы.</li>
+</ul>
+</div>
+
+<h2 id="locking"><span class="h-num">7.2</span>Блокировки в базе данных<span class="sk-num">#27</span></h2>
+<p>Блокировка — механизм управления параллельным доступом: транзакция «занимает» данные, и остальные либо ждут, либо работают совместно, если режимы совместимы. Без блокировок параллельные транзакции приводят к потерянным обновлениям и нарушенным инвариантам.</p>
+<figure class="sketch"><a href="img/27-database-locking.jpg"><img src="img/27-database-locking.jpg" width="1024" height="1536" loading="lazy" alt="Блокировки: shared и exclusive, уровни, матрица совместимости, взаимоблокировка"></a><figcaption><b>Конспект #27.</b> Database Locking <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="grid-2">
+  <div class="card"><h4>Режимы</h4><ul><li><b>Shared (S)</b> — для чтения; совместима с другими S.</li><li><b>Exclusive (X)</b> — для изменения; несовместима ни с чем.</li><li>Матрица: S+S — да, S+X — нет, X+X — нет.</li></ul></div>
+  <div class="card"><h4>Гранулярность</h4><ul><li>Строка → страница → таблица → база.</li><li>Чем мельче блокировка, тем выше параллелизм и больше накладные расходы.</li><li>InnoDB и PostgreSQL блокируют строки.</li></ul></div>
+</div>
+<h3>Взаимоблокировка (deadlock)</h3>
+<p>T1 держит блокировку A и ждёт B, T2 держит B и ждёт A — ни одна не продвинется. База обнаруживает цикл ожидания и принудительно откатывает одну из транзакций. Приложение обязано быть к этому готово.</p>
+<ul>
+  <li><b>Единый порядок захвата.</b> Если все транзакции блокируют строки в одном порядке (например, по возрастанию id счёта), цикл невозможен.</li>
+  <li><b>Короткие транзакции.</b> Никаких HTTP-вызовов и ожидания пользователя внутри транзакции.</li>
+  <li><b>Повтор при ошибке взаимоблокировки</b> — это штатная ситуация, а не авария.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Главное, чего нет на схеме: MVCC</span>
+Конспект описывает классическую блокировочную модель, где чтение берёт S-блокировку и ждёт писателей. Большинство современных баз (PostgreSQL, InnoDB, Oracle) работают иначе — через <b>многоверсионность</b>: каждое изменение создаёт новую версию строки, а читатель видит снимок на момент начала запроса или транзакции. Следствие: <b>читатели не блокируют писателей, писатели не блокируют читателей</b>; конфликтуют только две записи в одну строку. Поэтому строки раздела 9 («Read Committed uses shared locks») описывают теоретическую модель, а не поведение PostgreSQL или MySQL.
+</div>
+<p>Обычный <code>SELECT</code> в MVCC-базе ничего не блокирует. Когда прочитанное значение нужно защитить до конца транзакции, блокировку берут явно:</p>
+<pre data-title="явные блокировки строк"><code class="txt">SELECT balance FROM accounts WHERE id = 42 FOR UPDATE;    -- X: никто не изменит и не заблокирует строку до COMMIT
+SELECT * FROM products WHERE id = 7 FOR SHARE;            -- S: читать можно, менять нельзя
+SELECT * FROM jobs WHERE status = 'NEW'
+  ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;            -- очередь задач: пропустить строки, занятые другими воркерами
+</code></pre>
+
+<h2 id="optimistic"><span class="h-num">7.3</span>Оптимистичная и пессимистичная блокировка<span class="sk-num">#28</span></h2>
+<p>Два подхода к одной проблеме — потерянному обновлению. <b>Пессимистичный</b> исходит из того, что конфликт вероятен, и блокирует данные до изменения. <b>Оптимистичный</b> считает конфликт редким: ничего не блокирует, а при записи проверяет, не изменились ли данные с момента чтения.</p>
+<figure class="sketch"><a href="img/28-optimistic-vs-pessimistic.jpg"><img src="img/28-optimistic-vs-pessimistic.jpg" width="1122" height="1402" loading="lazy" alt="Оптимистичная и пессимистичная блокировка: сравнение, примеры, когда применять"></a><figcaption><b>Конспект #28.</b> Optimistic Lock vs Pessimistic Lock <span class="zoom-hint">увеличить ⤢</span></figcaption></figure>
+<div class="table-wrap"><table>
+<tr><th></th><th>Оптимистичная</th><th>Пессимистичная</th></tr>
+<tr><td>Допущение</td><td>Конфликты редки</td><td>Конфликты часты</td></tr>
+<tr><td>Когда обнаруживается конфликт</td><td>При записи</td><td>Не возникает — второй ждёт</td></tr>
+<tr><td>Реализация</td><td>Поле версии или метка времени</td><td><code>SELECT … FOR UPDATE</code></td></tr>
+<tr><td>Блокирует других</td><td>Нет</td><td>Да</td></tr>
+<tr><td>Цена конфликта</td><td>Повтор всей операции</td><td>Ожидание, риск взаимоблокировки</td></tr>
+<tr><td>Подходит для</td><td>Много чтений, редкие изменения одной строки</td><td>Частые изменения одних и тех же строк, дорогой повтор</td></tr>
+</table></div>
+<pre data-title="оптимистичная блокировка: суть в одном запросе"><code class="txt">UPDATE products
+   SET stock = 9, version = 2
+ WHERE id = 7 AND version = 1;     -- изменено 0 строк => кто-то успел раньше, перечитать и повторить
+</code></pre>
+<pre data-title="JPA / Hibernate"><code class="java">@Entity
+class Product {
+    @Id Long id;
+    int stock;
+    @Version long version;          // оптимистичная: Hibernate сам добавит "AND version = ?"
+}                                   // при конфликте — OptimisticLockException
+
+// пессимистичная: SELECT ... FOR UPDATE
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select p from Product p where p.id = :id")
+Optional&lt;Product&gt; findForUpdate(Long id);
+</code></pre>
+<div class="callout info"><span class="c-title">Дополнения к конспекту</span>
+<ul>
+  <li><b>«Transaction rolled back» — не конец истории.</b> При оптимистичном конфликте приложение должно само перечитать данные и повторить операцию (с ограничением числа попыток) либо показать пользователю «данные изменились». Если конфликтов много, повторы съедают всю выгоду — это сигнал перейти на пессимистичную блокировку.</li>
+  <li><b>Оптимистичная блокировка работает через границы транзакций.</b> Пользователь открыл форму, думал пять минут, нажал «Сохранить» — версия в форме защищает от затирания чужих правок. Пессимистичная блокировка на пять минут недопустима. В HTTP эта же идея — заголовки <code>ETag</code> и <code>If-Match</code>.</li>
+  <li><b>Третий путь — атомарное обновление</b>, когда новая величина выражается через старую: <code>UPDATE products SET stock = stock - 1 WHERE id = 7 AND stock &gt;= 1</code>. Ни версии, ни явной блокировки, а перерасхода нет.</li>
+  <li>Когда защищаемый ресурс находится вне одной базы, нужна распределённая блокировка — <a href="11-redis-toolkit.html#lock">тема 11</a>.</li>
+</ul>
+</div>
+
+<h2 id="sim"><span class="h-num">7.4</span>Интерактив: уровни изоляции и аномалии</h2>
+<div class="widget" id="isoW">
+  <div class="widget-title">Симулятор: возникнет ли аномалия</div>
+  <div class="controls">
+    <label>уровень изоляции<select id="isoLvl"><option value="ru">READ UNCOMMITTED</option><option value="rc" selected>READ COMMITTED</option><option value="rr">REPEATABLE READ</option><option value="ser">SERIALIZABLE</option></select></label>
+    <label>СУБД<select id="isoDb"><option value="pg">PostgreSQL</option><option value="my">MySQL InnoDB</option></select></label>
+    <label>сценарий<select id="isoCase" style="max-width:100%">
+      <option value="dirty">грязное чтение: T2 читает незакоммиченное изменение T1</option>
+      <option value="nonrep">неповторяемое чтение: T1 дважды читает строку, между чтениями T2 её изменил</option>
+      <option value="phantom">фантом: T1 дважды считает строки по условию, T2 вставил подходящую</option>
+      <option value="lost">потерянное обновление: обе читают остаток, вычитают в коде, пишут</option>
+      <option value="skew">write skew: два врача на дежурстве, каждый проверяет «есть второй» и снимает себя</option>
+    </select></label>
+  </div>
+  <div class="grid-2">
+    <div><b style="font-size:14px">T1</b><div class="log" id="isoT1" style="max-height:none"></div></div>
+    <div><b style="font-size:14px">T2</b><div class="log" id="isoT2" style="max-height:none"></div></div>
+  </div>
+  <div class="verdict" id="isoOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var T = {
+    dirty: [["BEGIN", "UPDATE acc SET bal = 0 WHERE id = 1", "", "ROLLBACK"], ["BEGIN", "", "SELECT bal FROM acc WHERE id = 1", ""]],
+    nonrep: [["BEGIN", "SELECT bal … id = 1 → 100", "", "SELECT bal … id = 1 → ?"], ["", "", "UPDATE acc SET bal = 50 WHERE id = 1; COMMIT", ""]],
+    phantom: [["BEGIN", "SELECT count(*) WHERE status = 'NEW' → 3", "", "SELECT count(*) WHERE status = 'NEW' → ?"], ["", "", "INSERT … status = 'NEW'; COMMIT", ""]],
+    lost: [["BEGIN", "SELECT stock → 10", "", "UPDATE SET stock = 9; COMMIT"], ["BEGIN", "SELECT stock → 10", "UPDATE SET stock = 9; COMMIT", ""]],
+    skew: [["BEGIN", "SELECT count(*) WHERE on_call → 2  ✓", "UPDATE SET on_call = false WHERE doc = 'A'", "COMMIT"], ["BEGIN", "SELECT count(*) WHERE on_call → 2  ✓", "UPDATE SET on_call = false WHERE doc = 'B'", "COMMIT"]]
+  };
+  // результат: 1 — аномалия возможна, 0 — нет; по [уровень][сценарий] для pg и my
+  var R = {
+    pg: { ru: { dirty: 0, nonrep: 1, phantom: 1, lost: 1, skew: 1 }, rc: { dirty: 0, nonrep: 1, phantom: 1, lost: 1, skew: 1 }, rr: { dirty: 0, nonrep: 0, phantom: 0, lost: 0, skew: 1 }, ser: { dirty: 0, nonrep: 0, phantom: 0, lost: 0, skew: 0 } },
+    my: { ru: { dirty: 1, nonrep: 1, phantom: 1, lost: 1, skew: 1 }, rc: { dirty: 0, nonrep: 1, phantom: 1, lost: 1, skew: 1 }, rr: { dirty: 0, nonrep: 0, phantom: 0, lost: 1, skew: 1 }, ser: { dirty: 0, nonrep: 0, phantom: 0, lost: 0, skew: 0 } }
+  };
+  var N = {
+    dirty: ["T2 увидела бы баланс 0, которого никогда не существовало: T1 откатилась.", "T2 видит только закоммиченные данные."],
+    nonrep: ["Второе чтение в T1 вернёт 50: одна и та же строка дала разные значения внутри одной транзакции.", "T1 работает со снимком на начало транзакции и снова видит 100."],
+    phantom: ["Второй подсчёт вернёт 4: появилась строка-«фантом».", "Снимок (PostgreSQL) или блокировки промежутков (InnoDB) не дают появиться новой строке в выборке."],
+    lost: ["Оба записали 9, хотя продано две штуки: одно обновление потеряно.", "Вторая транзакция получит ошибку сериализации (PostgreSQL) или будет ждать и перечитает — обновление не теряется."],
+    skew: ["Обе транзакции закоммитились, на дежурстве никого. Каждая изменила СВОЮ строку, конфликта записей нет — снимок это не ловит.", "СУБД обнаружит зависимость чтения-записи между транзакциями и откатит одну из них (ошибка 40001) — приложение должно повторить."]
+  };
+  function run() {
+    var l = $("isoLvl").value, d = $("isoDb").value, c = $("isoCase").value, bad = R[d][l][c];
+    $("isoT1").textContent = T[c][0].join("\n"); $("isoT2").textContent = T[c][1].join("\n");
+    var extra = "";
+    if (d === "pg" && l === "ru") extra = " (PostgreSQL не реализует READ UNCOMMITTED: он ведёт себя как READ COMMITTED.)";
+    if (d === "my" && l === "rr" && c === "lost") extra = " В InnoDB REPEATABLE READ обычный SELECT читает снимок, а UPDATE — актуальные данные: потерянное обновление возможно. Нужен SELECT … FOR UPDATE или атомарный UPDATE.";
+    if (c === "skew" && bad) extra += " Защита: SERIALIZABLE, явная блокировка проверяемых строк (FOR UPDATE) или ограничение на уровне схемы.";
+    if (c === "lost" && bad) extra += " Защита на любом уровне: UPDATE … SET stock = stock - 1 WHERE stock >= 1, FOR UPDATE или версия строки.";
+    $("isoOut").className = "verdict " + (bad ? "bad" : "ok"); $("isoOut").textContent = (bad ? "Аномалия возможна. " + N[c][0] : "Аномалии нет. " + N[c][1]) + extra;
+  }
+  ["isoLvl", "isoDb", "isoCase"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>Стандарт SQL описывает уровни через запрещённые аномалии, но реализации различаются: «REPEATABLE READ» в PostgreSQL — это изоляция снимков (сильнее стандарта), в MySQL — снимок для чтений плюс блокировки промежутков. Проверяйте поведение своей СУБД, а не название уровня.</p>
+
+<h2 id="quiz"><span class="h-num">7.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что означает буква D в ACID?</p><ul><li>Распределённость</li><li>Детерминированность</li><li>Долговечность: подтверждённая транзакция переживёт сбой (запись в журнал на диске до ответа клиенту)</li><li>Декларативность</li></ul><div class="why">Механизм — журнал предзаписи (WAL) с fsync. Отключение fsync ускоряет запись ценой этой гарантии.</div></div>
+<div class="mcq" data-ok="1"><p>Какой уровень изоляции по умолчанию в PostgreSQL и что он допускает?</p><ul><li>SERIALIZABLE; ничего</li><li>READ COMMITTED; неповторяемое чтение, фантомы, потерянное обновление при read-modify-write в приложении</li><li>REPEATABLE READ; грязное чтение</li><li>READ UNCOMMITTED; всё</li></ul><div class="why">Каждый оператор видит данные, закоммиченные к его началу. Для инвариантов нужны явные блокировки или более строгий уровень.</div></div>
+<div class="mcq" data-ok="0"><p>Две транзакции блокируют строки A и B в разном порядке. Что сделает СУБД?</p><ul><li>Обнаружит взаимную блокировку и прервёт одну из транзакций ошибкой — приложение должно повторить</li><li>Будет ждать вечно</li><li>Выполнит обе</li><li>Перезапустится</li></ul><div class="why">Детектор deadlock срабатывает через lock/deadlock timeout. Профилактика — единый порядок блокировок.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Два запроса одновременно читают остаток товара (1 шт.) и оба оформляют заказ. Как называется аномалия и три способа её предотвратить?</summary><div class="a"><p>Потерянное обновление (lost update). Способы: пессимистичная блокировка (<code>SELECT … FOR UPDATE</code> перед проверкой остатка); оптимистичная (поле версии, повтор при конфликте); атомарное условное обновление (<code>UPDATE … SET stock = stock - 1 WHERE stock &gt;= 1</code> и проверка числа изменённых строк).</p></div></details>
+<details class="q"><summary>Почему на уровне Read Committed отчёт может показать сумму, которой никогда не существовало?</summary><div class="a"><p>Каждый запрос видит данные, зафиксированные на момент <i>своего</i> начала. Если отчёт читает счета несколькими запросами, а между ними прошёл перевод, один счёт будет прочитан до перевода, другой — после. Для согласованного отчёта нужен снимок на всю транзакцию — Repeatable Read (snapshot isolation).</p></div></details>
+<details class="q"><summary>Что такое MVCC и что он меняет в картине блокировок?</summary><div class="a"><p>Многоверсионное управление параллелизмом: изменения создают новые версии строк, читатели работают со снимком и не берут блокировок. Чтение и запись не мешают друг другу; блокируются только параллельные записи в одну строку. Цена — хранение старых версий и их очистка (VACUUM в PostgreSQL, undo-журнал в InnoDB), а также проблемы от долгих транзакций, которые не дают очистить старые версии.</p></div></details>
+<details class="q"><summary>Как гарантированно избежать взаимоблокировки при переводе между двумя счетами?</summary><div class="a"><p>Блокировать счета всегда в одном порядке, например по возрастанию идентификатора, независимо от направления перевода. Тогда встречные переводы A→B и B→A оба сначала захватят счёт с меньшим id, и цикл ожидания невозможен. Плюс короткая транзакция и повтор на случай, если взаимоблокировка всё же возникнет по другой причине.</p></div></details>
+<details class="q"><summary>Когда оптимистичная блокировка хуже пессимистичной?</summary><div class="a"><p>При высокой конкуренции за одни и те же строки (счётчик, остаток популярного товара, баланс активного счёта): большинство попыток заканчиваются конфликтом и повтором, работа выполняется впустую. И когда повтор дорог или невозможен — например, внутри уже выполнен вызов внешней системы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

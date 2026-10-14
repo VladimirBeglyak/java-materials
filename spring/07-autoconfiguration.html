@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Автоконфигурация и стартеры</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · SPRING BOOT</div>
+  <h1>Автоконфигурация и стартеры</h1>
+  <p class="lead">Добавили <code>spring-boot-starter-data-jpa</code> и строку <code>spring.datasource.url</code> — и в контексте появились <code>DataSource</code>, пул Hikari, <code>EntityManagerFactory</code>, менеджер транзакций и репозитории. Это не магия, а около полутора сотен обычных <code>@Configuration</code>-классов с условиями. Разберём, как Boot их находит, в каком порядке применяет и почему ваш бин всегда побеждает.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">@Conditional</span><span class="tag">AutoConfiguration.imports</span><span class="tag">свой стартер</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="idea"><span class="h-num">7.1</span>Идея: бины по умолчанию, которые уступают</h2>
+<p>Каждая автоконфигурация отвечает на два вопроса: <b>есть ли технология</b> (класс на classpath, свойство задано) и <b>не сделал ли пользователь это сам</b> (бина такого типа ещё нет). Если технология есть, а бина нет — создаётся разумный бин по умолчанию. Если вы объявили свой — автоконфигурация отступает (back off). Поэтому настройка Boot — это почти всегда либо свойство, либо свой бин.</p>
+
+<h2 id="mechanism"><span class="h-num">7.2</span>Механизм загрузки</h2>
+<div class="flow col">
+  <div class="node acc"><b>@EnableAutoConfiguration</b><small>@Import(AutoConfigurationImportSelector.class) — это DeferredImportSelector: срабатывает после разбора всей вашей конфигурации</small></div><span class="to">↓</span>
+  <div class="node"><b>ImportCandidates.load(AutoConfiguration.class)</b><small>читает все файлы META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports на classpath (с Boot 2.7; spring.factories для автоконфигурации не поддерживается с 3.0)</small></div><span class="to">↓</span>
+  <div class="node"><b>exclusions</b><small>@SpringBootApplication(exclude = …), excludeName, свойство spring.autoconfigure.exclude</small></div><span class="to">↓</span>
+  <div class="node warn"><b>AutoConfigurationImportFilter: быстрый фильтр</b><small>OnClassCondition, OnWebApplicationCondition, OnBeanCondition по предвычисленным метаданным META-INF/spring-autoconfigure-metadata.properties — без загрузки классов</small></div><span class="to">↓</span>
+  <div class="node"><b>AutoConfigurationSorter</b><small>сортировка: по алфавиту → @AutoConfigureOrder → @AutoConfiguration(before/after) — топологически</small></div><span class="to">↓</span>
+  <div class="node ok"><b>ConfigurationClassParser</b><small>каждый класс разбирается как обычная @Configuration: условия на классе и на каждом @Bean</small></div>
+</div>
+<p>Быстрый фильтр важен для скорости: из ~150 кандидатов большая часть отбрасывается по отсутствию классов, причём без загрузки самих классов автоконфигурации. Метаданные генерирует <code>spring-boot-autoconfigure-processor</code> при сборке Boot.</p>
+<div class="callout info"><span class="c-title">Spring Boot 4</span>
+Монолитный модуль <code>spring-boot-autoconfigure</code> разделён на модули по технологиям (<code>spring-boot-jdbc</code>, <code>spring-boot-webmvc</code>, <code>spring-boot-data-jpa</code>…), и автоконфигурации переехали в пакеты вида <code>org.springframework.boot.jdbc.autoconfigure</code>. Механизм, описанный здесь, не изменился.
+</div>
+
+<h2 id="conditions"><span class="h-num">7.3</span>Условия</h2>
+<div class="table-wrap"><table>
+<tr><th>Аннотация</th><th>Срабатывает, если</th></tr>
+<tr><td><code>@ConditionalOnClass</code> / <code>OnMissingClass</code></td><td>класс есть / нет на classpath</td></tr>
+<tr><td><code>@ConditionalOnBean</code> / <code>OnMissingBean</code></td><td>бин такого типа (имени, аннотации) уже зарегистрирован / не зарегистрирован</td></tr>
+<tr><td><code>@ConditionalOnSingleCandidate</code></td><td>ровно один бин типа или один <code>@Primary</code></td></tr>
+<tr><td><code>@ConditionalOnProperty</code></td><td>свойство задано; <code>havingValue</code> — равно значению; <code>matchIfMissing</code> — считать выполненным, если свойства нет</td></tr>
+<tr><td><code>@ConditionalOnBooleanProperty</code> (3.5+)</td><td>короткая форма для булевых свойств</td></tr>
+<tr><td><code>@ConditionalOnWebApplication(type = SERVLET)</code></td><td>тип приложения</td></tr>
+<tr><td><code>@ConditionalOnResource</code></td><td>ресурс существует (<code>classpath:logback.xml</code>)</td></tr>
+<tr><td><code>@ConditionalOnThreading(VIRTUAL)</code></td><td>включены виртуальные потоки</td></tr>
+<tr><td><code>@ConditionalOnExpression</code>, <code>OnJava</code>, <code>OnCloudPlatform</code></td><td>SpEL, версия Java, Kubernetes/Cloud Foundry</td></tr>
+</table></div>
+<p>Все они — мета-аннотации над <code>@Conditional(SomeCondition.class)</code>, где <code>Condition.matches(ConditionContext, AnnotatedTypeMetadata)</code> получает реестр, Environment, ClassLoader. Boot-условия наследуют <code>SpringBootCondition</code>, который записывает каждое решение в <code>ConditionEvaluationReport</code>.</p>
+<div class="callout warn"><span class="c-title">Почему @ConditionalOnClass(Foo.class) не падает, когда Foo нет</span>
+Аннотации классов конфигурации читаются из байткода через ASM (<code>AnnotationMetadata</code>), а не через рефлексию — ссылка на отсутствующий класс остаётся просто строкой. Но если условие стоит на <code>@Bean</code>-методе класса, который сам загружается рефлексией, ссылка на отсутствующий класс в сигнатуре даст <code>NoClassDefFoundError</code>. Поэтому Boot выносит такие бины во вложенные статические классы-конфигурации с условием на классе.
+</div>
+<div class="callout bad"><span class="c-title">@ConditionalOnMissingBean в своей конфигурации</span>
+Условие проверяет бины, зарегистрированные <b>к этому моменту</b>. В автоконфигурации это надёжно: она обрабатывается после пользовательской конфигурации. В обычных <code>@Configuration</code> порядок разбора не гарантирован — условие может «не увидеть» бин, объявленный в другом классе. Используйте эти условия только в автоконфигурациях.
+</div>
+
+<h2 id="example"><span class="h-num">7.4</span>Пример: как устроена DataSourceAutoConfiguration</h2>
+<pre data-title="Упрощённо, по исходникам Spring Boot 3.x (в Boot 4 — модуль spring-boot-jdbc, before = DataSourceInitializationAutoConfiguration)"><code class="java">@AutoConfiguration(before = SqlInitializationAutoConfiguration.class)
+@ConditionalOnClass({ DataSource.class, EmbeddedDatabaseType.class })   // spring-jdbc на classpath
+@ConditionalOnMissingBean(type = "io.r2dbc.spi.ConnectionFactory")
+@EnableConfigurationProperties(DataSourceProperties.class)              // spring.datasource.*
+public class DataSourceAutoConfiguration {
+
+    @Configuration(proxyBeanMethods = false)
+    @Conditional(EmbeddedDatabaseCondition.class)       // нет url, нет пула, есть H2/HSQL/Derby
+    @ConditionalOnMissingBean({ DataSource.class, XADataSource.class })
+    @Import(EmbeddedDataSourceConfiguration.class)
+    protected static class EmbeddedDatabaseConfiguration { }
+
+    @Configuration(proxyBeanMethods = false)
+    @Conditional(PooledDataSourceCondition.class)       // есть Hikari/Tomcat/DBCP2 или spring.datasource.type
+    @ConditionalOnMissingBean({ DataSource.class, XADataSource.class })
+    @Import({ DataSourceConfiguration.Hikari.class, DataSourceConfiguration.Tomcat.class,
+              DataSourceConfiguration.Dbcp2.class, DataSourceConfiguration.Generic.class })
+    protected static class PooledDataSourceConfiguration { }
+}
+
+// DataSourceConfiguration.Hikari:
+@ConditionalOnClass(HikariDataSource.class)
+@ConditionalOnProperty(name = "spring.datasource.type", havingValue = "com.zaxxer.hikari.HikariDataSource", matchIfMissing = true)
+static class Hikari {
+    @Bean @ConfigurationProperties("spring.datasource.hikari")   // spring.datasource.hikari.* → сеттеры пула
+    HikariDataSource dataSource(DataSourceProperties props, JdbcConnectionDetails details) { /* ... */ }
+}</code></pre>
+
+<div class="widget" id="ac">
+  <div class="widget-title">Симулятор отчёта условий: JDBC и JPA</div>
+  <p class="hint">Отметьте, что есть в проекте. Ниже — фрагмент отчёта, который печатает <code>--debug</code>, и итоговые бины.</p>
+  <div class="checks">
+    <label><input type="checkbox" id="acJdbc" checked>spring-boot-starter-jdbc (spring-jdbc + HikariCP)</label>
+    <label><input type="checkbox" id="acJpa">spring-boot-starter-data-jpa (Hibernate)</label>
+    <label><input type="checkbox" id="acH2" checked>H2 на classpath</label>
+    <label><input type="checkbox" id="acUrl">spring.datasource.url задан</label>
+    <label><input type="checkbox" id="acMine">свой @Bean DataSource</label>
+    <label><input type="checkbox" id="acTx">свой @Bean PlatformTransactionManager</label>
+    <label><input type="checkbox" id="acEx">exclude = DataSourceAutoConfiguration</label>
+  </div>
+  <div class="log" id="acLog" style="max-height:320px"></div>
+  <div class="verdict" id="acOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var jpa = $("acJpa").checked, jdbc = $("acJdbc").checked || jpa, h2 = $("acH2").checked, url = $("acUrl").checked,
+        mine = $("acMine").checked, tx = $("acTx").checked, ex = $("acEx").checked;
+    if (jpa && !$("acJdbc").checked) $("acJdbc").checked = true;
+    var P = [], N = [], E = [], beans = [], fail = null, ds = false;
+    if (ex) E.push("DataSourceAutoConfiguration (spring.autoconfigure.exclude)");
+    if (!jdbc) N.push("DataSourceAutoConfiguration:\n      Did not match: @ConditionalOnClass did not find required class 'org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType'");
+    else if (!ex) {
+      P.push("DataSourceAutoConfiguration matched:\n      - @ConditionalOnClass found required classes 'javax.sql.DataSource', 'EmbeddedDatabaseType'");
+      if (mine) {
+        N.push("DataSourceAutoConfiguration.PooledDataSourceConfiguration:\n      Did not match: @ConditionalOnMissingBean (types: DataSource,XADataSource) found beans of type 'javax.sql.DataSource' dataSource");
+        beans.push("dataSource — ваш бин"); ds = true;
+      } else {
+        P.push("DataSourceAutoConfiguration.PooledDataSourceConfiguration matched:\n      - AnyNestedCondition 1 matched: supported DataSource pool type found (HikariDataSource)\n      - @ConditionalOnMissingBean (types: DataSource) did not find any beans");
+        P.push("DataSourceConfiguration.Hikari matched:\n      - @ConditionalOnClass found required class 'com.zaxxer.hikari.HikariDataSource'\n      - @ConditionalOnProperty (spring.datasource.type=com.zaxxer.hikari.HikariDataSource) matched");
+        N.push("DataSourceAutoConfiguration.EmbeddedDatabaseConfiguration:\n      Did not match: EmbeddedDataSource found supported pooled data source");
+        if (url) { beans.push("dataSource — HikariDataSource → spring.datasource.url"); ds = true; }
+        else if (h2) { beans.push("dataSource — HikariDataSource → jdbc:h2:mem:<uuid> (URL выведен из встроенной БД)"); ds = true; }
+        else fail = "Failed to configure a DataSource: 'url' attribute is not specified and no embedded datasource could be configured.\n\nReason: Failed to determine a suitable driver class\n\nAction: If you want an embedded database (H2, HSQL or Derby), please put it on the classpath. If you have database settings to be loaded from a particular profile you may need to activate it.";
+      }
+    } else if (mine) { beans.push("dataSource — ваш бин"); ds = true; }
+    if (jdbc && !fail) {
+      if (ds) { P.push("JdbcTemplateAutoConfiguration matched:\n      - @ConditionalOnSingleCandidate (types: DataSource) found a single bean"); beans.push("jdbcTemplate, namedParameterJdbcTemplate"); }
+      else N.push("JdbcTemplateAutoConfiguration:\n      Did not match: @ConditionalOnSingleCandidate (types: DataSource) did not find any beans");
+      if (jpa) {
+        if (ds) {
+          P.push("HibernateJpaAutoConfiguration matched:\n      - @ConditionalOnClass found required classes 'LocalContainerEntityManagerFactoryBean', 'EntityManager', 'SessionImplementor'");
+          beans.push("entityManagerFactory (LocalContainerEntityManagerFactoryBean)");
+          if (tx) N.push("JpaBaseConfiguration#transactionManager:\n      Did not match: @ConditionalOnMissingBean (types: TransactionManager) found beans 'transactionManager'");
+          else { P.push("JpaBaseConfiguration#transactionManager matched:\n      - @ConditionalOnMissingBean (types: TransactionManager) did not find any beans"); beans.push("transactionManager — JpaTransactionManager"); }
+          N.push("DataSourceTransactionManagerAutoConfiguration.JdbcTransactionManagerConfiguration#transactionManager:\n      Did not match: @ConditionalOnMissingBean (types: TransactionManager) found beans 'transactionManager'  ← JPA-конфигурация отработала раньше (before)");
+          beans.push("JPA-репозитории (JpaRepositoriesAutoConfiguration)");
+        } else N.push("HibernateJpaAutoConfiguration:\n      Did not match: @ConditionalOnSingleCandidate (types: DataSource) did not find any beans");
+      } else if (ds) {
+        if (tx) N.push("DataSourceTransactionManagerAutoConfiguration…#transactionManager:\n      Did not match: @ConditionalOnMissingBean (types: TransactionManager) found beans 'transactionManager'");
+        else { P.push("DataSourceTransactionManagerAutoConfiguration matched:\n      - @ConditionalOnSingleCandidate (types: DataSource) found a single bean"); beans.push("transactionManager — JdbcTransactionManager"); }
+      }
+    }
+    if (tx) beans.push("transactionManager — ваш бин");
+    var t = "============================\nCONDITIONS EVALUATION REPORT\n============================\n\nPositive matches:\n-----------------\n   " + (P.join("\n\n   ") || "(нет)") +
+      "\n\nNegative matches:\n-----------------\n   " + (N.join("\n\n   ") || "(нет)") + "\n\nExclusions:\n-----------\n   " + (E.join("\n   ") || "None");
+    $("acLog").textContent = t;
+    var o = $("acOut");
+    if (fail) { o.className = "verdict bad"; o.innerHTML = "<b>APPLICATION FAILED TO START</b><br>" + SG.esc(fail).replace(/\n/g, "<br>"); }
+    else { o.className = "verdict " + (ds || !jdbc ? "ok" : "warn"); o.innerHTML = "<b>Бины в контексте:</b> " + (beans.length ? SG.esc(beans.join(" · ")) : "ничего связанного с БД") + (jpa && !ds ? "<br>Репозиториям нужен EntityManagerFactory — приложение упадёт при их создании." : ""); }
+  }
+  ["acJdbc", "acJpa", "acH2", "acUrl", "acMine", "acTx", "acEx"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) Снимите H2 — классическая ошибка «Failed to configure a DataSource». (2) Добавьте JPA — менеджер транзакций станет <code>JpaTransactionManager</code>, а JDBC-вариант отступит. (3) Свой <code>DataSource</code> при включённом exclude.</p>
+
+<h2 id="debug"><span class="h-num">7.5</span>Диагностика</h2>
+<div class="grid-2">
+  <div class="card"><h4>Отчёт условий</h4><p><code>java -jar app.jar --debug</code> или <code>debug=true</code> — отчёт при старте: Positive matches, Negative matches с причиной, Exclusions, Unconditional classes. При ошибке старта отчёт печатается автоматически, если включён DEBUG для <code>ConditionEvaluationReportLogger</code>.</p></div>
+  <div class="card"><h4>Actuator</h4><p><code>/actuator/conditions</code> — тот же отчёт в JSON в работающем приложении. <code>/actuator/beans</code> — все бины с зависимостями. <code>/actuator/configprops</code> — значения <code>@ConfigurationProperties</code>.</p></div>
+</div>
+<p>Порядок действий, когда «бин не создаётся» или «создаётся не тот»: найти автоконфигурацию в отчёте → прочитать причину Negative match → проверить classpath (<code>./gradlew dependencies</code>, <code>mvn dependency:tree</code>) и свойства (<code>/actuator/env</code>).</p>
+
+<h2 id="starter"><span class="h-num">7.6</span>Свой стартер</h2>
+<p>Свой стартер нужен, когда несколько сервисов компании подключают одну и ту же инфраструктуру: клиент внутреннего API, аудит, единую настройку трассировки. Классическая структура — два модуля:</p>
+<div class="grid-2">
+  <div class="card"><h4>acme-audit-spring-boot-autoconfigure</h4><p>Классы <code>@AutoConfiguration</code>, <code>@ConfigurationProperties</code>, файл imports. Зависимости на сам аудит — <code>optional</code>.</p></div>
+  <div class="card"><h4>acme-audit-spring-boot-starter</h4><p>Пустой модуль, только зависимости: autoconfigure + сама библиотека. Его подключают сервисы.</p></div>
+</div>
+<pre data-title="AuditAutoConfiguration.java"><code class="java">@AutoConfiguration(after = JacksonAutoConfiguration.class)
+@ConditionalOnClass(AuditClient.class)
+@ConditionalOnBooleanProperty(name = "acme.audit.enabled", matchIfMissing = true)
+@EnableConfigurationProperties(AuditProperties.class)
+public class AuditAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean                         // пользователь может подменить
+    AuditClient auditClient(AuditProperties props, ObjectMapper mapper) {   // Boot 4: tools.jackson.databind.ObjectMapper (Jackson 3)
+        return new AuditClient(props.endpoint(), props.timeout(), mapper);
+    }
+}
+
+@ConfigurationProperties("acme.audit")
+public record AuditProperties(URI endpoint, @DefaultValue("2s") Duration timeout, boolean enabled) { }</code></pre>
+<pre data-title="src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports"><code class="txt">com.acme.audit.autoconfigure.AuditAutoConfiguration</code></pre>
+<pre data-title="Тест автоконфигурации без запуска всего приложения"><code class="java">class AuditAutoConfigurationTest {
+    private final ApplicationContextRunner runner = new ApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(AuditAutoConfiguration.class, JacksonAutoConfiguration.class))
+            .withPropertyValues("acme.audit.endpoint=http://audit");
+
+    @Test void createsClientByDefault() {
+        runner.run(ctx -&gt; assertThat(ctx).hasSingleBean(AuditClient.class));
+    }
+    @Test void backsOffWhenUserDefinesClient() {
+        runner.withBean("myClient", AuditClient.class, () -&gt; mock(AuditClient.class))
+              .run(ctx -&gt; assertThat(ctx).getBean(AuditClient.class).isSameAs(ctx.getBean("myClient")));
+    }
+    @Test void disabledByProperty() {
+        runner.withPropertyValues("acme.audit.enabled=false")
+              .run(ctx -&gt; assertThat(ctx).doesNotHaveBean(AuditClient.class));
+    }
+}</code></pre>
+<div class="callout ok">Добавьте <code>spring-boot-configuration-processor</code> (annotationProcessor) — он сгенерирует <code>META-INF/spring-configuration-metadata.json</code>, и IDE будет подсказывать <code>acme.audit.*</code> в application.yml с описаниями из Javadoc.</div>
+
+<h2 id="quiz"><span class="h-num">7.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему ваш @Bean DataSource побеждает DataSourceAutoConfiguration, хотя обе конфигурации — обычные @Configuration?</p><ul><li>Ваши бины имеют @Primary по умолчанию</li><li>AutoConfigurationImportSelector — DeferredImportSelector, автоконфигурации разбираются после пользовательских, и @ConditionalOnMissingBean видит ваш бин</li><li>Boot сравнивает имена пакетов</li><li>Автоконфигурация создаёт бин, но потом удаляет его</li></ul><div class="why">Порядок регистрации описаний гарантирован отложенным импортом. Условие OnMissingBean проверяется в фазе REGISTER_BEAN, когда ваше описание уже в реестре.</div></div>
+<div class="mcq" data-ok="3"><p>Где Spring Boot 3+ ищет список автоконфигураций?</p><ul><li>META-INF/spring.factories, ключ EnableAutoConfiguration</li><li>В application.yml, свойство spring.autoconfigure.include</li><li>Сканирует пакет org.springframework.boot</li><li>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</li></ul><div class="why">Формат imports появился в 2.7, а поддержка spring.factories для автоконфигураций удалена в 3.0. spring.factories по-прежнему используется для слушателей, инициализаторов, EnvironmentPostProcessor, FailureAnalyzer.</div></div>
+<div class="mcq" data-ok="0"><p>Чем быстрый фильтр AutoConfigurationImportFilter отличается от обычной проверки условий?</p><ul><li>Работает по предвычисленным метаданным, не загружая классы автоконфигураций</li><li>Проверяет только свойства</li><li>Выполняется в отдельном потоке</li><li>Ничем, это одно и то же</li></ul><div class="why">spring-autoconfigure-metadata.properties содержит для каждой автоконфигурации её ConditionalOnClass и т.п. — большинство кандидатов отбрасывается без загрузки классов.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как работает автоконфигурация Spring Boot? Расскажите от аннотации до бина.</summary><div class="a"><p>@SpringBootApplication содержит @EnableAutoConfiguration → @Import(AutoConfigurationImportSelector). Это DeferredImportSelector: после разбора пользовательской конфигурации он загружает кандидатов из AutoConfiguration.imports, убирает исключения, отфильтровывает по метаданным (OnClass/OnBean/OnWebApplication), сортирует по before/after/order. ConfigurationClassParser разбирает каждую как @Configuration, условия @Conditional* проверяются на классе и @Bean-методах; прошедшие регистрируют BeanDefinition. Бины создаются как обычно на шаге 11 refresh().</p></div></details>
+<details class="q"><summary>Как отключить автоконфигурацию и как переопределить один её бин?</summary><div class="a"><p>Отключить целиком: <code>@SpringBootApplication(exclude = X.class)</code> или <code>spring.autoconfigure.exclude</code>. Переопределить бин: объявить свой бин нужного типа — сработает @ConditionalOnMissingBean. Часто достаточно свойства или бина-кастомайзера (<code>JsonMapperBuilderCustomizer</code> для Jackson 3 в Boot 4, в Boot 3 — <code>Jackson2ObjectMapperBuilderCustomizer</code>; <code>WebServerFactoryCustomizer</code>, <code>RestClientCustomizer</code>), которые донастраивают бин по умолчанию.</p></div></details>
+<details class="q"><summary>Как протестировать свою автоконфигурацию?</summary><div class="a"><p>ApplicationContextRunner (WebApplicationContextRunner для веба): поднимает минимальный контекст с указанными автоконфигурациями, свойствами и бинами; AssertJ-утверждения hasSingleBean, doesNotHaveBean, hasFailed. Плюс FilteredClassLoader — имитация отсутствия класса на classpath для проверки @ConditionalOnClass.</p></div></details>
+<details class="q"><summary>Почему автоконфигурации используют proxyBeanMethods = false?</summary><div class="a"><p>Без CGLIB-подкласса быстрее старт и меньше памяти, проще AOT/native image. Межбиновые зависимости передаются параметрами @Bean-методов, поэтому перехват вызовов не нужен.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

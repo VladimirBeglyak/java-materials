@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Spliterator и параллельный обход</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.sp { margin: 10px 0; }
+.sp .lv { display: flex; gap: 3px; margin-bottom: 3px; }
+.sp .lv span { font: 11px var(--font-mono); text-align: center; padding: 6px 0; border-radius: 4px; border: 1.5px solid var(--line); background: var(--bg-sunk); overflow: hidden; white-space: nowrap; }
+.sp .lv span.leaf { background: var(--ok-soft); border-color: var(--ok); }
+.sp .lv span.big { background: var(--warn-soft); border-color: var(--warn); }
+</style>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ИТЕРАЦИЯ И СТРИМЫ</div>
+  <h1>Spliterator и параллельный обход</h1>
+  <p class="lead">Iterator умеет только «дай следующий». Spliterator (split + iterator, Java 8) умеет ещё и <b>разделиться</b> на две части для параллельной обработки, сообщить свой размер и свойства — на нём построены все стримы. Симулятор покажет, как по-разному делятся ArrayList, LinkedList и HashSet и почему <code>linkedList.parallelStream()</code> почти бесполезен. В конце — свой Spliterator.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">tryAdvance</span><span class="tag">trySplit</span><span class="tag">характеристики</span><span class="tag">late-binding</span><span class="tag">параллельные стримы</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="api"><span class="h-num">16.1</span>Интерфейс</h2>
+<pre data-title="java.util.Spliterator"><code class="java">public interface Spliterator&lt;T&gt; {
+    boolean tryAdvance(Consumer&lt;? super T&gt; action);   // обработать один элемент, если есть (hasNext + next в одном вызове)
+    default void forEachRemaining(Consumer&lt;? super T&gt; action) { do { } while (tryAdvance(action)); }
+    Spliterator&lt;T&gt; trySplit();      // отдать «префикс» элементов новому сплитератору, себе оставить остаток; null — не делится
+    long estimateSize();            // сколько осталось (точно, если SIZED)
+    int characteristics();          // битовая маска свойств
+    int ORDERED = 0x10, DISTINCT = 0x1, SORTED = 0x4, SIZED = 0x40, NONNULL = 0x100,
+        IMMUTABLE = 0x400, CONCURRENT = 0x1000, SUBSIZED = 0x4000;
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Характеристика</th><th>Что даёт стриму</th></tr>
+<tr><td><code>SIZED</code> / <code>SUBSIZED</code></td><td>размер известен (и у частей после split) — <code>toArray</code> выделит массив точно, <code>count()</code> может не обходить элементы (Java 9+)</td></tr>
+<tr><td><code>ORDERED</code></td><td>порядок встречи важен: <code>findFirst</code>, <code>limit</code>, <code>forEachOrdered</code> обязаны его соблюдать — дороже в параллели</td></tr>
+<tr><td><code>DISTINCT</code></td><td><code>distinct()</code> становится пустой операцией (у Set)</td></tr>
+<tr><td><code>SORTED</code></td><td><code>sorted()</code> с тем же порядком пропускается (у TreeSet)</td></tr>
+<tr><td><code>IMMUTABLE</code> / <code>CONCURRENT</code></td><td>источник не изменится / может изменяться безопасно — без проверок fail-fast</td></tr>
+</table></div>
+
+<h2 id="split"><span class="h-num">16.2</span>Как делятся разные коллекции</h2>
+<div class="widget" id="spW">
+  <div class="widget-title">Дерево trySplit для параллельного стрима</div>
+  <div class="controls">
+    <label>источник<select id="spS"><option value="array">ArrayList / массив</option><option value="linked">LinkedList</option><option value="hash">HashSet (таблица с пустыми корзинами)</option><option value="iter">Stream.iterate / Iterator неизвестного размера</option></select></label>
+    <label>элементов<input type="number" id="spN" value="10000" min="16"></label>
+    <label>потоков (ForkJoinPool)<select id="spP"><option>4</option><option selected>8</option><option>16</option></select></label>
+  </div>
+  <div class="sp" id="spTree"></div>
+  <div class="verdict" id="spV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("spS").value, n = Math.max(16, +$("spN").value), p = +$("spP").value, target = Math.max(1, Math.ceil(n / (p * 4))), levels = [[{ size: n, kind: s === "linked" || s === "iter" ? "linked" : s, batch: 0 }]], leaves = [];
+    // как AbstractTask: делим, пока estimateSize > n / (4 × parallelism)
+    function split(pt) {
+      if (pt.size <= target || pt.size < 2) return null;
+      if (pt.kind === "array") { var h = pt.size >>> 1; return [{ size: h, kind: "array" }, { size: pt.size - h, kind: "array" }]; }
+      if (pt.kind === "hash") { var r = 0.3 + Math.random() * 0.4, x = Math.max(1, Math.round(pt.size * r)); return [{ size: x, kind: "hash" }, { size: pt.size - x, kind: "hash" }]; }
+      var bsz = Math.min(pt.size, (pt.batch + 1) * 1024);      // партия 1024, 2048, 3072… копируется в массив
+      var out = [{ size: bsz, kind: "array" }];
+      if (pt.size - bsz > 0) out.push({ size: pt.size - bsz, kind: "linked", batch: pt.batch + 1 });
+      return out;
+    }
+    var cur = levels[0];
+    for (var depth = 0; depth < 80; depth++) {
+      var next = [], any = false;
+      cur.forEach(function (pt) { var r = pt.leaf ? null : split(pt); if (r) { any = true; next.push.apply(next, r); } else { pt.leaf = true; next.push(pt); } });
+      if (!any) break; levels.push(next); cur = next;
+    }
+    leaves = cur;
+    var maxL = Math.max.apply(null, leaves.map(function (l) { return l.size; })), minL = Math.min.apply(null, leaves.map(function (l) { return l.size; }));
+    var shown = levels.length <= 7 ? levels : levels.slice(0, 6).concat([levels[levels.length - 1]]);
+    $("spTree").innerHTML = shown.map(function (lv, d) { return '<div class="lv">' + lv.map(function (pt) { var big = d === shown.length - 1 && pt.size > maxL * 0.6 && maxL > minL * 4; return '<span class="' + (d === shown.length - 1 ? (big ? "big" : "leaf") : "") + '" style="flex:' + pt.size + '" title="' + pt.size + '">' + (pt.size >= n / 40 ? pt.size : "") + "</span>"; }).join("") + "</div>"; }).join("");
+    var v = $("spV");
+    if (s === "array") { v.className = "verdict ok"; v.textContent = "ArrayList делится точно пополам за O(1) (меняются только индексы), части SIZED и SUBSIZED. " + leaves.length + " равных частей по ~" + minL + " — идеальная загрузка " + p + " потоков. Лучший источник для parallel()."; }
+    else if (s === "hash") { v.className = "verdict ok"; v.textContent = "HashSet/HashMap делят диапазон корзин таблицы пополам: части неравны по числу элементов (пустые корзины), размер — оценка (не SUBSIZED). Параллелится неплохо."; }
+    else { v.className = "verdict warn"; v.textContent = "Узлы списка нельзя разделить без обхода: trySplit последовательно вычитывает партии 1024, 2048, 3072… в массив (дальше массив делится хорошо), а остаток снова делится тем же способом — цепочка глубиной " + (levels.length - 1) + " уровней. Для " + n + " элементов: " + leaves.length + " частей от " + minL + " до " + maxL + ". Узкое место — последовательное копирование узлов в одном потоке перед каждой раздачей работы. Вывод: LinkedList.parallelStream() редко быстрее последовательного; собирайте данные в ArrayList."; }
+  }
+  ["spS", "spN", "spP"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="late"><span class="h-num">16.3</span>Late-binding и fail-fast</h2>
+<p>Сплитераторы коллекций JDK — <b>late-binding</b>: привязываются к состоянию источника не при создании, а при первом обходе/делении/запросе размера. Поэтому можно создать стрим, затем изменить список и только потом запустить терминальную операцию — изменения будут учтены. Изменение <b>во время</b> обхода приводит к <code>ConcurrentModificationException</code> по завершении (сплитератор проверяет <code>modCount</code> в конце <code>forEachRemaining</code>, а не на каждом элементе — ради скорости).</p>
+<pre data-title="late-binding"><code class="java">List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("a", "b"));
+Stream&lt;String&gt; s = list.stream();     // сплитератор ещё не привязан
+list.add("c");                         // изменение ДО терминальной операции — допустимо
+s.forEach(System.out::print);          // abc
+
+list.stream().forEach(x -&gt; list.add("z"));   // изменение ВО ВРЕМЯ — ConcurrentModificationException</code></pre>
+
+<h2 id="custom"><span class="h-num">16.4</span>Свой Spliterator</h2>
+<pre data-title="диапазон чисел, хорошо делящийся для parallel()"><code class="java">final class RangeSpliterator implements Spliterator.OfLong {
+    private long from; private final long to;               // [from, to)
+    RangeSpliterator(long from, long to) { this.from = from; this.to = to; }
+    @Override public boolean tryAdvance(LongConsumer action) {
+        if (from &gt;= to) return false;
+        action.accept(from++); return true;
+    }
+    @Override public Spliterator.OfLong trySplit() {
+        long mid = (from + to) &gt;&gt;&gt; 1;
+        if (mid &lt;= from + 1024) return null;                // мелкие части не делим: накладные расходы выше выгоды
+        RangeSpliterator prefix = new RangeSpliterator(from, mid);
+        from = mid;                                          // себе — суффикс
+        return prefix;
+    }
+    @Override public long estimateSize() { return to - from; }
+    @Override public int characteristics() { return ORDERED | SIZED | SUBSIZED | IMMUTABLE | NONNULL | DISTINCT | SORTED; }
+    @Override public Comparator&lt;? super Long&gt; getComparator() { return null; }   // SORTED в естественном порядке
+}
+LongStream s = StreamSupport.longStream(new RangeSpliterator(0, 1_000_000_000), true);   // parallel</code></pre>
+<p>Чаще не нужно писать сплитератор вручную: <code>Spliterators.spliterator(array, characteristics)</code>, <code>Spliterators.spliteratorUnknownSize(iterator, ORDERED)</code> для своего итератора, <code>Iterable.spliterator()</code> по умолчанию.</p>
+
+<h2 id="quiz"><span class="h-num">16.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что возвращает trySplit()?</p><ul><li>Две новые половины</li><li>Новый сплитератор с префиксом элементов, а текущий остаётся с остатком; null, если делиться нецелесообразно</li><li>Количество частей</li><li>Копию сплитератора</li></ul><div class="why">Так ForkJoin рекурсивно раздаёт работу.</div></div>
+<div class="mcq" data-ok="2"><p>Почему parallelStream() по LinkedList обычно неэффективен?</p><ul><li>LinkedList не поддерживает стримы</li><li>Он синхронизирован</li><li>Список нельзя разделить без последовательного обхода: части формируются партиями в массивы, несбалансированно и с копированием</li><li>Параллельные стримы запрещены для списков</li></ul><div class="why">ArrayList и массивы делятся пополам за O(1).</div></div>
+<div class="mcq" data-ok="0"><p>Что значит характеристика SIZED?</p><ul><li>Точное число оставшихся элементов известно без обхода</li><li>Элементы отсортированы</li><li>Коллекция неизменяемая</li><li>Нет null-элементов</li></ul><div class="why">SUBSIZED — то же верно и для частей после trySplit.</div></div>
+<div class="mcq" data-ok="3"><p>Список изменили между вызовом list.stream() и forEach. Что будет?</p><ul><li>ConcurrentModificationException</li><li>Стрим обойдёт старое содержимое</li><li>IllegalStateException</li><li>Изменения учтутся: сплитератор late-binding привязывается при начале обхода</li></ul><div class="why">Изменение во время обхода — CME.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем Spliterator отличается от Iterator, кроме деления?</summary><div class="a"><p>tryAdvance объединяет hasNext и next в один вызов (меньше вызовов и проверок, проще реализация для источников, где «есть ли следующий» дорого узнать); forEachRemaining позволяет обойти всё в плотном цикле без проверок на каждом элементе; estimateSize и характеристики дают стриму информацию для оптимизаций (точный размер массива, пропуск distinct/sorted, отказ от учёта порядка).</p></div></details>
+<details class="q"><summary>Когда parallelStream ускоряет работу?</summary><div class="a"><p>Когда данных много (обычно от десятков–сотен тысяч элементов), источник хорошо делится (массивы, ArrayList, IntStream.range, HashMap), операции на элемент дорогие и независимые, нет блокирующего I/O и общего изменяемого состояния, а терминальная операция хорошо комбинируется (sum, reduce, collect с конкурентными коллекторами). Учитывайте, что общий ForkJoinPool разделяется со всем приложением. Подробнее — в пособии по конкурентности.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

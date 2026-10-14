@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Загрузка классов, рефлексия, JIT</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ПЛАТФОРМА ИЗНУТРИ</div>
+  <h1>Загрузка классов, рефлексия, JIT</h1>
+  <p class="lead">Spring создаёт бины по аннотациям, Hibernate подменяет объекты прокси, а <code>@Transactional</code> «не работает» при вызове из того же класса. За всей этой «магией» стоят три механизма JVM: динамическая загрузка классов, рефлексия и генерация кода на лету. Глава объясняет их — и то, как JIT превращает байткод в быстрый машинный код.</p>
+  <div class="meta"><span class="tag">~3,5 часа</span><span class="tag">ClassLoader</span><span class="tag">reflection</span><span class="tag">proxy</span><span class="tag">JIT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="lifecycle"><span class="h-num">15.1</span>Жизненный цикл класса</h2>
+<div class="table-wrap"><table>
+<tr><th>Этап</th><th>Что происходит</th></tr>
+<tr><td><b>Загрузка</b></td><td>Загрузчик находит байты класса (в JAR, каталоге, сети, сгенерированные в памяти) и создаёт объект <code>Class</code></td></tr>
+<tr><td><b>Связывание: проверка</b></td><td>Верификатор убеждается, что байткод корректен и безопасен: типы на стеке совпадают, нет переходов за границы метода</td></tr>
+<tr><td><b>Связывание: подготовка</b></td><td>Выделяется память под статические поля, они получают значения по умолчанию</td></tr>
+<tr><td><b>Связывание: разрешение</b></td><td>Символьные ссылки на другие классы и методы заменяются прямыми — обычно лениво, при первом использовании</td></tr>
+<tr><td><b>Инициализация</b></td><td>Выполняются статические инициализаторы и присваивания статическим полям — в порядке записи в коде</td></tr>
+</table></div>
+<p>Классы загружаются и инициализируются <b>лениво</b> — при первом реальном обращении. Инициализацию запускают: создание экземпляра, вызов статического метода, чтение или запись статического поля, инициализация наследника, <code>Class.forName(name)</code>.</p>
+<pre data-title="что не запускает инициализацию"><code class="java">class Config {
+    static final int MAX = 100;                 // константа времени компиляции
+    static final Instant STARTED = Instant.now();
+    static { System.out.println("Config инициализирован"); }
+}
+
+int a = Config.MAX;            // ничего не напечатает: значение 100 подставлено компилятором в вызывающий класс
+Class&lt;?&gt; c = Config.class;     // ничего не напечатает: загрузка без инициализации
+Instant t = Config.STARTED;    // «Config инициализирован»</code></pre>
+<div class="callout ok"><span class="c-title">Инициализация потокобезопасна — и это используют</span>
+JVM гарантирует, что статическая инициализация класса выполняется ровно один раз, даже если к нему одновременно обратились несколько потоков. На этом построен самый простой корректный «ленивый синглтон» — без <code>synchronized</code> и <code>volatile</code>:
+<pre><code class="java">class Registry {
+    private Registry() { }
+    private static class Holder { static final Registry INSTANCE = new Registry(); }
+    static Registry get() { return Holder.INSTANCE; }      // Holder загрузится при первом вызове get()
+}</code></pre>
+Обратная сторона: исключение в статическом инициализаторе делает класс навсегда непригодным (<a href="06-exceptions.html#errors">тема 06</a>), а взаимная зависимость статических инициализаторов двух классов в разных потоках даёт взаимоблокировку.
+</div>
+
+<h2 id="loaders"><span class="h-num">15.2</span>Загрузчики классов</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 250" role="img" aria-label="Иерархия загрузчиков классов и делегирование родителю">
+  <defs><marker id="l1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <rect x="180" y="16" width="300" height="56" rx="9" class="box-bad"/><text x="330" y="40" text-anchor="middle" font-weight="700" font-size="13">Bootstrap</text><text x="330" y="58" text-anchor="middle" font-size="11.5">ядро JDK: java.lang, java.util, java.io …</text>
+  <rect x="180" y="98" width="300" height="56" rx="9" class="box-warn"/><text x="330" y="122" text-anchor="middle" font-weight="700" font-size="13">Platform</text><text x="330" y="140" text-anchor="middle" font-size="11.5">остальные модули JDK: java.sql, java.xml …</text>
+  <rect x="180" y="180" width="300" height="56" rx="9" class="box-ok"/><text x="330" y="204" text-anchor="middle" font-weight="700" font-size="13">Application</text><text x="330" y="222" text-anchor="middle" font-size="11.5">classpath: ваш код и библиотеки</text>
+  <path d="M250 180 V158" class="ln-acc" marker-end="url(#l1)"/><path d="M250 98 V76" class="ln-acc" marker-end="url(#l1)"/>
+  <path d="M410 72 V94" class="ln" /><path d="M410 154 V176" class="ln"/>
+  <text x="500" y="112" font-size="12.5" font-weight="700">Делегирование родителю</text>
+  <text x="500" y="134" font-size="12.5">1. Сначала спросить родителя ↑</text>
+  <text x="500" y="154" font-size="12.5">2. Родитель не нашёл — искать самому ↓</text>
+  <text x="500" y="180" font-size="12.5" class="muted">Поэтому нельзя подменить java.lang.String</text>
+  <text x="500" y="198" font-size="12.5" class="muted">своим классом из classpath</text>
+  <text x="20" y="212" font-size="12.5" class="muted">ниже — свои</text><text x="20" y="230" font-size="12.5" class="muted">загрузчики</text>
+</svg>
+</figure>
+<div class="callout info"><span class="c-title">Класс определяется парой «полное имя + загрузчик»</span>
+Один и тот же файл <code>.class</code>, загруженный двумя разными загрузчиками, — это два <b>разных</b> класса с разными статическими полями. Отсюда загадочная ошибка <code>ClassCastException: com.shop.Order cannot be cast to com.shop.Order</code>: слева и справа классы с одним именем, но от разных загрузчиков.
+</div>
+<p><b>Собственные загрузчики</b> создают ради изоляции и динамики: сервер приложений даёт каждому приложению свой загрузчик (разные версии одной библиотеки не конфликтуют); Spring Boot читает классы из вложенных JAR внутри «толстого» архива; системы плагинов и горячая перезагрузка в инструментах разработки выбрасывают старый загрузчик вместе со всеми его классами.</p>
+<ul>
+  <li><b><code>Class.forName(name)</code></b> загружает <i>и инициализирует</i> класс; <code>loader.loadClass(name)</code> — только загружает.</li>
+  <li><b>Класс выгружается</b> только вместе со своим загрузчиком, когда ни на загрузчик, ни на один его класс, ни на один объект этих классов не осталось ссылок. Одна забытая ссылка (в статическом поле, <code>ThreadLocal</code>, зарегистрированном драйвере) удерживает всё — так возникает утечка Metaspace при переразвёртывании.</li>
+  <li><b>Контекстный загрузчик потока</b> (<code>Thread.getContextClassLoader()</code>) нужен, когда код из ядра JDK должен найти реализацию из приложения: драйверы JDBC, <code>ServiceLoader</code>.</li>
+</ul>
+<h3>Модули</h3>
+<p>С Java 9 JDK разбит на модули, а модуль явно объявляет, какие пакеты он экспортирует (<code>module-info.java</code>: <code>exports</code>, <code>requires</code>, <code>opens</code>). Большинство приложений по-прежнему живут на classpath — в «безымянном модуле», которому видно всё экспортированное. На практике модульность проявляется одним образом: с Java 17 внутренности JDK закрыты для рефлексии, и старая библиотека падает с <code>InaccessibleObjectException</code>. Временное решение — флаг <code>--add-opens java.base/java.lang=ALL-UNNAMED</code>, правильное — обновить библиотеку.</p>
+
+<h2 id="reflection"><span class="h-num">15.3</span>Рефлексия</h2>
+<p>Рефлексия — возможность программы во время выполнения исследовать классы и работать с ними по именам: узнать поля и методы, создать объект, вызвать метод, прочитать приватное поле.</p>
+<pre><code class="java">Class&lt;?&gt; type = Class.forName("com.shop.Order");            // или Order.class, или order.getClass()
+
+for (Field f : type.getDeclaredFields())                    // все поля класса, включая приватные
+    System.out.println(f.getType().getSimpleName() + " " + f.getName());
+
+Object order = type.getDeclaredConstructor().newInstance();   // создать объект
+Method m = type.getMethod("setStatus", String.class);
+m.invoke(order, "PAID");                                    // вызвать метод по имени
+
+Field id = type.getDeclaredField("id");
+id.setAccessible(true);                                     // снять проверку доступа
+id.set(order, 42L);                                         // записать в приватное поле</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Кто этим пользуется</h4><ul><li><b>Spring</b> — находит классы с аннотациями, создаёт бины, внедряет зависимости.</li><li><b>Jackson</b> — читает и заполняет поля по именам из JSON.</li><li><b>Hibernate</b> — создаёт сущности и заполняет их из строк таблицы.</li><li><b>JUnit, Mockito</b> — находят тестовые методы, создают подмены.</li></ul></div>
+  <div class="card"><h4>Чем за это платят</h4><ul><li><b>Нет проверки компилятором</b>: опечатка в имени — ошибка при выполнении.</li><li><b>Обход инкапсуляции</b>: приватное перестаёт быть приватным.</li><li><b>Скорость</b>: вызов медленнее прямого и хуже оптимизируется; фреймворки кэшируют найденные методы.</li><li><b>Несовместимость с AOT</b>: компилятор заранее не знает, что понадобится.</li></ul></div>
+</div>
+<p>В прикладном коде рефлексия нужна редко — обычно задача решается интерфейсом. Для фреймворков есть более быстрые инструменты: <code>MethodHandle</code> и <code>VarHandle</code> — типизированные ссылки на методы и поля, которые JIT оптимизирует почти как прямой вызов.</p>
+
+<h2 id="annotations"><span class="h-num">15.4</span>Аннотации</h2>
+<p>Аннотация — метаданные, прикреплённые к элементу кода. Сама по себе она <b>ничего не делает</b>: поведение появляется, только когда кто-то её прочитает.</p>
+<pre><code class="java">@Retention(RetentionPolicy.RUNTIME)       // до какого момента аннотация сохраняется
+@Target(ElementType.METHOD)               // к чему её можно применять
+public @interface Timed {
+    String value() default "";
+    long warnAfterMs() default 500;
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Retention</th><th>Где доступна</th><th>Кто обрабатывает</th><th>Примеры</th></tr>
+<tr><td><code>SOURCE</code></td><td>Только в исходном коде</td><td>Компилятор и процессоры аннотаций</td><td><code>@Override</code>, <code>@SuppressWarnings</code>, аннотации Lombok</td></tr>
+<tr><td><code>CLASS</code> (по умолчанию)</td><td>В файле <code>.class</code>, но не при выполнении</td><td>Инструменты, работающие с байткодом</td><td>Аннотации для статического анализа</td></tr>
+<tr><td><code>RUNTIME</code></td><td>Через рефлексию при выполнении</td><td>Фреймворки</td><td><code>@Service</code>, <code>@Transactional</code>, <code>@Entity</code>, <code>@Test</code></td></tr>
+</table></div>
+<p>Отсюда два принципиально разных способа обработки. <b>При компиляции</b> — процессор аннотаций генерирует код: Lombok добавляет методы, MapStruct пишет классы-преобразователи; ошибки видны сразу, накладных расходов при работе нет. <b>При выполнении</b> — фреймворк находит аннотации рефлексией и меняет поведение, как правило, через прокси.</p>
+
+<h2 id="proxy"><span class="h-num">15.5</span>Динамические прокси</h2>
+<p>Прокси — объект, созданный во время выполнения, который выглядит как исходный, но перехватывает вызовы методов и может выполнить что-то до и после. Так реализуются транзакции, кэширование, проверка прав, повторы.</p>
+<pre data-title="прокси средствами JDK"><code class="java">PaymentService real = new PaymentServiceImpl();
+
+PaymentService proxy = (PaymentService) Proxy.newProxyInstance(
+        PaymentService.class.getClassLoader(),
+        new Class&lt;?&gt;[] { PaymentService.class },                  // только интерфейсы
+        (self, method, args) -&gt; {
+            long start = System.nanoTime();
+            try {
+                return method.invoke(real, args);                 // вызов настоящего объекта
+            } finally {
+                log.info("{} — {} мкс", method.getName(), (System.nanoTime() - start) / 1000);
+            }
+        });</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>JDK Proxy</th><th>Генерация подкласса (CGLIB, Byte Buddy)</th></tr>
+<tr><td>Что создаёт</td><td>Класс, реализующий заданные интерфейсы</td><td>Наследника целевого класса с переопределёнными методами</td></tr>
+<tr><td>Требование</td><td>У цели должен быть интерфейс</td><td>Класс и методы не должны быть <code>final</code></td></tr>
+<tr><td>Кто использует</td><td>Spring AOP для бинов с интерфейсом, Spring Data, Feign</td><td>Spring AOP по умолчанию в Spring Boot, ленивые сущности Hibernate, Mockito</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Почему @Transactional «не сработал»</span>
+Прокси стоит <i>снаружи</i> объекта: перехватываются только вызовы, пришедшие через него. Из этого следуют все известные ограничения Spring AOP.
+<ul>
+  <li><b>Вызов метода того же класса</b> (<code>this.save()</code>) идёт напрямую, минуя прокси, — <code>@Transactional</code>, <code>@Cacheable</code>, <code>@Async</code> на вызываемом методе не действуют.</li>
+  <li><b><code>private</code>-методы</b> не перехватываются: наследник не может их переопределить.</li>
+  <li><b><code>final</code> классы и методы</b> — тоже (в Kotlin классы финальны по умолчанию, поэтому нужен плагин <code>kotlin-spring</code>).</li>
+  <li><b>В конструкторе</b> прокси ещё не существует.</li>
+</ul>
+Лечение — вынести метод в другой бин или управлять транзакцией явно через <code>TransactionTemplate</code>.
+</div>
+
+<h2 id="jit"><span class="h-num">15.6</span>JIT-компиляция</h2>
+<p>Байткод сначала исполняет интерпретатор, попутно собирая статистику. Методы и циклы, выполняемые часто, компилируются в машинный код — причём в несколько ступеней (<b>tiered compilation</b>).</p>
+<div class="table-wrap"><table>
+<tr><th>Ступень</th><th>Что делает</th><th>Свойства</th></tr>
+<tr><td>Интерпретатор</td><td>Исполняет байткод команда за командой</td><td>Запуск мгновенный, работа медленная</td></tr>
+<tr><td><b>C1</b></td><td>Быстро компилирует с простыми оптимизациями и продолжает собирать профиль</td><td>Раннее ускорение</td></tr>
+<tr><td><b>C2</b></td><td>Компилирует самые горячие методы с агрессивными оптимизациями на основе профиля</td><td>Максимальная скорость; компиляция дорогая</td></tr>
+</table></div>
+<div class="table-wrap"><table>
+<tr><th>Оптимизация</th><th>Суть</th></tr>
+<tr><td><b>Встраивание</b> (inlining)</td><td>Тело маленького метода подставляется в место вызова. Важнейшая оптимизация: убирает цену вызова и открывает дорогу остальным. Геттеры и небольшие методы бесплатны</td></tr>
+<tr><td><b>Девиртуализация</b></td><td>Если по профилю в точке вызова всегда один и тот же класс, виртуальный вызов заменяется прямым и встраивается</td></tr>
+<tr><td><b>Escape analysis</b></td><td>Объект, не покидающий метод, не создаётся в куче; блокировка на таком объекте убирается</td></tr>
+<tr><td><b>Удаление мёртвого кода, свёртка констант</b></td><td>Вычисления с известным результатом и неиспользуемые результаты выбрасываются</td></tr>
+<tr><td><b>Оптимизации циклов</b></td><td>Разворачивание, вынос неизменных выражений, векторизация, удаление проверок границ массива</td></tr>
+<tr><td><b>Интринсики</b></td><td>Известные методы (<code>System.arraycopy</code>, <code>Math.*</code>, операции со строками) заменяются написанным вручную машинным кодом</td></tr>
+</table></div>
+<p><b>Деоптимизация.</b> Оптимизации C2 основаны на предположениях: «здесь всегда <code>ArrayList</code>», «эта ветка не выполняется». Если предположение нарушено — загрузился новый класс, пришёл объект другого типа, — скомпилированный код отбрасывается, исполнение возвращается в интерпретатор, и метод будет скомпилирован заново. В графиках это видно как внезапный провал производительности после долгой стабильной работы.</p>
+<div class="callout bad"><span class="c-title">Почему нельзя мерить скорость через System.nanoTime()</span>
+<pre><code class="java">long start = System.nanoTime();
+for (int i = 0; i &lt; 1_000_000; i++) compute(i);     // результат не используется
+long ms = (System.nanoTime() - start) / 1_000_000;</code></pre>
+Такой «замер» показывает что угодно: первые итерации идут в интерпретаторе; JIT может выбросить весь цикл как мёртвый код; порядок двух замеряемых вариантов меняет результат; сборка мусора попадает в один из них. Для микрозамеров существует <b>JMH</b>: он прогревает код, запускает каждый вариант в отдельном процессе и защищает от удаления результата. Производительность сервиса целиком измеряют нагрузочным тестом после прогрева.
+</div>
+
+<h2 id="startup"><span class="h-num">15.7</span>Быстрый запуск: CDS, AOT, native image</h2>
+<p>Плата за JIT — медленный старт и прогрев: неудобно для бессерверных функций и частого масштабирования. Есть несколько способов её снизить.</p>
+<div class="table-wrap"><table>
+<tr><th>Подход</th><th>Идея</th><th>Цена</th></tr>
+<tr><td><b>CDS / AppCDS</b></td><td>Сохранить разобранные классы в архив и отображать его в память при запуске</td><td>Почти никакой; ускорение умеренное</td></tr>
+<tr><td><b>AOT-кэш</b> (Java 24–25, проект Leyden)</td><td>Тренировочный запуск записывает загруженные классы и профили; рабочий запуск начинает с них</td><td>Дополнительный шаг сборки; обычная JVM и все её возможности сохраняются</td></tr>
+<tr><td><b>GraalVM Native Image</b></td><td>Заранее скомпилировать приложение в исполняемый файл</td><td>Старт за миллисекунды и мало памяти, но «закрытый мир»: рефлексию, прокси и ресурсы нужно объявить заранее; долгая сборка; нет JIT — пиковая производительность может быть ниже</td></tr>
+<tr><td><b>CRaC</b></td><td>Снять снимок прогретого процесса и восстановить его за миллисекунды</td><td>Нужна поддержка в JDK и аккуратное обращение с соединениями и секретами</td></tr>
+</table></div>
+
+<h2 id="lab"><span class="h-num">15.8</span>Интерактив: делегирование загрузчиков классов</h2>
+<div class="widget" id="clW">
+  <div class="widget-title">Симулятор: кто загрузит класс</div>
+  <div class="controls"><label>класс, запрошенный кодом приложения<select id="clSel">
+    <option value="app">com.shop.Order (ваш код)</option>
+    <option value="lib">com.fasterxml.jackson.databind.ObjectMapper (jar на classpath)</option>
+    <option value="boot">java.lang.String</option>
+    <option value="plat">java.sql.Connection (модуль java.sql)</option>
+    <option value="fake">java.lang.String — подложенный в ваш jar</option>
+    <option value="miss">com.shop.Report (класса нет на classpath)</option>
+    <option value="dup">ObjectMapper, когда на classpath две версии Jackson</option>
+  </select></label></div>
+  <div class="flow">
+    <div class="node" id="clB"><b>Bootstrap</b><small>java.base: java.lang, java.util…</small></div><span class="to">←</span>
+    <div class="node" id="clP"><b>Platform</b><small>java.sql, java.xml…</small></div><span class="to">←</span>
+    <div class="node" id="clA"><b>Application</b><small>classpath / module path</small></div>
+  </div>
+  <div class="log" id="clLog"></div>
+  <div class="verdict" id="clOut"></div>
+</div>
+<script>
+(function () {
+  var S = {
+    app: ["A", "Класс найден в каталоге классов приложения. Определён загрузчиком Application: Order.class.getClassLoader() → jdk.internal.loader.ClassLoaders$AppClassLoader.", "ok"],
+    lib: ["A", "Найден в jackson-databind-x.y.jar на classpath. Библиотеки и ваш код загружает один и тот же Application-загрузчик.", "ok"],
+    boot: ["B", "String загружен Bootstrap-загрузчиком (он реализован в самой JVM). String.class.getClassLoader() возвращает null — так обозначается Bootstrap.", "ok"],
+    plat: ["P", "Модуль java.sql закреплён за Platform-загрузчиком (до Java 9 — Extension ClassLoader).", "ok"],
+    fake: ["B", "Ваш «java.lang.String» никогда не будет загружен: запрос сначала уходит вверх, и Bootstrap находит настоящий класс. Делегирование родителю — это защита ядра платформы от подмены. К тому же defineClass запрещает пакеты java.* для обычных загрузчиков (SecurityException).", "ok"],
+    miss: ["X", "ClassNotFoundException — класс не нашёл ни один загрузчик (при явной загрузке: Class.forName, loadClass). Если же класс был на classpath при компиляции, а в рантайме пропал, ссылка на него из байткода даст NoClassDefFoundError.", "bad"],
+    dup: ["A", "Загрузится класс из того jar, который раньше стоит в classpath; второй молча игнорируется. Отсюда NoSuchMethodError: код скомпилирован под новую версию, а загружена старая. Диагностика: -verbose:class или ObjectMapper.class.getProtectionDomain().getCodeSource().", "warn"]
+  };
+  var sel = document.getElementById("clSel"), $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var s = S[sel.value], who = s[0], L = [];
+    L.push("Application.loadClass(name)");
+    L.push("  findLoadedClass → не загружен ранее (иначе вернули бы из кэша загрузчика)");
+    L.push("  делегируем родителю → Platform.loadClass(name)");
+    L.push("    findLoadedClass → нет; делегируем → Bootstrap");
+    L.push(who === "B" ? "      Bootstrap: НАЙДЕН в java.base → defineClass → возврат вниз по цепочке" : "      Bootstrap: не найден");
+    if (who !== "B") {
+      L.push(who === "P" ? "    Platform.findClass: НАЙДЕН в своих модулях → defineClass" : "    Platform.findClass: не найден");
+      if (who !== "P") L.push(who === "A" ? "  Application.findClass: поиск по classpath слева направо → НАЙДЕН → defineClass" : "  Application.findClass: не найден ни в одном элементе classpath → ClassNotFoundException");
+    }
+    if (who !== "X") L.push("затем: связывание (verify → prepare → resolve) и при первом активном использовании — инициализация (static-блоки)");
+    $("clLog").textContent = L.join("\n");
+    $("clB").className = "node " + (who === "B" ? "hl" : "was");
+    $("clP").className = "node " + (who === "P" ? "hl" : (who === "B" ? "off" : "was"));
+    $("clA").className = "node " + (who === "A" ? "hl" : (who === "X" ? "stop" : "off"));
+    $("clOut").className = "verdict " + s[2]; $("clOut").textContent = s[1];
+  }
+  sel.addEventListener("change", run); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">Класс = имя + загрузчик</span>
+Один и тот же class-файл, загруженный двумя разными загрузчиками, — это два разных класса для JVM: <code>ClassCastException: com.shop.Order cannot be cast to com.shop.Order</code>. Так серверы приложений, OSGi и плагины изолируют версии библиотек, а Spring Boot DevTools перезагружает код: старый загрузчик выбрасывается целиком вместе с классами.</div>
+
+<h2 id="quiz"><span class="h-num">15.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В чём разница между ClassNotFoundException и NoClassDefFoundError?</p><ul><li>Это одно и то же</li><li>Первое — класс не найден при явной загрузке по имени; второе — класс был при компиляции, но не найден или не смог инициализироваться при выполнении</li><li>Первое бросает компилятор</li><li>Второе возникает только в тестах</li></ul><div class="why">NoClassDefFoundError часто следует за ExceptionInInitializerError: static-инициализация упала, и класс помечен как непригодный.</div></div>
+<div class="mcq" data-ok="2"><p>Почему рефлексия медленнее прямого вызова и где это важно?</p><ul><li>Она всегда в 1000 раз медленнее</li><li>Она выполняется в отдельном потоке</li><li>Проверки доступа, упаковка аргументов, труднее инлайнить JIT-у; заметно только в горячих циклах — при старте фреймворков это не проблема</li><li>Она не медленнее</li></ul><div class="why">Современные JDK реализуют Method.invoke через method handles; для горячих путей применяют MethodHandle/LambdaMetafactory или генерацию кода.</div></div>
+<div class="mcq" data-ok="0"><p>Что нужно, чтобы аннотацию можно было прочитать рефлексией во время выполнения?</p><ul><li>@Retention(RetentionPolicy.RUNTIME)</li><li>@Target(ElementType.TYPE)</li><li>@Inherited</li><li>Ничего, все аннотации доступны</li></ul><div class="why">По умолчанию Retention = CLASS: аннотация есть в class-файле, но JVM её не загружает. SOURCE (@Override) исчезает при компиляции.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Назовите этапы загрузки класса и момент, когда выполняются статические блоки.</summary><div class="a"><p>Загрузка (чтение байтов и создание <code>Class</code>) → связывание (проверка байткода, подготовка статических полей, разрешение ссылок) → инициализация. Статические блоки и присваивания статическим полям выполняются на этапе инициализации — лениво, при первом активном использовании класса, и ровно один раз.</p></div></details>
+<details class="q"><summary>Как работает делегирование загрузчиков и зачем оно нужно?</summary><div class="a"><p>Загрузчик сначала просит загрузить класс своего родителя и ищет сам, только если родитель не нашёл. Это гарантирует, что системные классы всегда загружаются загрузчиком платформы и существуют в одном экземпляре: приложение не может подменить <code>java.lang.String</code> собственным.</p></div></details>
+<details class="q"><summary>Откуда берётся <code>ClassCastException: X cannot be cast to X</code>?</summary><div class="a"><p>Класс с одним и тем же именем загружен двумя разными загрузчиками. Для JVM это разные классы, и объект одного нельзя привести к другому. Типично для серверов приложений, плагинов и инструментов горячей перезагрузки.</p></div></details>
+<details class="q"><summary>Метод <code>a()</code> вызывает <code>this.b()</code>, помеченный <code>@Transactional</code>. Откроется ли транзакция?</summary><div class="a"><p>Нет. Транзакцию открывает прокси, стоящий перед объектом. Вызов <code>this.b()</code> идёт внутри объекта и через прокси не проходит. Нужно вынести <code>b()</code> в другой бин, пометить аннотацией сам <code>a()</code> или использовать <code>TransactionTemplate</code>.</p></div></details>
+<details class="q"><summary>Чем обработка аннотаций Lombok отличается от обработки аннотаций Spring?</summary><div class="a"><p>Lombok работает при компиляции: процессор аннотаций изменяет код до создания байткода, и при выполнении от аннотаций ничего не остаётся. Spring читает аннотации при выполнении через рефлексию (retention <code>RUNTIME</code>) и на их основе создаёт бины и прокси.</p></div></details>
+<details class="q"><summary>Что такое деоптимизация?</summary><div class="a"><p>Откат скомпилированного JIT кода к интерпретации, когда нарушено предположение, на котором была основана оптимизация: например, в точке вызова появился объект второго класса или загружен наследник, переопределяющий встроенный метод. После накопления новой статистики код компилируется снова, уже без этого предположения.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

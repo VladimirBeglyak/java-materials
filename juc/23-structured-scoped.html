@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 · StructuredTaskScope, ScopedValue и утилиты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="23">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 23 · СОВРЕМЕННЫЙ API</div>
+  <h1>StructuredTaskScope, ScopedValue и утилиты</h1>
+  <p class="lead">Новое поколение конкурентного API, рассчитанное на виртуальные потоки. <b>Структурная конкурентность</b> (<code>StructuredTaskScope</code>, preview в Java 25) делает время жизни подзадач вложенным в блок кода: никаких «осиротевших» задач, автоматическая отмена при ошибке. <b>ScopedValue</b> (финальный в Java 25) — неизменяемая замена <code>ThreadLocal</code>, передающаяся в подзадачи. В конце — небольшие, но важные утилиты: <code>ThreadLocalRandom</code> и <code>TimeUnit</code>.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">StructuredTaskScope</span><span class="tag">Joiner</span><span class="tag">отмена</span><span class="tag">ScopedValue</span><span class="tag">ThreadLocalRandom</span><span class="tag">TimeUnit</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="sts"><span class="h-num">23.1</span>StructuredTaskScope</h2>
+<pre data-title="Java 25 (JEP 505, preview: --enable-preview)"><code class="java">Response handle(Request req) throws InterruptedException {
+    try (var scope = StructuredTaskScope.open()) {                 // по умолчанию: все подзадачи должны завершиться успешно
+        Subtask&lt;User&gt;   user   = scope.fork(() -&gt; userService.find(req.userId()));    // каждая — в своём виртуальном потоке
+        Subtask&lt;Orders&gt; orders = scope.fork(() -&gt; orderService.list(req.userId()));
+        scope.join();                                              // ждать; при первой ошибке остальные ОТМЕНЯЮТСЯ, join бросает FailedException
+        return new Response(user.get(), orders.get());
+    }                                                              // выход из блока гарантирует: ни одной живой подзадачи
+}
+// другие стратегии:
+StructuredTaskScope.open(Joiner.anySuccessfulResultOrThrow())     // первый успешный результат, остальные отменить
+StructuredTaskScope.open(Joiner.allSuccessfulOrThrow())           // поток всех результатов
+StructuredTaskScope.open(Joiner.awaitAll())                        // дождаться всех, ошибки разбирать вручную
+StructuredTaskScope.open(Joiner.awaitAllSuccessfulOrThrow(), cf -&gt; cf.withTimeout(Duration.ofSeconds(2)))   // таймаут на всю область</code></pre>
+<div class="widget" id="stW">
+  <div class="widget-title">Что вернёт область и кого отменит</div>
+  <div class="controls">
+    <label>стратегия<select id="stJ"><option value="all">open() — все должны успеть</option><option value="any">anySuccessfulResultOrThrow()</option><option value="await">awaitAll()</option></select></label>
+    <label>подзадача A (200 мс)<select id="stA"><option value="ok">успех</option><option value="fail">ошибка</option></select></label>
+    <label>подзадача B (500 мс)<select id="stB"><option value="ok">успех</option><option value="fail" selected>ошибка</option></select></label>
+    <label>подзадача C (2000 мс)<select id="stC"><option value="ok">успех</option><option value="fail">ошибка</option></select></label>
+  </div>
+  <div class="log" id="stLog"></div>
+  <div class="verdict" id="stV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var j = $("stJ").value, T = [["A", 200, $("stA").value], ["B", 500, $("stB").value], ["C", 2000, $("stC").value]].sort(function (a, b) { return a[1] - b[1]; }), log = ["t=0: fork A, B, C — три виртуальных потока"], res, cls = "ok", stopped = false;
+    for (var i = 0; i < T.length; i++) {
+      var t = T[i];
+      if (stopped) { log.push("t=" + t[1] + ": " + t[0] + " — уже ОТМЕНЕНА (прервана) при закрытии области"); continue; }
+      log.push("t=" + t[1] + ": " + t[0] + " завершилась " + (t[2] === "ok" ? "успешно" : "с исключением"));
+      if (j === "all" && t[2] === "fail") { stopped = true; log.push("  joiner: ошибка → область отменяет оставшиеся подзадачи (interrupt), join() бросает FailedException с причиной"); res = "FailedException(" + t[0] + ")"; cls = "bad"; }
+      if (j === "any" && t[2] === "ok") { stopped = true; log.push("  joiner: есть успешный результат → остальные отменяются"); res = "результат " + t[0]; }
+    }
+    if (!res) {
+      if (j === "all") res = "Response(A, B, C) через " + T[2][1] + " мс";
+      else if (j === "any") { res = "FailedException: ни одна подзадача не завершилась успешно"; cls = "bad"; }
+      else { res = "join() вернулся через 2000 мс; состояния подзадач: " + T.map(function (t) { return t[0] + "=" + (t[2] === "ok" ? "SUCCESS" : "FAILED"); }).join(", "); cls = "warn"; }
+    }
+    log.push("итог: " + res);
+    $("stLog").textContent = log.join("\n"); $("stV").className = "verdict " + cls;
+    $("stV").textContent = j === "all" ? "Политика «всё или ничего»: при первой ошибке медленная C не тратит ресурсы — она отменена. С CompletableFuture пришлось бы вручную отменять остальных." : j === "any" ? "Гонка реплик: берём самый быстрый успешный ответ, остальное отменяется автоматически." : "Ждём всех независимо от ошибок и сами разбираем Subtask.state(): для частичных результатов.";
+  }
+  ["stJ", "stA", "stB", "stC"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Preview API</span>
+StructuredTaskScope прошёл несколько итераций preview (Java 19–25) и в Java 25 сменил API на <code>open()</code> + <code>Joiner</code>. Для продакшена без preview — <code>ExecutorService</code> в try-with-resources + <code>invokeAll</code>/<code>invokeAny</code> или CompletableFuture с явной отменой. Подзадачи нельзя форкать из других потоков, кроме владельца области; дамп потоков (<code>jcmd Thread.dump_to_file -format=json</code>) показывает иерархию областей.
+</div>
+
+<h2 id="scoped"><span class="h-num">23.2</span>ScopedValue вместо ThreadLocal</h2>
+<pre data-title="Java 25 (JEP 506, финальный)"><code class="java">static final ScopedValue&lt;User&gt; CURRENT_USER = ScopedValue.newInstance();
+
+void serve(Request req) {
+    User u = authenticate(req);
+    ScopedValue.where(CURRENT_USER, u).run(() -&gt; handle(req));     // значение видно только внутри run и ниже по стеку
+}
+void audit(String action) {
+    User u = CURRENT_USER.get();                                   // NoSuchElementException вне области; isBound(), orElse(…)
+    log.info("{} by {}", action, u.name());
+}
+// подзадачи StructuredTaskScope автоматически наследуют привязки — без копирования (в отличие от InheritableThreadLocal)</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>ThreadLocal</th><th>ScopedValue</th></tr>
+<tr><td>Изменяемость</td><td>set() где угодно — трудно отследить поток данных</td><td>неизменяемо в области; новое значение — вложенная область where(…)</td></tr>
+<tr><td>Время жизни</td><td>до remove() или смерти потока — утечки в пулах</td><td>строго область run/call — очищается автоматически</td></tr>
+<tr><td>Наследование</td><td>InheritableThreadLocal копирует при создании потока (дорого для миллионов VT)</td><td>подзадачи StructuredTaskScope разделяют привязку без копирования</td></tr>
+<tr><td>Скорость чтения</td><td>хэш-таблица в потоке</td><td>кэшируется, оптимизируется JIT</td></tr>
+<tr><td>Когда</td><td>изменяемое состояние потока, кэши на поток (с платформенными потоками)</td><td>контекст запроса: пользователь, транзакция, trace id</td></tr>
+</table></div>
+
+<h2 id="utils"><span class="h-num">23.3</span>ThreadLocalRandom и TimeUnit</h2>
+<pre data-title="случайные числа без конкуренции"><code class="java">int delay = ThreadLocalRandom.current().nextInt(100, 200);   // НЕ сохраняйте current() в поле: генератор привязан к потоку
+// java.util.Random — один AtomicLong seed на все потоки: CAS-конкуренция; ThreadLocalRandom — seed в поле самого Thread (@Contended)
+// для криптографии — SecureRandom; для воспроизводимых параллельных вычислений — SplittableRandom / RandomGenerator.of("L64X128MixRandom")</code></pre>
+<pre data-title="TimeUnit"><code class="java">TimeUnit.SECONDS.toMillis(30);                 // 30000
+TimeUnit.MILLISECONDS.convert(Duration.ofMinutes(2));   // Java 11+
+TimeUnit.MILLISECONDS.sleep(250);              // читаемее Thread.sleep(250)
+TimeUnit.SECONDS.timedJoin(thread, 5);
+long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);   // дедлайны — только через nanoTime (монотонное время)</code></pre>
+
+<h2 id="quiz"><span class="h-num">23.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что гарантирует закрытие StructuredTaskScope?</p><ul><li>Что все подзадачи завершились успешно</li><li>Что ни одна подзадача не переживёт область: незавершённые отменены и дождались завершения</li><li>Что результаты сохранены в кэше</li><li>Что исключения подавлены</li></ul><div class="why">Время жизни задач совпадает со структурой кода.</div></div>
+<div class="mcq" data-ok="3"><p>Чем ScopedValue лучше ThreadLocal для контекста запроса?</p><ul><li>Он изменяемый</li><li>Он работает только в платформенных потоках</li><li>Он быстрее при записи</li><li>Неизменяем, ограничен областью (без утечек), дёшево передаётся в подзадачи</li></ul><div class="why">Особенно важно с миллионами виртуальных потоков.</div></div>
+<div class="mcq" data-ok="0"><p>Почему нельзя сохранить ThreadLocalRandom.current() в статическое поле?</p><ul><li>Генератор привязан к потоку, который его получил; использование из других потоков нарушает его гарантии</li><li>Он не сериализуем</li><li>Это запрещено компилятором</li><li>Он слишком большой</li></ul><div class="why">Вызывайте current() в месте использования.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как обработать запрос, требующий трёх параллельных вызовов, на Java 21 без preview?</summary><div class="a"><p>try (var exec = Executors.newVirtualThreadPerTaskExecutor()) { var a = exec.submit(...); var b = ...; ... } — close() дождётся всех задач. Для «всё или ничего» нужна ручная отмена: при ошибке одного Future — cancel(true) остальных. Альтернатива — CompletableFuture.allOf с orTimeout и отменой в exceptionally. StructuredTaskScope делает это автоматически, поэтому его стоит отслеживать и включить, когда API станет финальным.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

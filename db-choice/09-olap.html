@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Аналитика: ClickHouse и колоночные СУБД</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.gr-wrap { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0; }
+.gr { font: 11px var(--font-mono); padding: 5px 6px; border: 1.5px solid var(--line); border-radius: 5px; background: var(--bg-sunk); opacity: .4; }
+.gr.on { opacity: 1; border-color: var(--accent); background: var(--accent-soft); }
+</style>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Аналитика: ClickHouse и колоночные СУБД</h1>
+  <p class="lead">«Сколько выручки по регионам за квартал», «воронка регистрации по дням», «топ-100 страниц по уникальным посетителям за месяц» — запросы, которые читают миллиарды строк ради нескольких чисел. OLTP-база для этого не создана. Колоночные аналитические СУБД — ClickHouse, BigQuery, Snowflake, Redshift — отвечают за секунды. Разбираем, как устроен ClickHouse MergeTree, как выбрать ключ сортировки, почему там не делают UPDATE, и тренируем аналитический SQL в песочнице.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">OLTP vs OLAP</span><span class="tag">MergeTree</span><span class="tag">разреженный индекс</span><span class="tag">материализованные представления</span><span class="tag">DWH</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="oltp-olap"><span class="h-num">9.1</span>OLTP и OLAP</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>OLTP (PostgreSQL, MySQL)</th><th>OLAP (ClickHouse, BigQuery, Snowflake)</th></tr>
+<tr><td>Типичный запрос</td><td>прочитать/изменить несколько строк по ключу</td><td>просканировать миллиарды строк, агрегировать несколько столбцов</td></tr>
+<tr><td>Запись</td><td>мелкие транзакции, UPDATE, DELETE</td><td>пачками (тысячи строк), почти без изменений</td></tr>
+<tr><td>Хранение</td><td>строки, B-tree</td><td>колонки, сжатие 5–20×, векторное исполнение</td></tr>
+<tr><td>Одновременных запросов</td><td>тысячи коротких</td><td>десятки–сотни тяжёлых</td></tr>
+<tr><td>Схема</td><td>нормализованная</td><td>широкие денормализованные таблицы, звезда (факты + измерения)</td></tr>
+</table></div>
+
+<h2 id="mergetree"><span class="h-num">9.2</span>ClickHouse MergeTree изнутри</h2>
+<pre data-title="таблица событий"><code class="sql">CREATE TABLE events (
+  event_date  Date,
+  event_time  DateTime,
+  user_id     UInt64,
+  event_type  LowCardinality(String),     -- словарное кодирование
+  page        String,
+  country     LowCardinality(String),
+  revenue     Decimal(12, 2)
+) ENGINE = MergeTree
+PARTITION BY toYYYYMM(event_date)            -- для ретенции и отсечения, не для скорости
+ORDER BY (event_type, event_date, user_id)   -- порядок хранения = разреженный первичный индекс
+TTL event_date + INTERVAL 13 MONTH;</code></pre>
+<ul>
+  <li>Каждая вставка создаёт <b>part</b> — неизменяемый каталог с файлом на каждый столбец, отсортированный по <code>ORDER BY</code>. Фоновые слияния объединяют части (родство с LSM). Вставлять нужно пачками (от тысяч строк) или через асинхронные вставки — тысячи мелких вставок в секунду создают «Too many parts».</li>
+  <li><b>Разреженный индекс</b>: в памяти хранится значение ключа для каждой 8192-й строки (гранулы). Запрос по префиксу ключа сортировки отбрасывает гранулы, не читая их.</li>
+  <li>Каждый столбец сжат кодеками (LZ4/ZSTD, Delta, DoubleDelta, Gorilla) и читается только если нужен запросу.</li>
+</ul>
+<div class="widget" id="grW">
+  <div class="widget-title">Какие гранулы прочитает запрос (ORDER BY event_type, event_date, user_id)</div>
+  <div class="controls"><label>условие<select id="grQ" class="wide">
+    <option value="a">WHERE event_type = 'purchase' AND event_date = '2026-10-05'</option>
+    <option value="b">WHERE event_type = 'purchase'</option>
+    <option value="c">WHERE event_date = '2026-10-05'</option>
+    <option value="d">WHERE user_id = 42</option>
+  </select></label></div>
+  <div class="gr-wrap" id="grG"></div>
+  <div class="verdict" id="grV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var types = ["click", "pageview", "purchase", "signup"], G = [];
+  types.forEach(function (t) { for (var d = 1; d <= 8; d++) G.push([t, d]); });
+  var Q = {
+    a: [function (g) { return g[0] === "purchase" && g[1] === 5; }, "ok", "Полный префикс ключа: читается одна гранула из " + G.length + "."],
+    b: [function (g) { return g[0] === "purchase"; }, "ok", "Первый столбец ключа: читается непрерывный диапазон гранул."],
+    c: [function (g) { return g[1] === 5; }, "warn", "Второй столбец без первого: гранулы с нужной датой разбросаны по каждому event_type. ClickHouse умеет отсекать по нему (generic exclusion search), но эффективность падает с ростом числа значений первого столбца."],
+    d: [function () { return true; }, "bad", "Третий столбец ключа: отсечение практически невозможно — полный скан столбца user_id (быстрый, колоночный, но по всем данным). Для частых запросов по пользователю — проекция (PROJECTION) с другим порядком или skip-индекс bloom_filter."]
+  };
+  function run() {
+    var q = Q[$("grQ").value], n = 0;
+    $("grG").innerHTML = G.map(function (g) { var on = q[0](g); if (on) n++; return '<span class="gr' + (on ? " on" : "") + '">' + g[0].slice(0, 5) + " " + String(g[1]).padStart(2, "0") + "</span>"; }).join("");
+    $("grV").className = "verdict " + q[1]; $("grV").textContent = "Читается гранул: " + n + " из " + G.length + ". " + q[2];
+  }
+  $("grQ").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout ok"><span class="c-title">Как выбрать ORDER BY</span>
+Столбцы, по которым чаще всего фильтруют, от низкой кардинальности к высокой: <code>(tenant_id, event_type, toDate(time), user_id)</code>. Это одновременно и индекс, и порядок, определяющий сжатие: похожие строки рядом сжимаются лучше.
+</div>
+
+<h2 id="updates"><span class="h-num">9.3</span>Изменения, дедупликация, предагрегация</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Инструмент</th></tr>
+<tr><td>Строка «изменилась» (статус заказа)</td><td><code>ReplacingMergeTree(version)</code>: вставляете новую версию, старые схлопываются при слияниях; при чтении — <code>FINAL</code> или <code>argMax</code>. Легковесные <code>DELETE</code>/<code>UPDATE</code> есть, но это не OLTP</td></tr>
+<tr><td>Счётчики и суммы на лету</td><td><code>SummingMergeTree</code>, <code>AggregatingMergeTree</code> с состояниями агрегатов (<code>uniqState</code>)</td></tr>
+<tr><td>Дашборд читает одно и то же</td><td>материализованное представление: срабатывает на вставку и пишет агрегат в другую таблицу</td></tr>
+<tr><td>Уникальные пользователи</td><td><code>uniq</code> (HyperLogLog-подобный, приближённый) вместо <code>count(DISTINCT)</code></td></tr>
+<tr><td>Данные из PostgreSQL</td><td>CDC через Kafka (движок Kafka + MV), ClickPipes, или табличные функции <code>postgresql()</code> для небольших справочников</td></tr>
+</table></div>
+
+<h2 id="sandbox"><span class="h-num">9.4</span>Песочница: аналитический SQL</h2>
+<p>SQLite не колоночная база, но язык аналитических запросов тот же: группировки, условные агрегаты, оконные функции. Таблица <code>events(user_id, event_type, ts, revenue, country)</code> генерируется случайно при запуске (~6000 событий за 14 дней).</p>
+<div class="sqlbox" data-schema="evSchema">
+  <div class="widget-title">Продуктовая аналитика</div>
+  <div class="sql-presets">
+    <button type="button" data-sql="SELECT date(ts) AS day, count(DISTINCT user_id) AS dau, count(*) AS events&#10;FROM events GROUP BY day ORDER BY day;">DAU по дням</button>
+    <button type="button" data-sql="-- воронка: сколько пользователей дошли до каждого шага&#10;SELECT count(DISTINCT CASE WHEN event_type = 'pageview' THEN user_id END) AS viewed,&#10;       count(DISTINCT CASE WHEN event_type = 'add_to_cart' THEN user_id END) AS carted,&#10;       count(DISTINCT CASE WHEN event_type = 'purchase' THEN user_id END) AS bought&#10;FROM events;">воронка</button>
+    <button type="button" data-sql="SELECT country, sum(revenue) AS revenue, count(*) FILTER (WHERE event_type = 'purchase') AS orders,&#10;       round(sum(revenue) / count(DISTINCT user_id), 1) AS arpu&#10;FROM events GROUP BY country ORDER BY revenue DESC;">выручка по странам</button>
+    <button type="button" data-sql="-- скользящее среднее выручки за 3 дня&#10;WITH d AS (SELECT date(ts) AS day, sum(revenue) AS rev FROM events GROUP BY day)&#10;SELECT day, rev, round(avg(rev) OVER (ORDER BY day ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 1) AS rev_3d&#10;FROM d ORDER BY day;">скользящее среднее</button>
+    <button type="button" data-sql="-- удержание: вернулись ли пользователи через 7+ дней после первого визита&#10;WITH f AS (SELECT user_id, min(date(ts)) AS first_day FROM events GROUP BY user_id)&#10;SELECT f.first_day, count(*) AS cohort,&#10;       count(DISTINCT CASE WHEN julianday(date(e.ts)) - julianday(f.first_day) &gt;= 7 THEN e.user_id END) AS returned_7d&#10;FROM f JOIN events e USING (user_id)&#10;GROUP BY f.first_day ORDER BY f.first_day;">когорты</button>
+    <button type="button" data-sql="SELECT count(*) AS rows, count(DISTINCT user_id) AS users, min(ts), max(ts) FROM events;">объём</button>
+  </div>
+  <textarea>SELECT date(ts) AS day, count(DISTINCT user_id) AS dau, count(*) AS events
+FROM events GROUP BY day ORDER BY day;</textarea>
+</div>
+<script type="text/plain" id="evSchema">
+CREATE TABLE events (user_id INTEGER, event_type TEXT, ts TEXT, revenue REAL, country TEXT);
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6000)
+INSERT INTO events
+SELECT 1 + abs(random()) % 400,
+       CASE WHEN abs(random()) % 100 < 70 THEN 'pageview' WHEN abs(random()) % 100 < 75 THEN 'add_to_cart' ELSE 'purchase' END,
+       datetime('2026-09-26', '+' || (abs(random()) % 14) || ' days', '+' || (abs(random()) % 86400) || ' seconds'),
+       0, CASE abs(random()) % 4 WHEN 0 THEN 'BY' WHEN 1 THEN 'KZ' WHEN 2 THEN 'RU' ELSE 'PL' END
+FROM n;
+UPDATE events SET revenue = 500 + abs(random()) % 9500 WHERE event_type = 'purchase';
+</script>
+
+<h2 id="dwh"><span class="h-num">9.5</span>ClickHouse или облачное хранилище данных</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>ClickHouse (свой или Cloud)</th><th>BigQuery / Snowflake / Redshift</th></tr>
+<tr><td>Сильная сторона</td><td>низкая задержка (мс–с), высокий QPS, дешёвое хранение событий, пользовательские дашборды</td><td>корпоративное хранилище: много источников, SQL для аналитиков, разделение хранения и вычислений, почти без эксплуатации</td></tr>
+<tr><td>Модель оплаты</td><td>железо или вычисления в облаке</td><td>за просканированные байты или за время вычислительных кластеров</td></tr>
+<tr><td>JOIN</td><td>есть, но лучше денормализовать; правая таблица в памяти</td><td>развитые, звёздные схемы</td></tr>
+<tr><td>Типично</td><td>продуктовая аналитика, наблюдаемость, аналитика в продукте (для клиентов)</td><td>BI, отчётность компании, dbt-модели</td></tr>
+</table></div>
+<p>Также: Apache Druid и Pinot — для аналитики в реальном времени с высоким QPS; DuckDB — встраиваемый OLAP для одного узла и файлов Parquet (тема 15); StarRocks/Doris — MPP с сильными JOIN.</p>
+
+<h2 id="quiz"><span class="h-num">9.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="3"><p>Сервис вставляет в ClickHouse по одной строке 3000 раз в секунду. Что произойдёт?</p><ul><li>Всё в порядке, ClickHouse создан для этого</li><li>ClickHouse сам объединит строки в памяти без настроек</li><li>Строки будут потеряны</li><li>Каждая вставка создаёт часть, слияния не успевают — ошибка «Too many parts»; нужны пачки, буфер или async_insert</li></ul><div class="why">Колоночные базы рассчитаны на пакетную запись.</div></div>
+<div class="mcq" data-ok="1"><p>Что определяет ORDER BY в таблице MergeTree?</p><ul><li>Только порядок результата SELECT</li><li>Физический порядок данных и разреженный первичный индекс</li><li>Уникальность строк</li><li>Партиционирование</li></ul><div class="why">PRIMARY KEY в ClickHouse не уникален — это префикс ORDER BY.</div></div>
+<div class="mcq" data-ok="0"><p>Как в ClickHouse хранить заказы, статус которых меняется?</p><ul><li>ReplacingMergeTree с версией: вставлять новую версию строки, читать последнюю</li><li>Частые ALTER TABLE UPDATE на каждую смену статуса</li><li>Удалять и вставлять заново через DELETE</li><li>Хранить только финальный статус, отбрасывая изменения</li></ul><div class="why">Неизменяемые части + схлопывание версий при слияниях.</div></div>
+<div class="mcq" data-ok="2"><p>Почему аналитику не стоит строить на реплике OLTP-базы при росте объёмов?</p><ul><li>Реплика не поддерживает SELECT</li><li>Аналитика требует транзакций</li><li>Строковое хранение читает все столбцы и плохо сжимает, тяжёлые запросы конфликтуют с применением WAL и растёт отставание</li><li>Реплику нельзя индексировать</li></ul><div class="why">До определённого объёма реплика — разумный старт.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как доставить данные из PostgreSQL в ClickHouse для аналитики?</summary><div class="a"><p>CDC: Debezium читает логическую репликацию PostgreSQL → Kafka → таблица с движком Kafka + материализованное представление в ReplacingMergeTree (версия — LSN или updated_at). Удаления — флаг is_deleted. Для небольших справочников — словари (dictionary) с периодической загрузкой из PostgreSQL. Готовые решения: ClickPipes, PeerDB, Airbyte.</p></div></details>
+<details class="q"><summary>Как спроектировать таблицу для дашборда «выручка по магазинам по часам» при 1 млрд событий в сутки?</summary><div class="a"><p>Сырые события в MergeTree с ORDER BY (shop_id, toStartOfHour(time), …) и TTL; материализованное представление в SummingMergeTree/AggregatingMergeTree с ключом (shop_id, hour) — дашборд читает тысячи строк агрегата вместо миллиардов событий. Вставка пачками из Kafka.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

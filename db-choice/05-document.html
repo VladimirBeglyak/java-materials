@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Документные базы: MongoDB</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Документные базы: MongoDB</h1>
+  <p class="lead">Документ — самодостаточный агрегат (заказ со строками, профиль с адресами), который читается и пишется целиком. Документные базы хороши, когда данные естественно группируются в такие агрегаты и важна горизонтальная масштабируемость. Разбираем моделирование «встроить или сослаться», паттерны схемы, индексы и агрегации, гарантии записи и выбор ключа шардирования — и честно сравниваем с jsonb в PostgreSQL.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">агрегаты</span><span class="tag">embed vs reference</span><span class="tag">aggregation pipeline</span><span class="tag">write concern</span><span class="tag">shard key</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">5.1</span>Модель: документ как агрегат</h2>
+<pre data-title="заказ — один документ вместо трёх таблиц"><code class="js">{
+  _id: ObjectId("6650…"),
+  number: "A-1001",
+  status: "paid",
+  createdAt: ISODate("2026-10-01T10:15:00Z"),
+  customer: { id: 42, name: "Анна", city: "Минск" },     // копия нужных полей (extended reference)
+  items: [
+    { sku: "NB-14", name: "Ультрабук 14", qty: 1, price: 120000 },
+    { sku: "MS-01", name: "Мышь", qty: 2, price: 2500 }
+  ],
+  total: 125000,                                          // вычисленное поле (computed pattern)
+  delivery: { type: "courier", address: { city: "Минск", street: "…" } }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Плюсы</h4><ul><li>Чтение агрегата — одно обращение, без JOIN.</li><li>Структура в базе совпадает с объектом в коде.</li><li>Разные документы в коллекции могут иметь разные поля.</li><li>Встроенные репликация и шардинг.</li></ul></div>
+  <div class="card"><h4>Минусы</h4><ul><li>Связи между агрегатами — в приложении (<code>$lookup</code> есть, но ограничен и дорог при шардинге).</li><li>Дублирование данных → обновлять копии.</li><li>«Без схемы» = схема в коде, и все её версии живут в базе одновременно.</li><li>Лимит документа 16 МБ; неограниченно растущие массивы — антипаттерн.</li></ul></div>
+</div>
+
+<h2 id="embed"><span class="h-num">5.2</span>Встроить или сослаться</h2>
+<div class="widget" id="emW">
+  <div class="widget-title">Решение для связи «родитель → дочерние»</div>
+  <div class="controls">
+    <label>сколько дочерних на родителя<select id="emN"><option value="few">единицы–десятки (адреса, строки заказа)</option><option value="many">сотни–тысячи (комментарии к посту)</option><option value="huge">неограниченно (события устройства, подписчики)</option></select></label>
+    <label>читаются вместе с родителем<select id="emT"><option value="always">почти всегда</option><option value="sometimes">иногда</option><option value="rarely">редко, отдельно</option></select></label>
+    <label>дочерние меняются<select id="emU"><option value="rare">редко</option><option value="often">часто, независимо</option></select></label>
+    <label>дочерние нужны другим агрегатам<select id="emS"><option value="no">нет, принадлежат родителю</option><option value="yes">да, общие (товар, автор)</option></select></label>
+  </div>
+  <div class="verdict" id="emV"></div>
+  <pre><code class="js" id="emCode"></code></pre>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = $("emN").value, t = $("emT").value, u = $("emU").value, s = $("emS").value, v = $("emV"), c;
+    if (n === "huge") { v.className = "verdict bad"; v.textContent = "Ссылка из дочернего документа на родителя (или паттерн bucket: дочерние группами по времени/количеству). Встраивание неограниченного массива упрётся в 16 МБ, а каждое добавление переписывает документ целиком."; c = "// events: { deviceId: 7, day: \"2026-10-10\", count: 288, readings: [ {t, v}, … ] }  ← bucket на сутки\ndb.events.createIndex({ deviceId: 1, day: 1 })"; }
+    else if (s === "yes") { v.className = "verdict warn"; v.textContent = "Ссылка + копия нужных для отображения полей (extended reference): автор поста хранится отдельно, в посте — {authorId, name}. При переименовании автора — фоновое обновление копий (или терпимое устаревание)."; c = "{ _id: …, title: \"…\", author: { id: ObjectId(\"…\"), name: \"Анна\" } }"; }
+    else if (n === "few" && t !== "rarely") { v.className = "verdict ok"; v.textContent = "Встроить: дочерние принадлежат родителю, их немного, читаются вместе. Это сильная сторона документной модели."; c = "{ _id: 42, name: \"Анна\", addresses: [ { type: \"home\", city: \"Минск\" }, { type: \"work\", city: \"Минск\" } ] }"; }
+    else if (n === "many" && t === "always") { v.className = "verdict warn"; v.textContent = "Subset pattern: в родителе — последние/важные N дочерних (для первого экрана), полный список — в отдельной коллекции со ссылкой на родителя."; c = "// posts: { _id, title, lastComments: [ …10 последних… ], commentCount: 1834 }\n// comments: { _id, postId, author, text, createdAt }\ndb.comments.createIndex({ postId: 1, createdAt: -1 })"; }
+    else { v.className = "verdict ok"; v.textContent = "Отдельная коллекция со ссылкой на родителя: дочерние живут своей жизнью" + (u === "often" ? " и часто меняются — встраивание заставляло бы переписывать родителя." : "."); c = "// children: { _id, parentId, … }\ndb.children.createIndex({ parentId: 1 })"; }
+    $("emCode").textContent = c;
+  }
+  ["emN", "emT", "emU", "emS"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>Главное правило документного моделирования: <b>проектируйте под запросы</b>. «Что читается вместе — хранится вместе». Это обратное нормализации: вы заранее решаете, какие запросы дешёвые.</p>
+
+<h2 id="queries"><span class="h-num">5.3</span>Запросы, индексы, агрегации</h2>
+<pre data-title="запросы и индексы MongoDB"><code class="js">db.orders.find({ "customer.id": 42, status: "paid" }).sort({ createdAt: -1 }).limit(20)
+db.orders.createIndex({ "customer.id": 1, status: 1, createdAt: -1 })   // правило ESR: Equality, Sort, Range
+db.orders.createIndex({ "items.sku": 1 })                                // multikey: индекс по элементам массива
+
+// агрегация: выручка по городам за октябрь
+db.orders.aggregate([
+  { $match: { status: { $in: ["paid", "shipped"] }, createdAt: { $gte: ISODate("2026-10-01") } } },
+  { $unwind: "$items" },
+  { $group: { _id: "$customer.city", revenue: { $sum: { $multiply: ["$items.qty", "$items.price"] } } } },
+  { $sort: { revenue: -1 } }
+])
+db.orders.find({ … }).explain("executionStats")   // IXSCAN против COLLSCAN, totalDocsExamined</code></pre>
+<p>Индексы — B-tree, как в реляционных базах; правила составных индексов те же (равенство, сортировка, диапазон). Схему можно и нужно проверять: <code>$jsonSchema</code>-валидатор коллекции.</p>
+
+<h2 id="guarantees"><span class="h-num">5.4</span>Гарантии: write concern, read concern, транзакции</h2>
+<div class="table-wrap"><table>
+<tr><th>Настройка</th><th>Смысл</th><th>Последствие</th></tr>
+<tr><td><code>w: 1</code></td><td>подтверждение от primary</td><td>при переключении запись может откатиться (rollback)</td></tr>
+<tr><td><code>w: "majority"</code> (по умолчанию с 5.0)</td><td>большинство узлов набора реплик записали</td><td>подтверждённое не потеряется при переключении</td></tr>
+<tr><td><code>readConcern: "majority"</code></td><td>читать только то, что подтверждено большинством</td><td>не увидеть записи, которые потом откатятся</td></tr>
+<tr><td><code>readPreference: secondary</code></td><td>читать с реплик</td><td>устаревшие данные (как в реляционных базах)</td></tr>
+<tr><td>Транзакции (с 4.0, шардированные — с 4.2)</td><td>ACID для нескольких документов</td><td>работают, но дороже и с лимитами по времени; модель по-прежнему поощряет один документ на операцию</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Атомарность одного документа</span>
+Изменение одного документа атомарно всегда, включая вложенные массивы: <code>updateOne({_id, "items.sku": "MS-01"}, {$inc: {"items.$.qty": 1, total: 2500}})</code>. Если агрегат спроектирован правильно, большинству операций многодокументные транзакции не нужны.
+</div>
+
+<h2 id="sharding"><span class="h-num">5.5</span>Шардинг и ключ шардирования</h2>
+<div class="widget" id="skW">
+  <div class="widget-title">Оценка ключа шардирования для коллекции заказов</div>
+  <div class="controls"><label>ключ<select id="skK" class="wide">
+    <option value="created">{ createdAt: 1 } — по времени</option>
+    <option value="id">{ _id: "hashed" } — хэш идентификатора</option>
+    <option value="status">{ status: 1 }</option>
+    <option value="cust">{ customerId: 1 }</option>
+    <option value="custc">{ customerId: 1, createdAt: 1 }</option>
+    <option value="tenant">{ tenantId: 1, _id: 1 } — мультиарендная система</option>
+  </select></label></div>
+  <div class="rows" id="skRows"></div>
+  <div class="verdict" id="skV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    created: [[2, "высокая"], [0, "все вставки — в последний чанк: один «горячий» шард"], [1, "диапазоны по дате — на одном-двух шардах, по клиенту — на всех"], "bad", "Монотонный ключ: вся запись идёт в один шард, остальные простаивают. Классическая ошибка."],
+    id: [[2, "очень высокая"], [2, "идеально равномерно"], [0, "любой запрос, кроме по _id, идёт на все шарды (scatter-gather)"], "warn", "Хорошо для записи, плохо для чтения: «заказы клиента» опрашивают все шарды. Подходит, если почти все чтения — по _id."],
+    status: [[0, "4–5 значений"], [0, "всё в нескольких чанках, которые нельзя разделить (jumbo chunks)"], [1, "по статусу — на один шард"], "bad", "Низкая кардинальность: число шардов ограничено числом значений, чанки не делятся."],
+    cust: [[1, "высокая, но клиенты неравны"], [1, "крупные клиенты создают горячие шарды"], [2, "заказы клиента — на одном шарде"], "warn", "Запросы «по клиенту» адресные, но один огромный клиент может перегрузить шард, а его чанк не разделить."],
+    custc: [[2, "высокая"], [2, "вставки распределены по клиентам, чанки делятся по дате внутри клиента"], [2, "заказы клиента за период — на одном шарде"], "ok", "Хороший выбор: адресные запросы по основному паттерну и равномерная запись. Правило: ключ = как вы чаще всего ищете + что-то, делающее его достаточно уникальным."],
+    tenant: [[2, "высокая"], [1, "зависит от размеров арендаторов; крупных можно вынести на свои шарды (zone sharding)"], [2, "все данные арендатора локальны"], "ok", "Естественный ключ для SaaS: почти все запросы содержат tenantId. Следите за крупными арендаторами."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var d = D[$("skK").value], names = ["Кардинальность", "Распределение записи", "Адресность запросов"];
+    $("skRows").innerHTML = [0, 1, 2].map(function (i) { var s = d[i][0]; return '<div class="row' + (s === 2 ? " win" : "") + '"><span>' + ["🔴", "🟡", "🟢"][s] + "</span><span><b>" + names[i] + "</b><br><small>" + d[i][1] + '</small></span><span></span></div>'; }).join("");
+    $("skV").className = "verdict " + d[3]; $("skV").textContent = d[4];
+  }
+  $("skK").addEventListener("change", run); run();
+})();
+</script>
+<p>Ключ шардирования определяет, на какой шард попадает документ, и почти не меняется после выбора (с 5.0 есть resharding, но это тяжёлая операция). Ошибку в нём обычно исправляют миграцией данных.</p>
+
+<h2 id="vsjsonb"><span class="h-num">5.6</span>MongoDB или jsonb в PostgreSQL</h2>
+<div class="table-wrap"><table>
+<tr><th>Выбирайте MongoDB, если</th><th>Выбирайте PostgreSQL + jsonb, если</th></tr>
+<tr><td>данные действительно агрегатные, связи между агрегатами редки</td><td>есть сущности со связями и нужны JOIN, внешние ключи, транзакции между ними</td></tr>
+<tr><td>нужен встроенный горизонтальный шардинг на десятки ТБ</td><td>данные помещаются на один сервер (большинство случаев)</td></tr>
+<tr><td>команда и платформа умеют эксплуатировать MongoDB (или Atlas)</td><td>гибкость нужна части полей — гибрид «столбцы + jsonb»</td></tr>
+<tr><td>частые изменения структуры в разных документах и вложенные массивы</td><td>нужна аналитика SQL по тем же данным</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">5.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Пост и его комментарии (до сотен тысяч). Как моделировать?</p><ul><li>Все комментарии массивом в документе поста</li><li>Комментарии в отдельной коллекции со ссылкой на пост; в посте — счётчик и последние N</li><li>Пост внутри каждого комментария</li><li>Одна коллекция для всего без структуры</li></ul><div class="why">Неограниченный массив упирается в 16 МБ и переписывание документа; subset pattern даёт быстрый первый экран.</div></div>
+<div class="mcq" data-ok="3"><p>Почему <code>createdAt</code> — плохой ключ шардирования для потока вставок?</p><ul><li>Даты нельзя индексировать</li><li>Низкая кардинальность</li><li>Он не поддерживает диапазоны</li><li>Монотонный рост отправляет все вставки в последний чанк на одном шарде</li></ul><div class="why">Добавьте ведущее поле с распределением (клиент, тенант) или хэшируйте.</div></div>
+<div class="mcq" data-ok="0"><p>Что гарантирует <code>w: "majority"</code>?</p><ul><li>Подтверждённая запись сохранена большинством узлов и не откатится при переключении primary</li><li>Запись на всех узлах</li><li>Чтение с реплики увидит запись</li><li>Запись выполнена в транзакции</li></ul><div class="why">Чтение с реплик всё равно может быть устаревшим.</div></div>
+<div class="mcq" data-ok="2"><p>«Схема не нужна, MongoDB же schemaless» — что на практике?</p><ul><li>Схемы действительно нет</li><li>Схема только в индексах</li><li>Схема живёт в коде, и в коллекции одновременно лежат документы всех её версий — нужны валидация и стратегия миграций</li><li>Схему нельзя менять</li></ul><div class="why">Используйте $jsonSchema-валидатор и версию схемы в документе.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как мигрировать структуру документов без простоя?</summary><div class="a"><p>Добавить в документы поле версии схемы; код читает обе версии (ленивая миграция при чтении/записи); фоновая задача порциями переписывает старые документы; после завершения убрать поддержку старой версии из кода. Это тот же expand/contract, что и в реляционных базах, только без DDL.</p></div></details>
+<details class="q"><summary>Когда документная модель не подходит?</summary><div class="a"><p>Когда данные сильно связаны и читаются в разных разрезах (многие-ко-многим, отчёты по любым комбинациям), когда важны транзакции и ограничения между сущностями (финансы, учёт), когда агрегат не определяется однозначно (одни и те же данные нужны разным «родителям») — тогда дублирование и ручные JOIN в приложении дороже реляционной модели.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

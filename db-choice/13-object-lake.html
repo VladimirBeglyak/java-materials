@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Объектные хранилища и lakehouse</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Объектные хранилища и lakehouse</h1>
+  <p class="lead">S3 и совместимые хранилища (MinIO, Ceph, облачные аналоги) — самое дешёвое и долговечное место для байтов: файлов пользователей, бэкапов, архивов и петабайтов аналитических данных. Поверх них выросли открытые форматы Parquet и Iceberg, превращающие «папку с файлами» в таблицы с транзакциями — lakehouse. Разбираем семантику объектного хранилища, где хранить файлы приложения, форматы и табличные форматы, проблемы мелких файлов и стоимость.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">S3</span><span class="tag">presigned URL</span><span class="tag">классы хранения</span><span class="tag">Parquet</span><span class="tag">Iceberg</span><span class="tag">Trino/DuckDB</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="semantics"><span class="h-num">13.1</span>Что такое объектное хранилище</h2>
+<ul>
+  <li><b>Плоское пространство</b> «бакет → ключ → объект» (папки — лишь префиксы ключей); объект записывается и заменяется целиком, частичного изменения нет.</li>
+  <li><b>Долговечность</b> 11 девяток (данные распределены по зонам), практически бесконечный объём, оплата за хранение, запросы и исходящий трафик.</li>
+  <li><b>Согласованность</b>: в AWS S3 с 2020 года — строгая read-after-write для любых операций; у других реализаций проверяйте документацию.</li>
+  <li><b>Задержка</b> — десятки миллисекунд на запрос: это не диск, а сетевой сервис с высокой пропускной способностью при параллельном чтении.</li>
+  <li>Версионирование, блокировка объектов (WORM — защита бэкапов от удаления), правила жизненного цикла (переезд в холодный класс, удаление).</li>
+</ul>
+
+<h2 id="files"><span class="h-num">13.2</span>Файлы приложения: не в базе</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="файл через приложение и в базе"><code class="txt">клиент → приложение (буферизует 200 МБ) → bytea в PostgreSQL
+- база раздувается, бэкапы и реплики — тоже
+- соединения и память приложения заняты загрузкой
+- отдача файлов нагружает базу и приложение</code></pre>
+<pre class="good-code" data-title="presigned URL: байты идут мимо приложения"><code class="txt">1. клиент → приложение: «хочу загрузить avatar.png»
+2. приложение → S3 SDK: presigned PUT на 10 минут
+3. клиент → S3: PUT напрямую
+4. событие S3 / подтверждение клиента → приложение
+   сохраняет в базе метаданные: ключ, размер, тип, владелец
+5. отдача: presigned GET или CDN перед бакетом</code></pre>
+</div>
+<p>В базе — метаданные и ключ объекта, в объектном хранилище — байты. Маленькие (единицы КБ) и тесно связанные с записью данные можно оставить в базе; всё, что больше и раздаётся пользователям, — в S3.</p>
+<pre data-title="presigned URL в Java (AWS SDK v2)"><code class="java">PutObjectPresignRequest req = PutObjectPresignRequest.builder()
+    .signatureDuration(Duration.ofMinutes(10))
+    .putObjectRequest(b -&gt; b.bucket("user-files").key("u/42/" + UUID.randomUUID() + ".png").contentType("image/png"))
+    .build();
+String url = presigner.presignPutObject(req).url().toString();   // отдать клиенту</code></pre>
+
+<h2 id="cost"><span class="h-num">13.3</span>Классы хранения и стоимость</h2>
+<div class="widget" id="s3W">
+  <div class="widget-title">Сколько стоит хранить</div>
+  <div class="controls">
+    <label>объём, ТБ<input type="number" id="s3V" value="50" min="0.1" step="1"></label>
+    <label>читается в месяц, % объёма<input type="number" id="s3R" value="5" min="0" max="1000"></label>
+    <label>класс<select id="s3C"><option value="std">Standard</option><option value="ia">Infrequent Access</option><option value="gl">Glacier Instant Retrieval</option><option value="deep">Glacier Deep Archive</option></select></label>
+  </div>
+  <div class="out" id="s3Out"></div>
+  <div class="hint">Ориентировочные цены уровня публичного прайса AWS us-east-1 (за ГБ в месяц и за извлечение); проверяйте актуальные цены своего провайдера.</div>
+</div>
+<script>
+(function () {
+  var P = { std: [0.023, 0, "мгновенно", "часто читаемые данные"], ia: [0.0125, 0.01, "мгновенно, минимум 30 дней хранения", "резервные копии, редко нужные файлы"], gl: [0.004, 0.03, "мгновенно, минимум 90 дней", "архив, который иногда нужен быстро"], deep: [0.00099, 0.02, "до 12–48 часов, минимум 180 дней", "долгосрочный архив для регуляторов"] };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var v = Math.max(0.1, +$("s3V").value) * 1024, r = Math.max(0, +$("s3R").value) / 100, c = P[$("s3C").value];
+    var store = v * c[0], read = v * r * c[1], egress = v * r * 0.09;
+    $("s3Out").textContent = "хранение: $" + store.toFixed(0) + "/мес\nизвлечение: $" + read.toFixed(0) + "/мес\nисходящий трафик в интернет (если читают снаружи, ~$0.09/ГБ): $" + egress.toFixed(0) + "/мес\nдоступ: " + c[2] + "\nподходит для: " + c[3];
+  }
+  ["s3V", "s3R", "s3C"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Трафик дороже хранения</span>
+Раздача популярных файлов напрямую из бакета в интернет быстро становится главной статьёй расходов — ставьте CDN. И считайте число запросов: миллионы мелких объектов дорого стоят на операциях PUT/GET и неудобны для аналитики.
+</div>
+
+<h2 id="lake"><span class="h-num">13.4</span>Озеро данных и lakehouse</h2>
+<div class="flow col">
+  <div class="node"><b>Файлы: Parquet (колоночный), Avro (строчный, для потоков), ORC</b><small>сжатие, статистика min/max по блокам, схема внутри файла</small></div><span class="to">↓</span>
+  <div class="node acc"><b>Табличный формат: Apache Iceberg, Delta Lake, Hudi</b><small>метаданные поверх файлов: снимки таблицы, атомарные коммиты, эволюция схемы, скрытое партиционирование, time travel, удаление строк</small></div><span class="to">↓</span>
+  <div class="node info"><b>Каталог: REST catalog, AWS Glue, Unity, Nessie, Polaris</b><small>где лежит текущий снимок каждой таблицы</small></div><span class="to">↓</span>
+  <div class="node ok"><b>Движки: Spark, Trino, Flink, DuckDB, ClickHouse, Snowflake, BigQuery</b><small>разные движки читают и пишут одни и те же таблицы — нет привязки к вендору</small></div>
+</div>
+<pre data-title="DuckDB: запрос к Parquet в S3 прямо с ноутбука"><code class="sql">INSTALL httpfs; LOAD httpfs;
+SELECT country, count(*) AS orders, sum(total) AS revenue
+FROM read_parquet('s3://analytics/orders/year=2026/month=*/part-*.parquet', hive_partitioning = true)
+WHERE month IN ('09', '10')
+GROUP BY country ORDER BY revenue DESC;</code></pre>
+<ul>
+  <li><b>Проблема мелких файлов</b>: потоковая запись каждую минуту создаёт тысячи файлов по килобайту — запросы тратят время на открытие файлов. Нужна компактизация (Iceberg <code>rewrite_data_files</code>), целевой размер 128 МБ–1 ГБ.</li>
+  <li><b>Партиционирование</b> по дате и низкокардинальным полям; никогда — по user_id.</li>
+  <li><b>Когда lakehouse</b>: десятки ТБ+ аналитики, много движков и команд, требование открытых форматов и дешёвого хранения. Меньше — ClickHouse или облачное хранилище данных проще.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">13.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Как правильно принимать загрузку видео от пользователей?</p><ul><li>Через контроллер приложения в bytea</li><li>Presigned URL: клиент загружает напрямую в объектное хранилище, приложение хранит метаданные</li><li>В Redis</li><li>В Kafka</li></ul><div class="why">Байты идут мимо приложения и базы.</div></div>
+<div class="mcq" data-ok="3"><p>Что добавляет Iceberg к набору Parquet-файлов?</p><ul><li>Сжатие</li><li>Колоночное хранение</li><li>Шифрование</li><li>Таблицу с атомарными коммитами, снимками, эволюцией схемы и удалением строк</li></ul><div class="why">Parquet — формат файла, Iceberg — формат таблицы поверх файлов.</div></div>
+<div class="mcq" data-ok="0"><p>Почему потоковая запись в озеро без компактизации со временем замедляет запросы?</p><ul><li>Образуются тысячи мелких файлов: накладные расходы на открытие и метаданные перевешивают чтение</li><li>Parquet не поддерживает добавление</li><li>Объектное хранилище удаляет старые файлы</li><li>Файлы перестают сжиматься</li></ul><div class="why">Периодически объединяйте файлы до сотен мегабайт.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Где хранить чеки, договоры и сканы документов с требованием хранить 5 лет без возможности изменения?</summary><div class="a"><p>В объектном хранилище с версионированием и Object Lock в режиме compliance на 5 лет (WORM), шифрованием на стороне сервера (KMS), правилом жизненного цикла на перевод в холодный класс через N месяцев. В базе — метаданные, ключ объекта и хэш содержимого для проверки целостности. Копия в другой регион или аккаунт.</p></div></details>
+<details class="q"><summary>Когда переходить от ClickHouse/облачного DWH к lakehouse на Iceberg?</summary><div class="a"><p>Когда данные нужны многим движкам и командам (ML на Spark, BI на Trino, real-time на Flink), объёмы делают проприетарное хранение дорогим, важна независимость от вендора и единая копия данных. Цена — больше компонентов (каталог, компактизация, управление доступом) и инженерия данных.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

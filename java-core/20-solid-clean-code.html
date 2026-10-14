@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · SOLID и чистый код</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>SOLID и чистый код</h1>
+  <p class="lead">Код читают в десять раз чаще, чем пишут, а меняют годами после написания. Принципы проектирования — это накопленный опыт о том, какой код дёшево менять. Здесь каждый принцип показан на паре «было — стало», с объяснением, какую именно боль он снимает, и с границей, за которой его применение превращается в переусложнение.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">SOLID</span><span class="tag">связность и сцепление</span><span class="tag">запахи кода</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="goal"><span class="h-num">20.1</span>Цель: низкая стоимость изменений</h2>
+<div class="vs neutral">
+  <div class="card"><h4>Связность (cohesion) — высокая</h4><p>Всё внутри класса или модуля служит одной задаче и меняется по одной причине. Признак низкой связности: методы класса делятся на группы, которые не используют поля друг друга.</p></div>
+  <div class="card"><h4>Сцепление (coupling) — низкое</h4><p>Модули знают друг о друге как можно меньше: только публичный контракт. Признак сильного сцепления: правка одного класса требует правок в пяти других.</p></div>
+</div>
+<p>Все принципы ниже — частные способы добиться этих двух свойств.</p>
+
+<h2 id="srp"><span class="h-num">20.2</span>S — единственная ответственность</h2>
+<p><b>У класса должна быть одна причина для изменения</b> — одна группа людей или одно требование, из-за которого его правят.</p>
+<div class="vs">
+<pre class="good-code" data-title="Стало: три причины — три класса"><code class="java">class InvoiceCalculator {            // правила бухгалтерии
+    Money total(Invoice i) { /* ... */ }
+}
+class InvoiceRepository {            // хранение
+    void save(Invoice i) { /* ... */ }
+}
+class InvoicePdfRenderer {           // представление
+    byte[] render(Invoice i) { /* ... */ }
+}</code></pre>
+<pre class="bad-code" data-title="Было: бухгалтерия, БД и вёрстка в одном классе"><code class="java">class Invoice {
+    Money total() { /* налоги, скидки */ }
+    void saveToDatabase() { /* SQL */ }
+    byte[] toPdf() { /* шрифты, отступы */ }
+}
+// Смена шрифта в PDF требует пересборки и
+// перетестирования расчёта налогов.</code></pre>
+</div>
+<div class="callout warn">SRP — не «класс делает одну вещь» и не «один метод на класс». Десять классов по три строки, которые всегда меняются вместе, — это одна ответственность, размазанная по десяти файлам.</div>
+
+<h2 id="ocp"><span class="h-num">20.3</span>O — открытость для расширения, закрытость для изменения</h2>
+<p>Новое поведение добавляется <b>новым кодом</b>, а не правкой работающего.</p>
+<div class="vs">
+<pre class="good-code" data-title="Стало: новый способ = новый класс"><code class="java">interface ShippingCost { Money cost(Order o); DeliveryType type(); }
+
+@Component class CourierCost implements ShippingCost { /* ... */ }
+@Component class PostCost implements ShippingCost { /* ... */ }
+
+@Service class ShippingService {
+    private final Map&lt;DeliveryType, ShippingCost&gt; byType;
+    ShippingService(List&lt;ShippingCost&gt; all) {
+        byType = all.stream().collect(toMap(ShippingCost::type, c -&gt; c));
+    }
+    Money cost(Order o) { return byType.get(o.type()).cost(o); }
+}</code></pre>
+<pre class="bad-code" data-title="Было: каждый новый способ — правка switch"><code class="java">Money cost(Order o) {
+    switch (o.type()) {
+        case COURIER: return /* ... */;
+        case POST:    return /* ... */;
+        case PICKUP:  return Money.ZERO;
+        // + DRONE: правим здесь, и в трёх других
+        // switch по типу доставки
+    }
+}</code></pre>
+</div>
+<p>Исключение: <code>switch</code> по sealed-типу или enum с проверкой полноты компилятором (тема 12) — нормальное решение, когда набор вариантов закрыт, а операций над ними много. OCP нужен там, где ожидается рост числа <b>вариантов</b>.</p>
+
+<h2 id="lsp"><span class="h-num">20.4</span>L — подстановка Лисков</h2>
+<p>Код, работающий с базовым типом, должен правильно работать с любым подтипом, <b>не зная о нём</b>. Подтип не может требовать больше и обещать меньше, чем базовый тип.</p>
+<pre class="bad-code" data-title="Классика: квадрат — не прямоугольник"><code class="java">class Rectangle { void setWidth(int w) { this.w = w; } void setHeight(int h) { this.h = h; } int area() { return w * h; } }
+class Square extends Rectangle {
+    @Override void setWidth(int w)  { this.w = w; this.h = w; }      // «чинит» инвариант квадрата
+    @Override void setHeight(int h) { this.w = h; this.h = h; }
+}
+void resize(Rectangle r) { r.setWidth(5); r.setHeight(4); assert r.area() == 20; }   // для Square — 16</code></pre>
+<p>Признаки нарушения в реальном коде: <code>instanceof</code> с особым случаем для подкласса; метод подкласса бросает <code>UnsupportedOperationException</code>; подкласс ужесточает предусловия (не принимает <code>null</code>, который базовый принимал). Пример из JDK: <code>List.of(...).add(x)</code> бросает исключение — интерфейс <code>List</code> обещает больше, чем неизменяемая реализация выполняет.</p>
+<p>Лечение: не наследовать ради переиспользования кода (композиция), делать объекты неизменяемыми (неизменяемый <code>Square</code> — корректный подтип неизменяемого <code>Rectangle</code>), разделять интерфейсы.</p>
+
+<h2 id="isp"><span class="h-num">20.5</span>I — разделение интерфейсов</h2>
+<p>Клиент не должен зависеть от методов, которыми не пользуется. Один «толстый» интерфейс заставляет реализации писать заглушки, а клиентов — пересобираться из-за чужих изменений.</p>
+<div class="vs">
+<pre class="good-code" data-title="Стало: роли"><code class="java">interface OrderReader { Optional&lt;Order&gt; find(long id); }
+interface OrderWriter { void save(Order o); }
+interface OrderReports { Report monthly(YearMonth m); }
+
+class OrderController {          // зависит только от чтения
+    OrderController(OrderReader orders) { }
+}</code></pre>
+<pre class="bad-code" data-title="Было: всё в одном"><code class="java">interface OrderService {
+    Optional&lt;Order&gt; find(long id);
+    void save(Order o);
+    void delete(long id);
+    Report monthly(YearMonth m);
+    void exportToCsv(Path p);
+    void sendReminderEmails();
+}</code></pre>
+</div>
+
+<h2 id="dip"><span class="h-num">20.6</span>D — инверсия зависимостей</h2>
+<p>Модули высокого уровня (бизнес-правила) не зависят от модулей низкого уровня (БД, HTTP, файловая система). Оба зависят от абстракции, и <b>абстракция принадлежит высокоуровневому модулю</b>.</p>
+<div class="flow">
+  <div class="node acc"><b>OrderService</b><small>бизнес-правила</small></div><span class="to">→</span>
+  <div class="node ok"><b>interface PaymentGateway</b><small>объявлен рядом с OrderService</small></div><span class="to">←</span>
+  <div class="node"><b>StripePaymentGateway</b><small>инфраструктура, реализует интерфейс</small></div>
+</div>
+<p>Стрелка зависимости от инфраструктуры направлена <b>к</b> домену. Dependency Injection (внедрение через конструктор) — механизм, который это обеспечивает; DIP — принцип, DI — техника, IoC-контейнер (Spring) — инструмент.</p>
+
+<h2 id="lab"><span class="h-num">20.7</span>Интерактив: рефакторинг по шагам</h2>
+<div class="widget stepper" id="rfSim">
+  <div class="widget-title">От «божественного» метода к читаемому коду</div>
+  <section class="st-step" data-t="Исходный метод">
+    <h4>Было: один метод делает всё</h4>
+<pre class="bad-code"><code class="java">public String process(Map&lt;String, Object&gt; d) {
+    if (d != null) {
+        if (d.get("items") != null &amp;&amp; ((List) d.get("items")).size() &gt; 0) {
+            double t = 0;
+            for (Object o : (List) d.get("items")) {
+                Map m = (Map) o;
+                t += (double) m.get("p") * (int) m.get("q");
+            }
+            if (d.get("type").equals("vip")) t = t * 0.9;
+            if (t &gt; 5000) t = t - 300;
+            try { db.execute("insert into orders values (" + d.get("id") + "," + t + ")"); }
+            catch (Exception e) { return "error"; }
+            return "ok:" + t;
+        } else return "empty";
+    } else return "null";
+}</code></pre>
+    <p>Запахи: <code>Map</code> вместо типов, <code>double</code> для денег, магические числа, глубина вложенности 4, SQL-инъекция, строка как код результата, проглоченное исключение, три ответственности.</p>
+  </section>
+  <section class="st-step" data-t="1. Типы вместо Map">
+    <h4>Шаг 1. Ввести типы предметной области</h4>
+<pre><code class="java">record OrderLine(String sku, Money price, int quantity) {
+    Money total() { return price.times(quantity); }
+}
+record OrderRequest(long id, CustomerType type, List&lt;OrderLine&gt; lines) {
+    OrderRequest { lines = List.copyOf(lines); }           // защитная копия, null недопустим
+}</code></pre>
+    <p>Исчезли приведения типов и строковые ключи; опечатка в имени поля теперь ошибка компиляции. Деньги — отдельный тип, а не <code>double</code>.</p>
+  </section>
+  <section class="st-step" data-t="2. Ранний выход">
+    <h4>Шаг 2. Граничные случаи — в начало (guard clauses)</h4>
+<pre><code class="java">public Order place(OrderRequest request) {
+    Objects.requireNonNull(request, "request");
+    if (request.lines().isEmpty()) throw new EmptyOrderException(request.id());
+    // дальше — «счастливый путь» без вложенности
+}</code></pre>
+    <p>Вложенность ушла. Ошибки стали исключениями с именем и данными, а не строками <code>"empty"</code> и <code>"null"</code>, которые вызывающий обязан помнить.</p>
+  </section>
+  <section class="st-step" data-t="3. Имена вместо чисел">
+    <h4>Шаг 3. Назвать правила</h4>
+<pre><code class="java">private static final BigDecimal VIP_DISCOUNT = new BigDecimal("0.10");
+private static final Money FREE_SHIPPING_THRESHOLD = Money.rub(5000);
+private static final Money BULK_ORDER_BONUS = Money.rub(300);
+
+Money price(OrderRequest r) {
+    Money subtotal = r.lines().stream().map(OrderLine::total).reduce(Money.ZERO, Money::plus);
+    Money discounted = r.type() == CustomerType.VIP ? subtotal.minusPercent(VIP_DISCOUNT) : subtotal;
+    return discounted.isGreaterThan(FREE_SHIPPING_THRESHOLD) ? discounted.minus(BULK_ORDER_BONUS) : discounted;
+}</code></pre>
+    <p>Теперь видно, что <code>0.9</code> — скидка VIP, а <code>300</code> — бонус за крупный заказ. Расчёт — чистая функция: тестируется без БД.</p>
+  </section>
+  <section class="st-step" data-t="4. Разделить ответственности">
+    <h4>Шаг 4. Расчёт, хранение и сценарий — отдельно</h4>
+<pre class="good-code"><code class="java">@Service
+class PlaceOrder {
+    private final PricingPolicy pricing;       // правила цены
+    private final OrderRepository orders;      // хранение (параметризованные запросы)
+
+    @Transactional
+    public Order handle(OrderRequest request) {
+        if (request.lines().isEmpty()) throw new EmptyOrderException(request.id());
+        Order order = Order.create(request.id(), request.lines(), pricing.price(request));
+        return orders.save(order);             // исключения БД не глотаем — их обработают выше
+    }
+}</code></pre>
+    <p>Метод читается как описание сценария. Каждая часть меняется по своей причине и тестируется отдельно.</p>
+  </section>
+</div>
+
+<h2 id="smells"><span class="h-num">20.8</span>Запахи кода и приёмы</h2>
+<div class="table-wrap"><table>
+<tr><th>Запах</th><th>Чем плох</th><th>Что делать</th></tr>
+<tr><td>Длинный метод, глубокая вложенность</td><td>нельзя удержать в голове</td><td>выделить методы с говорящими именами, ранний выход</td></tr>
+<tr><td>Длинный список параметров, флаги-<code>boolean</code></td><td><code>send(u, true, false, null)</code> нечитаем</td><td>объект-параметр, два метода вместо флага, enum</td></tr>
+<tr><td>Одержимость примитивами</td><td><code>String email</code>, <code>long userId</code>, <code>long orderId</code> легко перепутать</td><td>типы-значения: <code>record Email(String value)</code></td></tr>
+<tr><td>Дублирование</td><td>исправление в одном месте забывают в другом</td><td>выносить — но только настоящее дублирование <b>знания</b>, а не случайно похожий код</td></tr>
+<tr><td>Завистливый метод (feature envy)</td><td>метод работает в основном с данными чужого класса</td><td>переместить метод к данным</td></tr>
+<tr><td>Цепочки <code>a.getB().getC().getD()</code></td><td>знание чужой структуры (нарушение закона Деметры)</td><td>спросить у ближайшего объекта то, что нужно</td></tr>
+<tr><td>Возврат <code>null</code></td><td>NPE далеко от причины</td><td>пустая коллекция, <code>Optional</code>, исключение</td></tr>
+<tr><td>Комментарий, объясняющий «что»</td><td>устаревает и врёт</td><td>переименовать; комментировать только «почему»</td></tr>
+<tr><td>Изменяемое разделяемое состояние</td><td>неожиданные побочные эффекты, гонки</td><td>неизменяемые объекты, <code>final</code>, копии на границах</td></tr>
+</table></div>
+<div class="grid-3">
+  <div class="card"><h4>DRY</h4><p>У каждого знания — одно место в системе. Не «никогда не повторяй строки»: два похожих куска с разными причинами изменения объединять не надо.</p></div>
+  <div class="card"><h4>KISS</h4><p>Простое решение, которое работает, лучше умного. Простота измеряется тем, сколько нужно знать, чтобы изменить код.</p></div>
+  <div class="card"><h4>YAGNI</h4><p>Не пишите то, что «может пригодиться». Неиспользуемая гибкость стоит денег сейчас и мешает настоящим изменениям потом.</p></div>
+</div>
+
+<h2 id="naming"><span class="h-num">20.9</span>Имена</h2>
+<div class="table-wrap"><table>
+<tr><th>Плохо</th><th>Лучше</th><th>Почему</th></tr>
+<tr><td><code>d</code>, <code>tmp</code>, <code>data</code>, <code>list2</code></td><td><code>elapsedDays</code>, <code>unpaidInvoices</code></td><td>имя отвечает на вопрос «что это»</td></tr>
+<tr><td><code>processData()</code>, <code>handle()</code>, <code>doWork()</code></td><td><code>cancelExpiredReservations()</code></td><td>глагол + объект из предметной области</td></tr>
+<tr><td><code>isNotDisabled</code></td><td><code>isEnabled</code></td><td>отрицания в условиях путают</td></tr>
+<tr><td><code>UserManager</code>, <code>OrderHelper</code>, <code>Utils</code></td><td><code>UserRegistration</code>, <code>OrderPricing</code></td><td>«Manager» и «Helper» притягивают несвязанный код</td></tr>
+<tr><td><code>getUser()</code>, делающий запрос в сеть</td><td><code>fetchUser()</code>, <code>loadUser()</code></td><td>get выглядит дешёвым</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">20.10</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Класс <code>ReportService</code> считает показатели, форматирует Excel и отправляет письмо. Какой принцип нарушен в первую очередь?</p><ul><li>LSP</li><li>ISP</li><li>SRP — три причины для изменения в одном классе</li><li>DIP</li></ul><div class="why">Изменение формата отчёта, правил расчёта и способа доставки исходит от разных людей и происходит независимо.</div></div>
+<div class="mcq" data-ok="1"><p>Метод подкласса бросает UnsupportedOperationException для операции, объявленной в базовом типе. Какой принцип нарушен?</p><ul><li>OCP</li><li>LSP — подтип нельзя подставить вместо базового</li><li>SRP</li><li>DRY</li></ul><div class="why">Клиент, написанный для базового типа, сломается на этом подтипе.</div></div>
+<div class="mcq" data-ok="0"><p>Чем DIP отличается от DI?</p><ul><li>DIP — принцип (зависеть от абстракций, принадлежащих высокому уровню); DI — техника передачи зависимостей извне</li><li>Это одно и то же</li><li>DI — принцип, DIP — библиотека</li><li>DIP применим только в Spring</li></ul><div class="why">Можно использовать DI и нарушать DIP: внедрять конкретный класс инфраструктуры в доменный сервис.</div></div>
+<div class="mcq" data-ok="3"><p>Два метода в разных модулях содержат одинаковые пять строк проверки. Всегда ли их нужно объединить?</p><ul><li>Да, DRY запрещает любое повторение</li><li>Да, если строк больше трёх</li><li>Нет, дублирование всегда лучше</li><li>Нет: если правила принадлежат разным требованиям и могут разойтись, общий метод создаст ненужное сцепление</li></ul><div class="why">DRY — про дублирование знания. Случайно совпавший код разных требований объединять вредно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите о SOLID на примере из своего кода.</summary><div class="a"><p>Хороший ответ — не определения, а случай: «был сервис с тремя ответственностями, изменения в отчёте ломали расчёт; разделили — тесты стали независимыми» (SRP); «новые способы оплаты добавляются бином, реализующим интерфейс, без правки сервиса» (OCP); «домен объявляет порт, инфраструктура реализует» (DIP).</p></div></details>
+<details class="q"><summary>Когда следование принципам вредит?</summary><div class="a"><p>Когда абстракция вводится без вариативности: интерфейс на каждый класс, фабрики и стратегии с одной реализацией, десятки микроклассов. Принципы — средство снизить стоимость изменений там, где изменения реально происходят.</p></div></details>
+<details class="q"><summary>Что такое связность и сцепление?</summary><div class="a"><p>Связность — насколько элементы модуля относятся к одной задаче (нужна высокая). Сцепление — насколько модули зависят друг от друга (нужно низкое). Хороший модуль можно понять и изменить, не читая остальные.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

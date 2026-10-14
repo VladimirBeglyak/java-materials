@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Зачем реактивность: event loop против потока на запрос</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · REACTOR</div>
+  <h1>Зачем реактивность: event loop против потока на запрос</h1>
+  <p class="lead">Spring MVC обслуживает каждый запрос отдельным потоком, который <b>ждёт</b>, пока база или внешний сервис ответит. Spring WebFlux обслуживает тысячи запросов горсткой потоков event loop, которые никогда не ждут: вместо ожидания регистрируется продолжение, вызываемое, когда данные пришли. Разбираем обе модели, считаем, где упирается каждая, и честно говорим, что изменилось с приходом виртуальных потоков.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">поток на запрос</span><span class="tag">event loop</span><span class="tag">неблокирующий I/O</span><span class="tag">закон Литтла</span><span class="tag">виртуальные потоки</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="models"><span class="h-num">1.1</span>Две модели обработки запросов</h2>
+<div class="widget stepper" id="mdSim">
+  <div class="widget-title">Запрос: прочитать пользователя из БД (40 мс) и вызвать сервис скидок (80 мс)</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>MVC: поток http-nio-7</h5><div class="items"><span class="chip" id="mvA">разбор запроса</span><span class="chip off" id="mvB">ЖДЁТ БД 40 мс</span><span class="chip off" id="mvC">ЖДЁТ HTTP 80 мс</span><span class="chip off" id="mvD">ответ</span></div></div>
+    <div class="lane"><h5>WebFlux: поток reactor-http-nio-2</h5><div class="items"><span class="chip" id="wfA">разбор запроса</span><span class="chip off" id="wfB">отправил запрос в БД → свободен</span><span class="chip off" id="wfC">обслуживает другие запросы</span><span class="chip off" id="wfD">пришли данные → продолжение</span></div></div>
+  </div>
+  <section class="st-step" data-t="Запрос пришёл" data-hl="mvA wfA" data-log="оба: разбор HTTP, маршрутизация, вызов контроллера (~0.1 мс CPU)"><p>Пока работа — вычисления, разницы нет: оба потока заняты CPU.</p></section>
+  <section class="st-step" data-t="Обращение к БД" data-hl="mvB wfB" data-log="MVC: jdbc → поток заблокирован в socketRead на 40 мс; WebFlux: r2dbc → запрос записан в сокет, поток возвращается в event loop"><p>MVC: поток вызывает JDBC и <b>спит</b> в ожидании ответа — 40 мс поток с мегабайтным стеком ничего не делает. WebFlux: драйвер R2DBC записал запрос в сокет и вернул <code>Mono</code>; поток сразу вернулся в цикл событий.</p></section>
+  <section class="st-step" data-t="Пока ждём" data-hl="mvB wfC" data-log="MVC: поток простаивает; WebFlux: тот же поток обрабатывает события сотен других соединений"><p>За 40 мс поток event loop успевает разобрать десятки других запросов и обработать пришедшие ответы — он реагирует на события готовности сокетов (epoll/kqueue).</p></section>
+  <section class="st-step" data-t="Внешний вызов" data-hl="mvC wfC" data-log="MVC: ещё 80 мс ожидания в RestTemplate; WebFlux: WebClient отправил запрос, поток опять свободен"><p>То же со вторым вызовом. За 120 мс ожидания поток MVC не сделал ничего полезного.</p></section>
+  <section class="st-step" data-t="Ответ" data-hl="mvD wfD" data-log="WebFlux: ответ сервиса скидок → Netty сообщает о готовности сокета → цепочка Mono продолжается → ответ клиенту"><p>Когда ответ пришёл, Netty вызывает подписчика, и реактивная цепочка продолжается — возможно, на другом потоке event loop. Итог: одинаковое время ответа клиенту, но разное число занятых потоков.</p></section>
+</div>
+
+<h2 id="little"><span class="h-num">1.2</span>Где упирается каждая модель</h2>
+<p>Закон Литтла: одновременно обрабатываемых запросов = пропускная способность × время ответа. При 2000 запросов/с и 120 мс ожидания на запрос нужно 240 одновременно «висящих» запросов — в MVC это 240 потоков.</p>
+<div class="widget" id="lcW">
+  <div class="widget-title">Потоки и память</div>
+  <div class="controls">
+    <label>запросов в секунду<input type="number" id="lcR" value="5000" min="10"></label>
+    <label>время ожидания I/O на запрос, мс<input type="number" id="lcL" value="200" min="1"></label>
+    <label>CPU на запрос, мс<input type="number" id="lcC" value="0.5" min="0.1" step="0.1"></label>
+    <label>ядер<input type="number" id="lcN" value="8" min="1"></label>
+  </div>
+  <div id="lcBars"></div>
+  <div class="verdict" id="lcV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var r = Math.max(10, +$("lcR").value), l = Math.max(1, +$("lcL").value), c = Math.max(0.1, +$("lcC").value), n = Math.max(1, +$("lcN").value);
+    var conc = r * (l + c) / 1000, cpuLoad = r * c / 1000 / n, mvcMem = conc * 0.5, loops = Math.max(n, 4);
+    var rows = [["Одновременных запросов (Литтл)", conc.toFixed(0), ""], ["MVC: потоков платформы", Math.ceil(conc), conc > 400 ? "bad" : conc > 200 ? "warn" : "ok"], ["MVC: память под стеки (~0,5 МБ фактически)", mvcMem.toFixed(0) + " МБ", mvcMem > 500 ? "bad" : "ok"], ["WebFlux: потоков event loop", loops, "ok"], ["Загрузка CPU", Math.round(cpuLoad * 100) + "%", cpuLoad > 0.9 ? "bad" : cpuLoad > 0.7 ? "warn" : "ok"]];
+    $("lcBars").innerHTML = '<div class="table-wrap"><table>' + rows.map(function (r2) { return "<tr><td>" + r2[0] + '</td><td style="font-family:var(--font-mono);color:' + (r2[2] === "bad" ? "var(--bad)" : r2[2] === "warn" ? "var(--warn)" : "inherit") + '">' + r2[1] + "</td></tr>"; }).join("") + "</table></div>";
+    var v = $("lcV");
+    if (cpuLoad > 0.9) { v.className = "verdict bad"; v.textContent = "Упор в CPU (" + Math.round(cpuLoad * 100) + "%): никакая модель не поможет — реактивность экономит потоки, а не процессорное время. Нужно больше ядер или меньше CPU на запрос."; }
+    else if (conc > 400) { v.className = "verdict warn"; v.textContent = "Классическому MVC нужно " + Math.ceil(conc) + " платформенных потоков — переключения контекста и память становятся проблемой (типичный предел пула Tomcat — 200). Здесь выигрывает модель без блокировок: WebFlux — или MVC на виртуальных потоках (тема 21)."; }
+    else { v.className = "verdict ok"; v.textContent = "Нагрузка укладывается в обычный пул потоков MVC. Реактивность здесь не даёт заметного выигрыша, а сложность кода растёт."; }
+  }
+  ["lcR", "lcL", "lcC", "lcN"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+
+<h2 id="when"><span class="h-num">1.3</span>Когда WebFlux оправдан</h2>
+<div class="grid-2">
+  <div class="card"><h4>Подходит</h4><ul><li>Много одновременных соединений, долгое ожидание I/O: шлюзы, агрегаторы API, прокси.</li><li>Стриминг: SSE, WebSocket, бесконечные потоки событий с противодавлением.</li><li>Весь стек неблокирующий: WebClient, R2DBC, реактивные Mongo/Redis/Kafka.</li><li>Spring Cloud Gateway (основной вариант) построен на WebFlux.</li></ul></div>
+  <div class="card"><h4>Не подходит</h4><ul><li>Есть блокирующие зависимости (JDBC/JPA, старые SDK) — их придётся выносить на отдельный пул, и выигрыш исчезает.</li><li>CPU-интенсивная работа.</li><li>Команда без опыта реактивного программирования: отладка и стектрейсы сложнее.</li><li>С Java 21 виртуальные потоки дают масштабируемость блокирующего кода без реактивного API.</li></ul></div>
+</div>
+<div class="callout info"><span class="c-title">Реактивность — это не только скорость</span>
+Главное, что даёт Reactor помимо экономии потоков, — <b>композиция асинхронных операций</b> (параллельные вызовы, таймауты, повторы, отмена одним оператором) и <b>противодавление</b> в потоках данных. Эти свойства остаются ценными и в эпоху виртуальных потоков.
+</div>
+
+<h2 id="stack"><span class="h-num">1.4</span>Стек</h2>
+<div class="flow col">
+  <div class="node acc"><b>Ваш код: контроллеры, сервисы — Mono/Flux</b></div><span class="to">↓</span>
+  <div class="node info"><b>Spring WebFlux: DispatcherHandler, кодеки, WebClient</b><small>темы 10–15</small></div><span class="to">↓</span>
+  <div class="node ok"><b>Project Reactor: Mono, Flux, операторы, планировщики</b><small>темы 02–09</small></div><span class="to">↓</span>
+  <div class="node"><b>Reactor Netty → Netty: event loop, неблокирующие сокеты (epoll)</b><small>также Tomcat/Jetty (Undertow удалён в Spring Framework 7 / Boot 4)</small></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">1.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что WebFlux экономит по сравнению с MVC?</p><ul><li>Процессорное время на запрос</li><li>Потоки, простаивающие в ожидании I/O</li><li>Сетевой трафик</li><li>Время ответа клиенту при низкой нагрузке</li></ul><div class="why">CPU-работа стоит столько же; выигрыш — при большом числе ожидающих запросов.</div></div>
+<div class="mcq" data-ok="3"><p>Сервис вызывает JPA-репозиторий. Даст ли переход на WebFlux выигрыш?</p><ul><li>Да, автоматически</li><li>Да, вдвое</li><li>Только с Netty</li><li>Нет: блокирующий JDBC придётся выносить на отдельный пул, и потоки снова будут ждать</li></ul><div class="why">Выигрыш — только при неблокирующем стеке целиком.</div></div>
+<div class="mcq" data-ok="0"><p>Сколько потоков event loop у Reactor Netty по умолчанию на 8-ядерной машине?</p><ul><li>Около числа ядер (max(ядра, 4)) — 8</li><li>200</li><li>1</li><li>По одному на соединение</li></ul><div class="why">Именно поэтому их нельзя блокировать (тема 20).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните разницу между «неблокирующим» и «асинхронным».</summary><div class="a"><p>Неблокирующий вызов не задерживает поток: он возвращается сразу, даже если результат ещё не готов (например, запись в сокет в неблокирующем режиме, регистрация интереса к событию). Асинхронность — способ получить результат позже через колбэк/Future/Publisher. WebFlux сочетает оба: неблокирующий I/O на уровне Netty и асинхронную композицию через Reactor. Асинхронный, но блокирующий код (CompletableFuture.supplyAsync с JDBC внутри) лишь переносит ожидание в другой поток.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

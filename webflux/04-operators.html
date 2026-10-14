@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Операторы: map, flatMap, concatMap, switchMap</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · REACTOR</div>
+  <h1>Операторы: map, flatMap, concatMap, switchMap</h1>
+  <p class="lead">Самый частый вопрос на собеседовании по Reactor — «чем flatMap отличается от map и concatMap». Ответ определяет порядок результатов, параллельность вызовов и нагрузку на внешние сервисы. Разбираем трансформирующие операторы на живых marble-диаграммах, а также filter, take, distinct, side-effect-операторы <code>doOn*</code> и их ловушки.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">map</span><span class="tag">flatMap</span><span class="tag">concatMap</span><span class="tag">flatMapSequential</span><span class="tag">switchMap</span><span class="tag">doOn*</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="map"><span class="h-num">4.1</span>map против flatMap</h2>
+<p><code>map(T → R)</code> — синхронное преобразование одного элемента в один. <code>flatMap(T → Publisher&lt;R&gt;)</code> — асинхронное: каждый элемент превращается во внутренний издатель (обычно вызов WebClient или репозитория), flatMap подписывается на них и сливает результаты в один поток.</p>
+<pre data-title="Типичная ошибка"><code class="java">Flux&lt;Mono&lt;Order&gt;&gt; wrong = ids.map(id -&gt; orderClient.get(id));      // Flux&lt;Mono&gt;: запросы НЕ выполнятся
+Flux&lt;Order&gt;       right = ids.flatMap(id -&gt; orderClient.get(id));  // подписка на каждый внутренний Mono</code></pre>
+
+<h2 id="marble"><span class="h-num">4.2</span>Сравнение на marble-диаграмме</h2>
+<div class="widget" id="fmW">
+  <div class="widget-title">Источник a, b, c → для каждого внутренний издатель из двух элементов (вызов сервиса)</div>
+  <div class="controls">
+    <label>Оператор<select id="fmOp">
+      <option value="flatMap">flatMap</option>
+      <option value="concatMap">concatMap</option>
+      <option value="flatMapSequential">flatMapSequential</option>
+      <option value="switchMap">switchMap</option>
+      <option value="map">map (для сравнения)</option>
+    </select></label>
+    <label>Задержка сервиса<select id="fmLat"><option value="diff">разная: a медленный</option><option value="eq">одинаковая</option></select></label>
+    <label>concurrency (flatMap)<select id="fmC"><option value="99">256 (по умолчанию)</option><option value="2">2</option><option value="1">1</option></select></label>
+  </div>
+  <div id="fmM"></div>
+  <div class="verdict" id="fmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var SRC = [{ v: "a", t: 6, c: 0 }, { v: "b", t: 18, c: 1 }, { v: "c", t: 30, c: 2 }], SRC_END = 34;
+  function sim(op, lat, k) {
+    var d = lat === "eq" ? { a: 11, b: 11, c: 11 } : { a: 22, b: 8, c: 9 };
+    var inners = [], out = [], prevStart = 0, ends = [];
+    if (op === "map") {
+      out = SRC.map(function (s) { return { t: s.t, v: s.v.toUpperCase(), c: s.c }; });
+      return { inners: [], out: out, end: SRC_END };
+    }
+    if (op === "concatMap") k = 1;
+    SRC.forEach(function (s, i) {
+      var start = s.t;
+      if (op === "flatMap" || op === "concatMap") {
+        start = Math.max(start, prevStart);
+        for (var guard = 0; guard < 10; guard++) {
+          var busy = ends.filter(function (e) { return e > start; });
+          if (busy.length < k) break;
+          start = Math.min.apply(null, busy);
+        }
+      }
+      prevStart = start;
+      var dd = d[s.v], items = [{ t: start + dd, v: s.v + "1", c: s.c }, { t: start + 2 * dd, v: s.v + "2", c: s.c }], end = start + 2 * dd, cancelled = false;
+      if (op === "switchMap" && i < SRC.length - 1) {
+        var cut = SRC[i + 1].t;
+        if (end > cut) { cancelled = cut; items = items.filter(function (e) { return e.t < cut; }); end = cut; }
+      }
+      ends.push(end);
+      inners.push({ s: s, start: start, items: items, end: end, cancelled: cancelled });
+    });
+    if (op === "flatMapSequential") {
+      var done = 0;
+      inners.forEach(function (n) { n.items.forEach(function (e) { out.push({ t: Math.max(e.t, done), v: e.v, c: e.c }); }); done = Math.max(done, n.end); });
+    } else inners.forEach(function (n) { n.items.forEach(function (e) { out.push({ t: e.t, v: e.v, c: e.c }); }); });
+    out.sort(function (a, b) { return a.t - b.t; });
+    var last = 0; out.forEach(function (e) { if (e.t <= last) e.t = last + 1.6; last = e.t; });
+    var endAll = Math.max(SRC_END, Math.max.apply(null, ends), last + 0.5);
+    return { inners: inners, out: out, end: endAll };
+  }
+  function run() {
+    var op = $("fmOp").value, r = sim(op, $("fmLat").value, +$("fmC").value);
+    var lanes = [{ label: "источник", events: SRC.concat([{ t: SRC_END, type: "complete" }]) }];
+    r.inners.forEach(function (n) {
+      var ev = n.items.slice(); if (!n.cancelled) ev.push({ t: n.end, type: "complete" });
+      lanes.push({ label: "  → " + n.s.v + "()", events: ev, note: n.cancelled ? "старт " + n.start + ", отменён в " + n.cancelled : (n.start > n.s.t ? "ждал слота до " + n.start : "старт " + n.start) });
+    });
+    lanes.push({ label: "результат", events: r.out.concat([{ t: r.end, type: "complete" }]) });
+    Marble.render("fmM", lanes, { T: Math.max(100, Math.ceil(r.end / 10) * 10 + 4) });
+    var order = r.out.map(function (e) { return e.v; }).join(" ");
+    var M = {
+      flatMap: "Внутренние издатели работают параллельно (до concurrency штук), результаты приходят в порядке готовности: " + order + (order === "a1 a2 b1 b2 c1 c2" ? ". Здесь порядок совпал случайно — при равных задержках; гарантии нет." : ". Порядок исходных элементов не сохраняется."),
+      concatMap: "Строго по одному: следующий вызов начинается после завершения предыдущего. Порядок сохранён (" + order + "), но время = сумма задержек.",
+      flatMapSequential: "Вызовы параллельны, как у flatMap, но результаты буферизуются и отдаются в исходном порядке: " + order + ". Медленный a задерживает выдачу быстрых b и c.",
+      switchMap: "Новый элемент отменяет текущий внутренний издатель: доживает только последний. Идеально для поиска по вводу: устаревший запрос отменяется. Результат: " + order + ".",
+      map: "map синхронный: ни одного внутреннего издателя, каждый элемент преобразуется сразу."
+    };
+    $("fmV").className = "verdict " + (op === "switchMap" ? "warn" : "ok"); $("fmV").textContent = M[op] + (op === "flatMap" && $("fmC").value === "1" ? " При concurrency=1 flatMap ведёт себя как concatMap." : "");
+  }
+  ["fmOp", "fmLat", "fmC"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="choose"><span class="h-num">4.3</span>Что выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Оператор</th><th>Параллельность</th><th>Порядок</th><th>Когда</th></tr>
+<tr><td><code>flatMap(f)</code></td><td>до 256 (concurrency), prefetch 32</td><td>по готовности</td><td>независимые вызовы, порядок неважен</td></tr>
+<tr><td><code>flatMap(f, 8)</code></td><td>до 8</td><td>по готовности</td><td>ограничить нагрузку на внешний сервис/пул соединений</td></tr>
+<tr><td><code>concatMap(f)</code></td><td>1</td><td>исходный</td><td>последовательные зависимости, запись в порядке</td></tr>
+<tr><td><code>flatMapSequential(f)</code></td><td>до 256</td><td>исходный</td><td>параллельно, но ответ нужен в порядке запроса</td></tr>
+<tr><td><code>switchMap(f)</code></td><td>1 (отменяет предыдущий)</td><td>—</td><td>интересен только последний: автодополнение, «последнее состояние»</td></tr>
+<tr><td><code>flatMapIterable(f)</code></td><td>синхронно</td><td>исходный</td><td>элемент → коллекция</td></tr>
+<tr><td><code>Mono.flatMapMany(f)</code></td><td>—</td><td>—</td><td>Mono → Flux</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">flatMap по умолчанию — 256 одновременных запросов</span>
+<code>Flux.fromIterable(10_000 ids).flatMap(client::get)</code> откроет до 256 параллельных HTTP-запросов и упрётся в пул соединений Reactor Netty (глобальный пул WebClient по умолчанию — 500 соединений на адрес, очередь ожидания 1000: при её переполнении — <code>PoolAcquirePendingLimitException</code>, после 45 с ожидания — <code>PoolAcquireTimeoutException</code>), а внешний сервис может это не пережить. Всегда задавайте concurrency явно.
+</div>
+
+<h2 id="filtering"><span class="h-num">4.4</span>Фильтрация и выборка</h2>
+<div class="grid-2">
+  <div class="card"><h4>Выборка</h4><ul><li><code>filter, filterWhen</code> (асинхронный предикат)</li><li><code>take(n)</code> — отменяет источник после n; <code>take(Duration)</code>; <code>takeWhile, takeUntil</code></li><li><code>skip, skipWhile, skipUntil</code></li><li><code>next()</code> — Flux → Mono первого; <code>last()</code>, <code>elementAt</code></li><li><code>distinct()</code> — держит HashSet всех ключей (память!); <code>distinctUntilChanged()</code> — только соседние</li></ul></div>
+  <div class="card"><h4>Агрегация</h4><ul><li><code>collectList, collectMap, collectMultimap</code> — Flux → Mono коллекции (держит всё в памяти)</li><li><code>reduce, scan</code> (scan отдаёт промежуточные)</li><li><code>count, hasElements, any, all</code></li><li><code>then()</code> — дождаться завершения, игнорируя элементы; <code>thenReturn(v)</code>, <code>then(mono)</code></li><li><code>defaultIfEmpty, switchIfEmpty</code></li></ul></div>
+</div>
+<pre data-title="switchIfEmpty — ленивость аргумента" class="bad-code"><code class="java">repo.findById(id)
+    .switchIfEmpty(createDefault(id));   // createDefault() вызовется ВСЕГДА при сборке —
+                                         // если он сам что-то делает до subscribe, побочный эффект случится
+repo.findById(id)
+    .switchIfEmpty(Mono.defer(() -&gt; createDefault(id)));   // вызов только при пустом результате</code></pre>
+
+<h2 id="side"><span class="h-num">4.5</span>doOn* и побочные эффекты</h2>
+<div class="table-wrap"><table>
+<tr><th>Хук</th><th>Когда вызывается</th></tr>
+<tr><td><code>doOnSubscribe</code></td><td>при onSubscribe</td></tr>
+<tr><td><code>doOnRequest</code></td><td>при request(n) — удобно отлаживать противодавление</td></tr>
+<tr><td><code>doOnNext</code></td><td>каждый элемент</td></tr>
+<tr><td><code>doOnError, doOnComplete</code></td><td>терминальные сигналы</td></tr>
+<tr><td><code>doOnCancel</code></td><td>отмена подписчиком (клиент разорвал соединение, take, timeout)</td></tr>
+<tr><td><code>doOnTerminate / doAfterTerminate</code></td><td>до / после complete или error (не cancel)</td></tr>
+<tr><td><code>doFinally(SignalType)</code></td><td>после любого завершения, включая cancel — место для освобождения ресурсов и метрик</td></tr>
+<tr><td><code>log()</code></td><td>печатает все сигналы, включая request — первый инструмент отладки</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Асинхронная работа в doOnNext не выполнится</span>
+<code>.doOnNext(o -&gt; auditClient.send(o))</code>, где send возвращает Mono, — запрос никогда не уйдёт: на возвращённый Mono никто не подписался. Используйте <code>flatMap(o -&gt; auditClient.send(o).thenReturn(o))</code> или <code>delayUntil(o -&gt; auditClient.send(o))</code>.
+</div>
+
+<h2 id="quiz"><span class="h-num">4.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Нужно сохранить 1000 записей в порядке поступления, каждая запись — асинхронный insert. Что выбрать?</p><ul><li>flatMap</li><li>map</li><li>concatMap</li><li>switchMap</li></ul><div class="why">Только concatMap выполняет вызовы по одному в исходном порядке.</div></div>
+<div class="mcq" data-ok="1"><p>Поле поиска: на каждое нажатие клавиши — запрос подсказок. Что выбрать?</p><ul><li>concatMap</li><li>switchMap</li><li>flatMap</li><li>flatMapSequential</li></ul><div class="why">Устаревший запрос отменяется, ответы на старые префиксы не перезапишут новые.</div></div>
+<div class="mcq" data-ok="0"><p>Чем опасен <code>flatMap(client::call)</code> на Flux из 10 000 элементов?</p><ul><li>До 256 одновременных вызовов — перегрузка сервиса и пула соединений</li><li>Вызовы пойдут последовательно</li><li>Порядок гарантирован, но медленно</li><li>Ничем</li></ul><div class="why">Задайте concurrency вторым аргументом.</div></div>
+<div class="mcq" data-ok="3"><p>Почему <code>.doOnNext(x -&gt; kafka.send(x))</code> (send возвращает Mono) ничего не отправляет?</p><ul><li>doOnNext вызывается только при ошибке</li><li>Нужен publishOn</li><li>Kafka не поддерживает Reactor</li><li>Возвращённый Mono не подписан — он просто выброшен</li></ul><div class="why">Асинхронный побочный эффект — через flatMap/delayUntil.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как flatMap обеспечивает противодавление?</summary><div class="a"><p>flatMap запрашивает у источника не больше concurrency элементов (по умолчанию 256), у каждого внутреннего — prefetch (32) и держит их в очереди, пока подписчик не запросит. Когда внутренний издатель завершается, flatMap запрашивает у источника следующий элемент. Поэтому concurrency — это одновременно и предел параллельности, и окно спроса к источнику.</p></div></details>
+<details class="q"><summary>Что произойдёт с запросом WebClient внутри switchMap, если пришёл новый элемент?</summary><div class="a"><p>switchMap вызовет cancel() у текущей внутренней подписки, и отмена дойдёт до Reactor Netty: соединение будет закрыто, ответ проигнорирован. На сервере может остаться уже выполняемая работа — отмена не откатывает побочные эффекты на удалённой стороне.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

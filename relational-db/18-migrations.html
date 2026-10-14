@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Миграции схемы без простоя</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ЭКСПЛУАТАЦИЯ И МАСШТАБ</div>
+  <h1>Миграции схемы без простоя</h1>
+  <p class="lead">Схема меняется с каждым релизом, а приложение работает 24/7 и при выкатке несколько минут живут старая и новая версии кода одновременно. Какие DDL-операции блокируют таблицу или переписывают её целиком, как делать их безопасно, паттерн expand/contract для переименований и смены типов, Flyway и Liquibase в Spring Boot.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">блокировки DDL</span><span class="tag">expand/contract</span><span class="tag">CONCURRENTLY</span><span class="tag">NOT VALID</span><span class="tag">Flyway</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="rules"><span class="h-num">18.1</span>Два вопроса к каждой миграции</h2>
+<div class="grid-2">
+  <div class="card"><h4>1. Какую блокировку берёт и как долго?</h4><p>Почти любой <code>ALTER TABLE</code> берёт ACCESS EXCLUSIVE. Если на миллисекунды — нормально (с <code>lock_timeout</code>, тема 13). Если на время перезаписи таблицы в 200 ГБ — простой.</p></div>
+  <div class="card"><h4>2. Совместима ли со старым кодом?</h4><p>Во время rolling-деплоя старые экземпляры работают с новой схемой. Удалили или переименовали столбец — старый код падает. Миграция должна быть совместима с версией N−1.</p></div>
+</div>
+
+<h2 id="lint"><span class="h-num">18.2</span>Проверка операции</h2>
+<div class="widget" id="mgW">
+  <div class="widget-title">Линтер миграций (PostgreSQL 12+)</div>
+  <div class="controls"><label>операция<select id="mgOp" class="wide">
+    <option value="addcol">ADD COLUMN note text</option>
+    <option value="adddef">ADD COLUMN status text NOT NULL DEFAULT 'new'</option>
+    <option value="addvol">ADD COLUMN token uuid DEFAULT gen_random_uuid()</option>
+    <option value="notnull">ALTER COLUMN email SET NOT NULL</option>
+    <option value="type">ALTER COLUMN amount TYPE numeric(14,2) (было integer)</option>
+    <option value="varchar">ALTER COLUMN name TYPE varchar(500) (было varchar(100))</option>
+    <option value="index">CREATE INDEX ON orders (customer_id)</option>
+    <option value="uniq">ADD CONSTRAINT … UNIQUE (email)</option>
+    <option value="fk">ADD FOREIGN KEY (customer_id) REFERENCES customers</option>
+    <option value="check">ADD CONSTRAINT … CHECK (amount &gt; 0)</option>
+    <option value="rename">RENAME COLUMN name TO full_name</option>
+    <option value="drop">DROP COLUMN legacy_flag</option>
+    <option value="pk">ALTER COLUMN id TYPE bigint (было integer, первичный ключ)</option>
+  </select></label></div>
+  <div class="verdict" id="mgV"></div>
+  <pre><code class="sql" id="mgFix"></code></pre>
+</div>
+<script>
+(function () {
+  var D = {
+    addcol: ["ok", "Мгновенно: меняется только каталог. Нужна короткая ACCESS EXCLUSIVE — ставьте lock_timeout.", "SET lock_timeout = '3s';\nALTER TABLE orders ADD COLUMN note text;"],
+    adddef: ["ok", "С PostgreSQL 11 постоянное значение по умолчанию хранится в каталоге — перезаписи нет, операция мгновенная.", "SET lock_timeout = '3s';\nALTER TABLE orders ADD COLUMN status text NOT NULL DEFAULT 'new';"],
+    addvol: ["bad", "Изменчивое значение по умолчанию (функция) вычисляется для каждой строки — полная перезапись таблицы под ACCESS EXCLUSIVE.", "ALTER TABLE orders ADD COLUMN token uuid;               -- мгновенно\nALTER TABLE orders ALTER COLUMN token SET DEFAULT gen_random_uuid();  -- для новых строк\n-- заполнить старые порциями:\nUPDATE orders SET token = gen_random_uuid() WHERE id BETWEEN :a AND :b AND token IS NULL;"],
+    notnull: ["warn", "SET NOT NULL сканирует всю таблицу под ACCESS EXCLUSIVE, чтобы проверить отсутствие NULL. С PG 12 скан пропускается, если есть проверенное CHECK (col IS NOT NULL).", "ALTER TABLE users ADD CONSTRAINT users_email_nn CHECK (email IS NOT NULL) NOT VALID;  -- мгновенно\nALTER TABLE users VALIDATE CONSTRAINT users_email_nn;   -- скан без блокировки записи\nALTER TABLE users ALTER COLUMN email SET NOT NULL;       -- мгновенно: использует CHECK\nALTER TABLE users DROP CONSTRAINT users_email_nn;"],
+    type: ["bad", "Смена типа с изменением представления (integer → numeric) переписывает таблицу и все индексы под ACCESS EXCLUSIVE.", "-- expand/contract:\nALTER TABLE orders ADD COLUMN amount_new numeric(14,2);\n-- код пишет в оба столбца (или триггер), фоновое заполнение порциями\n-- код читает amount_new; затем удалить старый столбец и переименовать"],
+    varchar: ["ok", "Увеличение длины varchar (или снятие ограничения, varchar → text) не требует перезаписи — только каталог.", "SET lock_timeout = '3s';\nALTER TABLE users ALTER COLUMN name TYPE varchar(500);"],
+    index: ["bad", "Обычный CREATE INDEX берёт SHARE — запись в таблицу заблокирована всё время построения (минуты и часы).", "-- вне транзакции! (Flyway: отдельный скрипт, executeInTransaction=false)\nCREATE INDEX CONCURRENTLY IF NOT EXISTS orders_customer_idx ON orders (customer_id);\n-- при неудаче остаётся INVALID-индекс: DROP INDEX CONCURRENTLY и повтор"],
+    uniq: ["bad", "Строит уникальный индекс с блокировкой записи.", "CREATE UNIQUE INDEX CONCURRENTLY users_email_uq ON users (email);\nALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE USING INDEX users_email_uq;  -- мгновенно"],
+    fk: ["warn", "Проверка всех существующих строк держит блокировки на обеих таблицах.", "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk\n  FOREIGN KEY (customer_id) REFERENCES customers (id) NOT VALID;   -- только для новых строк, мгновенно\nALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk;          -- проверка без блокировки записи\n-- и не забудьте индекс на orders(customer_id)"],
+    check: ["warn", "Проверка существующих строк под ACCESS EXCLUSIVE.", "ALTER TABLE orders ADD CONSTRAINT orders_amount_pos CHECK (amount > 0) NOT VALID;\nALTER TABLE orders VALIDATE CONSTRAINT orders_amount_pos;"],
+    rename: ["bad", "Само переименование мгновенное, но ломает работающую старую версию приложения (она обращается к name).", "-- expand/contract в несколько релизов:\n-- 1) ADD COLUMN full_name; код пишет в оба, читает name\n-- 2) заполнить full_name порциями; код читает full_name\n-- 3) код перестаёт использовать name\n-- 4) DROP COLUMN name"],
+    drop: ["warn", "Мгновенно (столбец помечается удалённым), но старая версия кода с этим столбцом упадёт; в Hibernate — если поле есть в сущности.", "-- релиз N: убрать использование столбца из кода (и из сущности)\n-- релиз N+1:\nSET lock_timeout = '3s';\nALTER TABLE orders DROP COLUMN legacy_flag;"],
+    pk: ["bad", "Перезапись таблицы, всех индексов и всех внешних ключей, ссылающихся на неё. Классический инцидент: «закончились int», 2^31 строк.", "-- заранее: новый столбец id_new bigint, триггер копирует id → id_new,\n-- фоновое заполнение, CREATE UNIQUE INDEX CONCURRENTLY,\n-- в короткой транзакции: переключить PK USING INDEX, переименовать столбцы, последовательность\n-- профилактика: сразу использовать bigint"]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("mgOp").value]; $("mgV").className = "verdict " + d[0]; $("mgV").textContent = (d[0] === "ok" ? "✔ Безопасно. " : d[0] === "warn" ? "⚠ Осторожно. " : "✘ Опасно. ") + d[1]; $("mgFix").textContent = d[2]; }
+  $("mgOp").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="expand"><span class="h-num">18.3</span>Expand / contract</h2>
+<div class="widget stepper" id="ecSim">
+  <div class="widget-title">Переименование столбца name → full_name без простоя</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Схема</h5><div class="items"><span class="chip" id="ecName">name</span><span class="chip off" id="ecFull">full_name</span></div></div>
+    <div class="lane"><h5>Код: запись</h5><div class="items"><span class="chip" id="ecWOld">→ name</span><span class="chip off" id="ecWNew">→ full_name</span></div></div>
+    <div class="lane"><h5>Код: чтение</h5><div class="items"><span class="chip" id="ecROld">← name</span><span class="chip off" id="ecRNew">← full_name</span></div></div>
+  </div>
+  <section class="st-step" data-t="Исходно" data-hl="ecName ecWOld ecROld" data-log="v1: столбец name; код пишет и читает name"><p>Версия 1 приложения работает со столбцом <code>name</code>.</p></section>
+  <section class="st-step" data-t="Expand: новый столбец" data-hl="ecFull" data-log="миграция: ALTER TABLE users ADD COLUMN full_name text — мгновенно; старый код не замечает"><p>Миграция добавляет <code>full_name</code> (nullable, без перезаписи). Версия 1 продолжает работать — лишний столбец ей не мешает.</p></section>
+  <section class="st-step" data-t="Двойная запись" data-hl="ecWOld ecWNew ecROld" data-log="v2: пишет в name И full_name, читает name; фоновое заполнение full_name порциями"><p>Версия 2 пишет в оба столбца, читает старый. Пока идёт rolling-деплой, v1 и v2 работают одновременно — обе корректны. Фоновая задача заполняет <code>full_name</code> у старых строк порциями (тема 09).</p></section>
+  <section class="st-step" data-t="Переключение чтения" data-hl="ecWOld ecWNew ecRNew" data-log="v3: пишет в оба, читает full_name; данные заполнены и проверены"><p>Когда заполнение завершено и сверено, версия 3 читает новый столбец. Пишет по-прежнему в оба — чтобы откат на v2 был безопасным.</p></section>
+  <section class="st-step" data-t="Contract" data-hl="ecFull ecWNew ecRNew" data-log="v4: только full_name; следующий релиз: ALTER TABLE users DROP COLUMN name"><p>Версия 4 использует только <code>full_name</code>. После того как её выкатили везде и откат на v3 больше не нужен, отдельная миграция удаляет <code>name</code>. Четыре релиза вместо одного — цена нулевого простоя.</p></section>
+</div>
+
+<h2 id="tools"><span class="h-num">18.4</span>Flyway и Liquibase в Spring Boot</h2>
+<pre data-title="Flyway: структура и настройки"><code class="yaml"># src/main/resources/db/migration/
+#   V1__init.sql
+#   V2__orders_add_note.sql
+#   V3__orders_customer_idx.sql        ← CREATE INDEX CONCURRENTLY
+spring:
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    validate-on-migrate: true      # контрольные суммы: применённые скрипты менять нельзя
+    out-of-order: false
+  # для V3 рядом положить V3__orders_customer_idx.sql.conf с executeInTransaction=false
+  # (или в Flyway 10+ — скрипт-директива в начале файла)</code></pre>
+<div class="callout warn"><span class="c-title">Миграции при старте приложения</span>
+Запуск миграций при старте каждого пода удобен, но: десять подов стартуют одновременно (Flyway берёт блокировку — ждут), долгая миграция превышает таймаут readiness-проверки, и под перезапускается посреди работы. Для долгих операций — отдельный шаг пайплайна (job/init-контейнер) до выкатки приложения, а длительные заполнения данных — фоновыми задачами, не миграцией.
+</div>
+<ul>
+  <li>Одна миграция — одно логическое изменение; скрипты после применения не редактируются, исправления — новой миграцией.</li>
+  <li>Проверка на копии продовых данных: время выполнения и блокировки на 10 строках и на 100 млн строк различаются радикально.</li>
+  <li>Откат схемы на практике — это новая миграция «вперёд», а не down-скрипт; поэтому каждый шаг expand/contract обратимо совместим.</li>
+  <li>Линтеры: <code>squawk</code> для SQL-миграций PostgreSQL ловит большинство опасных операций из таблицы выше в CI.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">18.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как безопасно добавить индекс на таблицу в 300 ГБ под нагрузкой?</p><ul><li>CREATE INDEX в транзакции миграции</li><li>Остановить приложение на ночь</li><li>CREATE INDEX CONCURRENTLY вне транзакции</li><li>Создать индекс на реплике</li></ul><div class="why">CONCURRENTLY не блокирует запись, но дольше и не может выполняться в транзакционном блоке.</div></div>
+<div class="mcq" data-ok="0"><p>Почему нельзя просто переименовать столбец в одном релизе?</p><ul><li>Во время деплоя старая версия приложения ещё работает и обращается к старому имени</li><li>PostgreSQL не умеет переименовывать столбцы</li><li>Переименование переписывает таблицу</li><li>Переименование удаляет индексы</li></ul><div class="why">Rolling-деплой = две версии кода одновременно.</div></div>
+<div class="mcq" data-ok="3"><p>Как добавить внешний ключ на большую таблицу с минимальной блокировкой?</p><ul><li>Обычный ADD FOREIGN KEY</li><li>Сначала удалить все данные</li><li>Внешние ключи на больших таблицах не нужны</li><li>ADD … NOT VALID, затем VALIDATE CONSTRAINT отдельной командой</li></ul><div class="why">VALIDATE берёт более слабую блокировку и не мешает записи.</div></div>
+<div class="mcq" data-ok="1"><p>Какая из операций мгновенна в PostgreSQL 11+?</p><ul><li>ADD COLUMN … DEFAULT gen_random_uuid()</li><li>ADD COLUMN … NOT NULL DEFAULT 'new'</li><li>ALTER COLUMN … TYPE bigint</li><li>CREATE INDEX</li></ul><div class="why">Постоянное значение по умолчанию хранится в каталоге; изменчивое — вычисляется для каждой строки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Нужно сменить тип <code>orders.amount</code> с integer на numeric на таблице в 1 млрд строк. План?</summary><div class="a"><p>Expand/contract: добавить столбец <code>amount_new numeric</code>; код (или триггер) пишет в оба; фоновое заполнение порциями с паузами и контролем отставания реплик; сверка; переключение чтения на новый столбец; создание нужных индексов CONCURRENTLY; затем в короткой миграции с lock_timeout — удаление старого столбца и переименование нового (или код сразу работает с новым именем). Всё — с проверкой на копии продовых данных.</p></div></details>
+<details class="q"><summary>Что включить в CI для миграций?</summary><div class="a"><p>Применение всех миграций на пустую базу той же версии PostgreSQL (Testcontainers), линтер squawk на опасные операции, проверку, что применённые миграции не изменены (validate), тесты приложения на новой схеме и, в идеале, совместимость предыдущей версии приложения с новой схемой.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

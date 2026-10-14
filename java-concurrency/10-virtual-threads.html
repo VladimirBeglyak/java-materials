@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Виртуальные потоки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ИСПОЛНЕНИЕ ЗАДАЧ</div>
+  <h1>Виртуальные потоки и Structured Concurrency</h1>
+  <p class="lead">Project Loom вернул простой блокирующий стиль «поток на запрос» без ограничения в несколько тысяч потоков. Разбираем механику монтирования, где виртуальные потоки не помогают, что такое pinning и как структурировать конкурентные подзадачи.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">JEP 444 · 491 · 505 · 506</span><span class="tag">JDK 21+</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="what"><span class="h-num">10.1</span>Что такое виртуальный поток</h2>
+<p>Виртуальный поток (VT) — это <code>java.lang.Thread</code>, которым управляет <b>JVM, а не ОС</b>. Его стек хранится в куче как объект-продолжение (continuation) и занимает сотни байт – единицы КБ. Выполняется VT на небольшом пуле платформенных <b>carrier-потоков</b> (по умолчанию <code>ForkJoinPool</code> с числом потоков ≈ ядрам). Схема M:N: миллион VT на 8 carrier'ах.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 360" role="img" aria-label="Монтирование виртуальных потоков на carrier">
+  <defs><marker id="j1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
+  <marker id="j2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="20" y="24" font-weight="700">Heap: виртуальные потоки (стеки-продолжения)</text>
+  <g font-size="12" class="mono">
+    <rect x="20" y="36" width="80" height="34" rx="6" class="box-ok"/><text x="60" y="58" text-anchor="middle">VT-1</text>
+    <rect x="110" y="36" width="80" height="34" rx="6" class="box"/><text x="150" y="58" text-anchor="middle">VT-2 zz</text>
+    <rect x="200" y="36" width="80" height="34" rx="6" class="box-ok"/><text x="240" y="58" text-anchor="middle">VT-3</text>
+    <rect x="290" y="36" width="80" height="34" rx="6" class="box"/><text x="330" y="58" text-anchor="middle">VT-4 zz</text>
+    <rect x="380" y="36" width="80" height="34" rx="6" class="box"/><text x="420" y="58" text-anchor="middle">VT-5 zz</text>
+    <rect x="470" y="36" width="80" height="34" rx="6" class="box"/><text x="510" y="58" text-anchor="middle">… 10⁶</text>
+  </g>
+  <text x="580" y="50" font-size="12.5" class="muted">zz — ждут I/O, lock, sleep:</text>
+  <text x="580" y="68" font-size="12.5" class="muted">не занимают carrier</text>
+
+  <text x="520" y="160" font-size="13" class="muted">ForkJoinPool:</text><text x="520" y="178" font-size="13" class="muted">платформенные carrier-потоки,</text><text x="520" y="196" font-size="13" class="muted">≈ число ядер</text>
+  <rect x="20" y="140" width="220" height="50" rx="8" class="box-acc"/><text x="130" y="170" text-anchor="middle" class="mono" font-size="13">carrier-1 ← VT-1</text>
+  <rect x="260" y="140" width="220" height="50" rx="8" class="box-acc"/><text x="370" y="170" text-anchor="middle" class="mono" font-size="13">carrier-2 ← VT-3</text>
+  <path d="M60 72 L100 136" class="ln-acc" marker-end="url(#j2)"/><text x="40" y="108" font-size="11.5" fill="var(--accent)">mount</text>
+  <path d="M240 72 L340 136" class="ln-acc" marker-end="url(#j2)"/>
+
+  <text x="20" y="236" font-weight="700" font-size="14">Что происходит при socket.read() в VT-1:</text>
+  <text x="20" y="260" font-size="13">1) JDK переводит сокет в неблокирующий режим и регистрирует его в poller'е;</text>
+  <text x="20" y="282" font-size="13">2) continuation VT-1 «снимается» с carrier (unmount); 3) carrier-1 берёт следующий готовый VT;</text>
+  <text x="20" y="304" font-size="13">4) данные пришли → VT-1 снова в очереди планировщика → mount на любой свободный carrier.</text>
+</svg>
+</figure>
+
+<pre data-title="Создание"><code class="java">Thread vt = Thread.ofVirtual().name("req-", 0).start(() -&gt; handle(request));
+Thread.startVirtualThread(() -&gt; work());
+
+try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+    List&lt;Future&lt;Response&gt;&gt; fs = requests.stream()
+            .map(r -&gt; exec.submit(() -&gt; client.send(r)))   // 10 000 блокирующих вызовов — нормально
+            .toList();
+    for (Future&lt;Response&gt; f : fs) process(f.get());
+}   // close() дожидается всех задач
+// Spring Boot 3.2+: spring.threads.virtual.enabled=true — Tomcat, @Async, планировщик на VT</code></pre>
+
+<h2 id="when"><span class="h-num">10.2</span>Когда помогают, а когда нет</h2>
+<div class="grid-2">
+  <div class="card"><h4>✔ Помогают</h4><ul><li>Много одновременных задач, которые <b>в основном ждут</b>: HTTP-вызовы, БД, очереди.</li><li>Цель — <b>пропускная способность</b> (throughput) при простом блокирующем коде вместо реактивного.</li><li>Ограничение «поток на запрос» было узким местом.</li></ul></div>
+  <div class="card"><h4>✘ Не помогают</h4><ul><li>CPU-bound задачи: ядер больше не стало, а планирование добавит накладных расходов.</li><li>Узкое место — внешний ресурс: пул соединений БД на 20 не обслужит 10 000 VT быстрее.</li><li>Задержку (latency) отдельного запроса VT не уменьшают.</li></ul></div>
+</div>
+
+<h3>Правила работы с VT</h3>
+<ol class="steps">
+  <li><b>Не пулируйте виртуальные потоки.</b> Они дешёвые — один VT на задачу. Пул VT — антипаттерн.</li>
+  <li><b>Ограничивайте ресурсы, а не потоки.</b> Раньше размер пула неявно ограничивал нагрузку на БД. Теперь это нужно делать явно — <code>Semaphore</code> на вызовы downstream, пул соединений с таймаутом ожидания.</li>
+  <li><b>Осторожно с ThreadLocal.</b> Миллион VT × тяжёлый кэш в ThreadLocal = гигабайты. Используйте <code>ScopedValue</code> для контекста.</li>
+  <li><b>Не используйте VT для долгих CPU-вычислений</b> — они не вытесняются планировщиком по времени и могут монополизировать carrier.</li>
+</ol>
+<pre data-title="Ограничение конкурентности к downstream" class="good-code"><code class="java">private final Semaphore dbPermits = new Semaphore(50);   // ≤ размера пула соединений
+
+Response handle(Request r) throws InterruptedException {
+    dbPermits.acquire();             // VT паркуется дёшево, carrier свободен
+    try {
+        return repo.load(r.id());
+    } finally {
+        dbPermits.release();
+    }
+}</code></pre>
+
+<h2 id="pinning"><span class="h-num">10.3</span>Pinning — когда VT не может отцепиться</h2>
+<p>Pinning — ситуация, когда VT при блокировке <b>не может</b> размонтироваться и держит carrier заблокированным. Если все carrier'ы пришпилены — приложение стоит, хотя VT много.</p>
+<div class="table-wrap"><table>
+<tr><th>Причина</th><th>JDK 21–23</th><th>JDK 24+</th></tr>
+<tr><td>Блокировка внутри <code>synchronized</code> (I/O, <code>wait()</code>, ожидание монитора)</td><td><b>pinning</b> — главная проблема ранних миграций; совет был «заменить на ReentrantLock»</td><td>исправлено JEP 491: VT отпускает carrier и внутри <code>synchronized</code></td></tr>
+<tr><td>Блокировка в нативном фрейме (JNI, Foreign Function API через downcall)</td><td>pinning</td><td>pinning (остаётся)</td></tr>
+<tr><td>Файловый I/O на некоторых ОС</td><td>carrier временно компенсируется доп. потоком</td><td>то же</td></tr>
+</table></div>
+<p>Диагностика: событие JFR <code>jdk.VirtualThreadPinned</code> (по умолчанию пишется при блокировке дольше 20 мс). В JDK 21–23 также <code>-Djdk.tracePinnedThreads=full</code> (свойство удалено в JDK 24). Thread dump с виртуальными потоками: <code>jcmd &lt;pid&gt; Thread.dump_to_file -format=json file.json</code>.</p>
+
+<h2 id="scoped"><span class="h-num">10.4</span>ScopedValue вместо ThreadLocal</h2>
+<p>Финален в JDK 25 (JEP 506). Неизменяемое значение, привязанное к <b>динамической области</b> выполнения: видно в вызванном коде и в дочерних задачах structured concurrency, недоступно после выхода из области. Нет <code>set</code>, нет утечек, нет копирования при наследовании.</p>
+<pre class="good-code"><code class="java">private static final ScopedValue&lt;RequestContext&gt; CTX = ScopedValue.newInstance();
+
+void serve(Request req) {
+    ScopedValue.where(CTX, new RequestContext(req.userId(), req.traceId()))
+               .run(() -&gt; controller.handle(req));          // внутри: CTX.get()
+}   // здесь CTX уже не привязан — забыть remove() невозможно
+
+void audit(String action) {
+    RequestContext c = CTX.get();     // NoSuchElementException, если вне области; CTX.isBound() для проверки
+    log.info("user={} trace={} action={}", c.userId(), c.traceId(), action);
+}</code></pre>
+
+<h2 id="structured"><span class="h-num">10.5</span>Structured Concurrency</h2>
+<p>Идея: подзадачи живут не дольше, чем блок кода, который их создал — как локальные переменные. Если одна упала, остальные отменяются; если родителя прервали, прерываются дети; в thread dump видна иерархия. Это решает проблему «осиротевших» задач у <code>CompletableFuture</code> и <code>ExecutorService</code>.</p>
+<div class="callout warn">В JDK 25 API — <b>preview</b> (JEP 505, пятая итерация, нужен <code>--enable-preview</code>). Сигнатуры менялись между версиями — сверяйтесь с javadoc вашего JDK.</div>
+<pre data-title="JDK 25 preview API"><code class="java">Dashboard dashboard(long id) throws InterruptedException {
+    try (var scope = StructuredTaskScope.open()) {        // Joiner по умолчанию: все должны быть успешны
+        Subtask&lt;Client&gt; client = scope.fork(() -&gt; clients.find(id));       // каждая — в своём VT
+        Subtask&lt;List&lt;Account&gt;&gt; acc = scope.fork(() -&gt; accountsApi.list(id));
+        scope.join();                  // ждём всех; если одна упала — остальные прерываются,
+                                       // join бросает StructuredTaskScope.FailedException
+        return new Dashboard(client.get(), acc.get());
+    }                                  // close(): гарантированно ни одной живой подзадачи
+}
+
+// «Кто первый ответил»: опросить две реплики, взять первый успех, вторую отменить
+String fastest() throws InterruptedException {
+    try (var scope = StructuredTaskScope.open(
+            StructuredTaskScope.Joiner.&lt;String&gt;anySuccessfulResultOrThrow(),
+            cfg -&gt; cfg.withTimeout(Duration.ofMillis(300)))) {
+        scope.fork(() -&gt; replicaA.query());
+        scope.fork(() -&gt; replicaB.query());
+        return scope.join();
+    }
+}</code></pre>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 190" role="img" aria-label="Неструктурированная и структурированная конкурентность">
+  <text x="20" y="22" font-weight="700">CompletableFuture / ExecutorService</text>
+  <path d="M20 50 H360" class="ln"/><text x="20" y="44" font-size="12" class="mono">parent</text>
+  <path d="M80 50 V80 H330" class="ln-acc"/><text x="300" y="74" font-size="12" class="mono">task A</text>
+  <path d="M120 50 V110 H380" class="ln-acc"/><text x="300" y="104" font-size="12" class="mono">task B ✘</text>
+  <circle cx="360" cy="50" r="5" fill="var(--fg-muted)"/><text x="20" y="150" font-size="12.5" class="muted">родитель вышел — задачи живут дальше,</text><text x="20" y="168" font-size="12.5" class="muted">ошибка B не отменила A</text>
+  <text x="440" y="22" font-weight="700">StructuredTaskScope</text>
+  <path d="M440 50 H780" class="ln"/><text x="440" y="44" font-size="12" class="mono">parent</text>
+  <path d="M500 50 V80 H640 V50" class="ln-acc"/><text x="560" y="74" font-size="12" class="mono">A ⟂</text>
+  <path d="M540 50 V110 H630 V50" class="ln-acc"/><text x="560" y="104" font-size="12" class="mono">B ✘</text>
+  <rect x="490" y="36" width="160" height="88" rx="8" fill="none" stroke="var(--ok)" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="440" y="150" font-size="12.5" class="muted">B упала → A отменена → join() бросает;</text><text x="440" y="168" font-size="12.5" class="muted">все дети завершены до выхода из блока</text>
+</svg>
+</figure>
+
+<h2 id="vs"><span class="h-num">10.6</span>VT против реактивного стека</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Virtual Threads</th><th>Reactor / WebFlux</th></tr>
+<tr><td>Стиль кода</td><td>обычный императивный, try/catch, отладчик и стек-трейсы работают</td><td>операторы, ленивые цепочки, сложная отладка</td></tr>
+<tr><td>Backpressure</td><td>нет встроенного — через ограниченные очереди и семафоры</td><td>встроен в протокол (request(n))</td></tr>
+<tr><td>Потоки данных (streams, события)</td><td>неудобно</td><td>естественно</td></tr>
+<tr><td>Экосистема</td><td>любые блокирующие библиотеки (JDBC)</td><td>нужны неблокирующие драйверы (R2DBC)</td></tr>
+<tr><td>Когда выбирать</td><td>request/response сервисы с I/O</td><td>стриминг, сложная композиция потоков событий</td></tr>
+</table></div>
+
+<h2 id="sim"><span class="h-num">10.7</span>Интерактив: монтирование и размонтирование виртуального потока</h2>
+<div class="widget stepper" id="vtSim">
+  <div class="widget-title">Симулятор: три виртуальных потока на двух carrier-потоках</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="vtC1"><h5>Carrier 1 (ForkJoinPool-1-worker-1)</h5><div class="items"><span class="chip acc" data-to="2">VT1 выполняется</span><span class="chip" data-from="2" data-to="3">свободен</span><span class="chip acc" data-from="3" data-to="6">VT3 выполняется</span><span class="chip bad" data-from="6">VT3 — pinned, carrier заблокирован</span></div></div>
+    <div class="lane node" id="vtC2"><h5>Carrier 2 (ForkJoinPool-1-worker-2)</h5><div class="items"><span class="chip acc" data-to="5">VT2 выполняется</span><span class="chip acc" data-from="5">VT1 выполняется</span></div></div>
+    <div class="lane node" id="vtQ"><h5>Очередь планировщика (готовы к запуску)</h5><div class="items"><span class="chip warn" data-to="3">VT3</span><span class="chip warn" data-from="4" data-to="5">VT1</span><span class="chip" data-from="5">пусто</span><span class="chip" data-from="3" data-to="4">пусто</span></div></div>
+    <div class="lane node" id="vtH"><h5>Куча: размонтированные стеки</h5><div class="items"><span class="chip info" data-from="2" data-to="5">VT1: кадры стека + ожидание сокета</span><span class="chip" data-to="2">пусто</span><span class="chip" data-from="5">пусто</span></div></div>
+  </div>
+  <section class="st-step" data-t="Начальное состояние" data-hl="vtC1 vtC2 vtQ"><h4>Три задачи, два carrier-потока</h4><p>Виртуальный поток — объект в куче плюс continuation. Чтобы исполняться, он «монтируется» на платформенный carrier-поток из пула планировщика (ForkJoinPool, размер по умолчанию = число ядер). VT1 и VT2 работают, VT3 ждёт в очереди.</p></section>
+  <section class="st-step" data-t="VT1: блокирующее чтение" data-hl="vtC1 vtH"><h4>VT1 вызывает socket.read()</h4><p>JDK внутри переводит сокет в неблокирующий режим, регистрирует его в поллере (epoll) и вызывает <code>Continuation.yield()</code>: кадры стека VT1 копируются с carrier-стека в кучу. Carrier 1 свободен — системный поток не заблокирован.</p></section>
+  <section class="st-step" data-t="Carrier 1 берёт VT3" data-hl="vtC1 vtQ"><h4>Монтирование VT3</h4><p>Освободившийся carrier берёт из очереди следующий виртуальный поток. Код VT1 выглядит блокирующим, но ни один системный поток не простаивает.</p></section>
+  <section class="st-step" data-t="Данные пришли" data-hl="vtQ vtH"><h4>Поллер будит VT1</h4><p>Отдельный поток-поллер получил событие готовности сокета и вызвал <code>unpark(VT1)</code>: VT1 поставлен в очередь планировщика. Он ещё не выполняется — нужен свободный carrier.</p></section>
+  <section class="st-step" data-t="VT1 на другом carrier" data-hl="vtC2 vtH"><h4>VT2 завершился → Carrier 2 монтирует VT1</h4><p>Кадры VT1 копируются из кучи обратно на стек carrier-а, выполнение продолжается после <code>read()</code>. Carrier <b>другой</b>, чем до блокировки, — поэтому идентичность потока для кода — это VT, а не carrier: <code>Thread.currentThread()</code> возвращает виртуальный поток, и его ThreadLocal-ы переезжают вместе с ним.</p></section>
+  <section class="st-step" data-t="Pinning" data-hl="vtC1"><h4>VT3 блокируется внутри synchronized (JDK 21–23)</h4><p>Если блокирующий вызов происходит внутри <code>synchronized</code>-блока или нативного кадра, стек нельзя размонтировать: VT «пришпилен» (pinned), и carrier блокируется вместе с ним. При двух carrier-ах два таких вызова останавливают все виртуальные потоки приложения.</p>
+    <p>С <b>JDK 24</b> (JEP 491) <code>synchronized</code> больше не вызывает pinning; остаются нативные кадры (JNI) и инициализаторы классов. Диагностика: событие JFR <code>jdk.VirtualThreadPinned</code>, ранее — <code>-Djdk.tracePinnedThreads=full</code>.</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">10.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Для какой нагрузки виртуальные потоки дают выигрыш?</p><ul><li>Перемножение матриц</li><li>Любой, они всегда быстрее</li><li>Много одновременных задач, которые большую часть времени ждут I/O</li><li>Один долгий расчёт</li></ul><div class="why">VT не ускоряют вычисления: ядер столько же. Они делают ожидание дешёвым.</div></div>
+<div class="mcq" data-ok="1"><p>Нужно ли создавать пул виртуальных потоков?</p><ul><li>Да, как и для обычных</li><li>Нет: они дёшевы, создаются на задачу; конкурентность ограничивают семафором, а не размером пула</li><li>Да, размером с число ядер</li><li>Пул создаёт JVM автоматически под каждый класс</li></ul><div class="why"><code>Executors.newVirtualThreadPerTaskExecutor()</code>. Пулинг нужен дорогим ресурсам; VT к ним не относятся.</div></div>
+<div class="mcq" data-ok="0"><p>Чем ScopedValue лучше ThreadLocal для виртуальных потоков?</p><ul><li>Значение неизменяемо, привязано к области вызова, автоматически исчезает и дёшево наследуется дочерними задачами</li><li>Он работает быстрее только на одном потоке</li><li>Он позволяет менять значение из любого места</li><li>Ничем</li></ul><div class="why">ThreadLocal на миллион потоков — миллион копий и риск утечек; ScopedValue задаёт значение на время выполнения блока.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему 10 000 виртуальных потоков, вызывающих HTTP, не требуют 10 000 потоков ОС?</summary><div class="a"><p>При блокирующей операции JDK переводит её в неблокирующую, регистрирует в poller'е и размонтирует continuation VT с carrier-потока. Carrier берёт следующий готовый VT. Стек ожидающего VT хранится в куче. Потоков ОС ≈ числу ядер плюс служебные.</p></div></details>
+<details class="q"><summary>Переводим сервис на VT, пул соединений Hikari = 20. Что изменится и что нужно сделать?</summary><div class="a"><p>Раньше пул Tomcat (200 потоков) ограничивал конкурентность. Теперь каждый запрос — VT, и тысячи VT одновременно будут ждать соединения из Hikari: рост времени ожидания, таймауты <code>connectionTimeout</code>. Нужно: явный лимит (Semaphore / bulkhead) с быстрым отказом, разумный <code>connectionTimeout</code>, метрики ожидания соединения; размер Hikari определяется возможностями БД, а не числом потоков.</p></div></details>
+<details class="q"><summary>Что такое pinning и актуален ли он в JDK 25?</summary><div class="a"><p>Ситуация, когда VT не может размонтироваться при блокировке и занимает carrier. До JDK 24 главная причина — блокировка внутри <code>synchronized</code>. JEP 491 (JDK 24) это убрал. Остаётся pinning при блокировке в нативных фреймах (JNI/FFM). Диагностика — JFR-событие <code>jdk.VirtualThreadPinned</code>.</p></div></details>
+<details class="q"><summary>Почему ScopedValue лучше ThreadLocal для контекста запроса?</summary><div class="a"><p>Значение неизменяемо и привязано к лексически ограниченной области: не нужно вызывать <code>remove</code>, утечка в следующую задачу невозможна. Наследуется дочерними задачами StructuredTaskScope без копирования (у <code>InheritableThreadLocal</code> — копия на каждый поток). Дешевле по памяти при миллионах VT.</p></div></details>
+<details class="q"><summary>Чем StructuredTaskScope лучше allOf из CompletableFuture?</summary><div class="a"><p>Подзадачи гарантированно завершены к выходу из блока; при ошибке одной остальные реально прерываются (а не просто перестают ждаться); прерывание родителя распространяется на детей; иерархия видна в thread dump; код блокирующий и читаемый, исключения — обычные.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

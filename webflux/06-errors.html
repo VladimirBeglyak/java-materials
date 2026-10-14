@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Ошибки, повторы и таймауты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · REACTOR</div>
+  <h1>Ошибки, повторы и таймауты</h1>
+  <p class="lead">В реактивном конвейере исключение — не <code>throw</code>, пролетающий по стеку, а сигнал <code>onError</code>, идущий вниз по цепочке и завершающий её. try/catch вокруг конвейера бесполезен. Разбираем операторы обработки ошибок, повторы с экспоненциальной задержкой, таймауты и то, почему <code>retry</code> работает только с ленивыми источниками.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">onErrorReturn / Resume / Map</span><span class="tag">retry / Retry.backoff</span><span class="tag">timeout</span><span class="tag">onErrorContinue</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="signal"><span class="h-num">6.1</span>Ошибка — терминальный сигнал</h2>
+<pre data-title="Откуда берётся onError"><code class="java">Flux.just("1", "2", "x", "4")
+    .map(Integer::parseInt)           // NumberFormatException → оператор ловит и шлёт onError вниз,
+    .subscribe(                        // а источнику — cancel(). "4" никогда не будет обработан.
+        v -&gt; log.info("{}", v),
+        e -&gt; log.error("failed", e));  // без этого колбэка — ErrorCallbackNotImplemented в лог</code></pre>
+<p>Reactor ловит исключения из лямбд операторов (map, filter, flatMap) и превращает их в onError. «Фатальные» (<code>VirtualMachineError</code>, <code>LinkageError</code>, <code>ThreadDeath</code>) пробрасываются как есть — <code>Exceptions.throwIfJvmFatal</code>. Checked-исключения внутри лямбд оборачивают через <code>Exceptions.propagate(e)</code>.</p>
+
+<h2 id="operators"><span class="h-num">6.2</span>Операторы обработки</h2>
+<div class="table-wrap"><table>
+<tr><th>Оператор</th><th>Аналог в императивном коде</th><th>Пример</th></tr>
+<tr><td><code>onErrorReturn(v)</code></td><td>catch { return default; }</td><td>значение по умолчанию; есть версия с фильтром по типу</td></tr>
+<tr><td><code>onErrorResume(e → pub)</code></td><td>catch { return fallback(); }</td><td>резервный сервис, кэш</td></tr>
+<tr><td><code>onErrorMap(e → e2)</code></td><td>catch { throw new DomainEx(e); }</td><td>перевод WebClientResponseException в доменное</td></tr>
+<tr><td><code>onErrorComplete()</code></td><td>catch {} — проглотить</td><td>с 3.4.23 / 3.5; завершает поток пусто</td></tr>
+<tr><td><code>doOnError(e → log)</code></td><td>catch { log; throw; }</td><td>логирование без изменения потока</td></tr>
+<tr><td><code>doFinally</code>, <code>using</code></td><td>finally</td><td>освобождение ресурсов</td></tr>
+<tr><td><code>retry, retryWhen</code></td><td>цикл с повтором</td><td>перевызов источника</td></tr>
+<tr><td><code>timeout(d[, fallback])</code></td><td>future.get(timeout)</td><td>TimeoutException или fallback</td></tr>
+</table></div>
+<pre data-title="Типичная цепочка вызова внешнего сервиса" class="good-code"><code class="java">return webClient.get().uri("/prices/{id}", id)
+    .retrieve()
+    .bodyToMono(Price.class)
+    .timeout(Duration.ofSeconds(2))                                    // на каждую попытку
+    .retryWhen(Retry.backoff(3, Duration.ofMillis(100))
+        .filter(e -&gt; e instanceof TimeoutException
+                  || e instanceof WebClientResponseException.ServiceUnavailable)
+        .onRetryExhaustedThrow((spec, sig) -&gt; sig.failure()))           // отдать исходную ошибку
+    .onErrorMap(WebClientResponseException.NotFound.class,
+                e -&gt; new PriceNotFound(id))
+    .onErrorResume(e -&gt; !(e instanceof PriceNotFound), e -&gt; cache.lastKnown(id));</code></pre>
+
+<h2 id="retry"><span class="h-num">6.3</span>Симулятор повторов</h2>
+<div class="widget" id="rtW">
+  <div class="widget-title">Вызов длится 50 мс; сервис падает первые N раз (S — момент подписки, P — ответ)</div>
+  <div class="controls">
+    <label>Сервис падает<select id="rtF"><option value="0">ни разу</option><option value="1">1 раз</option><option value="2" selected>2 раза</option><option value="5">постоянно</option></select></label>
+    <label>Стратегия<select id="rtS">
+      <option value="none">без обработки</option>
+      <option value="ret">onErrorReturn(DEFAULT)</option>
+      <option value="res">onErrorResume(e → fallback())</option>
+      <option value="retry">retry(3)</option>
+      <option value="fixed" selected>retryWhen(Retry.fixedDelay(3, 100ms))</option>
+      <option value="backoff">retryWhen(Retry.backoff(3, 100ms))</option>
+    </select></label>
+  </div>
+  <div id="rtM"></div>
+  <div class="verdict" id="rtV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var fails = +$("rtF").value, s = $("rtS").value, L = 50, lanes = [], t = 0, res = [], ok = false, k, maxA = 1;
+    if (s === "retry" || s === "fixed" || s === "backoff") maxA = 4;
+    for (k = 0; k < maxA; k++) {
+      var fail = k < fails, end = t + L;
+      lanes.push({ label: "попытка " + (k + 1), events: [{ t: t, v: "S", c: 4 }, fail ? { t: end, type: "error", v: "503" } : { t: end, v: "P", c: 2 }].concat(fail ? [] : [{ t: end + 0.5, type: "complete" }]), note: k ? "переподписка в " + t + " мс" : "subscribe" });
+      t = end;
+      if (!fail) { ok = true; res = [{ t: end, v: "P", c: 2 }, { t: end + 0.5, type: "complete" }]; break; }
+      if (k < maxA - 1) t += s === "fixed" ? 100 : s === "backoff" ? 100 * Math.pow(2, k) : 0;
+    }
+    var msg, cls = "ok";
+    if (!ok) {
+      if (s === "ret") { res = [{ t: t, v: "D", c: 1 }, { t: t + 0.5, type: "complete" }]; msg = "Ошибка заменена значением по умолчанию, поток завершён нормально. Осторожно: так легко замаскировать сбой — хотя бы залогируйте его (doOnError)."; cls = "warn"; }
+      else if (s === "res") { lanes.push({ label: "fallback()", events: [{ t: t, v: "S", c: 4 }, { t: t + 30, v: "F", c: 3 }, { t: t + 30.5, type: "complete" }], note: "резервный источник" }); res = [{ t: t + 30, v: "F", c: 3 }, { t: t + 30.5, type: "complete" }]; msg = "onErrorResume подписался на резервный издатель (кэш, другая реплика). Ответ получен за " + (t + 30) + " мс."; }
+      else if (s === "none") { res = [{ t: t, type: "error", v: "503" }]; msg = "Ошибка дошла до подписчика. В WebFlux это ответ 500 (или статус из ResponseStatusException)."; cls = "bad"; }
+      else if (s === "retry") { res = [{ t: t, type: "error", v: "503" }]; msg = "4 попытки подряд без паузы — за " + t + " мс сервис добили ещё тремя запросами. Повтор без задержки для перегруженного сервиса вреден."; cls = "bad"; }
+      else { res = [{ t: t, type: "error", v: "Exhausted" }]; msg = "Попытки исчерпаны: Retry бросает RetryExhaustedException (\"Retries exhausted: 3/3\") с исходной ошибкой в cause. Проверка — Exceptions.isRetryExhausted(e); onRetryExhaustedThrow позволяет пробросить исходную."; cls = "bad"; }
+    } else {
+      var n = lanes.length;
+      msg = n === 1 ? "Успех с первой попытки — операторы обработки не задействованы." : "Успех с попытки " + n + " через " + (t) + " мс. " + (s === "backoff" ? "Паузы растут: 100, 200, 400 мс… В реальности добавляется jitter (по умолчанию 0.5 → ±50%), чтобы клиенты не повторяли синхронно." : s === "fixed" ? "Фиксированная пауза 100 мс между попытками." : "Повтор мгновенный.");
+    }
+    lanes.push({ label: "результат", events: res });
+    var T = Math.max(100, Math.ceil((t + 40) / 50) * 50);
+    Marble.render("rtM", lanes, { T: T });
+    $("rtV").className = "verdict " + cls; $("rtV").textContent = msg;
+  }
+  $("rtF").addEventListener("change", run); $("rtS").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout bad"><span class="c-title">retry переподписывается — источник должен быть ленивым</span>
+<code>Mono.just(callService()).retry(3)</code> не повторит вызов: результат (или исключение) вычислен один раз при сборке. <code>Mono.fromCallable(this::callService).retry(3)</code> и WebClient-запросы — повторяются, потому что каждая подписка выполняет работу заново. Не ставьте retry после неидемпотентной операции (POST создания заказа) без ключа идемпотентности.
+</div>
+
+<h2 id="timeout"><span class="h-num">6.4</span>Таймауты</h2>
+<div class="grid-2">
+  <div class="card"><h4>timeout(Duration)</h4><p>Если следующий сигнал не пришёл за указанное время, источник отменяется и выдаётся <code>TimeoutException</code>. Для Flux таймер перезапускается на каждый элемент — это таймаут бездействия, а не общего времени. Общее время для Flux — <code>take(Duration)</code> или <code>timeout</code> на <code>collectList()</code>.</p></div>
+  <div class="card"><h4>Порядок с retry</h4><p><code>.timeout(2s).retry(3)</code> — до 2 с на каждую попытку, всего до 8 с. <code>.retry(3).timeout(2s)</code> — 2 с на всё, включая повторы. Обычно нужно первое, плюс общий таймаут сверху. Таймеры работают на <code>Schedulers.parallel()</code>.</p></div>
+</div>
+
+<h2 id="continue"><span class="h-num">6.5</span>Ошибки в потоках элементов</h2>
+<p>Ошибка в одном элементе Flux завершает весь поток. Чтобы «пропустить плохой элемент и продолжить», обрабатывайте ошибку <b>внутри</b> flatMap:</p>
+<pre data-title="Пропуск плохих элементов" class="good-code"><code class="java">Flux.fromIterable(ids)
+    .flatMap(id -&gt; client.get(id)
+        .doOnError(e -&gt; log.warn("skip {}", id, e))
+        .onErrorResume(e -&gt; Mono.empty()), 8)      // ошибка гасится во внутреннем Mono
+    .collectList();</code></pre>
+<div class="callout warn"><span class="c-title">onErrorContinue — не используйте без крайней нужды</span>
+<code>onErrorContinue</code> работает через Context и поддерживается не всеми операторами; он действует на операторы <b>выше</b> себя, меняя их поведение неочевидно, и плохо сочетается с onErrorResume ниже. Документация Reactor прямо рекомендует предпочитать обработку ошибок во внутреннем издателе.
+</div>
+
+<h2 id="quiz"><span class="h-num">6.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему try/catch вокруг <code>repo.findById(id).map(...)</code> не ловит ошибку БД?</p><ul><li>Reactor подавляет исключения</li><li>Нужен checked-тип</li><li>Метод лишь собирает конвейер; ошибка придёт позже сигналом onError</li><li>catch работает только с block()</li></ul><div class="why">Ошибка возникнет при подписке, в другом стеке и, возможно, потоке.</div></div>
+<div class="mcq" data-ok="0"><p>Что выдаст <code>Retry.backoff(3, 100ms)</code> после трёх неудачных повторов?</p><ul><li>RetryExhaustedException с исходной ошибкой в cause</li><li>Исходное исключение</li><li>Пустой Mono</li><li>Будет повторять бесконечно</li></ul><div class="why">Изменить можно через onRetryExhaustedThrow.</div></div>
+<div class="mcq" data-ok="3"><p><code>Flux.interval(1s).timeout(Duration.ofSeconds(5))</code> — когда сработает таймаут?</p><ul><li>Через 5 секунд после старта</li><li>После 5 элементов</li><li>Никогда, Flux бесконечный</li><li>Только если между элементами пройдёт больше 5 секунд — здесь никогда</li></ul><div class="why">timeout для Flux — это таймаут между сигналами.</div></div>
+<div class="mcq" data-ok="1"><p>Как продолжить обработку Flux, если вызов для одного элемента упал?</p><ul><li>onErrorResume после flatMap</li><li>onErrorResume внутри flatMap для каждого внутреннего Mono</li><li>retry()</li><li>Это невозможно</li></ul><div class="why">После flatMap ошибка уже завершила внешний поток.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как сделать повтор только для временных ошибок, а 4xx — не повторять?</summary><div class="a"><p><code>Retry.backoff(3, Duration.ofMillis(200)).filter(e -&gt; e instanceof WebClientResponseException w &amp;&amp; w.getStatusCode().is5xxServerError() || e instanceof TimeoutException || e instanceof PrematureCloseException)</code>. 4xx означает ошибку запроса — повтор даст тот же результат. Добавьте <code>maxBackoff</code>, <code>jitter</code> и <code>doBeforeRetry(s -&gt; log...)</code> для наблюдаемости.</p></div></details>
+<details class="q"><summary>Чем onErrorResume отличается от onErrorReturn с точки зрения ленивости?</summary><div class="a"><p>onErrorReturn принимает готовое значение (вычисленное при сборке), onErrorResume — функцию, вызываемую только при ошибке и возвращающую издатель: fallback-вызов произойдёт только тогда. Поэтому для дорогих fallback — onErrorResume.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

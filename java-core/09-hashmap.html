@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · HashMap изнутри, Map и Set</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ТИПЫ И КОЛЛЕКЦИИ</div>
+  <h1>HashMap изнутри, Map и Set</h1>
+  <p class="lead"><code>HashMap</code> — самая используемая структура данных в Java и самый частый вопрос на собеседовании. Нужно уметь рассказать путь ключа от <code>hashCode()</code> до ячейки, объяснить коллизии, деревья и расширение таблицы — и знать, когда вместо неё взять <code>LinkedHashMap</code> или <code>TreeMap</code>.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">бакеты</span><span class="tag">resize</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="internals"><span class="h-num">9.1</span>Устройство HashMap</h2>
+<p>Идея хэш-таблицы: вместо поиска ключа перебором вычислить по нему номер ячейки массива и обратиться к ней напрямую. Ячейку называют <b>бакетом</b> (bucket). Несколько ключей могут попасть в один бакет — это <b>коллизия</b>; тогда внутри бакета хранится небольшая цепочка.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="Структура HashMap: массив бакетов, цепочки и деревья">
+  <defs><marker id="h1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="20" y="20" font-weight="700" font-size="13">Node&lt;K,V&gt;[] table — длина всегда степень двойки</text>
+  <g font-size="12" class="mono">
+    <rect x="20" y="32" width="84" height="36" rx="5" class="box"/><text x="62" y="55" text-anchor="middle">[0] null</text>
+    <rect x="20" y="72" width="84" height="36" rx="5" class="box-warn"/><text x="62" y="95" text-anchor="middle">[1]</text>
+    <rect x="20" y="112" width="84" height="36" rx="5" class="box"/><text x="62" y="135" text-anchor="middle">[2] null</text>
+    <rect x="20" y="152" width="84" height="36" rx="5" class="box-ok"/><text x="62" y="175" text-anchor="middle">[3]</text>
+    <rect x="20" y="192" width="84" height="36" rx="5" class="box"/><text x="62" y="215" text-anchor="middle">[4] null</text>
+    <rect x="20" y="232" width="84" height="36" rx="5" class="box-info"/><text x="62" y="255" text-anchor="middle">[5]</text>
+    <rect x="140" y="72" width="160" height="36" rx="6" class="box-warn"/><text x="220" y="95" text-anchor="middle">hash│K1│V1│next</text>
+    <rect x="336" y="72" width="160" height="36" rx="6" class="box-warn"/><text x="416" y="95" text-anchor="middle">hash│K2│V2│null</text>
+    <rect x="140" y="152" width="160" height="36" rx="6" class="box-ok"/><text x="220" y="175" text-anchor="middle">TreeNode (корень)</text>
+    <rect x="140" y="232" width="160" height="36" rx="6" class="box-info"/><text x="220" y="255" text-anchor="middle">hash│K3│V3│null</text>
+  </g>
+  <path d="M104 90 H136" class="ln" marker-end="url(#h1)"/><path d="M300 90 H332" class="ln" marker-end="url(#h1)"/>
+  <path d="M104 170 H136" class="ln" marker-end="url(#h1)"/><path d="M104 250 H136" class="ln" marker-end="url(#h1)"/>
+  <text x="516" y="88" font-size="12.5">коллизия: односвязный список,</text><text x="516" y="106" font-size="12.5" class="muted">новый узел добавляется в хвост</text>
+  <text x="320" y="168" font-size="12.5">≥ 8 узлов в бакете и таблица ≥ 64 → красно-чёрное дерево</text><text x="320" y="186" font-size="12.5" class="muted">поиск в бакете O(log n) вместо O(n)</text>
+  <text x="320" y="248" font-size="12.5">один узел — обычный случай при хорошем hashCode</text>
+  <text x="20" y="292" class="mono" font-size="12.5">index = (table.length − 1) &amp; (h ^ (h &gt;&gt;&gt; 16)),  где h = key.hashCode()</text>
+</svg>
+</figure>
+<h3>Что происходит при put(key, value)</h3>
+<ol class="steps">
+  <li><b>Хэш.</b> Вызывается <code>key.hashCode()</code>; старшие 16 бит «подмешиваются» к младшим: <code>h ^ (h &gt;&gt;&gt; 16)</code>. Для ключа <code>null</code> хэш равен 0.</li>
+  <li><b>Индекс.</b> <code>(n − 1) &amp; hash</code>, где <code>n</code> — длина таблицы. Так как <code>n</code> — степень двойки, это быстрый эквивалент остатка от деления: берутся младшие биты хэша.</li>
+  <li><b>Бакет пуст</b> — создаётся узел.</li>
+  <li><b>Бакет занят</b> — узлы просматриваются по очереди. Ключ считается найденным, если совпал хэш <b>и</b> (<code>==</code> или <code>equals</code>). Найден — значение заменяется; нет — новый узел добавляется в конец цепочки.</li>
+  <li><b>Цепочка достигла 8 узлов</b> — она превращается в дерево (если таблица меньше 64 бакетов, вместо этого расширяется таблица).</li>
+  <li><b>Число элементов превысило порог</b> (<code>capacity × 0,75</code>) — таблица удваивается.</li>
+</ol>
+<p><code>get(key)</code> повторяет шаги 1, 2 и 4. Отсюда видно, зачем нужны оба метода: <code>hashCode</code> выбирает бакет, <code>equals</code> находит ключ внутри него (<a href="05-object-contract.html#hashcode">тема 05</a>).</p>
+<div class="callout info"><span class="c-title">Зачем подмешивать старшие биты</span>
+В таблице на 16 бакетов индекс определяют только 4 младших бита хэша. Если у ключей различаются лишь старшие биты (типично для <code>Float</code>, адресов, составных идентификаторов), все они попадут в один бакет. Операция <code>h ^ (h &gt;&gt;&gt; 16)</code> дёшево распространяет влияние старших битов на младшие.
+</div>
+
+<div class="widget" id="hm">
+  <div class="widget-title">Интерактив: куда попадёт ключ</div>
+  <p style="margin:4px 0 0;font-size:14.5px">Хэш вычисляется по тем же формулам, что в <code>String.hashCode()</code> и <code>HashMap.hash()</code>. Обратите внимание на <code>Aa</code> и <code>BB</code> — у них одинаковый хэш — и на то, как меняется раскладка при увеличении таблицы.</p>
+  <div class="controls">
+    <label>Ключи через запятую<input type="text" id="hmKeys" value="Aa, BB, AaAa, BBBB, AaBB, order-1, order-2, user:42, Москва"></label>
+    <label>Размер таблицы<select id="hmCap"><option>8</option><option selected>16</option><option>32</option><option>64</option></select></label>
+    <button class="btn primary" type="button" id="hmRun">Разложить</button>
+  </div>
+  <div class="table-wrap"><table id="hmCalc"></table></div>
+  <div class="buckets" id="hmBuckets"></div>
+</div>
+<script>
+(function () {
+  function javaHash(s) { var h = 0; for (var i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0; return h; }
+  function cell(tag, text) { var e = document.createElement(tag); e.textContent = text; return e; }
+  function run() {
+    var n = parseInt(document.getElementById("hmCap").value, 10);
+    var keys = document.getElementById("hmKeys").value.split(",").map(function (k) { return k.trim(); }).filter(Boolean);
+    var seen = {}, buckets = [], calc = document.getElementById("hmCalc");
+    for (var i = 0; i < n; i++) buckets.push([]);
+    calc.innerHTML = "";
+    var head = document.createElement("tr");
+    ["Ключ", "hashCode()", "h ^ (h >>> 16)", "индекс"].forEach(function (t) { head.appendChild(cell("th", t)); });
+    calc.appendChild(head);
+    keys.forEach(function (k) {
+      if (seen[k]) return; seen[k] = true;
+      var h = javaHash(k), spread = h ^ (h >>> 16), idx = (n - 1) & spread;
+      buckets[idx].push(k);
+      var tr = document.createElement("tr");
+      [k, String(h), String(spread), String(idx)].forEach(function (t) { tr.appendChild(cell("td", t)); });
+      calc.appendChild(tr);
+    });
+    var box = document.getElementById("hmBuckets"); box.innerHTML = "";
+    buckets.forEach(function (b, i) {
+      var d = document.createElement("div");
+      d.className = "bucket" + (b.length > 1 ? " coll" : b.length === 1 ? " used" : "");
+      d.appendChild(cell("b", "[" + i + "]"));
+      d.appendChild(document.createTextNode(b.length ? b.join(" → ") : "—"));
+      box.appendChild(d);
+    });
+  }
+  document.addEventListener("DOMContentLoaded", function () {
+    document.getElementById("hmRun").addEventListener("click", run);
+    document.getElementById("hmCap").addEventListener("change", run);
+    run();
+  });
+})();
+</script>
+
+<h2 id="collisions"><span class="h-num">9.2</span>Коллизии и деревья</h2>
+<p>При равномерном хэше цепочки короткие, и операции выполняются за O(1). Но хэш может быть плохим — случайно или по умыслу: злоумышленник подбирает тысячи строк с одинаковым <code>hashCode</code>, отправляет их параметрами запроса, и сервер тратит всё время на перебор одной цепочки. До Java 8 это давало O(n) на операцию.</p>
+<div class="table-wrap"><table>
+<tr><th>Константа</th><th>Значение</th><th>Смысл</th></tr>
+<tr><td><code>TREEIFY_THRESHOLD</code></td><td>8</td><td>Длина цепочки, при которой она превращается в красно-чёрное дерево</td></tr>
+<tr><td><code>MIN_TREEIFY_CAPACITY</code></td><td>64</td><td>Минимальный размер таблицы для этого; в меньшей таблице вместо дерева — расширение</td></tr>
+<tr><td><code>UNTREEIFY_THRESHOLD</code></td><td>6</td><td>Дерево снова становится списком, когда в нём остаётся столько узлов</td></tr>
+</table></div>
+<p>Дерево упорядочено по хэшу, а при равных хэшах — по <code>compareTo</code>, если ключи реализуют <code>Comparable</code>. Поэтому худший случай стал O(log n), но только для сравнимых ключей: у <code>String</code> это работает, у собственного класса без <code>Comparable</code> с константным <code>hashCode</code> поиск в дереве всё равно вырождается.</p>
+
+<h2 id="resize"><span class="h-num">9.3</span>Расширение таблицы</h2>
+<ul>
+  <li><b>Начальная ёмкость</b> — 16 бакетов; таблица создаётся при первой вставке.</li>
+  <li><b>Коэффициент загрузки</b> (load factor) — 0,75. Когда элементов становится больше <code>capacity × 0,75</code>, таблица удваивается: 16 → 32 при 13-м элементе.</li>
+  <li><b>Перераспределение.</b> При удвоении в индексе начинает участвовать ещё один бит хэша. Каждый узел либо остаётся в бакете <code>i</code>, либо переезжает в <code>i + oldCapacity</code> — хэш заново не вычисляется, порядок в цепочке сохраняется.</li>
+  <li><b>Таблица никогда не уменьшается</b>, даже после <code>clear()</code>.</li>
+</ul>
+<p>Значение 0,75 — компромисс: меньше — расходуется память на пустые бакеты, больше — растут цепочки.</p>
+<div class="callout bad"><span class="c-title">Ловушка: аргумент конструктора — это не число элементов</span>
+<pre><code class="java">Map&lt;String, User&gt; m1 = new HashMap&lt;&gt;(1000);        // таблица на 1024 бакета, порог 768 —
+                                                   // при вставке 769-го элемента произойдёт расширение
+Map&lt;String, User&gt; m2 = new HashMap&lt;&gt;(1000 * 4 / 3 + 1);   // правильно: ёмкость = элементы / 0,75
+Map&lt;String, User&gt; m3 = HashMap.newHashMap(1000);          // Java 19+: фабрика считает сама</code></pre>
+Расширение большой карты — копирование всех узлов. Если размер известен заранее, задайте его.
+</div>
+
+<h2 id="properties"><span class="h-num">9.4</span>Свойства, о которых спрашивают</h2>
+<div class="table-wrap"><table>
+<tr><th>Свойство</th><th>HashMap</th></tr>
+<tr><td>Ключ <code>null</code></td><td>Один, хранится в бакете 0. Значений <code>null</code> — сколько угодно</td></tr>
+<tr><td>Порядок обхода</td><td>Не определён и <b>может измениться</b> после расширения. Нельзя полагаться даже на «кажущийся» порядок</td></tr>
+<tr><td>Потокобезопасность</td><td>Нет</td></tr>
+<tr><td>Сложность</td><td>O(1) в среднем; O(log n) в худшем случае для сравнимых ключей</td></tr>
+<tr><td>Память</td><td>Узел — 32 байта плюс ссылка в таблице; на миллион записей ~40 МБ без учёта ключей и значений</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">HashMap в нескольких потоках</span>
+Одновременная запись приводит к потерянным записям и неверному <code>size()</code>; в Java 7 и ранее параллельное расширение могло зациклить цепочку и навсегда занять ядро процессора. «Только один поток пишет» тоже не спасает: читатель может увидеть таблицу в процессе расширения. Решение — <code>ConcurrentHashMap</code> (<a href="../java-concurrency/07-collections.html">Java Concurrency, тема 07</a>), а не <code>Collections.synchronizedMap</code> и тем более не <code>Hashtable</code>.
+</div>
+
+<h2 id="api"><span class="h-num">9.5</span>Современный API Map</h2>
+<pre data-title="до Java 8 и после"><code class="java">// счётчик
+Integer old = counts.get(word);
+counts.put(word, old == null ? 1 : old + 1);
+counts.merge(word, 1, Integer::sum);                       // то же одной строкой
+
+// группировка: ключ → список
+List&lt;Order&gt; list = byUser.get(userId);
+if (list == null) { list = new ArrayList&lt;&gt;(); byUser.put(userId, list); }
+list.add(order);
+byUser.computeIfAbsent(userId, k -&gt; new ArrayList&lt;&gt;()).add(order);   // то же одной строкой
+
+int n = counts.getOrDefault(word, 0);                      // без проверки на null
+cache.putIfAbsent(key, value);                             // положить, только если ключа нет
+stock.computeIfPresent(sku, (k, v) -&gt; v &gt; 1 ? v - 1 : null);   // вернуть null — удалить запись</code></pre>
+<pre data-title="обход"><code class="java">for (Map.Entry&lt;String, Integer&gt; e : counts.entrySet()) { use(e.getKey(), e.getValue()); }   // один проход
+counts.forEach((word, n) -&gt; use(word, n));
+for (String k : counts.keySet()) { use(k, counts.get(k)); }      // лишний поиск на каждом шаге — так не надо</code></pre>
+<ul>
+  <li><b><code>Map.of(k1, v1, …)</code></b> — неизменяемая карта (до 10 пар; больше — <code>Map.ofEntries</code>). Не допускает <code>null</code> и дубликатов ключей; порядок обхода намеренно случаен между запусками.</li>
+  <li><b>Функция в <code>computeIfAbsent</code></b> не должна изменять ту же карту — это приводит к <code>ConcurrentModificationException</code> или повреждению структуры.</li>
+  <li><b><code>get</code> возвращает <code>null</code> в двух случаях</b>: ключа нет или значение равно <code>null</code>. Различить их — <code>containsKey</code>; лучше не хранить <code>null</code>-значения вовсе.</li>
+</ul>
+
+<h2 id="others"><span class="h-num">9.6</span>LinkedHashMap, TreeMap и другие</h2>
+<div class="table-wrap"><table>
+<tr><th>Реализация</th><th>Порядок обхода</th><th>Сложность</th><th>null-ключ</th><th>Когда</th></tr>
+<tr><td><code>HashMap</code></td><td>Не определён</td><td>O(1)</td><td>да</td><td>По умолчанию</td></tr>
+<tr><td><code>LinkedHashMap</code></td><td>Порядок вставки (или доступа)</td><td>O(1)</td><td>да</td><td>Предсказуемый порядок: JSON, отчёты, LRU-кэш</td></tr>
+<tr><td><code>TreeMap</code></td><td>По возрастанию ключей</td><td>O(log n)</td><td>нет</td><td>Диапазоны, «ближайший ключ», сортированный вывод</td></tr>
+<tr><td><code>EnumMap</code></td><td>Порядок констант</td><td>O(1), массив</td><td>нет</td><td>Ключи — enum: быстрее и компактнее любой другой</td></tr>
+<tr><td><code>IdentityHashMap</code></td><td>—</td><td>O(1)</td><td>да</td><td>Сравнение ключей по <code>==</code>: обход графа объектов</td></tr>
+<tr><td><code>WeakHashMap</code></td><td>—</td><td>O(1)</td><td>да</td><td>Запись исчезает, когда на ключ не осталось сильных ссылок</td></tr>
+</table></div>
+<pre data-title="LRU-кэш на LinkedHashMap"><code class="java">class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int maxSize;
+    LruCache(int maxSize) {
+        super(16, 0.75f, true);                  // true — порядок по последнему доступу
+        this.maxSize = maxSize;
+    }
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; maxSize;                 // вызывается после каждой вставки
+    }
+}   // не потокобезопасен; в рабочем коде — библиотека Caffeine</code></pre>
+<pre data-title="TreeMap: навигация по ключам"><code class="java">TreeMap&lt;Integer, String&gt; grades = new TreeMap&lt;&gt;(Map.of(0, "F", 60, "D", 70, "C", 80, "B", 90, "A"));
+grades.floorEntry(85).getValue();     // "B": наибольший ключ ≤ 85
+grades.ceilingKey(61);                // 70: наименьший ключ ≥ 61
+grades.headMap(70);                   // {0=F, 60=D} — представление ключей &lt; 70
+grades.firstKey();  grades.lastEntry();  grades.descendingMap();</code></pre>
+<p><code>TreeMap</code> — красно-чёрное дерево. Ключи сравниваются через <code>compareTo</code> или компаратор, а <b>не</b> через <code>equals</code> (<a href="05-object-contract.html#compare">тема 05</a>). Методы <code>floor</code>/<code>ceiling</code> — основа диапазонных справочников: тарифные сетки, интервалы времени, кольцо согласованного хэширования.</p>
+
+<h2 id="sets"><span class="h-num">9.7</span>Множества</h2>
+<p><code>HashSet</code> — это <code>HashMap</code>, в котором элементы хранятся как ключи, а значением служит один общий объект-заглушка. <code>LinkedHashSet</code> и <code>TreeSet</code> так же построены на <code>LinkedHashMap</code> и <code>TreeMap</code>. Всё сказанное о ключах карты относится к элементам множества: согласованные <code>equals</code> и <code>hashCode</code>, неизменяемость.</p>
+<pre><code class="java">Set&lt;String&gt; a = new HashSet&lt;&gt;(List.of("x", "y", "z"));
+Set&lt;String&gt; b = Set.of("y", "z", "w");
+
+a.add("x");            // false — элемент уже есть; add сообщает, изменилось ли множество
+a.retainAll(b);        // пересечение: a = {y, z}
+a.addAll(b);           // объединение
+a.removeAll(b);        // разность
+
+List&lt;String&gt; unique = new ArrayList&lt;&gt;(new LinkedHashSet&lt;&gt;(withDuplicates));   // убрать дубликаты, сохранив порядок</code></pre>
+
+<h2 id="lab"><span class="h-num">9.8</span>Интерактив: коллизии, resize и превращение в дерево</h2>
+<div class="widget" id="rzW">
+  <div class="widget-title">Симулятор: что происходит с перегруженным бакетом</div>
+  <p class="hint">Введите хэши ключей через запятую (уже после «перемешивания» <code>h ^ (h &gt;&gt;&gt; 16)</code>). По умолчанию — девять ключей, которые при таблице 16 попадают в один бакет.</p>
+  <div class="controls"><label>хэши<input type="text" id="rzIn" class="wide" value="5, 21, 37, 53, 69, 85, 101, 117, 133"></label></div>
+  <div class="controls"><button class="btn" type="button" data-v="5, 21, 37, 53, 69, 85, 101, 117, 133">9 коллизий при n=16</button><button class="btn" type="button" data-v="5, 69, 133, 197, 261, 325, 389, 453, 517">коллизии и при n=64</button><button class="btn" type="button" data-v="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13">13 разных — порог 0,75</button></div>
+  <div class="out" id="rzOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("rzIn"), out = document.getElementById("rzOut");
+  function dist(hs, n) { var b = {}; hs.forEach(function (h) { var i = h & (n - 1); (b[i] = b[i] || []).push(h); }); return b; }
+  function fmt(b) { return Object.keys(b).map(function (i) { return "[" + i + "]: " + b[i].join(" → "); }).join("\n  "); }
+  function run() {
+    var hs = inp.value.split(",").map(function (s) { return parseInt(s.trim(), 10); }).filter(function (x) { return !isNaN(x); });
+    var n = 16, L = [], size = 0, bins = {};
+    L.push("Пустая HashMap: таблица создаётся при первом put, n = 16, порог resize = 16 × 0,75 = 12\n");
+    hs.forEach(function (h) {
+      var i = h & (n - 1); (bins[i] = bins[i] || []).push(h); size++;
+      var line = "put(hash " + h + "): index = " + h + " & " + (n - 1) + " = " + i + ", в бакете " + bins[i].length;
+      if (bins[i].length > 8 && n < 64) {
+        var old = n; n *= 2; bins = dist([].concat.apply([], Object.keys(bins).map(function (k) { return bins[k]; })), n);
+        line += "\n  цепочка длиннее 8, но таблица < 64 → вместо дерева resize " + old + " → " + n + ":\n  " + fmt(bins) + "\n  каждый узел остался на месте или переехал на +" + old + " — по биту (hash & " + old + ")";
+      } else if (bins[i].length > 8) { line += "\n  цепочка длиннее 8 и таблица ≥ 64 → treeifyBin: список превращается в красно-чёрное дерево, поиск O(log n)"; }
+      if (size > n * 0.75) {
+        var o2 = n; n *= 2; bins = dist([].concat.apply([], Object.keys(bins).map(function (k) { return bins[k]; })), n);
+        line += "\n  size " + size + " > порога " + (o2 * 0.75) + " → resize " + o2 + " → " + n;
+      }
+      L.push(line);
+    });
+    var max = Math.max.apply(null, Object.keys(bins).map(function (k) { return bins[k].length; }).concat(0));
+    L.push("\nИтог: n = " + n + ", size = " + size + ", самая длинная цепочка: " + max + "\n  " + fmt(bins));
+    out.textContent = L.join("\n");
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#rzW [data-v]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.getAttribute("data-v"); run(); }); });
+  run();
+})();
+</script>
+<div class="callout info"><span class="c-title">Почему при resize не пересчитывают индекс заново</span>
+Длина таблицы — степень двойки, и при удвоении в маске появляется ровно один новый бит. Узел либо остаётся в бакете <code>i</code>, либо уходит в <code>i + oldCap</code>; достаточно проверить <code>(hash &amp; oldCap) == 0</code>. Цепочка делится на две («lo» и «hi») с сохранением относительного порядка.</div>
+
+<h2 id="quiz"><span class="h-num">9.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Когда цепочка в бакете HashMap превращается в дерево?</p><ul><li>Когда в бакете 8 узлов</li><li>Когда load factor превышает 0,75</li><li>Когда в бакет добавляется узел сверх 8 и размер таблицы не меньше 64; иначе выполняется resize</li><li>Никогда, дерево только в TreeMap</li></ul><div class="why">TREEIFY_THRESHOLD = 8, MIN_TREEIFY_CAPACITY = 64. Обратно в список — при 6 узлах (UNTREEIFY_THRESHOLD).</div></div>
+<div class="mcq" data-ok="1"><p>Какая сложность get() в HashMap в худшем случае (Java 8+)?</p><ul><li>O(1)</li><li>O(log n) — бакет с коллизиями хранится деревом</li><li>O(n)</li><li>O(n log n)</li></ul><div class="why">До Java 8 худший случай был O(n) — длинный связный список, чем пользовались для DoS-атак на хэш-таблицы.</div></div>
+<div class="mcq" data-ok="0"><p>Нужно хранить записи в порядке вставки и вытеснять самую давнюю по обращению. Что выбрать?</p><ul><li>LinkedHashMap с accessOrder = true и переопределённым removeEldestEntry</li><li>TreeMap</li><li>HashMap с сортировкой при чтении</li><li>IdentityHashMap</li></ul><div class="why">Это готовый LRU-кэш в три строки. TreeMap упорядочивает по ключу, а не по времени.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите по шагам, что происходит при <code>map.put(key, value)</code>.</summary><div class="a"><p>Вычисляется <code>hashCode</code> ключа и перемешивается (<code>h ^ h &gt;&gt;&gt; 16</code>); индекс бакета — <code>(n − 1) &amp; hash</code>. Пустой бакет — создаётся узел. Занятый — узлы сравниваются по хэшу и <code>equals</code>: найден — значение заменяется, нет — узел добавляется в конец; при 8 узлах цепочка превращается в дерево (если таблица не меньше 64). Если размер превысил <code>capacity × loadFactor</code> — таблица удваивается.</p></div></details>
+<details class="q"><summary>Что такое коллизия и как HashMap её разрешает?</summary><div class="a"><p>Ситуация, когда разные ключи попадают в один бакет — из-за совпадения хэшей или их младших битов. Разрешается цепочкой узлов в бакете (метод цепочек); длинные цепочки с Java 8 превращаются в красно-чёрные деревья, что ограничивает худший случай O(log n).</p></div></details>
+<details class="q"><summary>Почему длина таблицы — всегда степень двойки?</summary><div class="a"><p>Индекс вычисляется побитовым «и» <code>(n − 1) &amp; hash</code> — это быстрее деления и корректно работает с отрицательными хэшами. А при удвоении каждый узел либо остаётся на месте, либо сдвигается ровно на старую ёмкость — определяется одним битом хэша, без пересчёта.</p></div></details>
+<details class="q"><summary>Нужно положить в HashMap 1000 записей. Как создать карту, чтобы избежать расширений?</summary><div class="a"><p><code>new HashMap&lt;&gt;(1000)</code> недостаточно: аргумент — ёмкость таблицы, она округлится до 1024, а порог составит 1024 × 0,75 = 768, и на 769-й записи таблица расширится. Надёжно: <code>new HashMap&lt;&gt;((int) (1000 / 0.75f) + 1)</code> или <code>HashMap.newHashMap(1000)</code> в Java 19+.</p></div></details>
+<details class="q"><summary>Чем LinkedHashMap и TreeMap отличаются от HashMap?</summary><div class="a"><p><code>LinkedHashMap</code> дополнительно связывает записи двусвязным списком и обходит их в порядке вставки или последнего доступа; операции остаются O(1). <code>TreeMap</code> хранит ключи в красно-чёрном дереве в отсортированном порядке: операции O(log n), зато есть поиск ближайшего ключа и срезы по диапазону; сравнение идёт через <code>compareTo</code>, ключ <code>null</code> запрещён.</p></div></details>
+<details class="q"><summary>Что произойдёт, если изменить поле ключа после вставки в HashMap?</summary><div class="a"><p>Если поле участвует в <code>hashCode</code>, запись останется в бакете, соответствующем старому хэшу. Поиск по изменённому ключу пойдёт в другой бакет и ничего не найдёт; запись нельзя ни получить, ни удалить, но она занимает память. Ключи должны быть неизменяемыми.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

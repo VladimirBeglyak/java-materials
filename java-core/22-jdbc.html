@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · JDBC: работа с базой данных</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="22">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>JDBC: работа с базой данных без фреймворков</h1>
+  <p class="lead">Hibernate, Spring Data, jOOQ, MyBatis — все они в итоге вызывают JDBC. Когда ORM выдаёт странный SQL, соединения в пуле заканчиваются, а транзакция «не откатывается», разбираться приходится на этом уровне. Здесь — весь API <code>java.sql</code>, который нужно знать: соединения, подготовленные запросы, транзакции, пакетная вставка и главная уязвимость — SQL-инъекция.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">PreparedStatement</span><span class="tag">транзакции</span><span class="tag">SQL-инъекция</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="arch"><span class="h-num">22.1</span>Архитектура JDBC</h2>
+<div class="flow">
+  <div class="node info"><b>Ваш код</b><small>интерфейсы java.sql</small></div><span class="to">→</span>
+  <div class="node acc"><b>DataSource</b><small>пул соединений (HikariCP)</small></div><span class="to">→</span>
+  <div class="node"><b>Driver</b><small>реализация для СУБД: org.postgresql</small></div><span class="to">→ TCP, протокол СУБД →</span>
+  <div class="node ok"><b>PostgreSQL</b></div>
+</div>
+<p>JDBC — набор <b>интерфейсов</b> (<code>Connection</code>, <code>PreparedStatement</code>, <code>ResultSet</code>). Реализацию даёт драйвер, который находится на classpath через механизм <code>ServiceLoader</code> (файл <code>META-INF/services/java.sql.Driver</code>) — <code>Class.forName("org.postgresql.Driver")</code> давно не нужен. Код зависит только от <code>java.sql</code>, драйвер подключается в scope <code>runtime</code>.</p>
+
+<h2 id="basic"><span class="h-num">22.2</span>Запрос от начала до конца</h2>
+<pre><code class="java">record Order(long id, String customer, BigDecimal total, Instant createdAt) { }
+
+List&lt;Order&gt; findByCustomer(DataSource ds, String customer) throws SQLException {
+    String sql = "SELECT id, customer, total, created_at FROM orders WHERE customer = ? ORDER BY created_at DESC";
+    try (Connection c = ds.getConnection();                          // взять соединение из пула
+         PreparedStatement ps = c.prepareStatement(sql)) {
+        ps.setString(1, customer);                                    // параметры нумеруются с 1
+        try (ResultSet rs = ps.executeQuery()) {
+            List&lt;Order&gt; result = new ArrayList&lt;&gt;();
+            while (rs.next()) {                                       // курсор стоит ПЕРЕД первой строкой
+                result.add(new Order(rs.getLong("id"), rs.getString("customer"),
+                        rs.getBigDecimal("total"), rs.getObject("created_at", OffsetDateTime.class).toInstant()));
+            }
+            return result;
+        }
+    }                                                                 // close() в обратном порядке: rs → ps → c (возврат в пул)
+}</code></pre>
+<div class="callout bad"><span class="c-title">Три ресурса — три закрытия</span>
+Незакрытый <code>Connection</code> не возвращается в пул: через несколько минут под нагрузкой пул пуст, и приложение стоит. Только <code>try-with-resources</code>. <code>close()</code> у соединения из пула не закрывает TCP-соединение, а возвращает его в пул.
+</div>
+<div class="callout warn"><span class="c-title">NULL и примитивы</span>
+<code>rs.getInt("qty")</code> для SQL NULL вернёт <b>0</b>. Проверка: <code>rs.wasNull()</code> сразу после чтения или <code>rs.getObject("qty", Integer.class)</code>, который вернёт <code>null</code>. Запись NULL: <code>ps.setNull(1, Types.INTEGER)</code> или <code>ps.setObject(1, null)</code>.
+</div>
+
+<h2 id="injection"><span class="h-num">22.3</span>Statement, PreparedStatement и SQL-инъекция</h2>
+<div class="widget" id="sqW">
+  <div class="widget-title">Симулятор: что получит база данных</div>
+  <p class="hint">Форма входа. Таблица <code>users(login, password_hash, role)</code>. Введите логин, как это сделал бы атакующий.</p>
+  <div class="controls"><label>логин<input type="text" id="sqIn" class="wide" value="admin' --"></label></div>
+  <div class="controls">
+    <button class="btn" type="button" data-v="ivan">ivan</button>
+    <button class="btn" type="button" data-v="admin' --">admin' --</button>
+    <button class="btn" type="button" data-v="' OR '1'='1">' OR '1'='1</button>
+    <button class="btn" type="button" data-v="x'; DROP TABLE users; --">'; DROP TABLE</button>
+    <button class="btn" type="button" data-v="' UNION SELECT login, password_hash, role FROM users --">UNION SELECT</button>
+    <button class="btn" type="button" data-v="O'Brien">O'Brien</button>
+  </div>
+  <div class="grid-2">
+    <div><b style="font-size:14px">Конкатенация строк (Statement)</b><div class="out" id="sqBad"></div><div class="verdict" id="sqBadV"></div></div>
+    <div><b style="font-size:14px">Параметр (PreparedStatement)</b><div class="out" id="sqGood"></div><div class="verdict ok" id="sqGoodV"></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("sqIn"), $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var v = inp.value, sql = "SELECT login, role FROM users\nWHERE login = '" + v + "'\n  AND password_hash = '5f4dcc…'";
+    $("sqBad").textContent = '"… WHERE login = \'" + login + "\' AND …"\n\n' + sql;
+    var cls = "ok", msg = "Запрос корректен: ввод не содержит спецсимволов. Но корректность зависит от данных пользователя.";
+    if (/--/.test(v) && /'/.test(v) && !/;|union/i.test(v)) { cls = "bad"; msg = "Кавычка закрыла строковый литерал, а «--» превратило проверку пароля в комментарий. Вход под любым логином без пароля."; }
+    else if (/'\s*or\s*'/i.test(v)) { cls = "bad"; msg = "Условие стало истинным для каждой строки (… OR '1'='1' AND … ). Запрос возвращает пользователей без знания логина и пароля."; }
+    else if (/;\s*drop|;\s*delete|;\s*update/i.test(v)) { cls = "bad"; msg = "Вторая команда после «;». Выполнится ли она, зависит от драйвера (PostgreSQL JDBC выполняет несколько команд в простом режиме запросов) — рассчитывать на то, что «не выполнится», нельзя."; }
+    else if (/union\s+select/i.test(v)) { cls = "bad"; msg = "UNION добавил к результату произвольные данные: атакующий читает хэши паролей всех пользователей, а при желании — любую таблицу."; }
+    else if (/'/.test(v)) { cls = "warn"; msg = "Атаки нет, но апостроф в фамилии ломает синтаксис: ERROR: syntax error at or near \"Brien\". Конкатенация не работает даже для честных пользователей."; }
+    $("sqBadV").className = "verdict " + cls; $("sqBadV").textContent = msg;
+    $("sqGood").textContent = 'c.prepareStatement("… WHERE login = ? AND password_hash = ?")\nps.setString(1, login)\n\nтекст запроса:  WHERE login = $1 AND password_hash = $2\nпараметр $1:    ' + JSON.stringify(v) + "   ← передаётся отдельно, как данные";
+    $("sqGoodV").textContent = "Структура запроса зафиксирована при подготовке. Значение параметра никогда не разбирается как SQL — какие бы символы в нём ни были, это просто строка для сравнения с login.";
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#sqW [data-v]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.getAttribute("data-v"); run(); }); });
+  run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th></th><th><code>Statement</code></th><th><code>PreparedStatement</code></th></tr>
+<tr><td>Параметры</td><td>вклеиваются в текст — инъекции</td><td>передаются отдельно от текста</td></tr>
+<tr><td>План запроса</td><td>разбор и планирование каждый раз</td><td>сервер может переиспользовать разобранный запрос (в PostgreSQL JDBC — после 5 выполнений, <code>prepareThreshold</code>)</td></tr>
+<tr><td>Типы</td><td>всё строками, форматирование дат и чисел вручную</td><td>драйвер передаёт типизированные значения</td></tr>
+<tr><td>Когда</td><td>DDL и статический SQL без внешних данных</td><td>всё остальное</td></tr>
+</table></div>
+<p>Параметром можно сделать только <b>значение</b>. Имя таблицы, столбца, направление сортировки параметризовать нельзя — их проверяют по белому списку: <code>Set.of("created_at", "total").contains(sortColumn)</code>.</p>
+
+<h2 id="tx"><span class="h-num">22.4</span>Транзакции</h2>
+<pre><code class="java">void transfer(DataSource ds, long from, long to, BigDecimal amount) throws SQLException {
+    try (Connection c = ds.getConnection()) {
+        c.setAutoCommit(false);                                  // по умолчанию true: каждое выражение — своя транзакция
+        try (PreparedStatement debit  = c.prepareStatement("UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance &gt;= ?");
+             PreparedStatement credit = c.prepareStatement("UPDATE accounts SET balance = balance + ? WHERE id = ?")) {
+            debit.setBigDecimal(1, amount); debit.setLong(2, from); debit.setBigDecimal(3, amount);
+            if (debit.executeUpdate() != 1) throw new InsufficientFundsException(from);   // число изменённых строк
+            credit.setBigDecimal(1, amount); credit.setLong(2, to);
+            credit.executeUpdate();
+            c.commit();
+        } catch (Exception e) {
+            c.rollback();                                        // без него транзакция осталась бы открытой
+            throw e;
+        } finally {
+            c.setAutoCommit(true);                               // соединение вернётся в пул — оставляем в исходном состоянии
+        }
+    }
+}</code></pre>
+<p>Транзакция — это состояние <b>соединения</b>: всё, что должно быть атомарно, выполняется через один <code>Connection</code>. Именно этот шаблон (взять соединение, выключить autocommit, commit/rollback, вернуть) автоматизирует <code>@Transactional</code> в Spring, пряча соединение в ThreadLocal.</p>
+<div class="table-wrap"><table>
+<tr><th>Уровень изоляции</th><th>Константа JDBC</th><th>Защищает от</th></tr>
+<tr><td>Read committed (по умолчанию в PostgreSQL)</td><td><code>TRANSACTION_READ_COMMITTED</code></td><td>грязного чтения</td></tr>
+<tr><td>Repeatable read</td><td><code>TRANSACTION_REPEATABLE_READ</code></td><td>+ неповторяемого чтения</td></tr>
+<tr><td>Serializable</td><td><code>TRANSACTION_SERIALIZABLE</code></td><td>+ фантомов; возможны ошибки сериализации — нужен повтор транзакции</td></tr>
+</table></div>
+
+<h2 id="batch"><span class="h-num">22.5</span>Пакетные операции и большие выборки</h2>
+<pre><code class="java">try (PreparedStatement ps = c.prepareStatement("INSERT INTO events(id, type, payload) VALUES (?, ?, ?::jsonb)")) {
+    int n = 0;
+    for (Event e : events) {
+        ps.setObject(1, e.id()); ps.setString(2, e.type()); ps.setString(3, e.json());
+        ps.addBatch();
+        if (++n % 1000 == 0) ps.executeBatch();              // порциями, чтобы не держать всё в памяти
+    }
+    ps.executeBatch();
+}
+// PostgreSQL: в URL добавьте reWriteBatchedInserts=true — драйвер склеит вставки в многострочный INSERT (в разы быстрее)
+
+// Сгенерированный ключ:
+PreparedStatement ps = c.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
+ps.executeUpdate();
+try (ResultSet keys = ps.getGeneratedKeys()) { keys.next(); long id = keys.getLong(1); }</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Почему batch быстрее</h4><p>10 000 отдельных INSERT — 10 000 сетевых обменов «запрос-ответ». Batch отправляет их пачкой за один обмен. Время определяется не работой БД, а сетевыми задержками.</p></div>
+  <div class="card"><h4>Чтение миллионов строк</h4><p>По умолчанию драйвер PostgreSQL загружает <b>весь</b> результат в память. Потоковое чтение: <code>autoCommit=false</code> и <code>ps.setFetchSize(1000)</code> — строки приходят порциями через серверный курсор.</p></div>
+</div>
+
+<h2 id="pool"><span class="h-num">22.6</span>Пул соединений</h2>
+<pre><code class="java">HikariConfig cfg = new HikariConfig();
+cfg.setJdbcUrl("jdbc:postgresql://db:5432/shop");
+cfg.setUsername("shop"); cfg.setPassword(System.getenv("DB_PASSWORD"));
+cfg.setMaximumPoolSize(10);                    // больше — не значит быстрее: БД ограничена ядрами и дисками
+cfg.setConnectionTimeout(3_000);               // сколько ждать свободное соединение
+cfg.setMaxLifetime(30 * 60_000);               // пересоздавать раньше, чем соединение закроет БД или сетевое оборудование
+try (HikariDataSource ds = new HikariDataSource(cfg)) { /* приложение */ }</code></pre>
+<p>Создание соединения — TCP, TLS, аутентификация, выделение процесса на стороне PostgreSQL: десятки миллисекунд. Пул держит готовые соединения и выдаёт их за микросекунды. Подробности настройки и диагностики — пособие Spring, тема 12.</p>
+
+<h2 id="errors"><span class="h-num">22.7</span>Ошибки</h2>
+<p><code>SQLException</code> — checked-исключение с двумя кодами: <code>getSQLState()</code> — стандартный пятисимвольный (первые два — класс ошибки) и <code>getErrorCode()</code> — специфичный для СУБД.</p>
+<div class="table-wrap"><table>
+<tr><th>SQLState</th><th>Значение</th><th>Реакция</th></tr>
+<tr><td><code>23505</code></td><td>нарушение уникальности</td><td>бизнес-ошибка «уже существует»</td></tr>
+<tr><td><code>23503</code></td><td>нарушение внешнего ключа</td><td>бизнес-ошибка</td></tr>
+<tr><td><code>40001</code>, <code>40P01</code></td><td>ошибка сериализации, deadlock</td><td>повторить транзакцию целиком</td></tr>
+<tr><td><code>08xxx</code></td><td>проблемы соединения</td><td>повтор с новым соединением, circuit breaker</td></tr>
+<tr><td><code>57014</code></td><td>запрос отменён по таймауту</td><td>сообщить о таймауте</td></tr>
+</table></div>
+<p>Таймауты обязательны: <code>ps.setQueryTimeout(секунды)</code>, а также сетевые <code>connectTimeout</code> и <code>socketTimeout</code> в URL драйвера — без них зависший запрос держит соединение бесконечно.</p>
+
+<h2 id="quiz"><span class="h-num">22.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему PreparedStatement защищает от SQL-инъекции?</p><ul><li>Он экранирует кавычки в строках</li><li>Текст запроса и значения параметров передаются раздельно: значение не разбирается как SQL</li><li>Он проверяет ввод регулярным выражением</li><li>Он шифрует запрос</li></ul><div class="why">Это не экранирование, а разделение кода и данных на уровне протокола.</div></div>
+<div class="mcq" data-ok="2"><p>Столбец <code>discount INTEGER NULL</code> содержит NULL. Что вернёт <code>rs.getInt("discount")</code>?</p><ul><li>null</li><li>Исключение</li><li>0 — и только rs.wasNull() позволит отличить его от настоящего нуля</li><li>-1</li></ul><div class="why">Примитив не может быть null. Используйте <code>getObject("discount", Integer.class)</code>.</div></div>
+<div class="mcq" data-ok="0"><p>Метод выполняет два UPDATE через <code>ds.getConnection()</code>, вызванный дважды. Будут ли они в одной транзакции?</p><ul><li>Нет: транзакция принадлежит соединению, а это два разных соединения</li><li>Да, если один поток</li><li>Да, если autocommit выключен</li><li>Зависит от пула</li></ul><div class="why">Атомарность требует одного Connection. Spring решает это привязкой соединения к потоку.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт, если не закрыть Connection, взятый из пула?</p><ul><li>Его закроет сборщик мусора без последствий</li><li>Ничего</li><li>Транзакция закоммитится автоматически</li><li>Соединение не вернётся в пул; со временем пул исчерпается, и запросы начнут падать по таймауту ожидания</li></ul><div class="why">Утечка соединений — одна из самых частых причин «приложение повисло». HikariCP умеет её обнаруживать: leakDetectionThreshold.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите шаги выполнения запроса через JDBC.</summary><div class="a"><p>Получить Connection из DataSource → prepareStatement с плейсхолдерами → установить параметры → executeQuery/executeUpdate → пройти ResultSet курсором next(), читая столбцы → закрыть ResultSet, Statement, Connection (try-with-resources) → обработать SQLException.</p></div></details>
+<details class="q"><summary>Как реализовать транзакцию на чистом JDBC?</summary><div class="a"><p>На одном соединении: setAutoCommit(false) → операции → commit(); при исключении — rollback(); в finally вернуть autocommit и закрыть соединение. Все участвующие операции обязаны использовать это же соединение.</p></div></details>
+<details class="q"><summary>Как быстро вставить миллион строк?</summary><div class="a"><p>PreparedStatement + addBatch/executeBatch порциями по 500–5000, одна транзакция на порцию или несколько порций, reWriteBatchedInserts для PostgreSQL; для максимальной скорости — COPY через API драйвера (CopyManager). Отключить на время лишние индексы, если это разовая загрузка.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Аннотированные контроллеры</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · WEBFLUX</div>
+  <h1>Аннотированные контроллеры</h1>
+  <p class="lead">Аннотации те же, что в MVC: <code>@RestController</code>, <code>@GetMapping</code>, <code>@PathVariable</code>, <code>@RequestBody</code>. Отличаются типы: аргументы и результаты могут быть Mono и Flux, и от выбора типа зависят статус ответа, момент фиксации заголовков, буферизация и поведение при ошибке посреди потока. Разбираем сигнатуры, валидацию и обработку ошибок с ProblemDetail.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">@RestController</span><span class="tag">Mono&lt;ResponseEntity&gt;</span><span class="tag">@RequestBody Mono</span><span class="tag">@Valid</span><span class="tag">@ExceptionHandler</span><span class="tag">ProblemDetail</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="crud"><span class="h-num">11.1</span>CRUD-контроллер</h2>
+<pre data-title="UserController.java"><code class="java">@RestController
+@RequestMapping("/api/users")
+@RequiredArgsConstructor
+class UserController {
+    private final UserService users;
+
+    @GetMapping("/{id}")
+    Mono&lt;ResponseEntity&lt;UserDto&gt;&gt; get(@PathVariable long id) {
+        return users.find(id)
+                    .map(ResponseEntity::ok)
+                    .defaultIfEmpty(ResponseEntity.notFound().build());   // пустой Mono → 404
+    }
+
+    @GetMapping
+    Flux&lt;UserDto&gt; list(@RequestParam(defaultValue = "0") int page,
+                       @RequestParam(defaultValue = "20") int size) {
+        return users.page(page, size);
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    Mono&lt;UserDto&gt; create(@Valid @RequestBody Mono&lt;CreateUser&gt; body) {   // тело читается асинхронно
+        return body.flatMap(users::create);
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    Mono&lt;Void&gt; delete(@PathVariable long id) {
+        return users.delete(id);       // ответ отправится, когда Mono&lt;Void&gt; завершится
+    }
+}</code></pre>
+<p><code>@RequestBody CreateUser body</code> (без Mono) тоже работает: фреймворк сам дождётся декодирования перед вызовом метода. Mono-аргумент нужен, если вы хотите контролировать момент чтения или обработку ошибок декодирования внутри цепочки.</p>
+
+<h2 id="returns"><span class="h-num">11.2</span>Тип результата и что уходит клиенту</h2>
+<div class="widget" id="rtW">
+  <div class="widget-title">Возвращаемый тип → HTTP-ответ</div>
+  <div class="controls"><label>Метод возвращает<select id="rtSel">
+    <option value="mono">Mono&lt;User&gt;</option>
+    <option value="monoEmpty">Mono&lt;User&gt; — пустой</option>
+    <option value="entity">Mono&lt;ResponseEntity&lt;User&gt;&gt; + defaultIfEmpty(404)</option>
+    <option value="fluxJson">Flux&lt;User&gt;, Accept: application/json</option>
+    <option value="fluxNd">Flux&lt;User&gt;, Accept: application/x-ndjson</option>
+    <option value="fluxSse">Flux&lt;User&gt;, Accept: text/event-stream</option>
+    <option value="fluxErr">Flux&lt;User&gt; (json), ошибка после 2 элементов</option>
+    <option value="void">Mono&lt;Void&gt;</option>
+    <option value="plain">User (не реактивный тип)</option>
+  </select></label></div>
+  <div class="out" id="rtOut"></div>
+  <div class="verdict" id="rtV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var U1 = '{"id":1,"name":"Ann"}', U2 = '{"id":2,"name":"Bob"}';
+  var M = {
+    mono: ["HTTP/1.1 200 OK\nContent-Type: application/json\nContent-Length: 21\n\n" + U1, "ok", "Одно значение кодируется целиком; Content-Length известен."],
+    monoEmpty: ["HTTP/1.1 200 OK\nContent-Length: 0\n\n(пустое тело)", "warn", "Пустой Mono → 200 с пустым телом, а не 404! Нужен Mono<ResponseEntity> с defaultIfEmpty или switchIfEmpty(Mono.error(new ResponseStatusException(NOT_FOUND)))."],
+    entity: ["HTTP/1.1 404 Not Found\nContent-Length: 0\n\n(если пользователь не найден)\n\nHTTP/1.1 200 OK … " + U1 + "\n(если найден)", "ok", "Mono<ResponseEntity<T>> — статус и заголовки решаются асинхронно, по результату. ResponseEntity<Mono<T>> — наоборот: статус известен сразу, тело позже."],
+    fluxJson: ["HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\n[" + U1 + "," + U2 + ", …]", "ok", "Flux кодируется как JSON-массив поэлементно (без сбора в List), но без flush на каждый элемент — клиент получит данные порциями буферов. Для бесконечного Flux это неправильный выбор."],
+    fluxNd: ["HTTP/1.1 200 OK\nContent-Type: application/x-ndjson\nTransfer-Encoding: chunked\n\n" + U1 + "\n" + U2 + "\n…", "ok", "NDJSON: по объекту на строку, flush после каждого. Подходит для потоковой выдачи между сервисами — клиент парсит построчно (тема 14)."],
+    fluxSse: ["HTTP/1.1 200 OK\nContent-Type: text/event-stream\n\ndata:" + U1 + "\n\ndata:" + U2 + "\n\n…", "ok", "Server-Sent Events: каждый элемент — событие, сброс сразу. Браузер читает через EventSource и переподключается сам."],
+    fluxErr: ["HTTP/1.1 200 OK\nContent-Type: application/json\nTransfer-Encoding: chunked\n\n[" + U1 + "," + U2 + "\n(соединение оборвано: последний chunk не отправлен)", "bad", "Статус 200 и заголовки уже ушли с первым элементом — сменить их на 500 невозможно. Клиент получит обрезанный JSON. Валидируйте всё, что можно, до начала выдачи; для потоков предусмотрите событие-ошибку в протоколе."],
+    void: ["HTTP/1.1 200 OK\nContent-Length: 0\n\n(после завершения Mono)", "ok", "Ответ отправляется, когда Mono<Void> завершился. Статус меняется через @ResponseStatus или ResponseEntity<Void>."],
+    plain: ["HTTP/1.1 200 OK\nContent-Type: application/json\n\n" + U1, "warn", "Можно, но метод выполняется прямо в event loop: если внутри блокирующий вызов — это блокировка сервера. Для простых вычислений допустимо."]
+  };
+  function run() { var m = M[$("rtSel").value]; $("rtOut").textContent = m[0]; $("rtV").className = "verdict " + m[1]; $("rtV").textContent = m[2]; }
+  $("rtSel").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="args"><span class="h-num">11.3</span>Аргументы</h2>
+<div class="table-wrap"><table>
+<tr><th>Аргумент</th><th>Замечание</th></tr>
+<tr><td><code>@PathVariable, @RequestParam, @RequestHeader, @CookieValue</code></td><td>как в MVC; нет Servlet-зависимостей</td></tr>
+<tr><td><code>@RequestBody T | Mono&lt;T&gt; | Flux&lt;T&gt;</code></td><td>Flux — потоковое чтение (NDJSON, JSON-массив)</td></tr>
+<tr><td><code>ServerWebExchange, ServerHttpRequest, ServerHttpResponse</code></td><td>низкоуровневый доступ</td></tr>
+<tr><td><code>Mono&lt;Principal&gt;, @AuthenticationPrincipal</code></td><td>из Reactor Context безопасности</td></tr>
+<tr><td><code>WebSession / Mono&lt;WebSession&gt;</code></td><td>сессия создаётся лениво</td></tr>
+<tr><td><code>@RequestPart, Flux&lt;PartEvent&gt;, Mono&lt;MultiValueMap&lt;String, Part&gt;&gt;</code></td><td>multipart; FilePart.transferTo(path) — неблокирующая запись</td></tr>
+<tr><td><code>@ModelAttribute</code>, <code>BindingResult</code></td><td>BindingResult не поддерживается с реактивным @RequestBody — используйте ошибку WebExchangeBindException</td></tr>
+</table></div>
+
+<h2 id="errors"><span class="h-num">11.4</span>Валидация и ошибки</h2>
+<pre data-title="Глобальный обработчик с ProblemDetail (RFC 9457)" class="good-code"><code class="java">@RestControllerAdvice
+class ApiErrors extends ResponseEntityExceptionHandler {      // реактивная версия из spring-webflux
+
+    @ExceptionHandler(UserNotFound.class)
+    ProblemDetail notFound(UserNotFound e) {
+        ProblemDetail pd = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
+        pd.setProperty("userId", e.id());
+        return pd;                                             // application/problem+json
+    }
+
+    @ExceptionHandler(DuplicateKeyException.class)
+    Mono&lt;ResponseEntity&lt;ProblemDetail&gt;&gt; conflict(DuplicateKeyException e) {
+        return Mono.just(ResponseEntity.status(409)
+                .body(ProblemDetail.forStatus(409)));         // обработчик тоже может быть реактивным
+    }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Что бросает фреймворк</h4><ul><li><code>WebExchangeBindException</code> — @Valid не прошёл (400), содержит FieldError-ы</li><li><code>ServerWebInputException</code> — не разобран параметр/тело (400)</li><li><code>UnsupportedMediaTypeStatusException</code> (415), <code>NotAcceptableStatusException</code> (406)</li><li><code>ResponseStatusException</code> — ваш статус из кода</li><li><code>DataBufferLimitException</code> — тело больше max-in-memory-size; при чтении через @RequestBody превращается в 413 (Spring 6.2 — PayloadTooLargeException, с 7.0 — ContentTooLargeException)</li></ul></div>
+  <div class="card"><h4>Порядок обработки</h4><ol><li>@ExceptionHandler в самом контроллере</li><li>@ControllerAdvice</li><li>WebExceptionHandler-ы (Boot: DefaultErrorWebExceptionHandler, order −1, формирует JSON по ErrorAttributes)</li><li><code>spring.webflux.problemdetails.enabled=true</code> — встроенные исключения в формате ProblemDetail</li></ol></div>
+</div>
+<div class="callout warn"><span class="c-title">@ExceptionHandler не видит ошибку в WebFilter</span>
+Исключения из WebFilter-ов (до DispatcherHandler) и после начала записи ответа не попадают в @ExceptionHandler. Их обрабатывают WebExceptionHandler-ы — либо ловите в самом фильтре через onErrorResume.
+</div>
+
+<h2 id="quiz"><span class="h-num">11.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Контроллер вернул пустой Mono&lt;User&gt;. Какой статус получит клиент?</p><ul><li>404</li><li>204</li><li>200 с пустым телом</li><li>500</li></ul><div class="why">Пустота — не ошибка. Нужен defaultIfEmpty(404) или ResponseStatusException.</div></div>
+<div class="mcq" data-ok="0"><p>Flux&lt;User&gt; выдал 2 элемента и упал (application/json). Что увидит клиент?</p><ul><li>200 и оборванное тело</li><li>500 с ProblemDetail</li><li>200 и полный массив из 2 элементов</li><li>Повторный запрос</li></ul><div class="why">Статус зафиксирован при первом элементе.</div></div>
+<div class="mcq" data-ok="1"><p>Чем Mono&lt;ResponseEntity&lt;T&gt;&gt; отличается от ResponseEntity&lt;Mono&lt;T&gt;&gt;?</p><ul><li>Ничем</li><li>В первом статус и заголовки определяются асинхронно по результату, во втором известны сразу</li><li>Второй не поддерживается</li><li>Первый блокирует поток</li></ul><div class="why">Для «200 или 404» нужен Mono&lt;ResponseEntity&gt;.</div></div>
+<div class="mcq" data-ok="3"><p>Где обработать исключение, брошенное в WebFilter?</p><ul><li>@ExceptionHandler в контроллере</li><li>@ControllerAdvice</li><li>HandlerInterceptor</li><li>WebExceptionHandler или onErrorResume в самом фильтре</li></ul><div class="why">Фильтры работают до DispatcherHandler.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как принять загрузку большого файла без загрузки в память?</summary><div class="a"><p><code>@PostMapping(consumes = MULTIPART_FORM_DATA_VALUE) Mono&lt;Void&gt; upload(@RequestPart("file") FilePart file) { return file.transferTo(Path.of(dir, file.filename())); }</code> — FilePart.content() это Flux&lt;DataBuffer&gt;, transferTo пишет неблокирующе через AsynchronousFileChannel. Или <code>Flux&lt;PartEvent&gt;</code> для полностью потоковой обработки. Лимиты — spring.webflux.multipart.max-disk-usage-per-part, max-in-memory-size; помните про проверку имени файла (path traversal).</p></div></details>
+<details class="q"><summary>Что делает @Valid на @RequestBody Mono&lt;T&gt;?</summary><div class="a"><p>Валидация встраивается в Mono: при декодировании объект проверяется, и при нарушении Mono завершается ошибкой WebExchangeBindException. Если вы обрабатываете ошибку внутри цепочки (onErrorResume), получите управление; иначе она дойдёт до обработчиков и станет 400. С Spring 6.1 также доступна валидация параметров методов (@Constraint на @RequestParam/@PathVariable) через HandlerMethodValidationException.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

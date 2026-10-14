@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · JDBC, JPA, Spring Data</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ДАННЫЕ</div>
+  <h1>JDBC, JPA и Spring Data изнутри</h1>
+  <p class="lead">Вы пишете интерфейс <code>OrderRepository extends JpaRepository</code> без единой строки реализации — и он работает. Разберём, кто его реализует, как имя метода превращается в запрос, что такое persistence context, почему появляются N+1 и <code>LazyInitializationException</code>, и когда лучше спуститься до <code>JdbcClient</code>.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">HikariCP</span><span class="tag">EntityManager</span><span class="tag">RepositoryFactory</span><span class="tag">N+1</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="layers"><span class="h-num">12.1</span>Слои доступа к данным</h2>
+<div class="flow col">
+  <div class="node acc"><b>Spring Data репозиторий</b><small>интерфейс → прокси, производные запросы, пагинация</small></div><span class="to">↓</span>
+  <div class="node"><b>JPA EntityManager (Hibernate)</b><small>persistence context, dirty checking, ленивые связи, JPQL</small></div><span class="to">↓</span>
+  <div class="node info"><b>JdbcTemplate / JdbcClient</b><small>SQL руками, маппинг строк, трансляция исключений</small></div><span class="to">↓</span>
+  <div class="node"><b>DataSource = HikariCP</b><small>пул физических соединений</small></div><span class="to">↓</span>
+  <div class="node"><b>JDBC-драйвер → БД</b></div>
+</div>
+
+<h2 id="pool"><span class="h-num">12.2</span>Пул соединений HikariCP</h2>
+<p>Открыть TCP-соединение к PostgreSQL с TLS и аутентификацией — десятки миллисекунд. Пул держит готовые соединения; <code>getConnection()</code> отдаёт свободное, а <code>close()</code> возвращает его в пул, а не закрывает.</p>
+<pre data-title="application.yml"><code class="yaml">spring:
+  datasource:
+    url: jdbc:postgresql://db:5432/shop
+    username: shop
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 20          # по умолчанию 10; формула-ориентир: ядра_БД × 2 + диски
+      minimum-idle: 20               # фиксированный пул — рекомендация автора Hikari
+      connection-timeout: 3000         # мс; ожидание свободного соединения → SQLTransientConnectionException
+      max-lifetime: 1800000            # мс (30 мин); меньше, чем таймаут простоя у БД/прокси
+      leak-detection-threshold: 20000  # мс; лог со стектрейсом, если соединение не вернули
+      # Hikari-сеттеры принимают long в миллисекундах — суффиксы 3s/30m здесь не работают</code></pre>
+<div class="callout warn">Больший пул не значит быстрее. БД выполняет параллельно столько запросов, сколько у неё ядер и дисков; сотни соединений создают конкуренцию за блокировки и кэш. Сумма пулов всех экземпляров сервиса должна помещаться в <code>max_connections</code> БД.</div>
+
+<h2 id="jdbc"><span class="h-num">12.3</span>JdbcClient и JdbcTemplate</h2>
+<pre data-title="JdbcClient (6.1+) — fluent-обёртка над JdbcTemplate"><code class="java">@Repository
+class ReportDao {
+    private final JdbcClient jdbc;
+    ReportDao(JdbcClient jdbc) { this.jdbc = jdbc; }       // бин создаёт автоконфигурация
+
+    List&lt;DailyRevenue&gt; revenue(LocalDate from) {
+        return jdbc.sql("""
+                SELECT date_trunc('day', created_at) AS day, sum(total) AS revenue
+                FROM orders WHERE created_at &gt;= :from GROUP BY 1 ORDER BY 1""")
+            .param("from", from)
+            .query(DailyRevenue.class)                       // маппинг колонок в record по именам
+            .list();
+    }
+}</code></pre>
+<p>Внутри <code>JdbcTemplate.execute</code>: <code>DataSourceUtils.getConnection(ds)</code> (соединение текущей транзакции или новое) → создание <code>PreparedStatement</code> → выполнение → маппинг → закрытие ресурсов → <code>DataSourceUtils.releaseConnection</code>. <code>SQLException</code> переводится <code>SQLExceptionTranslator</code> (по умолчанию с Spring 6 — <code>SQLExceptionSubclassTranslator</code>: по типу <code>SQLException</code> из JDBC 4 и SQLState; по кодам ошибок БД — только если в classpath есть <code>sql-error-codes.xml</code>) в <code>DuplicateKeyException</code>, <code>DataIntegrityViolationException</code>, <code>CannotAcquireLockException</code> и т.д. — единая иерархия <code>DataAccessException</code> (unchecked).</p>
+
+<h2 id="jpa"><span class="h-num">12.4</span>JPA: persistence context</h2>
+<p><code>EntityManager</code> держит <b>persistence context</b> — карту «id → управляемая сущность» (кэш первого уровня). Внутри одной транзакции:</p>
+<ul>
+  <li><code>find(Order.class, 1)</code> дважды → один SQL, один и тот же объект;</li>
+  <li>изменили поле управляемой сущности → при flush Hibernate сравнит со снимком (dirty checking) и сам выполнит <code>UPDATE</code> — <code>save()</code> не нужен;</li>
+  <li>flush происходит перед коммитом, перед JPQL-запросом, затрагивающим изменённые таблицы, и при явном <code>flush()</code>.</li>
+</ul>
+<div class="flow">
+  <div class="node"><b>new / transient</b><small>new Order()</small></div><span class="to">→ persist →</span>
+  <div class="node ok"><b>managed</b><small>в persistence context</small></div><span class="to">→ commit/clear/close →</span>
+  <div class="node warn"><b>detached</b><small>изменения не отслеживаются</small></div><span class="to">→ merge →</span>
+  <div class="node ok"><b>managed (копия)</b></div>
+</div>
+<h3>Как в синглтон-бин внедряется EntityManager</h3>
+<p>EntityManager не потокобезопасен и должен быть свой на каждую транзакцию. Но в репозиторий он внедряется один раз. Внедряется <b>прокси</b> (<code>SharedEntityManagerCreator</code>): каждый вызов прокси ищет EntityManager, привязанный к текущей транзакции через <code>TransactionSynchronizationManager</code> (его туда положил <code>JpaTransactionManager.doBegin</code>). Нет транзакции — создаётся временный EntityManager на одну операцию.</p>
+<div class="callout bad"><span class="c-title">Open Session in View</span>
+Boot по умолчанию включает <code>spring.jpa.open-in-view=true</code> (и пишет WARN при старте): <code>OpenEntityManagerInViewInterceptor</code> открывает EntityManager на весь HTTP-запрос, и ленивые связи грузятся даже при сериализации JSON в контроллере. Удобно, но соединение держится до конца запроса, а ленивые SQL-запросы разлетаются по слою представления незаметно. В продакшен-сервисах рекомендуют <code>false</code> и явную загрузку данных в сервисе.
+</div>
+
+<h2 id="repo"><span class="h-num">12.5</span>Как устроен репозиторий Spring Data</h2>
+<ol class="steps">
+  <li><code>@EnableJpaRepositories</code> (в Boot — автоконфигурация) через <code>ImportBeanDefinitionRegistrar</code> сканирует пакет и для каждого интерфейса-наследника <code>Repository</code> регистрирует описание бина с классом <code>JpaRepositoryFactoryBean</code>.</li>
+  <li>Фабрика (<code>JpaRepositoryFactory</code>) создаёт <b>target</b> — <code>SimpleJpaRepository</code>, общую реализацию CRUD (<code>save</code>, <code>findById</code>, <code>findAll(Pageable)</code>…).</li>
+  <li>Для каждого метода интерфейса выбирается стратегия (<code>QueryLookupStrategy</code>, по умолчанию CREATE_IF_NOT_FOUND): <code>@Query</code> → именованный запрос → <b>разбор имени метода</b> (<code>PartTree</code>). Ошибка в имени метода обнаруживается на старте.</li>
+  <li><code>ProxyFactory</code> собирает JDK-прокси над интерфейсом с перехватчиками: трансляция исключений, <code>TransactionInterceptor</code> (<code>SimpleJpaRepository</code> помечен <code>@Transactional(readOnly = true)</code>, изменяющие методы — <code>@Transactional</code>), <code>QueryExecutorMethodInterceptor</code> (вызов → заранее подготовленный запрос), default-методы интерфейса, фрагменты с пользовательской реализацией.</li>
+</ol>
+<pre data-title="Репозиторий: производные запросы, @Query, проекции"><code class="java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    List&lt;Order&gt; findByCustomerEmailAndStatusOrderByCreatedAtDesc(String email, Status status);
+
+    @Query("select o from Order o join fetch o.items where o.id = :id")
+    Optional&lt;Order&gt; findWithItems(long id);                          // fetch join против N+1
+
+    @EntityGraph(attributePaths = {"customer"})   // коллекцию items с Pageable так не грузить — пагинация уйдёт в память
+    Page&lt;Order&gt; findByStatus(Status status, Pageable page);
+
+    interface OrderSummary { Long getId(); BigDecimal getTotal(); }     // интерфейсная проекция → SELECT только этих колонок
+    List&lt;OrderSummary&gt; findTop10ByOrderByTotalDesc();
+
+    @Modifying(clearAutomatically = true)
+    @Query("update Order o set o.status = 'EXPIRED' where o.createdAt &lt; :before and o.status = 'NEW'")
+    int expireOlderThan(Instant before);                               // массовый UPDATE мимо persistence context
+}</code></pre>
+
+<div class="widget" id="pt">
+  <div class="widget-title">Симулятор PartTree: имя метода → JPQL</div>
+  <p class="hint">Так Spring Data на старте разбирает имя метода. Сущность — <code>Order</code>.</p>
+  <div class="controls"><label>метод репозитория<input type="text" id="ptIn" class="wide" value="findTop5ByCustomerEmailIgnoreCaseAndTotalGreaterThanEqualOrderByCreatedAtDesc"></label></div>
+  <div class="controls">
+    <button class="btn" type="button" data-m="findByStatusInAndCreatedAtBetween">In + Between</button>
+    <button class="btn" type="button" data-m="countByStatus">count</button>
+    <button class="btn" type="button" data-m="existsByCustomerEmail">exists</button>
+    <button class="btn" type="button" data-m="deleteByCreatedAtBefore">delete</button>
+    <button class="btn" type="button" data-m="findDistinctByItemsSkuStartingWith">Distinct + вложенное свойство</button>
+    <button class="btn" type="button" data-m="findByPaidTrueOrNoteIsNull">True / IsNull / Or</button>
+    <button class="btn" type="button" data-m="findByStatusOrderBy">ошибка</button>
+  </div>
+  <div class="out" id="ptOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("ptIn"), out = document.getElementById("ptOut");
+  var OPS = [
+    ["IsNotNull", "{p} is not null", 0], ["NotNull", "{p} is not null", 0], ["IsNull", "{p} is null", 0], ["Null", "{p} is null", 0],
+    ["GreaterThanEqual", "{p} >= ?", 1], ["GreaterThan", "{p} > ?", 1], ["LessThanEqual", "{p} <= ?", 1], ["LessThan", "{p} < ?", 1],
+    ["Between", "{p} between ? and ?", 2], ["NotIn", "{p} not in ?", 1], ["In", "{p} in ?", 1], ["NotLike", "{p} not like ?", 1], ["Like", "{p} like ?", 1],
+    ["StartingWith", "{p} like ?||'%'", 1], ["StartsWith", "{p} like ?||'%'", 1], ["EndingWith", "{p} like '%'||?", 1], ["NotContaining", "{p} not like '%'||?||'%'", 1],
+    ["Containing", "{p} like '%'||?||'%'", 1], ["Contains", "{p} like '%'||?||'%'", 1], ["Before", "{p} < ?", 1], ["After", "{p} > ?", 1],
+    ["IsTrue", "{p} = true", 0], ["True", "{p} = true", 0], ["IsFalse", "{p} = false", 0], ["False", "{p} = false", 0],
+    ["IsNot", "{p} <> ?", 1], ["Not", "{p} <> ?", 1], ["Is", "{p} = ?", 1], ["Equals", "{p} = ?", 1]
+  ];
+  function prop(s) {
+    // CustomerEmail → customer.email (Spring Data пробует сначала свойство customerEmail, затем обход по camelCase)
+    var parts = s.match(/[A-Z][a-z0-9]*/g) || [s];
+    var path = parts.length > 1 && /^(Customer|Items|Address)$/.test(parts[0]) ? parts[0].toLowerCase() + "." + parts.slice(1).join("").replace(/^./, function (c) { return c.toLowerCase(); }) : s.replace(/^./, function (c) { return c.toLowerCase(); });
+    return "o." + path;
+  }
+  function run() {
+    var m = inp.value.trim(), L = [];
+    var re = /^(find|read|get|query|search|stream|count|exists|delete|remove)((?:Distinct)?)((?:First|Top)\d*)?(.*?)By(.*)$/;
+    var r = m.match(re);
+    if (!r) { out.textContent = "Не распознан префикс: метод должен начинаться с find…By, count…By, exists…By, delete…By и т.п.\n→ PropertyReferenceException / QueryCreationException на старте приложения."; return; }
+    var subject = r[1], distinct = !!r[2], limit = r[3], rest = r[5], order = "";
+    var oi = rest.indexOf("OrderBy");
+    if (oi >= 0) { order = rest.slice(oi + 7); rest = rest.slice(0, oi); }
+    L.push("subject: " + subject + (distinct ? " + Distinct" : "") + (limit ? " + " + limit : "") + "   predicate: " + (rest || "—") + (order ? "   order: " + order : ""));
+    var n = 0, err = null;
+    var ors = rest ? rest.split(/Or(?=[A-Z])/) : [];
+    var where = ors.map(function (orPart) {
+      return orPart.split(/And(?=[A-Z])/).map(function (part) {
+        var ic = false;
+        if (/(IgnoreCase|IgnoringCase)$/.test(part)) { ic = true; part = part.replace(/(IgnoreCase|IgnoringCase)$/, ""); }
+        var op = null;
+        for (var i = 0; i < OPS.length; i++) { var k = OPS[i][0]; if (part.length > k.length && part.slice(-k.length) === k) { op = OPS[i]; part = part.slice(0, -k.length); break; } }
+        if (!op) op = ["", "{p} = ?", 1];
+        if (!part) { err = "пустое имя свойства перед «" + op[0] + "»"; return ""; }
+        var p = prop(part); if (ic) p = "upper(" + p + ")";
+        var expr = op[1].replace("{p}", p).replace(/\?/g, function () { n++; return (ic ? "upper(?" + n + ")" : "?" + n); });
+        L.push("  часть «" + part + (op[0] ? " + " + op[0] : "") + (ic ? " + IgnoreCase" : "") + "» → " + expr);
+        return expr;
+      }).join(" and ");
+    });
+    if (order === "" && oi >= 0) err = "после OrderBy не указано свойство";
+    var orderSql = "";
+    if (order) orderSql = " order by " + order.split(/(?<=Asc|Desc)(?=[A-Z])/).map(function (o) { var d = /Desc$/.test(o) ? " desc" : " asc"; return prop(o.replace(/(Asc|Desc)$/, "")) + d; }).join(", ");
+    if (err) { out.textContent = L.join("\n") + "\n\n✘ " + err + " → ошибка создания запроса при старте: приложение не поднимется."; return; }
+    var w = where.length ? " where " + (where.length > 1 ? where.map(function (x) { return x.indexOf(" and ") > 0 ? "(" + x + ")" : x; }).join(" or ") : where[0]) : "";
+    var sel;
+    if (subject === "count") sel = "select count(" + (distinct ? "distinct " : "") + "o) from Order o";
+    else if (subject === "exists") sel = "select o.id from Order o";
+    else if (subject === "delete" || subject === "remove") sel = "select o from Order o";
+    else sel = "select " + (distinct ? "distinct " : "") + "o from Order o";
+    var q = sel + w + orderSql;
+    var tail = [];
+    if (limit) tail.push("лимит: setMaxResults(" + (limit.replace(/\D/g, "") || "1") + ")");
+    if (subject === "exists") tail.push("exists: setMaxResults(1), результат → boolean");
+    if (subject === "delete" || subject === "remove") tail.push("derived delete: сначала SELECT сущностей, затем em.remove() для каждой — каскады и @PreRemove работают, но это N запросов. Для массового удаления — @Modifying @Query(\"delete …\"). Нужна транзакция.");
+    if (/\.(customer|items)\./.test(q)) tail.push("обход связи (customer.email / items.sku) → неявный join в SQL");
+    out.textContent = L.join("\n") + "\n\nJPQL:\n" + q + (tail.length ? "\n\n" + tail.join("\n") : "");
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#pt [data-m]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.getAttribute("data-m"); run(); }); });
+  run();
+})();
+</script>
+<div class="callout info">Длинные имена методов быстро становятся нечитаемыми. Правило: два-три условия — производный запрос; больше — <code>@Query</code>, <code>Specification</code>/Querydsl для динамических фильтров или <code>JdbcClient</code> для отчётов.</div>
+
+<h2 id="save"><span class="h-num">12.6</span>save(): persist или merge</h2>
+<pre data-title="SimpleJpaRepository.save — по исходникам"><code class="java">@Transactional
+public &lt;S extends T&gt; S save(S entity) {
+    if (entityInformation.isNew(entity)) {   // есть @Version-обёртка → version == null; иначе id == null (примитивный id — 0); Persistable → isNew()
+        em.persist(entity);
+        return entity;
+    } else {
+        return em.merge(entity);             // SELECT по id + копирование состояния в управляемую копию
+    }
+}</code></pre>
+<p>Если id назначается вручную (UUID в конструкторе), <code>isNew</code> вернёт false, и каждый «новый» объект пойдёт через <code>merge</code>: лишний <code>SELECT</code> перед <code>INSERT</code>. Решение — <code>@Version</code>-поле (null у нового) или реализация <code>Persistable</code>.</p>
+
+<h2 id="nplus1"><span class="h-num">12.7</span>N+1 и LazyInitializationException</h2>
+<pre class="bad-code"><code class="java">List&lt;Order&gt; orders = repo.findByStatus(Status.NEW);   // 1 запрос: 100 заказов
+for (Order o : orders) {
+    total += o.getItems().size();                      // +1 запрос на каждый заказ → 101 запрос
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Решение</th><th>Как</th><th>Когда</th></tr>
+<tr><td>fetch join</td><td><code>join fetch o.items</code> в <code>@Query</code></td><td>одна коллекция; с пагинацией осторожно — Hibernate пагинирует в памяти (HHH90003004)</td></tr>
+<tr><td><code>@EntityGraph</code></td><td><code>attributePaths</code> на методе репозитория</td><td>то же, декларативно</td></tr>
+<tr><td>batch fetching</td><td><code>hibernate.default_batch_fetch_size=50</code></td><td>N+1 превращается в N/50+1 — простое глобальное средство</td></tr>
+<tr><td>DTO-проекция</td><td><code>select new ...Dto(...)</code>, интерфейсная проекция, <code>JdbcClient</code></td><td>чтение для API и отчётов — лучший вариант</td></tr>
+</table></div>
+<p><code>LazyInitializationException: could not initialize proxy - no Session</code> — обращение к ленивой связи после закрытия EntityManager (транзакция кончилась, сущность ушла в контроллер при <code>open-in-view=false</code>). Лечится загрузкой нужных данных внутри транзакции, а не включением OSIV или <code>FetchType.EAGER</code> (EAGER на <code>@ManyToOne</code> по умолчанию — частый источник лишних join-ов).</p>
+
+<h2 id="quiz"><span class="h-num">12.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Кто реализует интерфейс OrderRepository extends JpaRepository?</p><ul><li>Annotation processor генерирует класс при компиляции</li><li>JpaRepositoryFactoryBean создаёт в рантайме JDK-прокси над интерфейсом с target SimpleJpaRepository и перехватчиками запросов</li><li>Hibernate</li><li>CGLIB-подкласс интерфейса</li></ul><div class="why">Spring Data строит прокси через ProxyFactory; CRUD-методы делегируются SimpleJpaRepository, производные и @Query — QueryExecutorMethodInterceptor. (Для AOT/native эти части генерируются заранее, но в обычном режиме — рантайм-прокси.)</div></div>
+<div class="mcq" data-ok="2"><p>В транзакции загрузили Order, поменяли статус, save() не вызывали. Что будет при коммите?</p><ul><li>Ничего, изменения потеряны</li><li>Исключение: сущность не сохранена</li><li>UPDATE: dirty checking при flush найдёт изменение управляемой сущности</li><li>INSERT дубликата</li></ul><div class="why">Сущность managed: Hibernate сравнит её со снимком при flush перед коммитом и выполнит UPDATE.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем Spring внедряет в репозитории прокси EntityManager, а не настоящий?</p><ul><li>EntityManager не потокобезопасен и должен быть свой на транзакцию; прокси на каждом вызове находит EntityManager текущей транзакции</li><li>Для ленивой загрузки сущностей</li><li>Для кэширования запросов</li><li>Чтобы можно было использовать CGLIB</li></ul><div class="why">SharedEntityManagerCreator делегирует в EntityManager, привязанный к потоку через TransactionSynchronizationManager.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое persistence context и dirty checking?</summary><div class="a"><p>Кэш управляемых сущностей EntityManager на время транзакции: идентичность объектов по id, повторный find без SQL. При загрузке Hibernate сохраняет снимок состояния; при flush сравнивает текущее состояние со снимком и генерирует UPDATE для изменённых. Поэтому save() для управляемых сущностей не нужен, а readOnly-транзакции экономят память на снимках.</p></div></details>
+<details class="q"><summary>Как бороться с N+1?</summary><div class="a"><p>Обнаружить: логирование SQL, счётчик запросов в тестах (datasource-proxy, Hibernate statistics). Лечить: fetch join или @EntityGraph для нужных связей, batch fetching, DTO-проекции для чтения; не использовать EAGER как «решение».</p></div></details>
+<details class="q"><summary>Когда JdbcClient лучше JPA?</summary><div class="a"><p>Отчёты и агрегаты, массовые операции, сложный SQL с оконными функциями, работа с чужой схемой, критичные по производительности чтения. JPA удобна для агрегатов с бизнес-логикой и изменений через объектную модель. В одном сервисе их нормально совмещать — они разделяют одну транзакцию через JpaTransactionManager.</p></div></details>
+<details class="q"><summary>Почему derived deleteBy… может быть медленным?</summary><div class="a"><p>Spring Data сначала выбирает сущности, затем вызывает em.remove для каждой — N операций, загрузка в persistence context, каскады и колбэки. Для массового удаления — @Modifying @Query("delete from …"), помня, что он обходит persistence context (clearAutomatically).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

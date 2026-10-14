@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Wide-column: Cassandra, ScyllaDB, DynamoDB</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Wide-column: Cassandra, ScyllaDB, DynamoDB</h1>
+  <p class="lead">Базы для огромной записи и предсказуемого чтения по ключу на любом масштабе и в нескольких регионах — без единой точки отказа. Цена — запросы проектируются заранее: таблица под каждый запрос, никаких JOIN и произвольных фильтров. Разбираем модель «ключ партиции + ключ кластеризации», кольцо и репликацию, настраиваемую согласованность, DynamoDB и single-table design, и где эти базы ломаются.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">partition key</span><span class="tag">clustering key</span><span class="tag">консистентное хэширование</span><span class="tag">кворумы</span><span class="tag">DynamoDB</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">6.1</span>Модель данных</h2>
+<p>Таблица — это распределённая отсортированная карта: <b>ключ партиции</b> определяет узлы, где лежат данные; внутри партиции строки отсортированы по <b>ключу кластеризации</b>. Эффективные запросы — только «одна партиция, диапазон по кластерному ключу».</p>
+<pre data-title="CQL: сообщения чата"><code class="sql">CREATE TABLE messages_by_chat (
+  chat_id    uuid,
+  bucket     text,          -- месяц: '2026-10' — ограничивает размер партиции
+  sent_at    timeuuid,
+  author_id  uuid,
+  body       text,
+  PRIMARY KEY ((chat_id, bucket), sent_at)     -- ((ключ партиции), ключ кластеризации)
+) WITH CLUSTERING ORDER BY (sent_at DESC)
+  AND default_time_to_live = 31536000;          -- TTL год
+
+-- эффективно: одна партиция, срез по порядку
+SELECT * FROM messages_by_chat WHERE chat_id = ? AND bucket = '2026-10' LIMIT 50;
+
+-- невозможно без ALLOW FILTERING (= полный просмотр кластера):
+SELECT * FROM messages_by_chat WHERE author_id = ?;</code></pre>
+
+<h2 id="query-first"><span class="h-num">6.2</span>Проектирование от запросов</h2>
+<p>В реляционной модели сначала данные, потом запросы. Здесь наоборот: <b>для каждого запроса — своя таблица</b>, данные дублируются при записи (запись дешёвая).</p>
+<div class="table-wrap"><table>
+<tr><th>Запрос приложения</th><th>Таблица</th><th>PRIMARY KEY</th></tr>
+<tr><td>Сообщения чата, новые сверху</td><td>messages_by_chat</td><td>((chat_id, bucket), sent_at)</td></tr>
+<tr><td>Чаты пользователя по последней активности</td><td>chats_by_user</td><td>((user_id), last_activity, chat_id)</td></tr>
+<tr><td>Сообщения автора (для модерации)</td><td>messages_by_author</td><td>((author_id, bucket), sent_at)</td></tr>
+</table></div>
+<p>Одна отправка сообщения = запись в три таблицы (logged batch для атомарности по нескольким партициям, или асинхронно). Изменение запроса = новая таблица + перенос данных.</p>
+
+<h2 id="ring"><span class="h-num">6.3</span>Кольцо, репликация и кворумы</h2>
+<p>Узлы равноправны и образуют кольцо токенов: хэш ключа партиции (Murmur3) определяет первый узел, следующие <code>RF−1</code> узлов по кольцу (с учётом стоек и дата-центров) хранят реплики. Любой узел может принять запрос и стать координатором.</p>
+<div class="widget" id="qW">
+  <div class="widget-title">Калькулятор кворумов: N реплик, W подтверждений записи, R ответов на чтение</div>
+  <div class="controls">
+    <label>RF (N)<select id="qN"><option>1</option><option>2</option><option selected>3</option><option>5</option></select></label>
+    <label>запись (W)<select id="qW2"><option value="1">ONE</option><option value="q" selected>QUORUM</option><option value="all">ALL</option></select></label>
+    <label>чтение (R)<select id="qR"><option value="1">ONE</option><option value="q" selected>QUORUM</option><option value="all">ALL</option></select></label>
+  </div>
+  <div class="out" id="qOut"></div>
+  <div class="verdict" id="qV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function val(v, n) { return v === "q" ? Math.floor(n / 2) + 1 : v === "all" ? n : 1; }
+  function run() {
+    var n = +$("qN").value, w = val($("qW2").value, n), r = val($("qR").value, n);
+    var strong = r + w > n;
+    $("qOut").textContent = "N = " + n + ", W = " + w + ", R = " + r + "  →  R + W = " + (r + w) + (strong ? " > " : " ≤ ") + "N" +
+      "\nзапись переживёт отказ узлов: " + (n - w) + "\nчтение переживёт отказ узлов: " + (n - r) +
+      "\nзадержка: запись ждёт " + w + "-го самого быстрого ответа из " + n + ", чтение — " + r + "-го";
+    $("qV").className = "verdict " + (strong ? "ok" : "warn");
+    $("qV").textContent = strong ? "Множества реплик записи и чтения пересекаются: чтение увидит последнюю подтверждённую запись (при отсутствии конкурирующих записей; Cassandra разрешает конфликты по отметке времени — «последняя запись побеждает»)." : "Чтение может попасть только на реплики, не получившие последнюю запись: возможны устаревшие данные (eventual consistency). Read repair и anti-entropy repair со временем выравнивают реплики.";
+  }
+  ["qN", "qW2", "qR"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">«Последняя запись побеждает»</span>
+Конфликтующие записи в одну ячейку разрешаются по отметке времени клиента/координатора — без транзакций и без ошибки. Расхождение часов или параллельные «прочитать-изменить-записать» тихо теряют обновления. Для условных операций есть lightweight transactions (<code>IF NOT EXISTS</code>, <code>IF balance = ?</code>) на Paxos — в разы медленнее; в новых версиях — Accord-транзакции (Cassandra 5+).
+</div>
+
+<h2 id="partition"><span class="h-num">6.4</span>Размер партиции и антипаттерны</h2>
+<div class="widget" id="psW">
+  <div class="widget-title">Не разрастётся ли партиция</div>
+  <div class="controls">
+    <label>событий на ключ в сутки<input type="number" id="psE" value="20000" min="1"></label>
+    <label>байт на строку<input type="number" id="psB" value="200" min="1"></label>
+    <label>корзина (bucket)<select id="psK"><option value="0">нет — партиция на весь срок</option><option value="30">месяц</option><option value="1" selected>сутки</option></select></label>
+    <label>срок хранения, дней<input type="number" id="psT" value="365" min="1"></label>
+  </div>
+  <div class="verdict" id="psV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var e = Math.max(1, +$("psE").value), b = Math.max(1, +$("psB").value), k = +$("psK").value, t = Math.max(1, +$("psT").value);
+    var days = k || t, rows = e * days, mb = rows * b / 1048576, v = $("psV");
+    v.className = "verdict " + (mb < 100 ? "ok" : mb < 1000 ? "warn" : "bad");
+    v.textContent = "Партиция: " + rows.toLocaleString("ru") + " строк, ~" + mb.toFixed(0) + " МБ. " + (mb < 100 ? "Норма (ориентир — до ~100 МБ и сотен тысяч строк)." : mb < 1000 ? "Большая партиция: медленные компакции и чтения, давление на кучу JVM. Уменьшите корзину." : "Огромная партиция: узел-владелец перегружен, ремонт и компакции неделями, таймауты чтения. Обязательно добавьте корзину времени в ключ партиции.");
+  }
+  ["psE", "psB", "psK", "psT"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<ul>
+  <li><b>Горячая партиция</b>: популярный ключ (знаменитость, глобальный счётчик) — все запросы на 3 узла. Решение — шардирование ключа (<code>user_id + bucket</code>, <code>counter_id + shard 0..N</code>).</li>
+  <li><b>Надгробия</b>: удаления и TTL оставляют tombstones; запрос, проходящий тысячи надгробий, падает (<code>tombstone_failure_threshold</code>). Не используйте таблицу как очередь.</li>
+  <li><b>ALLOW FILTERING и вторичные индексы</b> — опрос многих узлов; почти всегда признак, что нужна ещё одна таблица.</li>
+  <li><b>Чтение перед записью</b> — сводит на нет главное преимущество (дешёвую запись).</li>
+</ul>
+
+<h2 id="dynamo"><span class="h-num">6.5</span>DynamoDB и single-table design</h2>
+<p>Управляемое key-value/wide-column хранилище AWS: партиционный ключ (PK) + ключ сортировки (SK), оплата за операции или выделенную ёмкость, почти без эксплуатации. Популярный подход — <b>одна таблица</b> для нескольких типов сущностей с перегруженными ключами:</p>
+<div class="table-wrap"><table>
+<tr><th>PK</th><th>SK</th><th>Данные</th><th>Запрос</th></tr>
+<tr><td>CUSTOMER#42</td><td>PROFILE</td><td>имя, email</td><td rowspan="3">Query PK = CUSTOMER#42 → профиль и все заказы одним запросом; SK begins_with ORDER# → только заказы</td></tr>
+<tr><td>CUSTOMER#42</td><td>ORDER#2026-10-01#A1001</td><td>статус, сумма</td></tr>
+<tr><td>CUSTOMER#42</td><td>ORDER#2026-10-05#A1002</td><td>статус, сумма</td></tr>
+<tr><td>ORDER#A1001</td><td>ITEM#NB-14</td><td>кол-во, цена</td><td>Query PK = ORDER#A1001 → позиции</td></tr>
+</table></div>
+<p>Другие пути доступа — глобальные вторичные индексы (GSI, асинхронные, со своей ёмкостью). Транзакции — <code>TransactWriteItems</code> до 100 элементов. Потоки изменений — DynamoDB Streams. Предел — 1000 WCU/3000 RCU на партицию: горячий ключ троттлится.</p>
+
+<h2 id="when"><span class="h-num">6.6</span>Когда выбирать</h2>
+<div class="grid-2">
+  <div class="card"><h4>Подходит</h4><ul><li>Огромная запись: события, сообщения, IoT, история действий.</li><li>Известные заранее пути доступа по ключу.</li><li>Активная запись в нескольких регионах, нет единой точки отказа.</li><li>Линейное масштабирование добавлением узлов.</li></ul></div>
+  <div class="card"><h4>Не подходит</h4><ul><li>Произвольные запросы, отчёты, JOIN.</li><li>Транзакции между сущностями, инварианты (деньги, остатки).</li><li>Небольшие объёмы — кластер из 3+ узлов и эксплуатация не окупаются.</li><li>Часто меняющиеся требования к запросам.</li></ul></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">6.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>RF = 3. Какие уровни дают чтение последней подтверждённой записи?</p><ul><li>W = ONE, R = ONE</li><li>W = ONE, R = QUORUM</li><li>W = QUORUM, R = QUORUM</li><li>Никакие</li></ul><div class="why">2 + 2 > 3: множества реплик пересекаются.</div></div>
+<div class="mcq" data-ok="0"><p>Новый запрос «сообщения по автору» к таблице с ключом ((chat_id, bucket), sent_at). Правильное решение?</p><ul><li>Новая таблица messages_by_author, заполняемая при записи</li><li>SELECT … ALLOW FILTERING</li><li>Вторичный индекс и забыть</li><li>JOIN с таблицей пользователей</li></ul><div class="why">Запрос-ориентированное моделирование: таблица под путь доступа.</div></div>
+<div class="mcq" data-ok="3"><p>Почему в ключ партиции добавляют корзину времени (месяц, сутки)?</p><ul><li>Чтобы работал TTL</li><li>Для сортировки</li><li>Чтобы ускорить запись</li><li>Чтобы партиция не росла бесконечно и нагрузка распределялась</li></ul><div class="why">Неограниченные партиции — главная причина проблем в Cassandra.</div></div>
+<div class="mcq" data-ok="1"><p>Что произойдёт при двух одновременных «прочитать баланс → записать новый» в Cassandra без LWT?</p><ul><li>Ошибка конфликта</li><li>Победит запись с большей отметкой времени, другое обновление тихо потеряется</li><li>Оба применятся</li><li>Кластер заблокирует строку</li></ul><div class="why">Last-write-wins — не место для балансов.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Спроектируйте хранение истории просмотров видео (миллиард событий в день) с запросом «последние 100 просмотров пользователя».</summary><div class="a"><p>Таблица <code>views_by_user</code>, PRIMARY KEY ((user_id, month), viewed_at DESC, video_id), TTL на срок хранения. Запрос — одна партиция с LIMIT 100 (при необходимости — предыдущий месяц). Запись с consistency ONE/LOCAL_QUORUM, асинхронно. Аналитика по просмотрам — не здесь, а в колоночном хранилище через поток событий.</p></div></details>
+<details class="q"><summary>Cassandra или DynamoDB?</summary><div class="a"><p>DynamoDB — если вы в AWS и хотите почти ноль эксплуатации, нагрузка умеренная или неравномерная (on-demand), подходит single-table моделирование; минусы — стоимость при большой стабильной нагрузке, привязка к AWS, лимиты на элемент (400 КБ) и партицию. Cassandra/ScyllaDB — своя инфраструктура или мультиоблако, очень большая стабильная нагрузка (дешевле на своём железе), нужен контроль над настройками; минус — эксплуатация кластера (ремонты, компакции, обновления).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>24 · Практикум и собеседование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="24">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 24 · СОВРЕМЕННЫЙ API</div>
+  <h1>Практикум и собеседование</h1>
+  <p class="lead">Закрепление курса: восемь задач, в которых нужно выбрать и правильно применить классы пакета (с разобранными решениями), тренажёр из 34 вопросов о внутреннем устройстве с сохранением прогресса и итоговый тест.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">8 задач</span><span class="tag">34 вопроса</span><span class="tag">итоговый тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="tasks"><span class="h-num">24.1</span>Задачи</h2>
+<div class="quiz">
+<details class="q"><summary>1. Объединение одинаковых запросов (request coalescing): если 100 потоков одновременно просят профиль пользователя 42, в БД должен уйти один запрос.</summary><div class="a"><pre><code class="java">private final ConcurrentHashMap&lt;Long, CompletableFuture&lt;Profile&gt;&gt; inFlight = new ConcurrentHashMap&lt;&gt;();
+CompletableFuture&lt;Profile&gt; load(long id) {
+    CompletableFuture&lt;Profile&gt; f = inFlight.computeIfAbsent(id,
+        k -&gt; CompletableFuture.supplyAsync(() -&gt; repo.find(k), io));   // функция лишь СОЗДАЁТ future — быстро, под блокировкой корзины
+    f.whenComplete((p, ex) -&gt; inFlight.remove(id, f));               // убрать после завершения (remove(key, value)!)
+    return f;
+}</code></pre><p>Важно: долгая работа не внутри computeIfAbsent (там только создание future), удаление — условное, чтобы не снести более новый запрос.</p></div></details>
+<details class="q"><summary>2. Ограничитель частоты «не больше N операций в секунду» без блокировок.</summary><div class="a"><pre><code class="java">final class TokenBucket {
+    private final long capacity, nanosPerToken;
+    private final AtomicLong state;     // время, «до которого» токены израсходованы (virtual scheduling)
+    TokenBucket(long perSecond) { capacity = perSecond; nanosPerToken = 1_000_000_000L / perSecond; state = new AtomicLong(System.nanoTime()); }
+    boolean tryAcquire() {
+        while (true) {
+            long now = System.nanoTime(), cur = state.get();
+            long base = Math.max(cur, now - capacity * nanosPerToken);   // не копить больше capacity
+            long next = base + nanosPerToken;
+            if (next &gt; now) return false;                                // токенов нет
+            if (state.compareAndSet(cur, next)) return true;
+        }
+    }
+}</code></pre><p>Один CAS-цикл, состояние — одно число. Для распределённого ограничения — Redis.</p></div></details>
+<details class="q"><summary>3. Кэш «читается постоянно, обновляется раз в минуту целиком».</summary><div class="a"><p><code>volatile Map&lt;K, V&gt; snapshot = Map.copyOf(load())</code>; читатели — просто чтение ссылки; ScheduledExecutorService раз в минуту строит новую карту и присваивает (copy-on-write). Без блокировок, без RWLock, читатели всегда видят согласованный снимок. Обновление — с try/catch, чтобы ошибка не остановила расписание.</p></div></details>
+<details class="q"><summary>4. Дебаунс: вызывать сохранение черновика не чаще раза в 500 мс после последнего изменения.</summary><div class="a"><pre><code class="java">private final ScheduledExecutorService ses = Executors.newSingleThreadScheduledExecutor();
+private final AtomicReference&lt;ScheduledFuture&lt;?&gt;&gt; pending = new AtomicReference&lt;&gt;();
+void onChange(Draft d) {
+    ScheduledFuture&lt;?&gt; next = ses.schedule(() -&gt; save(d), 500, TimeUnit.MILLISECONDS);
+    ScheduledFuture&lt;?&gt; prev = pending.getAndSet(next);
+    if (prev != null) prev.cancel(false);        // отменить предыдущее отложенное сохранение
+}</code></pre></div></details>
+<details class="q"><summary>5. Параллельная сортировка слиянием на ForkJoinPool.</summary><div class="a"><pre><code class="java">final class MergeSort extends RecursiveAction {
+    final int[] a, tmp; final int lo, hi;
+    MergeSort(int[] a, int[] tmp, int lo, int hi) { this.a = a; this.tmp = tmp; this.lo = lo; this.hi = hi; }
+    protected void compute() {
+        if (hi - lo &lt; 4096) { Arrays.sort(a, lo, hi); return; }
+        int mid = (lo + hi) &gt;&gt;&gt; 1;
+        invokeAll(new MergeSort(a, tmp, lo, mid), new MergeSort(a, tmp, mid, hi));   // fork + compute + join
+        merge(a, tmp, lo, mid, hi);
+    }
+}
+ForkJoinPool.commonPool().invoke(new MergeSort(arr, new int[arr.length], 0, arr.length));
+// на практике — Arrays.parallelSort(arr)</code></pre></div></details>
+<details class="q"><summary>6. Остановить пул воркеров, читающих BlockingQueue, без потери уже принятых задач.</summary><div class="a"><p>Перестать принимать новые задачи (флаг/закрыть вход), положить в очередь по одному poison pill на каждого воркера (они встают после реальных задач — FIFO), дождаться завершения (CountDownLatch или join/awaitTermination с таймаутом), по истечении — interrupt. Если воркеры — ExecutorService: shutdown() + awaitTermination, затем shutdownNow().</p></div></details>
+<details class="q"><summary>7. Счётчик запросов по эндпоинтам под нагрузкой 100 тыс. запросов/с.</summary><div class="a"><p><code>ConcurrentHashMap&lt;String, LongAdder&gt;</code> + <code>computeIfAbsent(endpoint, k -&gt; new LongAdder()).increment()</code>: конкуренции нет ни на карте (после создания ключа — только чтение), ни на счётчике (ячейки LongAdder). Чтение — <code>sum()</code> при выгрузке метрик.</p></div></details>
+<details class="q"><summary>8. Выполнить 10 000 HTTP-запросов, но не больше 50 одновременно, и собрать результаты.</summary><div class="a"><pre><code class="java">Semaphore limit = new Semaphore(50);
+try (var exec = Executors.newVirtualThreadPerTaskExecutor()) {
+    List&lt;Future&lt;Result&gt;&gt; fs = urls.stream().map(u -&gt; exec.submit(() -&gt; {
+        limit.acquire();
+        try { return client.send(request(u), ofString()); }
+        finally { limit.release(); }
+    })).toList();
+    for (var f : fs) results.add(f.get());
+}   // close() дождётся всех задач</code></pre></div></details>
+</div>
+
+<h2 id="trainer"><span class="h-num">24.2</span>Тренажёр вопросов</h2>
+<div class="widget" id="trW">
+  <div class="widget-title">Ответьте вслух, затем проверьте</div>
+  <div class="controls"><label>тема<select id="trF"><option value="all">все</option></select></label><label>показывать<select id="trM"><option value="todo">невыученные</option><option value="all">все</option></select></label><span class="st-count" id="trP"></span></div>
+  <div class="verdict" id="trQ"></div>
+  <div class="out" id="trA" style="display:none"></div>
+  <div class="controls"><button class="btn" type="button" id="trShow">Показать ответ</button><button class="btn primary" type="button" id="trOk">✔ Знаю</button><button class="btn" type="button" id="trNo">↻ Повторить</button><button class="btn" type="button" id="trReset">Сбросить</button></div>
+</div>
+<script>
+(function () {
+  var Q = [
+    ["Фундамент", "Из каких двух кирпичей построены блокирующие классы пакета?", "CAS над полем состояния (быстрый путь) и LockSupport.park/unpark (ожидание); AQS объединяет их с очередью потоков."],
+    ["Фундамент", "Как CAS реализован на x86 и ARM?", "x86 — lock cmpxchg (полный барьер); ARMv8.0 — пара ldaxr/stlxr (LL/SC, возможны ложные неудачи); ARMv8.1 LSE — инструкция cas."],
+    ["Фундамент", "Почему атомарный счётчик плохо масштабируется?", "Кэш-линия со значением перебрасывается между ядрами при каждой операции (когерентность кэшей) — операции сериализуются, передача стоит десятки–сотни наносекунд."],
+    ["Фундамент", "Что такое false sharing и как его лечат?", "Разные переменные разных потоков в одной 64-байтной линии мешают друг другу. Лечат разнесением: @Contended (отступы 128 Б), ручные отступы."],
+    ["Фундамент", "Четыре режима доступа VarHandle.", "plain (никаких межпоточных гарантий), opaque (атомарность и когерентность одной переменной), release/acquire (публикация: всё до release видно после acquire), volatile (последовательная согласованность)."],
+    ["Фундамент", "Почему release/acquire не хватает для алгоритма Деккера?", "Он допускает перестановку записи и последующего чтения другой переменной (StoreLoad) — оба потока могут прочитать 0. Нужен volatile или fullFence."],
+    ["Atomic", "incrementAndGet против updateAndGet(x -> x + 1).", "Первый — lock xadd, не проваливается; второй — CAS-цикл, может повторяться и пересчитывать функцию."],
+    ["Atomic", "Почему функция в updateAndGet должна быть чистой?", "При неудачном CAS она вызывается повторно — побочные эффекты дублируются."],
+    ["Atomic", "Что такое ABA и как защититься?", "CAS проходит, потому что значение вернулось к ожидаемому после изменений. Защита — штамп/версия (AtomicStampedReference), в Java с GC на ссылках редкость (кроме пулов объектов)."],
+    ["Atomic", "Как устроен LongAdder?", "Striped64: base для отсутствия конкуренции; при конкуренции массив @Contended-ячеек (до ≈ NCPU), поток выбирает ячейку по probe и перехеширует при столкновениях; sum() складывает base и ячейки — не атомарный снимок."],
+    ["Atomic", "Требования к функции LongAccumulator.", "Ассоциативна, коммутативна, без побочных эффектов — порядок применения и объединения ячеек не определён."],
+    ["Locks", "Семантика park/unpark.", "Двоичное разрешение на поток: unpark выдаёт (не копится), park потребляет или ждёт; возможны ложные пробуждения и возврат при прерывании (без исключения) — park всегда в цикле."],
+    ["Locks", "Что определяет наследник AQS?", "tryAcquire/tryRelease (эксклюзивно), tryAcquireShared/tryReleaseShared (разделяемо), isHeldExclusively — смысл state; очередь, парковку, таймауты и условия делает AQS."],
+    ["Locks", "Как устроена очередь AQS?", "Вариант CLH: двусвязный список с фиктивной головой, добавление CAS-ом в хвост, будится первый неотменённый узел после головы; отменённые по таймауту/прерыванию узлы вычищаются."],
+    ["Locks", "Честная и нечестная ReentrantLock.", "Нечестная позволяет пришедшему потоку захватить свободную блокировку, не уступая очереди (barging): выше пропускная способность. Честная проверяет hasQueuedPredecessors: ровнее, но простаивает, пока разбуженный поток просыпается."],
+    ["Locks", "Что хранит state ReentrantLock?", "Число повторных захватов владельцем; владелец — exclusiveOwnerThread; tryRelease до нуля освобождает."],
+    ["Locks", "Как работают await и signal у Condition?", "await полностью отпускает блокировку, ставит узел в очередь условия и паркуется; signal переносит узел в очередь блокировки; поток продолжит после повторного захвата и должен перепроверить условие в цикле."],
+    ["Locks", "Как упакован state ReentrantReadWriteLock?", "Старшие 16 бит — число захватов чтения, младшие 16 — захватов записи; удержания каждого читателя — firstReader, cachedHoldCounter, ThreadLocal."],
+    ["Locks", "Почему нельзя повысить чтение до записи в RRWL?", "writeLock ждёт ухода всех читателей, включая сам поток, — взаимоблокировка. Понижение (запись → чтение) разрешено."],
+    ["Locks", "Идиома оптимистичного чтения StampedLock.", "tryOptimisticRead → скопировать поля в локальные переменные → validate(stamp) → при неудаче перечитать под readLock; до validate данные могут быть несогласованными. Не реентерабелен, нет Condition."],
+    ["Синхронизаторы", "CountDownLatch через AQS.", "state = счётчик; acquireShared успешен при 0; countDown — releaseShared с CAS-уменьшением, при нуле будит всех; одноразовый."],
+    ["Синхронизаторы", "Опасность Semaphore по сравнению с Lock.", "Нет владельца: release без acquire увеличивает число разрешений; учёт — дисциплиной acquire перед try, release в finally."],
+    ["Синхронизаторы", "Что происходит при сбое участника CyclicBarrier?", "Поколение помечается сломанным: все ожидающие получают BrokenBarrierException, новые await — сразу исключение до reset()."],
+    ["Синхронизаторы", "Чем Phaser отличается от CyclicBarrier?", "Динамическая регистрация и снятие участников, номера фаз, ожидание без участия, onAdvance для завершения, иерархия фазеров для масштабирования."],
+    ["Исполнители", "Что такое ctl в ThreadPoolExecutor?", "AtomicInteger: 3 старших бита — состояние пула (RUNNING, SHUTDOWN, STOP, TIDYING, TERMINATED), 29 младших — число рабочих потоков; один CAS меняет оба."],
+    ["Исполнители", "Алгоритм execute().", "Меньше core — новый поток; иначе offer в очередь; очередь полна — поток сверх core до max; иначе политика отказа. С неограниченной очередью потоков никогда не больше core."],
+    ["Исполнители", "Куда девается исключение задачи при execute и submit?", "execute — вылетает из run, убивает поток (пул создаёт новый), печатается UncaughtExceptionHandler; submit — сохраняется в Future, видно только через get()."],
+    ["Исполнители", "Fixed rate против fixed delay.", "Rate — следующее начало от запланированного предыдущего (догоняет при задержках, без наложения); delay — от конца предыдущего. Исключение останавливает периодическую задачу навсегда."],
+    ["Исполнители", "Как устроен work-stealing в ForkJoinPool?", "У каждого рабочего своя дека: свои задачи — с вершины (LIFO), воры крадут с дна (FIFO, крупные куски); конфликт только на последнем элементе."],
+    ["Исполнители", "Состояния FutureTask.", "NEW → COMPLETING → NORMAL | EXCEPTIONAL; NEW → CANCELLED; NEW → INTERRUPTING → INTERRUPTED; run выполняет только один поток (CAS runner)."],
+    ["Исполнители", "В каком потоке выполняется thenApply?", "Если CF уже завершён — в вызывающем потоке синхронно; иначе — в потоке, который его завершит. *Async — в указанном executor или commonPool."],
+    ["Исполнители", "Прерывает ли CompletableFuture.cancel(true) задачу?", "Нет: CF не связан с выполняющим потоком; отмена завершает его CancellationException, работа продолжается."],
+    ["Очереди", "Почему LinkedBlockingQueue быстрее ArrayBlockingQueue при многих производителях и потребителях?", "Две блокировки (putLock на хвост, takeLock на голову) и атомарный счётчик — вставка и извлечение параллельны; у ABQ одна блокировка на массив."],
+    ["Очереди", "Как работает очередь Майкла–Скотта?", "Добавление: CAS last.next (точка линеаризации), затем CAS tail (может отставать); любой поток, заметивший отставание, помогает сдвинуть tail; извлечение — CAS head. Lock-free."]
+  ];
+  var $ = function (i) { return document.getElementById(i); }, K = "juc-trainer-known", known = {}, cur = -1;
+  try { known = JSON.parse(localStorage.getItem(K) || "{}"); } catch (e) {}
+  var topics = Q.map(function (q) { return q[0]; }).filter(function (t, i, a) { return a.indexOf(t) === i; });
+  $("trF").innerHTML += topics.map(function (t) { return "<option>" + t + "</option>"; }).join("");
+  function save() { try { localStorage.setItem(K, JSON.stringify(known)); } catch (e) {} }
+  function pool() { var f = $("trF").value, m = $("trM").value; return Q.map(function (q, i) { return i; }).filter(function (i) { return (f === "all" || Q[i][0] === f) && (m === "all" || !known[i]); }); }
+  function next() {
+    var p = pool(); $("trA").style.display = "none"; $("trP").textContent = "выучено " + Object.keys(known).length + " из " + Q.length;
+    if (!p.length) { cur = -1; $("trQ").className = "verdict ok"; $("trQ").textContent = "В этой выборке всё выучено."; return; }
+    var c = p.filter(function (i) { return i !== cur; }); cur = (c.length ? c : p)[Math.floor(Math.random() * (c.length || p.length))];
+    $("trQ").className = "verdict"; $("trQ").textContent = "[" + Q[cur][0] + "] " + Q[cur][1];
+  }
+  $("trShow").addEventListener("click", function () { if (cur < 0) return; $("trA").textContent = Q[cur][2]; $("trA").style.display = ""; });
+  $("trOk").addEventListener("click", function () { if (cur >= 0) { known[cur] = 1; save(); } next(); });
+  $("trNo").addEventListener("click", function () { if (cur >= 0) { delete known[cur]; save(); } next(); });
+  $("trReset").addEventListener("click", function () { known = {}; save(); next(); });
+  ["trF", "trM"].forEach(function (i) { $(i).addEventListener("change", next); });
+  next();
+})();
+</script>
+
+<h2 id="final"><span class="h-num">24.3</span>Итоговый тест</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой класс выбрать для метрики «число запросов» под высокой конкурентной записью?</p><ul><li>AtomicLong</li><li>volatile long</li><li>LongAdder</li><li>synchronized long</li></ul><div class="why">Распределённые ячейки без конкуренции.</div></div>
+<div class="mcq" data-ok="0"><p>ThreadPoolExecutor(core=4, max=20, LinkedBlockingQueue()). Сколько потоков будет под перегрузкой?</p><ul><li>4</li><li>20</li><li>Неограниченно</li><li>24</li></ul><div class="why">Очередь без предела никогда не заполнится.</div></div>
+<div class="mcq" data-ok="3"><p>Что вернёт park(), если до него уже трижды вызвали unpark этого потока?</p><ul><li>Заблокируется</li><li>Бросит исключение</li><li>Вернётся три раза</li><li>Вернётся сразу, потребив единственное разрешение</li></ul><div class="why">Разрешение двоичное.</div></div>
+<div class="mcq" data-ok="1"><p>Какая блокировка допускает чтение вообще без записи в общую память?</p><ul><li>ReentrantReadWriteLock</li><li>StampedLock (оптимистичное чтение)</li><li>ReentrantLock</li><li>Semaphore</li></ul><div class="why">Читается штамп, затем validate.</div></div>
+<div class="mcq" data-ok="2"><p>Что гарантирует закрытие StructuredTaskScope?</p><ul><li>Успех всех подзадач</li><li>Логирование ошибок</li><li>Что все подзадачи завершены (отменены, если не успели) — ни одна не переживает область</li><li>Повтор упавших задач</li></ul><div class="why">Структурная конкурентность.</div></div>
+
+</div></main>
+</div>
+</body>
+</html>

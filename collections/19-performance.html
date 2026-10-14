@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Производительность и память</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ПРАКТИКА</div>
+  <h1>Производительность и память</h1>
+  <p class="lead">Асимптотика — только первая половина правды о скорости коллекций. Вторая — константы: упаковка примитивов, накладные расходы на объект-узел, промахи кэша процессора при прыжках по ссылкам. Здесь — сводная таблица сложностей всех операций, калькулятор памяти на миллион элементов, объяснение, почему обход массива в разы быстрее обхода связного списка при одинаковом O(n), и как правильно мерить (JMH).</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">Big-O</span><span class="tag">память на элемент</span><span class="tag">упаковка</span><span class="tag">кэш CPU</span><span class="tag">примитивные коллекции</span><span class="tag">JMH</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="bigo"><span class="h-num">19.1</span>Сводная таблица сложности</h2>
+<div class="widget" id="boW">
+  <div class="widget-title">Выберите операцию — подсветятся лучшие структуры</div>
+  <div class="controls"><label>операция<select id="boO"><option value="0">доступ по индексу</option><option value="1">поиск элемента (contains/get по ключу)</option><option value="2">добавление в конец</option><option value="3">добавление в начало</option><option value="4">вставка/удаление в середине</option><option value="5">минимум / максимум</option><option value="6">обход по порядку</option><option value="7">диапазон / ближайший</option></select></label></div>
+  <div class="table-wrap"><table id="boT"></table></div>
+</div>
+<script>
+(function () {
+  var S = [
+    ["ArrayList", ["O(1)", "O(n)", "O(1)*", "O(n)", "O(n)", "O(n)", "O(n) ✦", "O(log n)†"]],
+    ["LinkedList", ["O(n)", "O(n)", "O(1)", "O(1)", "O(n)‡", "O(n)", "O(n)", "—"]],
+    ["ArrayDeque", ["—", "O(n)", "O(1)*", "O(1)*", "—", "O(n)", "O(n) ✦", "—"]],
+    ["HashMap / HashSet", ["—", "O(1)~", "O(1)~", "—", "—", "O(n)", "O(cap)", "—"]],
+    ["LinkedHashMap / Set", ["—", "O(1)~", "O(1)~", "—", "—", "O(n)", "O(n)", "—"]],
+    ["TreeMap / TreeSet", ["—", "O(log n)", "O(log n)", "O(log n)", "O(log n)", "O(log n)", "O(n)", "O(log n)"]],
+    ["PriorityQueue", ["—", "O(n)", "O(log n)", "—", "—", "O(1) мин.", "—", "—"]],
+    ["EnumSet / EnumMap", ["—", "O(1)", "O(1)", "—", "—", "O(1)", "O(k) ✦", "—"]]
+  ];
+  var BEST = [[0], [3, 4, 7], [0, 1, 2], [1, 2], [5], [6, 7], [0, 2, 7], [5]];
+  var H = ["по индексу", "поиск", "в конец", "в начало", "в середину", "мин/макс", "обход", "диапазон"];
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var o = +$("boO").value;
+    $("boT").innerHTML = "<tr><th>Структура</th>" + H.map(function (h, i) { return "<th" + (i === o ? ' style="background:var(--accent-soft)"' : "") + ">" + h + "</th>"; }).join("") + "</tr>" + S.map(function (r, ri) { return "<tr><td><b>" + r[0] + "</b></td>" + r[1].map(function (c, ci) { var best = ci === o && BEST[o].indexOf(ri) >= 0; return "<td" + (best ? ' style="background:var(--ok-soft);font-weight:700"' : ci === o ? ' style="background:var(--bg-sunk)"' : "") + ">" + c + "</td>"; }).join("") + "</tr>"; }).join("");
+  }
+  $("boO").addEventListener("change", run); run();
+})();
+</script>
+<p class="hint">* амортизированно; ~ в среднем при хорошем hashCode (худший случай O(log n) с деревьями в корзинах); † бинарный поиск по отсортированному; ‡ O(1) при наличии итератора в позиции; ✦ непрерывная память — быстрее «того же O(n)»; O(cap) — обход идёт по всей таблице, включая пустые корзины.</p>
+
+<h2 id="memory"><span class="h-num">19.2</span>Сколько памяти займёт коллекция</h2>
+<div class="widget" id="mmW">
+  <div class="widget-title">Калькулятор (64-бит JVM, сжатые указатели)</div>
+  <div class="controls">
+    <label>структура<select id="mmS"><option value="arr">примитивный массив int[] / long[]</option><option value="al" selected>ArrayList</option><option value="ll">LinkedList</option><option value="hs">HashSet</option><option value="hm">HashMap (ключ + значение)</option><option value="ts">TreeSet</option><option value="prim">IntArrayList / IntOpenHashSet (fastutil)</option></select></label>
+    <label>элементы<select id="mmE"><option value="int">целые (Integer вне кэша)</option><option value="long">Long</option><option value="str">String ~10 символов латиницей</option><option value="obj">свой объект 24 байта</option></select></label>
+    <label>элементов, млн<input type="number" id="mmN" value="1" min="0.01" step="0.5"></label>
+  </div>
+  <div id="mmBars"></div>
+  <div class="verdict" id="mmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var ELEM = { int: [16, 4], long: [24, 8], str: [56, 0], obj: [24, 0] };   // размер объекта-элемента, размер примитива
+  function run() {
+    var s = $("mmS").value, e = ELEM[$("mmE").value], n = Math.max(0.01, +$("mmN").value) * 1e6, struct, elem, note;
+    if (s === "arr") { if (!e[1]) { struct = 4; elem = e[0]; note = "Для объектов массив хранит ссылки (4 Б) + сами объекты."; } else { struct = e[1]; elem = 0; note = "Без объектов-обёрток: только значения подряд — максимальная плотность и скорость обхода."; } }
+    else if (s === "al") { struct = 4 * 1.25; elem = e[0]; note = "Ссылка 4 Б (+ в среднем 25% запаса ёмкости) + объект-элемент."; }
+    else if (s === "ll") { struct = 24; elem = e[0]; note = "Узел Node 24 Б на каждый элемент + объект-элемент; узлы разбросаны по памяти."; }
+    else if (s === "hs") { struct = 32 + 4 / 0.75 * 1.2; elem = e[0]; note = "Узел HashMap 32 Б (hash, key, value, next) + слот таблицы ~6 Б + элемент."; }
+    else if (s === "hm") { struct = 32 + 4 / 0.75 * 1.2; elem = e[0] * 2; note = "Узел + ключ и значение — оба объекты (например, Long → Long)."; }
+    else if (s === "ts") { struct = 40; elem = e[0]; note = "Узел TreeMap.Entry ~40 Б (key, value, left, right, parent, color)."; }
+    else { if (!e[1]) { struct = 4 * 1.25; elem = e[0]; note = "Примитивные коллекции выигрывают только на примитивах."; } else { struct = e[1] * 1.3; elem = 0; note = "Значения хранятся в примитивном массиве без обёрток (open addressing у множеств)."; } }
+    var tot = (struct + elem) * n / 1048576, base = e[1] ? e[1] * n / 1048576 : e[0] * n / 1048576, mx = Math.max(tot, base);
+    $("mmBars").innerHTML = '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>Структура (узлы, ссылки, таблицы)</b><span style="font-family:var(--font-mono)">' + (struct * n / 1048576).toFixed(1) + ' МБ</span></div><div class="bar"><i style="width:' + (struct * n / 1048576 / mx * 100) + '%"></i></div>' +
+      '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>Объекты-элементы</b><span style="font-family:var(--font-mono)">' + (elem * n / 1048576).toFixed(1) + ' МБ</span></div><div class="bar"><i style="width:' + (elem * n / 1048576 / mx * 100) + '%"></i></div>' +
+      '<div style="display:flex;justify-content:space-between;font-size:14px;font-weight:700"><span>Итого</span><span style="font-family:var(--font-mono)">' + tot.toFixed(1) + " МБ (" + ((struct + elem)).toFixed(0) + ' Б на элемент)</span></div>';
+    $("mmV").className = "verdict " + (tot > base * 4 ? "warn" : "ok");
+    $("mmV").textContent = note + (e[1] ? " Полезных данных: " + base.toFixed(1) + " МБ — накладные расходы ×" + (tot / base).toFixed(1) + "." : "");
+  }
+  ["mmS", "mmE", "mmN"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="cache"><span class="h-num">19.3</span>Кэш процессора: почему O(n) бывает разным</h2>
+<p>Процессор читает память строками кэша по 64 байта и предсказывает последовательный доступ. Обход <code>int[]</code> — 16 значений за одну загрузку строки, предвыборка работает идеально. Обход <code>ArrayList&lt;Integer&gt;</code> — ссылки подряд, но объекты Integer разбросаны (хотя часто выделены рядом в TLAB). Обход <code>LinkedList</code> — каждый следующий узел по случайному адресу: промах кэша стоит ~100 нс против ~1 нс попадания.</p>
+<div class="table-wrap"><table>
+<tr><th>Сумма 10 млн элементов (порядок величин на современном x86)</th><th>Время</th></tr>
+<tr><td><code>int[]</code> (векторизовано JIT)</td><td>~3 мс</td></tr>
+<tr><td><code>ArrayList&lt;Integer&gt;</code>, элементы выделены подряд</td><td>~15 мс</td></tr>
+<tr><td><code>ArrayList&lt;Integer&gt;</code> после перемешивания элементов в памяти</td><td>~60 мс</td></tr>
+<tr><td><code>LinkedList&lt;Integer&gt;</code></td><td>~80–150 мс</td></tr>
+</table></div>
+<p class="hint">Цифры ориентировочные и сильно зависят от железа, GC и прогрева — проверяйте своими JMH-бенчмарками.</p>
+
+<h2 id="jmh"><span class="h-num">19.4</span>Как правильно мерить</h2>
+<pre data-title="JMH-бенчмарк обхода"><code class="java">@State(Scope.Benchmark) @BenchmarkMode(Mode.AverageTime) @OutputTimeUnit(TimeUnit.MILLISECONDS)
+@Warmup(iterations = 5) @Measurement(iterations = 5) @Fork(2)
+public class SumBench {
+    @Param({"1000", "1000000"}) int n;
+    List&lt;Integer&gt; arrayList, linkedList; int[] array;
+    @Setup public void setup() {
+        array = IntStream.range(0, n).toArray();
+        arrayList = Arrays.stream(array).boxed().collect(Collectors.toCollection(ArrayList::new));
+        linkedList = new LinkedList&lt;&gt;(arrayList);
+    }
+    @Benchmark public long arraySum()  { long s = 0; for (int x : array) s += x; return s; }      // возвращаем результат — иначе JIT выбросит цикл
+    @Benchmark public long arrayList() { long s = 0; for (int x : arrayList) s += x; return s; }
+    @Benchmark public long linked()    { long s = 0; for (int x : linkedList) s += x; return s; }
+}
+// запуск с профилировщиком аллокаций: -prof gc ; нативный: -prof perfasm</code></pre>
+<div class="callout info"><span class="c-title">Практические советы</span>
+Задавайте начальную ёмкость при известном размере; используйте примитивные массивы и стримы (<code>IntStream</code>) для числовых данных; примитивные коллекции (fastutil, Eclipse Collections, HPPC) для больших объёмов чисел; не держите миллионы маленьких коллекций (у каждой пустой HashMap — ~48 Б, а с таблицей — больше); удаляйте ссылки, которые больше не нужны (кэши с ограничением).
+</div>
+
+<h2 id="quiz"><span class="h-num">19.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько примерно байт на элемент занимает HashSet&lt;Integer&gt; с 1 млн элементов?</p><ul><li>4</li><li>16</li><li>~50–60: узел 32 + слот таблицы + объект Integer 16</li><li>~200</li></ul><div class="why">Против 4 байт в int[] — разница более чем в 10 раз.</div></div>
+<div class="mcq" data-ok="0"><p>Почему обход LinkedList медленнее ArrayList при одинаковом O(n)?</p><ul><li>Узлы разбросаны по памяти — промахи кэша и невозможность предвыборки</li><li>LinkedList синхронизирован</li><li>LinkedList проверяет modCount</li><li>Итератор LinkedList создаёт копию</li></ul><div class="why">Локальность данных важнее асимптотики на реальном железе.</div></div>
+<div class="mcq" data-ok="3"><p>Почему обход HashMap с ёмкостью 1 млн и 10 элементами медленный?</p><ul><li>Из-за коллизий</li><li>Из-за блокировок</li><li>HashMap копирует данные при итерации</li><li>Итератор проходит все корзины таблицы, включая пустые: O(capacity)</li></ul><div class="why">Таблица не сжимается после удаления элементов.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сервис хранит 50 млн пар long → long в HashMap и занимает 6 ГБ. Как сократить?</summary><div class="a"><p>Каждая пара — узел 32 Б + два Long по 24 Б + слот таблицы ≈ 85–90 Б, то есть ~4,5 ГБ только на карту. Примитивная карта с открытой адресацией (fastutil Long2LongOpenHashMap) — ~16 Б на пару с учётом заполнения: ~1 ГБ. Если ключи плотные — просто long[] по индексу. Если данные отсортированы — два long[] и бинарный поиск. Для ещё больших объёмов — off-heap (Chronicle Map) или внешнее хранилище.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Environment, профили, события</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · КОНТЕЙНЕР</div>
+  <h1>Environment, профили, конвертация и события</h1>
+  <p class="lead">Контейнер отвечает не только за бины. <code>Environment</code> даёт единый доступ к настройкам из любых источников и знает активные профили. <code>ConversionService</code> превращает строки в типы. Механизм событий позволяет компонентам общаться без прямых зависимостей — с тонкостями про потоки и транзакции, на которых ошибаются даже опытные разработчики.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">PropertySource</span><span class="tag">@Profile</span><span class="tag">@TransactionalEventListener</span><span class="tag">2 симулятора</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="env"><span class="h-num">5.1</span>Environment и PropertySource</h2>
+<p><code>Environment</code> объединяет две вещи: <b>профили</b> и <b>свойства</b>. Свойства хранятся в упорядоченном списке <code>MutablePropertySources</code>. Поиск ключа идёт по списку сверху вниз, побеждает <b>первый</b> источник, где ключ найден (<code>PropertySourcesPropertyResolver</code>).</p>
+<div class="flow col">
+  <div class="node acc"><b>commandLineArgs</b><small>--server.port=9000 (Boot)</small></div><span class="to">↓ если не найдено</span>
+  <div class="node"><b>systemProperties</b><small>-Dserver.port=9000</small></div><span class="to">↓</span>
+  <div class="node"><b>systemEnvironment</b><small>SERVER_PORT=9000 (с «расслабленным» сопоставлением имён)</small></div><span class="to">↓</span>
+  <div class="node"><b>Config resource 'class path resource [application.yml]'</b><small>файлы конфигурации Boot</small></div><span class="to">↓</span>
+  <div class="node"><b>@PropertySource("classpath:extra.properties")</b><small>добавляются в конец списка</small></div>
+</div>
+<p>Полный порядок источников Spring Boot (их 15+) — тема 08. Здесь важен механизм: любая библиотека может добавить свой <code>PropertySource</code> (Vault, Consul, Kubernetes ConfigMap) в нужную позицию, и для кода ничего не меняется.</p>
+<pre data-title="Чтение свойств: три способа"><code class="java">@Component
+class Example {
+    Example(Environment env,
+            @Value("${app.timeout:5s}") Duration timeout,           // плейсхолдер с значением по умолчанию
+            @Value("#{${app.retries:3} * 2}") int attempts) {      // SpEL поверх плейсхолдера
+        String region = env.getProperty("app.region", "eu");
+        boolean prod  = env.matchesProfiles("prod");
+    }
+}
+// Для групп настроек — @ConfigurationProperties (тема 08): типобезопасно и с валидацией.</code></pre>
+
+<h3>Как разрешается @Value</h3>
+<ol class="steps">
+  <li><code>AutowiredAnnotationBeanPostProcessor</code> находит <code>@Value</code> на поле/параметре и передаёт строку в <code>beanFactory.resolveEmbeddedValue()</code>.</li>
+  <li>Зарегистрированные <code>StringValueResolver</code>-ы (в Boot — от <code>PropertySourcesPlaceholderConfigurer</code>) раскрывают <code>${...}</code> по Environment, рекурсивно и с поддержкой <code>:default</code>.</li>
+  <li>Если результат содержит <code>#{...}</code>, его вычисляет <code>StandardBeanExpressionResolver</code> (SpEL).</li>
+  <li><code>TypeConverter</code> / <code>ConversionService</code> приводит строку к типу параметра: <code>Duration</code>, <code>List&lt;String&gt;</code>, enum.</li>
+</ol>
+
+<div class="widget" id="ph">
+  <div class="widget-title">Симулятор: разрешение плейсхолдеров</div>
+  <p class="hint">Слева — свойства в Environment (формат <code>key=value</code>). Справа — строка, как в <code>@Value</code>. Пробуйте вложенность, значения по умолчанию, циклы.</p>
+  <div class="grid-2">
+    <label>Environment<textarea id="phProps" spellcheck="false">app.host=shop.local
+server.port=8443
+app.url=https://${app.host}:${server.port}
+app.name=${APP_NAME:shop}
+loop.a=${loop.b}
+loop.b=${loop.a}</textarea></label>
+    <div><label>Выражение<input type="text" id="phExpr" class="wide" value="${app.url}/api?client=${app.name}&amp;debug=${app.debug:false}"></label>
+      <div class="controls" style="margin-top:8px"><button class="btn" type="button" data-ex="${app.url}/api?client=${app.name}&amp;debug=${app.debug:false}">вложенность</button><button class="btn" type="button" data-ex="${db.url:jdbc:h2:mem:${app.name}}">default с вложенным</button><button class="btn" type="button" data-ex="${payment.key}">нет значения</button><button class="btn" type="button" data-ex="${loop.a}">цикл</button></div>
+    </div>
+  </div>
+  <div class="log" id="phLog"></div>
+  <div class="verdict" id="phOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function parseProps(t) {
+    var m = {};
+    t.split("\n").forEach(function (l) { var i = l.indexOf("="); if (i > 0 && l.trim()[0] !== "#") m[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
+    return m;
+  }
+  function run() {
+    var props = parseProps($("phProps").value), log = [], err = null;
+    function resolve(s, depth, stack) {
+      var out = "", i = 0;
+      while (i < s.length) {
+        var st = s.indexOf("${", i);
+        if (st < 0) { out += s.slice(i); break; }
+        out += s.slice(i, st);
+        var d = 1, j = st + 2;
+        while (j < s.length && d > 0) { if (s.substr(j, 2) === "${") { d++; j += 2; continue; } if (s[j] === "}") d--; j++; }
+        if (d > 0) { out += s.slice(st); break; }
+        var inner = s.slice(st + 2, j - 1), k = 0, nd = 0, sep = -1;
+        for (; k < inner.length; k++) { if (inner.substr(k, 2) === "${") { nd++; k++; } else if (inner[k] === "}") nd--; else if (inner[k] === ":" && nd === 0) { sep = k; break; } }
+        var key = sep >= 0 ? inner.slice(0, sep) : inner, def = sep >= 0 ? inner.slice(sep + 1) : null;
+        key = resolve(key, depth + 1, stack);
+        if (err) return "";
+        var pad = new Array(depth + 1).join("  ");
+        if (stack.indexOf(key) >= 0) { err = "PlaceholderResolutionException (подкласс IllegalArgumentException): Circular placeholder reference '" + key + "'"; log.push(pad + "${" + key + "} — уже раскрывается выше по стеку → цикл"); return ""; }
+        var val;
+        if (Object.prototype.hasOwnProperty.call(props, key)) {
+          log.push(pad + "${" + key + "} → найдено: " + props[key]);
+          val = resolve(props[key], depth + 1, stack.concat(key));
+        } else if (def !== null) {
+          log.push(pad + "${" + key + "} → нет в Environment, берём значение по умолчанию: " + def);
+          val = resolve(def, depth + 1, stack);
+        } else {
+          err = "IllegalArgumentException: Could not resolve placeholder '" + key + "' in value \"" + s + "\"";
+          log.push(pad + "${" + key + "} → нет в Environment и нет значения по умолчанию");
+          return "";
+        }
+        if (err) return "";
+        out += val; i = j;
+      }
+      return out;
+    }
+    var res = resolve($("phExpr").value, 0, []);
+    $("phLog").textContent = log.join("\n") || "плейсхолдеров нет";
+    var o = $("phOut");
+    if (err) { o.className = "verdict bad"; o.textContent = err + " — бин не создастся, контекст не стартует."; }
+    else { o.className = "verdict ok"; o.textContent = "Результат: " + res; }
+  }
+  $("phProps").addEventListener("input", run); $("phExpr").addEventListener("input", run);
+  document.querySelectorAll("#ph [data-ex]").forEach(function (b) { b.addEventListener("click", function () { $("phExpr").value = b.getAttribute("data-ex"); run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="profiles"><span class="h-num">5.2</span>Профили</h2>
+<p>Профиль — именованный набор бинов и настроек, который включается целиком. <code>@Profile</code> — это <code>@Conditional(ProfileCondition.class)</code>: условие проверяется при разборе конфигурации, неподходящие классы и <code>@Bean</code>-методы просто не регистрируются.</p>
+<pre><code class="java">@Configuration
+class StorageConfig {
+    @Bean @Profile("!cloud")                       // все профили, кроме cloud
+    FileStorage localStorage() { return new LocalFileStorage(Path.of("/tmp/files")); }
+
+    @Bean @Profile("cloud &amp; (eu | us)")            // выражения: !, &amp;, |, скобки
+    FileStorage s3Storage(S3Client s3) { return new S3FileStorage(s3); }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Как активировать</h4><p><code>spring.profiles.active=prod</code> в любом источнике свойств (переменная <code>SPRING_PROFILES_ACTIVE</code>, аргумент <code>--spring.profiles.active</code>); в тестах — <code>@ActiveProfiles</code>. Если ничего не активно, работает профиль <code>default</code>.</p></div>
+  <div class="card"><h4>Группы профилей (Boot)</h4><p><code>spring.profiles.group.prod=postgres,kafka,metrics</code> — активация <code>prod</code> включает всю группу. <code>spring.profiles.include</code> добавляет профили всегда.</p></div>
+</div>
+<div class="callout warn"><span class="c-title">Практика</span>
+Профили хороши для подключения <b>реализаций</b> (локальное хранилище против S3, заглушка платёжного шлюза). Плохо, когда профиль на каждое окружение (<code>dev</code>, <code>stage</code>, <code>prod</code>) содержит разные бины: на проде запускается код, который не прогонялся в тестах. Разницу между окружениями держите в <b>значениях</b> свойств, а код — одинаковым.
+</div>
+
+<h2 id="conversion"><span class="h-num">5.3</span>Конвертация типов</h2>
+<p>Строки из конфигурации и HTTP превращаются в типы через <code>ConversionService</code> (в Boot — <code>ApplicationConversionService</code> с расширенным набором конвертеров). Расширяется так:</p>
+<pre><code class="java">@Component
+@ConfigurationPropertiesBinding                         // использовать и при биндинге @ConfigurationProperties
+class MoneyConverter implements Converter&lt;String, Money&gt; {
+    public Money convert(String s) {                    // "100.50 RUB"
+        String[] p = s.trim().split("\\s+");
+        return Money.of(new BigDecimal(p[0]), p[1]);
+    }
+}
+// Встроенные форматы Boot: Duration — "30s", "5m", "PT1H"; DataSize — "10MB", "512KB";
+// списки — "a,b,c"; Period — "1y2m3d".</code></pre>
+
+<h2 id="events"><span class="h-num">5.4</span>События: механизм</h2>
+<pre data-title="Публикация и прослушивание"><code class="java">public record OrderPlaced(long orderId, String email) { }   // событие — любой объект
+
+@Service
+class OrderService {
+    private final ApplicationEventPublisher events;
+    OrderService(ApplicationEventPublisher events) { this.events = events; }
+
+    @Transactional
+    public Order place(Cart cart) {
+        Order o = repo.save(Order.from(cart));
+        events.publishEvent(new OrderPlaced(o.id(), cart.email()));   // обёртывается в PayloadApplicationEvent
+        return o;
+    }
+}
+
+@Component
+class Notifications {
+    @EventListener                                     // по умолчанию: синхронно, в том же потоке и транзакции
+    void onPlaced(OrderPlaced e) { /* ... */ }
+
+    @EventListener(condition = "#e.email.endsWith('@corp.ru')")
+    void onCorporate(OrderPlaced e) { /* SpEL-условие */ }
+}</code></pre>
+<p>Внутри: на шаге 11 refresh() <code>EventListenerMethodProcessor</code> (это <code>SmartInitializingSingleton</code>) находит методы с <code>@EventListener</code> и через <code>DefaultEventListenerFactory</code> регистрирует для каждого <code>ApplicationListenerMethodAdapter</code>. <code>publishEvent</code> передаёт событие в <code>SimpleApplicationEventMulticaster</code>, который выбирает слушателей по типу (с учётом generics, результат кэшируется) и вызывает их <b>по очереди в потоке публикующего</b>. Если метод слушателя возвращает объект — он публикуется как новое событие.</p>
+<div class="callout bad"><span class="c-title">Синхронность — это и плюс, и риск</span>
+Исключение синхронного слушателя пробрасывается в <code>publishEvent</code> → в метод <code>place()</code> → транзакция заказа откатывается из-за упавшей отправки письма. И наоборот: письмо уже ушло, а транзакция потом откатилась — клиент получил подтверждение несуществующего заказа. Для побочных эффектов наружу используйте <code>@TransactionalEventListener</code>.
+</div>
+
+<h3>@TransactionalEventListener</h3>
+<p>Слушатель не вызывается сразу. <code>TransactionalApplicationListenerMethodAdapter</code> регистрирует <code>TransactionSynchronization</code> в текущей транзакции, и метод выполнится в выбранной фазе: <code>BEFORE_COMMIT</code>, <code>AFTER_COMMIT</code> (по умолчанию), <code>AFTER_ROLLBACK</code>, <code>AFTER_COMPLETION</code>.</p>
+
+<div class="widget" id="ev">
+  <div class="widget-title">Симулятор: когда и как выполнится слушатель</div>
+  <div class="controls">
+    <label>слушатель<select id="evKind"><option value="sync">@EventListener</option><option value="async">@Async @EventListener</option><option value="ac" selected>@TransactionalEventListener (AFTER_COMMIT)</option><option value="bc">@TransactionalEventListener(BEFORE_COMMIT)</option><option value="ar">@TransactionalEventListener(AFTER_ROLLBACK)</option></select></label>
+    <label>publishEvent вызван<select id="evTx"><option value="tx">внутри @Transactional</option><option value="none">без транзакции</option></select></label>
+    <label>после publishEvent<select id="evEnd"><option value="commit">метод завершается успешно</option><option value="fail">метод бросает исключение</option></select></label>
+    <label>слушатель<select id="evThrow"><option value="no">отрабатывает нормально</option><option value="yes">бросает исключение</option></select></label>
+  </div>
+  <div class="log" id="evLog"></div>
+  <div class="verdict" id="evOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var k = $("evKind").value, tx = $("evTx").value === "tx", fail = $("evEnd").value === "fail", thr = $("evThrow").value === "yes";
+    var L = [], cls = "ok", v;
+    L.push("[http-nio-8080-exec-1] " + (tx ? "BEGIN; " : "") + "INSERT INTO orders …");
+    L.push("[http-nio-8080-exec-1] publishEvent(OrderPlaced)");
+    if (k === "sync") {
+      L.push("[http-nio-8080-exec-1]   → Notifications.onPlaced() сразу, " + (tx ? "внутри той же транзакции" : "без транзакции"));
+      if (thr) {
+        L.push("[http-nio-8080-exec-1]   ✘ исключение слушателя летит в publishEvent и дальше в place()");
+        if (tx) L.push("[http-nio-8080-exec-1] ROLLBACK — заказ не сохранён");
+        cls = "bad"; v = "Сбой второстепенного слушателя сломал основную операцию" + (tx ? ": заказ откатился." : ", а вызывающий получил ошибку.");
+      } else if (fail) {
+        L.push("[http-nio-8080-exec-1]   письмо отправлено"); if (tx) L.push("[http-nio-8080-exec-1] ROLLBACK"); cls = "bad";
+        v = "Письмо ушло, но заказ " + (tx ? "откатился" : "не завершён") + ": клиент получил подтверждение несуществующего заказа.";
+      } else { if (tx) L.push("[http-nio-8080-exec-1] COMMIT"); v = "Работает, но слушатель увеличивает время запроса и связан с транзакцией. Для внешних эффектов (письма, Kafka) лучше AFTER_COMMIT."; cls = "warn"; }
+    } else if (k === "async") {
+      L.push("[http-nio-8080-exec-1]   задача отдана в executor, publishEvent сразу возвращается");
+      L.push("[task-1]               Notifications.onPlaced() — другой поток, ВНЕ транзакции публикующего");
+      if (tx) L.push("[task-1]               SELECT order → может не найти: транзакция ещё не закоммичена");
+      if (thr) L.push("[task-1]               ✘ исключение → AsyncUncaughtExceptionHandler (лог), публикующий не узнает");
+      if (tx) L.push("[http-nio-8080-exec-1] " + (fail ? "ROLLBACK" : "COMMIT"));
+      cls = (fail || tx) ? "bad" : "warn";
+      v = fail ? "Слушатель уже работает, а транзакция откатилась — асинхронный обработчик не знает об откате." : (tx ? "Гонка: асинхронный слушатель может выполниться до коммита и не увидеть данные. Комбинируйте @Async с @TransactionalEventListener." : "Не блокирует вызывающего; ошибки теряются в логах, порядок не гарантирован.");
+    } else if (!tx) {
+      L.push("[http-nio-8080-exec-1]   активной транзакции нет → событие ОТБРОШЕНО (в DEBUG-логе: No transaction is active)");
+      cls = "bad"; v = "Слушатель не вызовется. Нужно либо публиковать внутри транзакции, либо @TransactionalEventListener(fallbackExecution = true).";
+    } else if (k === "bc") {
+      L.push("[http-nio-8080-exec-1]   зарегистрирована TransactionSynchronization");
+      if (fail) { L.push("[http-nio-8080-exec-1] ROLLBACK — beforeCommit не наступил, слушатель не вызван"); v = "Слушатель не вызван: до коммита дело не дошло."; cls = "warn"; }
+      else {
+        L.push("[http-nio-8080-exec-1] beforeCommit → onPlaced() внутри транзакции (можно писать в БД — запишется атомарно)");
+        if (thr) { L.push("[http-nio-8080-exec-1]   ✘ исключение → ROLLBACK, исключение получит вызывающий"); cls = "bad"; v = "Исключение в BEFORE_COMMIT откатывает всю транзакцию."; }
+        else { L.push("[http-nio-8080-exec-1] COMMIT"); v = "Подходит для действий, которые должны попасть в ту же транзакцию: аудит, outbox-запись."; }
+      }
+    } else if (k === "ac") {
+      L.push("[http-nio-8080-exec-1]   зарегистрирована TransactionSynchronization");
+      if (fail) { L.push("[http-nio-8080-exec-1] ROLLBACK → afterCompletion(ROLLED_BACK): AFTER_COMMIT-слушатель не вызывается"); v = "Отката не было видно наружу: письмо не ушло. Именно это и нужно."; }
+      else {
+        L.push("[http-nio-8080-exec-1] COMMIT");
+        L.push("[http-nio-8080-exec-1] afterCompletion(COMMITTED) → onPlaced() — тот же поток, данные уже видны всем");
+        L.push("[http-nio-8080-exec-1]   ⚠ запись в БД здесь требует @Transactional(propagation = REQUIRES_NEW)");
+        if (thr) { L.push("[http-nio-8080-exec-1]   ✘ исключение логируется и проглатывается — коммит уже случился"); cls = "warn"; v = "Заказ сохранён, но письмо не ушло, и вызывающий об этом не узнает. Для надёжной доставки — паттерн Transactional Outbox."; }
+        else v = "Правильный выбор для внешних побочных эффектов. Ограничение: если приложение упадёт между COMMIT и отправкой, событие потеряется (решение — outbox).";
+      }
+    } else {
+      if (fail) { L.push("[http-nio-8080-exec-1] ROLLBACK → afterCompletion(ROLLED_BACK) → onPlaced()"); v = "Вызывается только при откате: компенсация, метрика неудачных заказов."; }
+      else { L.push("[http-nio-8080-exec-1] COMMIT — AFTER_ROLLBACK-слушатель не вызывается"); v = "Транзакция успешна — слушатель молчит."; cls = "warn"; }
+    }
+    $("evLog").textContent = L.join("\n");
+    var o = $("evOut"); o.className = "verdict " + cls; o.textContent = v;
+  }
+  ["evKind", "evTx", "evEnd", "evThrow"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+
+<h3>Встроенные события</h3>
+<div class="table-wrap"><table>
+<tr><th>Событие</th><th>Когда</th></tr>
+<tr><td><code>ContextRefreshedEvent</code></td><td>конец <code>refresh()</code>; может прийти несколько раз при иерархии контекстов</td></tr>
+<tr><td><code>ContextClosedEvent</code></td><td>начало <code>close()</code>, до уничтожения бинов</td></tr>
+<tr><td><code>ApplicationStartedEvent</code> / <code>ApplicationReadyEvent</code> (Boot)</td><td>после refresh / после runner-ов — приложение готово обслуживать запросы</td></tr>
+<tr><td><code>AvailabilityChangeEvent</code> (Boot)</td><td>смена liveness/readiness — используется Kubernetes-пробами</td></tr>
+<tr><td><code>ServletRequestHandledEvent</code></td><td>после обработки каждого HTTP-запроса в Spring MVC (включено по умолчанию; отключается <code>spring.mvc.publish-request-handled-events=false</code>)</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">5.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Свойство задано в application.yml и в переменной окружения. Что увидит Environment.getProperty?</p><ul><li>Значение из application.yml</li><li>Значение из переменной окружения — этот источник стоит выше в списке</li><li>Ошибку неоднозначности</li><li>Последнее загруженное</li></ul><div class="why">Поиск идёт по упорядоченному списку PropertySource, побеждает первый найденный. Переменные окружения в Boot выше файлов конфигурации.</div></div>
+<div class="mcq" data-ok="2"><p>@TransactionalEventListener, а publishEvent вызван вне транзакции. Что будет?</p><ul><li>Слушатель вызовется немедленно</li><li>Слушатель вызовется после ближайшей транзакции в этом потоке</li><li>Событие будет отброшено, если не указан fallbackExecution = true</li><li>IllegalStateException</li></ul><div class="why">Регистрировать синхронизацию не в чем. По умолчанию такое событие игнорируется — частая причина «пропавших» писем.</div></div>
+<div class="mcq" data-ok="0"><p>В каком потоке выполняется обычный @EventListener?</p><ul><li>В потоке, вызвавшем publishEvent</li><li>В отдельном пуле Spring</li><li>В main-потоке</li><li>В ForkJoinPool.commonPool</li></ul><div class="why">SimpleApplicationEventMulticaster без настроенного executor вызывает слушателей синхронно в потоке публикующего.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как разрешается @Value("${a:${b:x}}")?</summary><div class="a"><p>AutowiredAnnotationBPP передаёт строку в resolveEmbeddedValue; резолвер PropertySourcesPlaceholderConfigurer ищет <code>a</code> по PropertySources; если нет — разрешает значение по умолчанию <code>${b:x}</code>: ищет <code>b</code>, если нет — <code>x</code>. Затем при необходимости SpEL и конвертация к типу. Неразрешимый плейсхолдер без default — IllegalArgumentException и падение старта.</p></div></details>
+<details class="q"><summary>Почему внешние побочные эффекты лучше делать в AFTER_COMMIT, и чего этот подход не гарантирует?</summary><div class="a"><p>Эффект происходит только если данные реально закоммичены — не бывает писем о несуществующих заказах. Но нет гарантии доставки: падение процесса между коммитом и вызовом слушателя теряет событие, а исключения слушателя проглатываются. Для гарантий — Transactional Outbox: запись события в таблицу в той же транзакции и отдельная доставка (Debezium, Spring Modulith Event Publication Registry).</p></div></details>
+<details class="q"><summary>Как сделать обработку событий асинхронной?</summary><div class="a"><p>@Async на методе слушателя (с @EnableAsync) — выполнение в TaskExecutor, ошибки в AsyncUncaughtExceptionHandler. Либо настроить executor у бина applicationEventMulticaster — тогда асинхронными станут все слушатели, включая системные, что обычно нежелательно. Комбинация @Async + @TransactionalEventListener — асинхронно и только после коммита.</p></div></details>
+<details class="q"><summary>Как работает @Profile технически?</summary><div class="a"><p>Это мета-аннотация @Conditional(ProfileCondition.class). ConfigurationClassPostProcessor при разборе вызывает ConditionEvaluator; ProfileCondition проверяет <code>environment.matchesProfiles(...)</code>. Не прошло — класс или @Bean-метод не регистрируется как BeanDefinition.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

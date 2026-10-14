@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>23 · Файлы, CDN и полнотекстовый поиск</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="23">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 23 · ПРОЕКТИРОВАНИЕ НА ПРАКТИКЕ</div>
+  <h1>Файлы, CDN и полнотекстовый поиск</h1>
+  <p class="lead">Две задачи, с которыми реляционная база справляется плохо: хранить большие двоичные объекты и искать по тексту. Для первой есть объектные хранилища и CDN, для второй — поисковые движки на инвертированном индексе. Оба — производные или вспомогательные хранилища рядом с основной базой, и главный вопрос проектирования — как держать их согласованными с источником истины.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">S3 и подписанные ссылки</span><span class="tag">CDN</span><span class="tag">инвертированный индекс</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="object"><span class="h-num">23.1</span>Объектное хранилище</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Блочное (диск)</th><th>Файловое (NFS)</th><th>Объектное (S3)</th></tr>
+<tr><td>Единица</td><td>блок</td><td>файл в дереве каталогов</td><td>объект: ключ → данные + метаданные</td></tr>
+<tr><td>Доступ</td><td>один сервер монтирует том</td><td>несколько серверов, POSIX</td><td>HTTP API из любого места</td></tr>
+<tr><td>Изменение</td><td>на месте</td><td>на месте</td><td>только замена объекта целиком</td></tr>
+<tr><td>Масштаб</td><td>терабайты</td><td>десятки терабайт</td><td>практически не ограничен</td></tr>
+<tr><td>Для чего</td><td>диск базы данных</td><td>общие файлы приложений</td><td>медиа, бэкапы, логи, статика, данные аналитики</td></tr>
+</table></div>
+<p>Свойства S3-подобных хранилищ: долговечность «одиннадцать девяток» за счёт копий в нескольких зонах; плоское пространство ключей («каталоги» — лишь общий префикс); строгая согласованность чтения после записи; версии объектов; классы хранения и правила жизненного цикла (через 30 дней — в дешёвый класс, через год — удалить).</p>
+
+<h3>Загрузка: файл не должен идти через ваш сервис</h3>
+<div class="widget stepper" id="upSim">
+  <div class="widget-title">Симулятор: загрузка фото пользователем</div>
+  <div class="flow st-stage">
+    <div class="node" id="upC"><b>Клиент</b></div><span class="to">⇄</span>
+    <div class="node" id="upS"><b>Сервис</b><small>stateless</small></div><span class="to">⇄</span>
+    <div class="node" id="upDb"><b>База</b><small>метаданные</small></div>
+    <div class="node" id="upO"><b>Объектное хранилище</b></div><span class="to">→</span>
+    <div class="node" id="upW"><b>Обработчик</b><small>очередь + воркеры</small></div><span class="to">→</span>
+    <div class="node" id="upCdn"><b>CDN</b></div>
+  </div>
+  <section class="st-step" data-t="Запрос на загрузку" data-hl="upC upS" data-log="POST /uploads {name: cat.jpg, size: 3.1MB, type: image/jpeg}"><h4>Клиент сообщает, что хочет загрузить</h4><p>Сервис проверяет права, квоту, тип и размер — до того, как байты куда-либо пошли.</p></section>
+  <section class="st-step" data-t="Подписанная ссылка" data-hl="upS upDb" data-log="→ 201 {uploadId: u-91, putUrl: https://bucket.s3…/raw/u-91?X-Amz-Signature=…&amp;X-Amz-Expires=300}"><h4>Сервис выдаёт presigned URL</h4><p>В базе создаётся запись <code>uploads(u-91, owner, status = PENDING)</code>. Ссылка подписана ключом сервиса: разрешает <b>один</b> PUT с заданным ключом, типом и максимальным размером, действует 5 минут. Секреты хранилища клиенту не передаются.</p></section>
+  <section class="st-step" data-t="Прямая загрузка" data-hl="upC upO" data-log="PUT https://bucket.s3…/raw/u-91  (3,1 МБ напрямую в хранилище)"><h4>Клиент грузит файл прямо в хранилище</h4><p>Мегабайты не проходят через серверы приложения: те не тратят память, соединения и трафик. Для больших файлов — multipart: части по 5–100 МБ загружаются параллельно и докачиваются по отдельности при обрыве.</p></section>
+  <section class="st-step" data-t="Событие" data-hl="upO upW" data-log="S3 event: ObjectCreated raw/u-91 → очередь"><h4>Хранилище сообщает о новом объекте</h4><p>Событие попадает в очередь. Нельзя полагаться на то, что клиент сам сообщит об окончании загрузки: он может закрыть вкладку.</p></section>
+  <section class="st-step" data-t="Обработка" data-hl="upW upO" data-log="worker: проверка формата и вирусов → 3 размера → public/u-91/{200,800,1600}.webp"><h4>Асинхронная обработка</h4><p>Воркеры проверяют, что это действительно изображение (не доверяя расширению и Content-Type), удаляют метаданные с геопозицией, создают уменьшенные копии. Операция идемпотентна: повторная доставка события даст те же ключи.</p></section>
+  <section class="st-step" data-t="Готово" data-hl="upDb" data-log="UPDATE uploads SET status = READY, variants = […] WHERE id = u-91"><h4>Запись в базе обновлена</h4><p>Только теперь файл виден в приложении. «Сироты» — объекты, для которых запись так и осталась PENDING, — удаляет правило жизненного цикла по префиксу <code>raw/</code>.</p></section>
+  <section class="st-step" data-t="Раздача" data-hl="upCdn upC" data-log="GET https://cdn.shop.ru/public/u-91/800.webp  → CDN: HIT"><h4>Чтение через CDN</h4><p>Публичные файлы — через CDN с долгим кэшем (имя содержит идентификатор версии, поэтому содержимое по адресу не меняется). Приватные — по подписанным ссылкам на чтение с коротким сроком или через подписанные cookie CDN.</p></section>
+</div>
+
+<h2 id="cdn"><span class="h-num">23.2</span>CDN</h2>
+<div class="grid-2">
+  <div class="card"><h4>Как работает</h4><p>Пользователь попадает на ближайший узел (anycast или GeoDNS). Узел отдаёт объект из своего кэша или запрашивает у источника (origin), сохраняет согласно <code>Cache-Control</code> и отдаёт следующим. TLS-рукопожатие — с ближним узлом.</p></div>
+  <div class="card"><h4>Инвалидация</h4><p>Очистка кэша по всему миру медленная и платная. Надёжнее версионировать адреса: <code>app.3f9a1c.js</code>, <code>/img/u-91/v2/800.webp</code> с <code>Cache-Control: immutable</code>. Меняется содержимое — меняется URL.</p></div>
+  <div class="card"><h4>Что ещё делает CDN</h4><p>Защита от DDoS, WAF, сжатие, преобразование изображений на лету, кэширование API-ответов на секунды, вычисления на границе (edge functions).</p></div>
+  <div class="card"><h4>Риски</h4><p>Закэшированный персональный ответ, отданный другому пользователю (нужны <code>private</code>/<code>no-store</code> и корректный <code>Vary</code>); зависимость от одного провайдера; «холодный» кэш после очистки бьёт по источнику.</p></div>
+</div>
+
+<h2 id="index"><span class="h-num">23.3</span>Полнотекстовый поиск: инвертированный индекс</h2>
+<p>Запрос <code>WHERE description LIKE '%чехол%'</code> заставляет базу читать каждую строку. Поисковый движок заранее строит обратное отображение: <b>слово → список документов</b>, где оно встречается.</p>
+<div class="widget" id="ixW">
+  <div class="widget-title">Песочница: постройте индекс и выполните запрос</div>
+  <label>документы (по одному в строке)<textarea id="ixDocs" spellcheck="false" style="min-height:120px">Красный чехол для телефона
+Чехол для ноутбука 15 дюймов
+Зарядка для телефона быстрая
+Красная сумка для ноутбука
+Телефон красный 128 ГБ</textarea></label>
+  <div class="controls">
+    <label>запрос<input type="text" id="ixQ" value="красный чехол"></label>
+    <label>оператор<select id="ixOp"><option value="or">OR — любое слово (с ранжированием)</option><option value="and">AND — все слова</option></select></label>
+    <label>анализатор<select id="ixAn"><option value="stem">нижний регистр + усечение окончаний</option><option value="lower">только нижний регистр</option></select></label>
+  </div>
+  <div class="out" id="ixIndex"></div>
+  <div class="log" id="ixRes"></div>
+</div>
+<script>
+(function () {
+  var STOP = { "для": 1, "и": 1, "в": 1, "на": 1, "с": 1 }, $ = function (i) { return document.getElementById(i); };
+  function terms(s, stem) { return (s.toLowerCase().match(/[a-zа-яё0-9]+/g) || []).filter(function (t) { return !STOP[t]; }).map(function (t) { return stem && t.length > 4 ? t.replace(/(ами|ями|ого|его|ому|ему|ая|яя|ое|ее|ые|ие|ый|ий|ой|ов|ев|ам|ям|ах|ях|ом|ем|а|я|ы|и|у|ю|е|о)$/, "") : t; }); }
+  function run() {
+    var docs = $("ixDocs").value.split("\n").map(function (d) { return d.trim(); }).filter(Boolean), stem = $("ixAn").value === "stem", idx = {}, len = [];
+    docs.forEach(function (d, i) { var ts = terms(d, stem); len[i] = ts.length; ts.forEach(function (t) { (idx[t] = idx[t] || {})[i] = (idx[t][i] || 0) + 1; }); });
+    var keys = Object.keys(idx).sort();
+    $("ixIndex").textContent = "Инвертированный индекс (слово → документы):\n" + keys.map(function (k) { return "  " + k.padEnd(12) + "→ " + Object.keys(idx[k]).map(function (i) { return "d" + (+i + 1); }).join(", "); }).join("\n");
+    var q = terms($("ixQ").value, stem), and = $("ixOp").value === "and", score = {}, hit = {};
+    q.forEach(function (t) { var post = idx[t] || {}, df = Object.keys(post).length; if (!df) return; var idf = Math.log(1 + (docs.length - df + 0.5) / (df + 0.5)); Object.keys(post).forEach(function (i) { score[i] = (score[i] || 0) + idf * post[i] / (post[i] + 1.2 * (0.25 + 0.75 * len[i] / 4)); hit[i] = (hit[i] || 0) + 1; }); });
+    var res = Object.keys(score).filter(function (i) { return !and || hit[i] === q.length; }).sort(function (a, b) { return score[b] - score[a]; });
+    var L = ["Запрос после анализатора: [" + q.join(", ") + "]", q.map(function (t) { return "  " + t + " → " + (idx[t] ? Object.keys(idx[t]).map(function (i) { return "d" + (+i + 1); }).join(", ") : "нет в индексе"); }).join("\n"), "", "Результаты (" + (and ? "пересечение списков" : "объединение списков, сортировка по релевантности") + "):"];
+    res.forEach(function (i) { L.push("  " + score[i].toFixed(2) + "  d" + (+i + 1) + ": " + docs[i]); });
+    if (!res.length) L.push("  ничего не найдено" + (!stem ? " — без приведения форм слова «красный» и «красная» — разные термины" : ""));
+    $("ixRes").textContent = L.join("\n");
+  }
+  ["ixDocs", "ixQ"].forEach(function (i) { $(i).addEventListener("input", run); }); ["ixOp", "ixAn"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p><b>Попробуйте:</b> переключите анализатор на «только нижний регистр» — «Красная сумка» перестанет находиться по слову «красный». Смените оператор на AND. Добавьте документ и посмотрите, как изменятся оценки: редкое слово весит больше частого (IDF), а совпадение в коротком документе ценнее, чем в длинном.</p>
+<div class="table-wrap"><table>
+<tr><th>Этап</th><th>Что происходит</th></tr>
+<tr><td>Анализ текста</td><td>разбиение на токены → нижний регистр → удаление стоп-слов → приведение к основе (стемминг, лемматизация) → синонимы. <b>Один и тот же анализатор применяется к документам и к запросу</b></td></tr>
+<tr><td>Индексация</td><td>для каждого термина — отсортированный список документов с частотами и позициями (позиции нужны для поиска фраз)</td></tr>
+<tr><td>Поиск</td><td>найти списки терминов запроса → пересечь или объединить → оценить релевантность (BM25: частота термина в документе, редкость термина, длина документа) → вернуть первые N</td></tr>
+<tr><td>Сегменты</td><td>индекс состоит из неизменяемых сегментов; новые документы попадают в новый сегмент (виден после refresh, раз в секунду — «почти реальное время»), сегменты сливаются фоном; удаление — пометка</td></tr>
+</table></div>
+
+<h2 id="sync"><span class="h-num">23.4</span>Синхронизация поискового индекса с базой</h2>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Как</th><th>Оценка</th></tr>
+<tr><td>Двойная запись</td><td>сервис пишет в базу и сразу в индекс</td><td>плохо: при сбое между двумя записями хранилища расходятся навсегда и незаметно</td></tr>
+<tr><td>Outbox + потребитель</td><td>событие в той же транзакции, отдельный процесс индексирует</td><td>надёжно; индекс отстаёт на секунды</td></tr>
+<tr><td>CDC (Debezium)</td><td>чтение журнала изменений базы → Kafka → индексатор</td><td>надёжно и без изменений в коде сервиса; ловит и правки «в обход» приложения</td></tr>
+<tr><td>Периодическая переиндексация</td><td>полный или по метке изменения</td><td>страховка: исправляет любые расхождения; должна быть всегда</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Индекс — производные данные</span>
+Его всегда можно и нужно уметь перестроить с нуля: смена анализатора или схемы требует полной переиндексации. Приём: строить новый индекс рядом и атомарно переключать псевдоним (alias). Поиск возвращает идентификаторы, а актуальные цена и наличие берутся из основной базы — отставший индекс не должен показывать неверную цену.</div>
+
+<h2 id="quiz"><span class="h-num">23.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему файлы пользователей не хранят в столбцах реляционной базы?</p><ul><li>Базы не поддерживают двоичные данные</li><li>Это запрещено стандартом SQL</li><li>Они раздувают базу, её кэш, репликацию и резервные копии; объектное хранилище дешевле, масштабируется без ограничений и раздаёт напрямую через CDN</li><li>Файлы нельзя индексировать</li></ul><div class="why">В базе хранят ключ объекта и метаданные.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем нужна подписанная (presigned) ссылка для загрузки?</p><ul><li>Чтобы сжать файл</li><li>Чтобы клиент мог загрузить файл прямо в хранилище с ограниченными правами и сроком, минуя серверы приложения и не получая секретов</li><li>Чтобы ускорить CDN</li><li>Для шифрования файла</li></ul><div class="why">Сервис сохраняет контроль (права, размер, тип), не пропуская байты через себя.</div></div>
+<div class="mcq" data-ok="0"><p>Что хранит инвертированный индекс?</p><ul><li>Для каждого термина — список документов, в которых он встречается</li><li>Для каждого документа — его полный текст</li><li>Хэши документов</li><li>B-дерево по первичному ключу</li></ul><div class="why">Поиск по слову превращается из просмотра всех документов в чтение одного готового списка.</div></div>
+<div class="mcq" data-ok="3"><p>Как обновить закэшированный в CDN файл стилей без ожидания и ручной очистки?</p><ul><li>Уменьшить TTL до нуля</li><li>Отключить CDN</li><li>Перезапустить сервис</li><li>Версионировать имя файла (хэш содержимого в имени): новая версия — новый URL</li></ul><div class="why">Неизменяемые адреса позволяют кэшировать «навсегда» и обновлять мгновенно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите загрузку и раздачу пользовательских изображений.</summary><div class="a"><p>Клиент запрашивает у сервиса подписанную ссылку → загружает напрямую в объектное хранилище (multipart для больших) → событие в очередь → воркеры проверяют файл и создают производные → статус в базе → раздача через CDN по версионированным или подписанным адресам; сироты удаляет правило жизненного цикла.</p></div></details>
+<details class="q"><summary>Как держать поисковый индекс согласованным с базой?</summary><div class="a"><p>Не двойной записью, а потоком изменений: outbox или CDC → очередь → идемпотентный индексатор; плюс периодическая сверка и возможность полной переиндексации с переключением псевдонима. Критичные поля (цена, наличие) подтягивать из основной базы при показе.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

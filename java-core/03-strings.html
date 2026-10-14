@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · String и строковый пул</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ОСНОВА ЯЗЫКА</div>
+  <h1>String и строковый пул</h1>
+  <p class="lead">Строки — самый используемый тип в любой программе: ключи, идентификаторы, JSON, логи. Поэтому у <code>String</code> особый статус: он неизменяем, литералы хранятся в общем пуле, а компилятор и JVM оптимизируют работу с ним отдельно.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">immutable</span><span class="tag">string pool</span><span class="tag">StringBuilder</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="immutable"><span class="h-num">3.1</span>Неизменяемость</h2>
+<p>Объект <code>String</code> после создания не меняется. Любой метод, «изменяющий» строку, возвращает новый объект.</p>
+<pre data-title="самая частая ошибка новичка" class="bad-code"><code class="java">String name = "  alice ";
+name.trim();              // результат выброшен, name не изменилась
+name.toUpperCase();
+System.out.println(name); // "  alice "</code></pre>
+<pre class="good-code"><code class="java">name = name.trim().toUpperCase();   // "ALICE"</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Зачем это нужно</h4><ul><li><b>Безопасность.</b> Строку с путём к файлу или именем класса нельзя подменить после проверки.</li><li><b>Потокобезопасность.</b> Неизменяемый объект можно без синхронизации отдавать любым потокам.</li><li><b>Кэш хэша.</b> <code>hashCode()</code> вычисляется один раз — строки идеальны как ключи <code>HashMap</code>.</li><li><b>Пул.</b> Одинаковые литералы могут быть одним объектом только потому, что его никто не изменит.</li></ul></div>
+  <div class="card"><h4>Чем обеспечивается</h4><ul><li>Класс <code>final</code> — нельзя унаследовать и переопределить поведение.</li><li>Внутренний массив <code>private final</code> и никогда не отдаётся наружу.</li><li>Нет ни одного метода, меняющего массив.</li></ul><p>Это образец для собственных неизменяемых классов (<a href="05-object-contract.html#immutable">тема 05</a>).</p></div>
+</div>
+
+<h2 id="internals"><span class="h-num">3.2</span>Внутреннее устройство</h2>
+<pre data-title="java.lang.String, упрощённо"><code class="java">public final class String {
+    private final byte[] value;   // содержимое
+    private final byte coder;     // 0 — LATIN1 (1 байт на символ), 1 — UTF16 (2 байта)
+    private int hash;             // кэш hashCode, вычисляется при первом вызове
+}</code></pre>
+<ul>
+  <li><b>Compact strings (Java 9+).</b> Если все символы помещаются в Latin-1, строка хранится по байту на символ, иначе — по два. Для типичного приложения с идентификаторами и английским текстом это уменьшило память под строки почти вдвое. Одна кириллическая буква переводит всю строку в UTF-16.</li>
+  <li><b><code>length()</code> возвращает число кодовых единиц UTF-16</b>, а не символов, видимых человеку. Символы вне базовой плоскости занимают две единицы (суррогатную пару).</li>
+</ul>
+<pre><code class="java">String s = "a😀";
+s.length();                         // 3
+s.codePointCount(0, s.length());    // 2 — число кодовых точек Юникода
+s.charAt(1);                        // половина эмодзи — бессмысленный символ
+new StringBuilder(s).reverse();     // корректно: reverse учитывает суррогатные пары</code></pre>
+<p><b>Хэш</b> вычисляется по формуле <code>s[0]·31ⁿ⁻¹ + s[1]·31ⁿ⁻² + … + s[n−1]</code>. Разные строки могут давать одинаковый хэш: у <code>"Aa"</code> и <code>"BB"</code> он равен 2112. На этом строится атака на хэш-таблицы и защита от неё в <code>HashMap</code> (<a href="09-hashmap.html#internals">тема 09</a>).</p>
+
+<h2 id="pool"><span class="h-num">3.3</span>Пул строк</h2>
+<p>Пул — таблица уникальных строк внутри JVM. Каждый строковый литерал попадает в неё при загрузке класса, и все одинаковые литералы во всей программе — один объект. Оператор <code>new</code> всегда создаёт новый объект в куче в обход пула.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 190" role="img" aria-label="Литералы указывают на один объект в пуле, new String создаёт отдельный объект">
+  <defs><marker id="s1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <g class="mono" font-size="13">
+    <rect x="20" y="24" width="250" height="32" rx="5" class="box-info"/><text x="32" y="45">String a = "java";</text>
+    <rect x="20" y="64" width="250" height="32" rx="5" class="box-info"/><text x="32" y="85">String b = "java";</text>
+    <rect x="20" y="118" width="250" height="32" rx="5" class="box-warn"/><text x="32" y="139">String c = new String("java");</text>
+  </g>
+  <rect x="440" y="14" width="340" height="92" rx="9" class="box" stroke-dasharray="5 4"/><text x="456" y="36" font-weight="700" font-size="13">Пул строк (часть кучи)</text>
+  <rect x="520" y="48" width="180" height="42" rx="7" class="box-ok"/><text x="610" y="74" text-anchor="middle" class="mono" font-size="13">"java"</text>
+  <rect x="520" y="118" width="180" height="42" rx="7" class="box-warn"/><text x="610" y="144" text-anchor="middle" class="mono" font-size="13">"java" (копия)</text>
+  <text x="456" y="180" class="muted" font-size="12">a == b → true      a == c → false      a.equals(c) → true      a == c.intern() → true</text>
+  <path d="M270 40 C 380 40, 420 58, 516 64" class="ln-acc" marker-end="url(#s1)"/>
+  <path d="M270 80 C 380 80, 420 76, 516 74" class="ln-acc" marker-end="url(#s1)"/>
+  <path d="M270 134 H516" class="ln-acc" marker-end="url(#s1)"/>
+</svg>
+</figure>
+<pre data-title="что вычисляется при компиляции, а что — при выполнении"><code class="java">String a = "java";
+String d = "ja" + "va";            // константное выражение: компилятор сам запишет "java"
+String part = "ja";
+String e = part + "va";            // вычисляется при выполнении — новый объект в куче
+final String fp = "ja";
+String f = fp + "va";              // final-переменная с литералом — тоже константа
+
+a == d;            // true
+a == e;            // false
+a == f;            // true
+a == e.intern();   // true: intern() возвращает экземпляр из пула</code></pre>
+<div class="callout bad"><span class="c-title">Строки сравнивают через equals</span>
+<code>==</code> проверяет, один ли это объект, и «работает» ровно до тех пор, пока обе строки — литералы. Строка из базы данных, HTTP-запроса или результата <code>substring</code> — отдельный объект, и <code>==</code> вернёт <code>false</code> при одинаковом содержимом. Безопасная форма при возможном <code>null</code>: <code>"ADMIN".equals(role)</code> или <code>Objects.equals(a, b)</code>.
+</div>
+<ul>
+  <li><b>Пул находится в куче</b> (с Java 7; раньше — в PermGen) и очищается сборщиком мусора.</li>
+  <li><b><code>intern()</code></b> вручную кладёт строку в пул. Имеет смысл редко — когда в памяти миллионы повторяющихся строк; обычно выгоднее собственный <code>HashMap</code> для дедупликации или опция G1 <code>-XX:+UseStringDeduplication</code>.</li>
+  <li><b>Сколько объектов создаёт <code>new String("java")</code>?</b> Один в куче при выполнении; литерал <code>"java"</code> попал в пул ещё при загрузке класса. Отсюда типичный ответ «один или два».</li>
+</ul>
+
+<h2 id="concat"><span class="h-num">3.4</span>Конкатенация и StringBuilder</h2>
+<p>Оператор <code>+</code> для строк компилятор превращает в вызов, который один раз вычисляет итоговую длину и собирает строку (с Java 9 — через <code>invokedynamic</code>, раньше — через временный <code>StringBuilder</code>). В одном выражении это эффективно. Проблема возникает в цикле.</p>
+<pre data-title="O(n²): каждая итерация копирует всё накопленное" class="bad-code"><code class="java">String csv = "";
+for (String item : items) {
+    csv += item + ",";        // новая строка на каждом шаге; для 100 000 элементов — секунды и гигабайты мусора
+}</code></pre>
+<pre class="good-code"><code class="java">StringBuilder sb = new StringBuilder();
+for (String item : items) sb.append(item).append(',');
+String csv = sb.toString();
+
+String csv2 = String.join(",", items);                                  // ещё проще
+String csv3 = items.stream().collect(Collectors.joining(",", "[", "]")); // с префиксом и суффиксом</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>String</th><th>StringBuilder</th><th>StringBuffer</th></tr>
+<tr><td>Изменяемость</td><td>нет</td><td>да</td><td>да</td></tr>
+<tr><td>Потокобезопасность</td><td>да (неизменяем)</td><td>нет</td><td>да — каждый метод <code>synchronized</code></td></tr>
+<tr><td>Когда</td><td>Хранение и передача</td><td>Сборка строки в одном потоке — почти всегда</td><td>Наследие; в новом коде не нужен</td></tr>
+</table></div>
+<p><code>StringBuilder</code> хранит массив с запасом (по умолчанию 16 символов) и при нехватке места увеличивает его примерно вдвое. Если итоговый размер известен, передайте его в конструктор — исчезнут промежуточные копирования.</p>
+
+<h2 id="api"><span class="h-num">3.5</span>API и его ловушки</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Как</th><th>На что обратить внимание</th></tr>
+<tr><td>Пустая ли строка</td><td><code>isEmpty()</code>, <code>isBlank()</code> (11)</td><td><code>isBlank</code> считает пустой и строку из пробелов</td></tr>
+<tr><td>Обрезать пробелы</td><td><code>strip()</code> (11), <code>trim()</code></td><td><code>trim</code> не знает о юникодных пробелах</td></tr>
+<tr><td>Разбить</td><td><code>split(regex)</code></td><td>Аргумент — <b>регулярное выражение</b>; пустые строки в конце отбрасываются</td></tr>
+<tr><td>Заменить</td><td><code>replace(a, b)</code> — буквально, <code>replaceAll(regex, b)</code> — по выражению</td><td>Оба заменяют все вхождения; различие в трактовке первого аргумента</td></tr>
+<tr><td>Регистр</td><td><code>toLowerCase(Locale.ROOT)</code></td><td>Без локали результат зависит от настроек системы</td></tr>
+<tr><td>Сравнить без регистра</td><td><code>equalsIgnoreCase</code></td><td>—</td></tr>
+<tr><td>Форматировать</td><td><code>String.format</code>, <code>"…".formatted(args)</code> (15)</td><td>Медленнее конкатенации; не для горячих циклов</td></tr>
+<tr><td>Повторить, разбить на строки</td><td><code>repeat(n)</code>, <code>lines()</code> (11)</td><td>—</td></tr>
+</table></div>
+<pre data-title="ловушки split и регистра"><code class="java">"a.b.c".split(".").length;        // 0! точка в регулярном выражении — «любой символ»
+"a.b.c".split("\\.").length;      // 3
+"a,b,,".split(",").length;        // 2: хвостовые пустые строки отброшены
+"a,b,,".split(",", -1).length;    // 4: отрицательный limit сохраняет их
+
+"TITLE".toLowerCase();            // в турецкой локали — "tıtle" (i без точки): ключи и enum перестают совпадать
+"TITLE".toLowerCase(Locale.ROOT); // "title" всегда</code></pre>
+<pre data-title="text blocks (Java 15): многострочные литералы без экранирования"><code class="java">String json = """
+        {
+          "name": "%s",
+          "roles": ["admin", "user"]
+        }
+        """.formatted(name);     // общий отступ удаляется по положению закрывающих кавычек</code></pre>
+
+<h2 id="encoding"><span class="h-num">3.6</span>Строки и байты</h2>
+<p>Строка — последовательность символов; файл и сеть передают байты. Преобразование между ними задаёт <b>кодировка</b>, и её нужно указывать явно.</p>
+<pre><code class="java">byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+String back  = new String(bytes, StandardCharsets.UTF_8);
+
+"я".getBytes(StandardCharsets.UTF_8).length;       // 2
+"я".getBytes(StandardCharsets.UTF_16LE).length;    // 2
+"😀".getBytes(StandardCharsets.UTF_8).length;      // 4</code></pre>
+<div class="callout warn"><span class="c-title">Кодировка по умолчанию</span>
+<code>getBytes()</code> и <code>new String(bytes)</code> без аргумента используют кодировку платформы. До Java 18 она зависела от ОС (Cp1251 на русской Windows, UTF-8 на Linux) — код, работавший у разработчика, превращал кириллицу в «кракозябры» на сервере. С Java 18 по умолчанию всегда UTF-8, но явное указание по-прежнему обязательно: оно документирует намерение и работает на любой версии.
+</div>
+<p><b>Пароли и секреты.</b> Строку нельзя стереть из памяти — она живёт до сборки мусора и может попасть в дамп кучи. Поэтому API безопасности (<code>JPasswordField</code>, <code>PBEKeySpec</code>) принимают <code>char[]</code>, который можно обнулить сразу после использования.</p>
+
+<h2 id="lab"><span class="h-num">3.7</span>Интерактив: пул строк по шагам</h2>
+<pre data-title="Код, который выполняем"><code class="java">String a = "java";                 // 1
+String b = "java";                 // 2
+String c = new String("java");     // 3
+String d = c.intern();             // 4
+String e = "ja" + "va";            // 5  константное выражение
+String part = "ja";
+String f = part + "va";            // 6  вычисляется во время выполнения
+final String p2 = "ja";
+String g = p2 + "va";              // 7  final-константа</code></pre>
+<div class="widget stepper" id="spSim">
+  <div class="widget-title">Симулятор: где живут строки и что вернёт ==</div>
+  <div class="lanes st-stage">
+    <div class="lane node" id="spPool"><h5>Пул строк (String Table)</h5><div class="items"><span class="chip ok" data-from="1">"java" @1a2b</span><span class="chip" data-from="6">"ja" @3c4d</span><span class="chip" data-from="6">"va" @5e6f</span></div></div>
+    <div class="lane node" id="spHeap"><h5>Обычная куча</h5><div class="items"><span class="chip warn" data-from="3">String "java" @77aa (new)</span><span class="chip warn" data-from="6">String "java" @88bb (конкатенация)</span></div></div>
+    <div class="lane node" id="spVars"><h5>Переменные → ссылки</h5><div class="items"><span class="chip" data-from="1">a → @1a2b</span><span class="chip" data-from="2">b → @1a2b</span><span class="chip" data-from="3">c → @77aa</span><span class="chip" data-from="4">d → @1a2b</span><span class="chip" data-from="5">e → @1a2b</span><span class="chip" data-from="6">f → @88bb</span><span class="chip" data-from="7">g → @1a2b</span></div></div>
+  </div>
+  <section class="st-step" data-t="a = &quot;java&quot;" data-hl="spPool"><h4>Литерал</h4><p>При загрузке класса литерал <code>"java"</code> попадает в пул констант класса; при первом использовании (<code>ldc</code>) JVM ищет такую строку в String Table, не находит и добавляет. <code>a</code> указывает на объект в пуле.</p></section>
+  <section class="st-step" data-t="b = &quot;java&quot;" data-hl="spPool"><h4>Тот же литерал</h4><p>Строка уже в пуле — возвращается та же ссылка. <code>a == b</code> → <b>true</b>.</p></section>
+  <section class="st-step" data-t="c = new String(&quot;java&quot;)" data-hl="spHeap"><h4>new String</h4><p><code>new</code> всегда создаёт новый объект в куче, даже если такая строка есть в пуле. Массив символов внутри общий, но объект другой. <code>a == c</code> → <b>false</b>, <code>a.equals(c)</code> → true.</p></section>
+  <section class="st-step" data-t="d = c.intern()" data-hl="spPool"><h4>intern()</h4><p>Ищет в пуле строку, равную <code>c</code> по equals, и возвращает ссылку из пула (если нет — добавляет саму строку). <code>a == d</code> → <b>true</b>.</p></section>
+  <section class="st-step" data-t="e = &quot;ja&quot; + &quot;va&quot;" data-hl="spPool"><h4>Константное выражение</h4><p>Оба операнда — литералы, поэтому <b>javac</b> склеивает их при компиляции: в class-файле лежит готовый <code>"java"</code>. <code>a == e</code> → <b>true</b>.</p></section>
+  <section class="st-step" data-t="f = part + &quot;va&quot;" data-hl="spHeap"><h4>Конкатенация во время выполнения</h4><p><code>part</code> — обычная переменная, компилятор не знает её значения. Конкатенация выполняется в рантайме (через <code>invokedynamic</code> → <code>StringConcatFactory</code>, до Java 9 — StringBuilder) и создаёт новую строку в куче. <code>a == f</code> → <b>false</b>.</p></section>
+  <section class="st-step" data-t="g = p2 + &quot;va&quot;" data-hl="spPool"><h4>final-константа</h4><p><code>final String p2 = "ja"</code> — константа времени компиляции, поэтому <code>p2 + "va"</code> снова склеивается компилятором. <code>a == g</code> → <b>true</b>. Одно слово <code>final</code> меняет результат сравнения ссылок — ещё одна причина сравнивать строки только через <code>equals</code>.</p></section>
+</div>
+
+<h2 id="quiz"><span class="h-num">3.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сколько объектов String создаст <code>String s = new String("hello");</code>, если литерал встречается впервые?</p><ul><li>Один</li><li>Два: один в пуле для литерала, второй в куче для new</li><li>Три</li><li>Ни одного</li></ul><div class="why">Литерал интернируется в пул, конструктор создаёт отдельный объект в куче. Если литерал уже был в пуле — создаётся только один.</div></div>
+<div class="mcq" data-ok="2"><p>Почему конкатенация в цикле через <code>s += x</code> — плохая идея?</p><ul><li>Она не компилируется</li><li>Строки пула переполняются</li><li>Строки неизменяемы: каждая итерация создаёт новую строку и копирует всё накопленное — O(n²)</li><li>Оператор += не работает со строками</li></ul><div class="why">Используйте StringBuilder (один изменяемый буфер) или String.join / Collectors.joining.</div></div>
+<div class="mcq" data-ok="0"><p>Почему String хорош как ключ HashMap?</p><ul><li>Он неизменяем, поэтому hashCode не меняется и кэшируется в поле объекта</li><li>У него нет метода hashCode</li><li>Строки всегда лежат в пуле</li><li>HashMap обрабатывает строки особым образом</li></ul><div class="why">Неизменяемость гарантирует, что ключ не «потеряется» в таблице, а кэш хэша делает повторные вычисления бесплатными.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему String неизменяем? Назовите минимум три причины.</summary><div class="a"><p>Безопасность (строку нельзя изменить после проверки — пути, имена классов, параметры подключения); потокобезопасность без синхронизации; возможность кэшировать <code>hashCode</code> и надёжно использовать строки как ключи; возможность пула строк — общий объект безопасен только потому, что его никто не изменит.</p></div></details>
+<details class="q"><summary><code>String s1 = "hi"; String s2 = new String("hi"); String s3 = s2.intern();</code> — какие сравнения через == истинны?</summary><div class="a"><p><code>s1 == s3</code> — true: <code>intern()</code> вернул объект из пула, тот же, на который указывает литерал. <code>s1 == s2</code> и <code>s2 == s3</code> — false: <code>new</code> создал отдельный объект в куче.</p></div></details>
+<details class="q"><summary>Почему конкатенация в цикле через += медленная, если компилятор и так использует эффективную сборку?</summary><div class="a"><p>Оптимизация действует в пределах одного выражения. На каждой итерации создаётся новая строка, в которую копируется всё накопленное содержимое: суммарно 1 + 2 + … + n копирований, то есть O(n²). Один <code>StringBuilder</code> вне цикла дописывает в общий буфер — O(n).</p></div></details>
+<details class="q"><summary>Чем StringBuilder отличается от StringBuffer?</summary><div class="a"><p>Методы <code>StringBuffer</code> синхронизированы, <code>StringBuilder</code> — нет, поэтому он быстрее. Синхронизация на уровне отдельного вызова редко полезна: последовательность из нескольких <code>append</code> всё равно не атомарна. В новом коде используют <code>StringBuilder</code>.</p></div></details>
+<details class="q"><summary>Что вернёт <code>"a|b|c".split("|")</code>?</summary><div class="a"><p>Массив из отдельных символов <code>["a", "|", "b", "|", "c"]</code>: вертикальная черта в регулярном выражении означает «или», пустая альтернатива совпадает между любыми символами. Нужно экранирование: <code>split("\\|")</code> или <code>split(Pattern.quote("|"))</code>.</p></div></details>
+<details class="q"><summary>Чему равно <code>"😀".length()</code> и почему?</summary><div class="a"><p>2. <code>length()</code> считает кодовые единицы UTF-16, а этот символ лежит вне базовой плоскости и кодируется суррогатной парой. Число символов Юникода даёт <code>codePointCount</code>; перебирать их — <code>codePoints()</code>.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

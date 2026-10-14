@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Быстрый старт: CDS, AOT cache, CRaC, native image</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>Быстрый старт: CDS, AOT cache, CRaC, native image</h1>
+  <p class="lead">Spring Boot-сервис стартует за 5–10 секунд и ещё минуту прогревается — для автоскейлинга, serverless и CLI это много. Куда уходит время старта, и как его сократить на разных уровнях: общий архив классов (CDS), AOT-кэш проекта Leyden (Java 24–25), снимок прогретого процесса (CRaC) и полная компиляция в исполняемый файл (GraalVM Native Image) — с их ценой и ограничениями.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">фазы старта</span><span class="tag">CDS/AppCDS</span><span class="tag">AOT cache (JEP 483/514/515)</span><span class="tag">CRaC</span><span class="tag">GraalVM Native Image</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="where"><span class="h-num">20.1</span>Куда уходит время старта</h2>
+<div class="table-wrap"><table>
+<tr><th>Фаза</th><th>Типично для Spring Boot</th><th>Что ускоряет</th></tr>
+<tr><td>Создание JVM</td><td>50–100 мс</td><td>—</td></tr>
+<tr><td>Загрузка, верификация, линковка классов (15–30 тыс.)</td><td>1–3 с</td><td>CDS, AOT cache, меньше зависимостей</td></tr>
+<tr><td>Инициализация классов, лямбды и indy-связывание</td><td>0,5–1 с</td><td>AOT cache (сохраняет связанные indy)</td></tr>
+<tr><td>Фреймворк: сканирование, рефлексия, создание бинов, прокси</td><td>2–5 с</td><td>Spring AOT, ленивая инициализация, меньше автоконфигурации</td></tr>
+<tr><td>Прогрев JIT до пиковой производительности</td><td>30 с – минуты</td><td>AOT-профили (JEP 515), CRaC, native image</td></tr>
+</table></div>
+<pre data-title="измерить"><code class="txt">java -Xlog:startuptime -Xlog:class+load:file=cl.txt -jar app.jar
+java -Xshare:off -jar app.jar     # сравнить со стартом без CDS
+# Spring Boot: ApplicationStartup + /actuator/startup, BufferingApplicationStartup</code></pre>
+
+<h2 id="cds"><span class="h-num">20.2</span>CDS: общий архив классов</h2>
+<p><b>Class Data Sharing</b> сохраняет уже разобранные и проверенные метаданные классов в файл, который отображается в память при старте (mmap) — классы не надо читать из jar, разбирать и верифицировать. Архив JDK включён по умолчанию с Java 12 (<code>lib/server/classes.jsa</code>); <b>AppCDS</b> добавляет классы приложения. Бонус: несколько JVM на одной машине разделяют одни и те же страницы архива.</p>
+<pre data-title="AppCDS для Spring Boot (распакованный jar)"><code class="txt">java -Djarmode=tools -jar app.jar extract --destination app      # распаковать (Spring Boot 3.3+)
+java -XX:ArchiveClassesAtExit=app.jsa -Dspring.context.exit=onRefresh -jar app/app.jar   # тренировочный запуск
+java -XX:SharedArchiveFile=app.jsa -jar app/app.jar             # старт быстрее на 30–40%
+# classpath при использовании архива должен совпадать с тем, на котором его создавали</code></pre>
+
+<h2 id="leyden"><span class="h-num">20.3</span>AOT cache: проект Leyden</h2>
+<div class="widget stepper" id="aotSim">
+  <div class="widget-title">Тренировочный запуск → кэш → быстрый продакшен-старт (Java 25)</div>
+  <div class="flow st-stage">
+    <div class="node" id="ao1"><b>training run</b></div><span class="to">→</span>
+    <div class="node" id="ao2"><b>AOT cache</b><small>app.aot</small></div><span class="to">→</span>
+    <div class="node" id="ao3"><b>production run</b></div>
+  </div>
+  <section class="st-step" data-t="Тренировочный запуск" data-hl="ao1" data-log="java -XX:AOTCacheOutput=app.aot -jar app.jar   # + реалистичная нагрузка (тесты, прогревающие запросы)"><p>Приложение запускается в режиме записи и проходит типичные сценарии: старт контекста, несколько характерных запросов. JVM наблюдает, какие классы загружены и связаны, какие indy-вызовы разрешены, какие методы горячие и какой у них профиль.</p></section>
+  <section class="st-step" data-t="Создание кэша" data-hl="ao2" data-log="JEP 483 (24): классы в загруженном и слинкованном состоянии; JEP 514 (25): один флаг; JEP 515 (25): профили методов"><p>JVM сохраняет AOT-кэш: классы уже в <b>загруженном и слинкованном</b> состоянии (JEP 483, Java 24), разрешённые лямбды и константы, а в Java 25 — <b>профили методов</b> (JEP 515), чтобы JIT сразу компилировал горячий код по готовому профилю. С JEP 514 запись и создание — одним флагом <code>-XX:AOTCacheOutput</code>.</p></section>
+  <section class="st-step" data-t="Продакшен" data-hl="ao3" data-log="java -XX:AOTCache=app.aot -jar app.jar   # тот же JDK, та же платформа, тот же classpath"><p>При запуске с кэшем классы сразу доступны в связанном виде, JIT стартует с профилями — по данным JEP старт Spring PetClinic ускоряется примерно на 40%, а прогрев сокращается. Ограничения: тот же JDK, ОС и архитектура, совместимый classpath; приложение остаётся обычной JVM с динамической загрузкой и JIT — никаких ограничений native image.</p></section>
+</div>
+
+<h2 id="crac"><span class="h-num">20.4</span>CRaC: снимок прогретого процесса</h2>
+<p><b>Coordinated Restore at Checkpoint</b> (OpenJDK-проект; сборки Azul Zulu, BellSoft Liberica, поддержка в Spring Boot 3.2+ и AWS Lambda SnapStart по схожей идее) сохраняет образ работающего процесса — кучу, скомпилированный код, состояние потоков — на диск и восстанавливает его за десятки миллисекунд уже прогретым.</p>
+<ul>
+  <li>Перед снимком приложение должно закрыть то, что нельзя сохранить: соединения с БД, сокеты, открытые файлы — через ресурсы <code>org.crac.Resource</code> (<code>beforeCheckpoint/afterRestore</code>); Spring делает это для своего жизненного цикла.</li>
+  <li>Снимок содержит память процесса — <b>секреты</b> (пароли, ключи, токены) попадут в файл. Получайте их после восстановления.</li>
+  <li>Случайность и время: генераторы, инициализированные до снимка, восстановятся с тем же состоянием во всех экземплярах — пересоздавайте после restore.</li>
+  <li>Требуется Linux и CRIU (или его встроенная альтернатива), права на checkpoint в контейнере.</li>
+</ul>
+
+<h2 id="native"><span class="h-num">20.5</span>GraalVM Native Image</h2>
+<p>Компиляция приложения <b>заранее</b> в исполняемый файл: статический анализ достижимости от <code>main</code> («закрытый мир»), компиляция всего достижимого кода, выполнение части инициализации классов при сборке, снимок кучи в образ. Результат — старт за десятки миллисекунд, меньше памяти, никакого прогрева. Цена:</p>
+<div class="grid-2">
+  <div class="card"><h4>Ограничения</h4><ul><li>Рефлексия, ресурсы, прокси, сериализация, JNI — только объявленные в метаданных (<code>reflect-config</code>, reachability metadata repository, Spring AOT генерирует сам).</li><li>Нет динамической загрузки классов в рантайме, агентов и большей части JVMTI.</li><li>Сборка — минуты и гигабайты памяти.</li></ul></div>
+  <div class="card"><h4>Производительность</h4><ul><li>Пиковая пропускная способность без PGO обычно ниже, чем у C2 (нет спекулятивных оптимизаций по живому профилю); PGO в Oracle GraalVM сокращает разрыв.</li><li>GC: Serial (по умолчанию) или G1 (Oracle GraalVM, Linux) — меньше выбора.</li><li>Отладка и профилирование — нативными инструментами.</li></ul></div>
+</div>
+<pre data-title="Spring Boot"><code class="txt">./mvnw -Pnative native:compile            # GraalVM в окружении
+./mvnw spring-boot:build-image -Pnative    # образ через Paketo buildpacks
+# тесты в native-режиме: ./mvnw -PnativeTest test</code></pre>
+
+<h2 id="compare"><span class="h-num">20.6</span>Сравнение подходов</h2>
+<div class="widget" id="stW">
+  <div class="widget-title">Spring Boot-сервис среднего размера (ориентировочно)</div>
+  <div class="controls"><label>сценарий<select id="stS" class="wide">
+    <option value="k8s">долгоживущий сервис в Kubernetes</option>
+    <option value="scale">автоскейлинг под всплески (новые поды за секунды)</option>
+    <option value="lambda">serverless-функция (AWS Lambda)</option>
+    <option value="cli">CLI-утилита</option>
+  </select></label></div>
+  <div id="stBars"></div>
+  <div class="verdict" id="stV"></div>
+</div>
+<script>
+(function () {
+  var M = [["Обычная JVM", 6000, 60, 450, 0], ["AppCDS", 3800, 55, 430, 1], ["AOT cache (Java 25)", 2900, 25, 430, 1], ["CRaC", 120, 1, 480, 3], ["Native Image", 90, 0, 150, 4]];
+  var REC = { k8s: "Обычная JVM или AOT cache: пиковая производительность C2 важнее секунд старта; AOT cache — почти бесплатное ускорение (тренировочный запуск в CI). Native image оправдан, если важна память на под.", scale: "AOT cache или CRaC: новые поды должны быстро стать полезными, включая прогрев. CRaC — если устроят требования к снимку и секретам.", lambda: "Native Image или SnapStart/CRaC: каждая холодная секунда оплачивается и видна пользователю; ограничения native image приемлемы для небольших функций.", cli: "Native Image: мгновенный старт и маленькая память; либо JVM с -XX:TieredStopAtLevel=1 и AppCDS." };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("stS").value;
+    $("stBars").innerHTML = M.map(function (m) { return '<div style="display:flex;justify-content:space-between;gap:8px;font-size:13.5px;flex-wrap:wrap"><b>' + m[0] + '</b><span style="font-family:var(--font-mono)">старт ' + (m[1] >= 1000 ? (m[1] / 1000).toFixed(1) + " с" : m[1] + " мс") + " · прогрев " + m[2] + " с · RSS " + m[3] + " МБ · сложность " + "●".repeat(m[4] + 1) + '</span></div><div class="bar ' + (m[1] < 1000 ? "ok" : "") + '"><i style="width:' + Math.max(1, m[1] / 6000 * 100) + '%"></i></div>'; }).join("");
+    $("stV").className = "verdict ok"; $("stV").textContent = REC[s];
+  }
+  $("stS").addEventListener("change", run); run();
+})();
+</script>
+<p class="hint">Цифры — порядок величин для типичного Spring Boot-приложения; реальные зависят от приложения, железа и версий — измеряйте.</p>
+
+<h2 id="quiz"><span class="h-num">20.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что сохраняет CDS-архив?</p><ul><li>Скомпилированный машинный код приложения</li><li>Снимок кучи процесса</li><li>Разобранные и проверенные метаданные классов, отображаемые в память при старте</li><li>Логи старта</li></ul><div class="why">Классы не нужно читать из jar, разбирать и верифицировать.</div></div>
+<div class="mcq" data-ok="0"><p>Чем опасен CRaC-снимок с точки зрения безопасности?</p><ul><li>В нём сохранена вся память процесса, включая загруженные секреты</li><li>Он отключает TLS</li><li>Он требует root в продакшене</li><li>Он раскрывает исходный код</li></ul><div class="why">Секреты получайте после restore.</div></div>
+<div class="mcq" data-ok="3"><p>Почему native image может уступать JIT по пиковой производительности?</p><ul><li>Он не использует оптимизации вообще</li><li>Он интерпретирует байткод</li><li>В нём нет сборщика мусора</li><li>AOT-компиляция не видит живого профиля и не может делать спекулятивные оптимизации с деоптимизацией (PGO частично компенсирует)</li></ul><div class="why">Зато нет прогрева и меньше памяти.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как бы вы сократили время старта Spring Boot-сервиса с 9 до 2 секунд?</summary><div class="a"><p>Измерить фазы (startup actuator, -Xlog:startuptime). Убрать лишние зависимости и автоконфигурации, ленивую инициализацию для редко используемых бинов, избегать тяжёлой работы при старте (прогрев кэшей — асинхронно). Распакованный jar + AppCDS или AOT cache (Java 24/25) — 30–50%. Достаточно CPU на старте (лимиты пода). Если нужно ещё быстрее — CRaC или native image с учётом их ограничений.</p></div></details>
+<details class="q"><summary>Что значит «закрытый мир» в GraalVM Native Image?</summary><div class="a"><p>При сборке должно быть известно всё, что может выполняться: анализ достижимости от точки входа определяет классы и методы, попадающие в образ; всё динамическое (рефлексия, ресурсы, прокси, загрузка классов по имени) должно быть описано в метаданных. В рантайме новые классы не появляются. Это позволяет компилировать заранее и выбрасывать неиспользуемый код, но ломает фреймворки, полагающиеся на динамику без метаданных.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

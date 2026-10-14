@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · ArrayList изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.arr { display: flex; flex-wrap: wrap; gap: 3px; margin: 12px 0; }
+.arr span { min-width: 34px; text-align: center; font: 12px var(--font-mono); padding: 8px 2px; border-radius: 4px; border: 1.5px solid var(--line); background: var(--bg); }
+.arr span.u { background: var(--info-soft); border-color: var(--info); }
+.arr span.mv { background: var(--warn-soft); border-color: var(--warn); }
+.arr span.nw { background: var(--ok-soft); border-color: var(--ok); }
+</style>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · СПИСКИ И ОЧЕРЕДИ</div>
+  <h1>ArrayList изнутри</h1>
+  <p class="lead">Самая используемая коллекция Java — это массив <code>Object[]</code> и счётчик <code>size</code>. Разберём, как он растёт в 1,5 раза и почему добавление в конец «амортизированно O(1)», сколько стоит вставка в начало, что делают <code>ensureCapacity</code> и <code>trimToSize</code>, как устроены представления <code>subList</code> и <code>toArray</code> — с симулятором, считающим реальные копирования элементов.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">elementData</span><span class="tag">рост ×1,5</span><span class="tag">System.arraycopy</span><span class="tag">амортизация</span><span class="tag">subList</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="fields"><span class="h-num">5.1</span>Устройство</h2>
+<pre data-title="ArrayList (JDK 21, упрощённо)"><code class="java">public class ArrayList&lt;E&gt; extends AbstractList&lt;E&gt; implements List&lt;E&gt;, RandomAccess, Cloneable, Serializable {
+    private static final int DEFAULT_CAPACITY = 10;
+    private static final Object[] DEFAULTCAPACITY_EMPTY_ELEMENTDATA = {};  // общий пустой массив
+    transient Object[] elementData;   // ёмкость = elementData.length
+    private int size;                 // сколько элементов реально
+
+    public ArrayList() { elementData = DEFAULTCAPACITY_EMPTY_ELEMENTDATA; }   // массив на 10 — только при первом add
+
+    private Object[] grow(int minCapacity) {
+        int old = elementData.length;
+        if (old &gt; 0 || elementData != DEFAULTCAPACITY_EMPTY_ELEMENTDATA) {
+            int newCap = ArraysSupport.newLength(old, minCapacity - old, old &gt;&gt; 1);  // old + old/2
+            return elementData = Arrays.copyOf(elementData, newCap);
+        }
+        return elementData = new Object[Math.max(DEFAULT_CAPACITY, minCapacity)];
+    }
+    public void add(int index, E e) {
+        …; modCount++;
+        if (size == elementData.length) grow(size + 1);
+        System.arraycopy(elementData, index, elementData, index + 1, size - index);  // сдвиг хвоста
+        elementData[index] = e; size++;
+    }
+}</code></pre>
+
+<h2 id="sim"><span class="h-num">5.2</span>Симулятор: ёмкость, сдвиги, копирования</h2>
+<div class="widget" id="alW">
+  <div class="widget-title">ArrayList&lt;Integer&gt; list = new ArrayList&lt;&gt;();</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="add">add(x)</button>
+    <button class="btn" type="button" data-a="add10">add ×10</button>
+    <button class="btn" type="button" data-a="add0">add(0, x)</button>
+    <button class="btn" type="button" data-a="rem0">remove(0)</button>
+    <button class="btn" type="button" data-a="remLast">remove(size-1)</button>
+    <button class="btn" type="button" data-a="ensure">ensureCapacity(50)</button>
+    <button class="btn" type="button" data-a="trim">trimToSize()</button>
+    <button class="btn" type="button" data-a="clear">clear()</button>
+    <button class="btn" type="button" data-a="reset">↺ new</button>
+  </div>
+  <div class="arr" id="alArr"></div>
+  <div class="out" id="alOut"></div>
+  <div class="log" id="alLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, data, cap, next, copies, allocs, ops, log, mark;
+  function reset() { data = []; cap = 0; next = 1; copies = 0; allocs = 0; ops = 0; log = ["new ArrayList<>(): elementData — общий пустой массив, ёмкость 0"]; mark = {}; draw(); }
+  function grow(min) {
+    var nc = cap === 0 ? Math.max(10, min) : Math.max(min, cap + (cap >> 1));
+    log.push("  grow: ёмкость " + cap + " → " + nc + (cap ? " (×1,5): Arrays.copyOf скопировал " + data.length + " ссылок" : " (первое добавление — массив на 10)"));
+    copies += data.length; allocs++; cap = nc;
+  }
+  function act(a) {
+    mark = {};
+    if (a === "add" || a === "add10") { for (var k = 0; k < (a === "add" ? 1 : 10); k++) { if (data.length === cap) grow(data.length + 1); data.push(next++); ops++; mark[data.length - 1] = "nw"; } log.push(a === "add" ? "add(" + (next - 1) + "): в конец, без сдвигов" : "10 × add в конец"); }
+    else if (a === "add0") { if (data.length === cap) grow(data.length + 1); var moved = data.length; data.unshift(next++); copies += moved; ops++; for (var i = 1; i <= moved; i++) mark[i] = "mv"; mark[0] = "nw"; log.push("add(0, " + (next - 1) + "): System.arraycopy сдвинул вправо " + moved + " элементов"); }
+    else if (a === "rem0") { if (!data.length) { log.push("remove(0): IndexOutOfBoundsException"); } else { var m2 = data.length - 1; data.shift(); copies += m2; ops++; for (var j = 0; j < m2; j++) mark[j] = "mv"; log.push("remove(0): сдвиг влево " + m2 + " элементов, последняя ячейка обнулена (иначе — утечка ссылки)"); } }
+    else if (a === "remLast") { if (data.length) { data.pop(); ops++; log.push("remove(size-1): без сдвигов, ячейка = null"); } }
+    else if (a === "ensure") { if (cap < 50) { log.push("ensureCapacity(50): заранее выделить массив на 50 — следующие добавления без копирований"); copies += data.length; allocs++; cap = 50; } else log.push("ensureCapacity(50): ёмкости хватает — ничего"); }
+    else if (a === "trim") { if (cap > data.length) { log.push("trimToSize(): ёмкость " + cap + " → " + data.length + " (копирование " + data.length + " ссылок) — экономия памяти для долгоживущих списков"); copies += data.length; allocs++; cap = data.length; } }
+    else if (a === "clear") { log.push("clear(): все ячейки обнулены, size = 0, но ёмкость " + cap + " сохраняется"); data = []; ops++; }
+    draw();
+  }
+  function draw() {
+    var h = ""; for (var i = 0; i < Math.max(cap, 1); i++) h += i < data.length ? '<span class="u ' + (mark[i] || "") + '">' + data[i] + "</span>" : '<span title="пустая ячейка">' + (cap ? "·" : "∅") + "</span>";
+    $("alArr").innerHTML = h;
+    $("alOut").textContent = "size = " + data.length + ", capacity = " + cap + ", пустых ячеек = " + (cap - data.length) + " (" + (cap ? Math.round((cap - data.length) / cap * 100) : 0) + "%)\nопераций: " + ops + ", перевыделений массива: " + allocs + ", скопировано/сдвинуто ссылок всего: " + copies + (ops ? " (" + (copies / ops).toFixed(2) + " на операцию)" : "");
+    $("alLog").textContent = log.slice(-7).join("\n"); $("alLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll("#alW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var a = b.getAttribute("data-a"); if (a === "reset") reset(); else act(a); }); });
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Почему add в конец — амортизированно O(1)</span>
+Рост в 1,5 раза: чтобы вырасти до n, массив перевыделяется ~log₁.₅(n) раз, а суммарно копируется 10 + 15 + 22 + … &lt; 3n ссылок. На одно добавление — меньше трёх копирований в среднем. Отдельное добавление с ростом — O(n), поэтому при известном размере задайте ёмкость: <code>new ArrayList&lt;&gt;(n)</code>.
+</div>
+
+<h2 id="costs"><span class="h-num">5.3</span>Стоимость операций</h2>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Сложность</th><th>Комментарий</th></tr>
+<tr><td><code>get(i)</code>, <code>set(i, e)</code></td><td>O(1)</td><td>проверка индекса + чтение из массива</td></tr>
+<tr><td><code>add(e)</code></td><td>O(1) амортизированно</td><td>иногда рост O(n)</td></tr>
+<tr><td><code>add(i, e)</code>, <code>remove(i)</code></td><td>O(n − i)</td><td>сдвиг хвоста <code>System.arraycopy</code> — очень быстрый (memmove), но линейный</td></tr>
+<tr><td><code>contains</code>, <code>indexOf</code>, <code>remove(Object)</code></td><td>O(n)</td><td>линейный поиск с equals</td></tr>
+<tr><td><code>removeIf</code></td><td>O(n)</td><td>один проход (тема 03)</td></tr>
+<tr><td>итерация</td><td>O(n)</td><td>последовательный доступ к памяти — лучшая локальность среди всех коллекций</td></tr>
+</table></div>
+
+<h2 id="views"><span class="h-num">5.4</span>subList, toArray и копии</h2>
+<pre data-title="subList — представление, а не копия"><code class="java">List&lt;Integer&gt; list = new ArrayList&lt;&gt;(List.of(0, 1, 2, 3, 4, 5));
+List&lt;Integer&gt; mid = list.subList(1, 4);   // [1, 2, 3] — окно в тот же массив (offset 1, size 3)
+mid.set(0, 100);                          // list = [0, 100, 2, 3, 4, 5]
+mid.clear();                              // удаляет диапазон из исходного: list = [0, 4, 5]  ← идиома удаления диапазона
+list.add(9);                              // структурное изменение в обход представления
+mid.size();                               // ConcurrentModificationException
+
+Integer[] a1 = list.toArray(new Integer[0]);   // предпочтительно: JVM оптимизирует, без гонки по размеру
+Object[]  a2 = list.toArray();                  // Object[], не Integer[]
+List&lt;Integer&gt; copy = new ArrayList&lt;&gt;(list);     // поверхностная копия (те же объекты-элементы)
+List&lt;Integer&gt; frozen = List.copyOf(list);       // неизменяемая копия (null запрещены)</code></pre>
+<div class="callout warn"><span class="c-title">Утечка через subList</span>
+<code>bigList.subList(0, 10)</code>, сохранённый в поле, держит весь большой массив. Для долгого хранения делайте копию: <code>new ArrayList&lt;&gt;(big.subList(0, 10))</code>. То же с <code>Arrays.asList(array)</code> — он держит исходный массив.
+</div>
+
+<h2 id="quiz"><span class="h-num">5.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какая ёмкость у <code>new ArrayList&lt;&gt;()</code> до первого add и после него?</p><ul><li>10 и 10</li><li>0 (общий пустой массив) и 10</li><li>16 и 16</li><li>0 и 1</li></ul><div class="why">Ленивое выделение экономит память пустых списков.</div></div>
+<div class="mcq" data-ok="3"><p>Список из 1 млн элементов. Сколько элементов сдвинет <code>list.add(0, x)</code>?</p><ul><li>0</li><li>1</li><li>log n</li><li>1 млн — весь массив сдвигается вправо</li></ul><div class="why">Для вставок в начало — ArrayDeque.</div></div>
+<div class="mcq" data-ok="0"><p>Что вернёт <code>list.subList(2, 5)</code>?</p><ul><li>Представление на тот же массив: изменения видны в обе стороны</li><li>Независимую копию</li><li>Неизменяемый список</li><li>Массив</li></ul><div class="why">Структурное изменение исходного списка в обход представления ломает его (CME).</div></div>
+<div class="mcq" data-ok="2"><p>Почему remove обнуляет освободившуюся последнюю ячейку?</p><ul><li>Для ускорения</li><li>Так требует RandomAccess</li><li>Иначе массив держал бы ссылку на удалённый объект и мешал GC собрать его</li><li>Чтобы уменьшить ёмкость</li></ul><div class="why">Классическая «утечка устаревших ссылок» из Effective Java.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему коэффициент роста 1,5, а не 2?</summary><div class="a"><p>Компромисс между частотой перевыделений и неиспользуемой памятью: при ×2 в среднем пустует до половины массива; при ×1,5 — до трети, а копирований чуть больше, но всё ещё O(1) амортизированно. Ещё один аргумент — переиспользование освобождённых блоков аллокатором (сумма предыдущих размеров при ×1,5 со временем может вместить новый блок), хотя в JVM с перемещающим GC это менее важно.</p></div></details>
+<details class="q"><summary>Как быстро удалить диапазон элементов из ArrayList?</summary><div class="a"><p><code>list.subList(from, to).clear()</code> — вызывает removeRange: один сдвиг хвоста и обнуление ячеек, O(n − from). Удаление по одному индексу в цикле — O(k·n).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

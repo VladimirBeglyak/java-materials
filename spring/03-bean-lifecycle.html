@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Жизненный цикл бина, scopes, циклы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · КОНТЕЙНЕР</div>
+  <h1>Жизненный цикл бина, scopes и циклические зависимости</h1>
+  <p class="lead">Вызов <code>getBean()</code> — это конвейер из десятка этапов: создание экземпляра, внедрение, Aware-колбэки, пост-процессоры, init-методы, обёртка в прокси. Понимание конвейера отвечает на практические вопросы: почему <code>@Transactional</code> не работает в <code>@PostConstruct</code>, почему prototype внутри singleton «не обновляется» и как Spring разрешает циклы через три кэша.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">doCreateBean</span><span class="tag">scoped proxy</span><span class="tag">три уровня кэша</span><span class="tag">2 симулятора</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pipeline"><span class="h-num">3.1</span>Конвейер создания бина</h2>
+<p><code>getBean</code> → <code>doGetBean</code> объявлены в <code>AbstractBeanFactory</code>, создание — в <code>AbstractAutowireCapableBeanFactory</code>: <code>getBean</code> → <code>doGetBean</code> (проверка кэша singleton-ов) → <code>createBean</code> → <code>doCreateBean</code>.</p>
+<div class="flow col">
+  <div class="node info"><b>resolveBeforeInstantiation</b><small>InstantiationAwareBPP.postProcessBeforeInstantiation может вернуть готовый объект и пропустить всё остальное (редко)</small></div><span class="to">↓</span>
+  <div class="node"><b>createBeanInstance</b><small>выбор конструктора (determineCandidateConstructors), разрешение аргументов; либо вызов @Bean-метода; либо Supplier</small></div><span class="to">↓</span>
+  <div class="node"><b>applyMergedBeanDefinitionPostProcessors</b><small>AutowiredAnnotationBPP и CommonAnnotationBPP находят и кэшируют точки @Autowired/@Value/@Resource/@PostConstruct</small></div><span class="to">↓</span>
+  <div class="node warn"><b>addSingletonFactory</b><small>ранняя ссылка в кэш 3-го уровня — для разрешения циклов (3.5)</small></div><span class="to">↓</span>
+  <div class="node"><b>populateBean</b><small>postProcessAfterInstantiation → postProcessProperties: внедрение полей и сеттеров</small></div><span class="to">↓</span>
+  <div class="node acc"><b>initializeBean</b><small>Aware-методы → BPP.postProcessBeforeInitialization (@PostConstruct) → afterPropertiesSet → init-method → BPP.postProcessAfterInitialization (прокси)</small></div><span class="to">↓</span>
+  <div class="node"><b>registerDisposableBeanIfNecessary</b><small>запомнить destroy-колбэки</small></div><span class="to">↓</span>
+  <div class="node ok"><b>addSingleton</b><small>готовый объект (возможно, прокси) в singletonObjects</small></div>
+</div>
+
+<h2 id="sim"><span class="h-num">3.2</span>Пошагово: какие колбэки и в каком порядке</h2>
+<pre data-title="Бин, реализующий все колбэки сразу (так в проде не пишут — это учебный пример)"><code class="java">@Service
+class ReportService implements BeanNameAware, ApplicationContextAware, InitializingBean, DisposableBean {
+    private final ReportRepository repo;            // внедрение через конструктор
+    @Autowired private Clock clock;                 // внедрение в поле — для демонстрации
+
+    ReportService(ReportRepository repo) { this.repo = repo; log("constructor"); }
+
+    public void setBeanName(String n)                  { log("setBeanName(" + n + ")"); }
+    public void setApplicationContext(ApplicationContext c) { log("setApplicationContext"); }
+    @PostConstruct void postConstruct()                { log("@PostConstruct"); }
+    public void afterPropertiesSet()                   { log("afterPropertiesSet"); }
+    void customInit()                                  { log("init-method"); }   // @Bean(initMethod = "customInit")
+    @Transactional public Report build(long id)        { /* ... */ }
+    @PreDestroy void preDestroy()                      { log("@PreDestroy"); }
+    public void destroy()                              { log("DisposableBean.destroy"); }
+}</code></pre>
+
+<div class="widget stepper" id="lc">
+  <div class="widget-title">Симулятор жизненного цикла ReportService</div>
+  <p class="hint">Внизу — лог, который напечатает бин. Подсвечены участвующие механизмы.</p>
+  <div class="flow st-stage">
+    <div class="node" id="lcCtor"><b>конструктор</b></div><span class="to">→</span>
+    <div class="node" id="lcPop"><b>populate</b></div><span class="to">→</span>
+    <div class="node" id="lcAware"><b>Aware</b></div><span class="to">→</span>
+    <div class="node" id="lcBefore"><b>BPP before</b></div><span class="to">→</span>
+    <div class="node" id="lcInit"><b>init</b></div><span class="to">→</span>
+    <div class="node" id="lcAfter"><b>BPP after</b></div><span class="to">→</span>
+    <div class="node" id="lcReady"><b>в работе</b></div><span class="to">→</span>
+    <div class="node" id="lcDestroy"><b>destroy</b></div>
+  </div>
+  <section class="st-step" data-t="Создание экземпляра" data-hl="lcCtor" data-log="constructor">
+    <h4>createBeanInstance</h4>
+    <p><code>AutowiredAnnotationBeanPostProcessor.determineCandidateConstructors</code> находит единственный конструктор. <code>ConstructorResolver</code> разрешает аргумент <code>ReportRepository</code> — это рекурсивный <code>getBean</code>: если репозиторий ещё не создан, контейнер сначала полностью создаст его. Затем конструктор вызывается через рефлексию (<code>BeanUtils.instantiateClass</code>).</p>
+    <p>Объект существует, но поле <code>clock</code> ещё <code>null</code>.</p>
+  </section>
+  <section class="st-step" data-t="Внедрение полей" data-hl="lcPop">
+    <h4>populateBean</h4>
+    <p>Для каждого <code>InstantiationAwareBeanPostProcessor</code> вызывается <code>postProcessProperties</code>. <code>AutowiredAnnotationBeanPostProcessor</code> по закэшированным метаданным (<code>InjectionMetadata</code>) находит поле <code>clock</code>, разрешает зависимость и записывает её через <code>Field.set</code>. Здесь же обрабатываются <code>@Value</code> и сеттеры с <code>@Autowired</code>; <code>@Resource</code> — в <code>CommonAnnotationBeanPostProcessor</code>.</p>
+  </section>
+  <section class="st-step" data-t="Aware-интерфейсы фабрики" data-hl="lcAware" data-log="setBeanName(reportService)">
+    <h4>invokeAwareMethods</h4>
+    <p>Фабрика сама вызывает три «базовых» Aware: <code>BeanNameAware</code>, <code>BeanClassLoaderAware</code>, <code>BeanFactoryAware</code>. Остальные (<code>EnvironmentAware</code>, <code>ApplicationContextAware</code>, <code>ApplicationEventPublisherAware</code>…) — не фабрика, а BPP на следующем шаге.</p>
+  </section>
+  <section class="st-step" data-t="BPP before: Aware контекста" data-hl="lcBefore" data-log="setApplicationContext">
+    <h4>postProcessBeforeInitialization — ApplicationContextAwareProcessor</h4>
+    <p>Первый BPP в списке, добавлен на шаге 3 refresh(). Вызывает <code>setApplicationContext</code>. Внедрять <code>ApplicationContext</code> конструктором проще — Aware-интерфейсы остались в основном для инфраструктурного кода.</p>
+  </section>
+  <section class="st-step" data-t="BPP before: @PostConstruct" data-hl="lcBefore" data-log="@PostConstruct">
+    <h4>postProcessBeforeInitialization — CommonAnnotationBeanPostProcessor</h4>
+    <p>Его родитель <code>InitDestroyAnnotationBeanPostProcessor</code> вызывает методы с <code>@PostConstruct</code> (jakarta.annotation). Здесь же <code>ConfigurationPropertiesBindingPostProcessor</code> заполнил бы поля <code>@ConfigurationProperties</code>-бина.</p>
+    <div class="callout bad" style="margin:10px 0 0"><b>Важно:</b> <code>this</code> здесь — ещё не прокси. Вызов транзакционного метода из <code>@PostConstruct</code> выполнится без транзакции, <code>@Async</code> — синхронно.</div>
+  </section>
+  <section class="st-step" data-t="InitializingBean и init-method" data-hl="lcInit" data-log="afterPropertiesSet&#10;init-method">
+    <h4>invokeInitMethods</h4>
+    <p>Сначала <code>InitializingBean.afterPropertiesSet()</code>, затем метод из <code>@Bean(initMethod=...)</code>. Если один и тот же метод объявлен несколькими способами — вызывается один раз.</p>
+    <p>Рекомендуемый порядок предпочтения: <code>@PostConstruct</code> (без зависимости от Spring API) → <code>initMethod</code> (для чужих классов) → <code>InitializingBean</code> (инфраструктура).</p>
+  </section>
+  <section class="st-step" data-t="BPP after: прокси" data-hl="lcAfter">
+    <h4>postProcessAfterInitialization — AbstractAutoProxyCreator</h4>
+    <p><code>AnnotationAwareAspectJAutoProxyCreator.wrapIfNecessary</code> собирает advisors, подходящие к классу: <code>BeanFactoryTransactionAttributeSourceAdvisor</code> находит <code>@Transactional</code> на методе <code>build</code>. Создаётся CGLIB-прокси <code>ReportService$$SpringCGLIB$$0</code>, внутри которого лежит настоящий объект (target).</p>
+    <p>Именно прокси (а не исходный объект) попадёт в <code>singletonObjects</code> и будет внедряться в другие бины.</p>
+  </section>
+  <section class="st-step" data-t="Бин в работе" data-hl="lcReady">
+    <h4>addSingleton → использование</h4>
+    <p>Регистрируются destroy-колбэки (<code>DisposableBeanAdapter</code>), объект кладётся в кэш. Вызов <code>reportService.build(1)</code> из контроллера идёт через прокси → <code>TransactionInterceptor</code> → настоящий метод.</p>
+    <p>После создания <b>всех</b> singleton-ов вызовутся <code>SmartInitializingSingleton</code>, затем <code>SmartLifecycle.start()</code>, затем события (Boot: <code>ApplicationReadyEvent</code>). Логику «на старте приложения» с транзакциями пишите в обработчике <code>ApplicationReadyEvent</code> или <code>ApplicationRunner</code> — там прокси уже работают.</p>
+  </section>
+  <section class="st-step" data-t="Остановка контекста" data-hl="lcDestroy" data-log="@PreDestroy&#10;DisposableBean.destroy">
+    <h4>close() → destroyBeans()</h4>
+    <p>При <code>context.close()</code> или по shutdown hook JVM (Boot регистрирует его сам): публикуется <code>ContextClosedEvent</code>, останавливаются <code>SmartLifecycle</code> (по убыванию phase: сначала веб-сервер перестаёт принимать запросы), затем singleton-ы уничтожаются в порядке, <b>обратном зависимостям</b>: <code>ReportService</code> раньше, чем <code>ReportRepository</code>, который ему нужен.</p>
+    <p>Порядок колбэков: <code>@PreDestroy</code> → <code>DisposableBean.destroy()</code> → destroy-method (для <code>@Bean</code> по умолчанию выводится: публичный <code>close()</code> или <code>shutdown()</code>). Для prototype-бинов destroy не вызывается никогда.</p>
+  </section>
+</div>
+
+<h2 id="scopes"><span class="h-num">3.3</span>Scopes</h2>
+<div class="table-wrap"><table>
+<tr><th>Scope</th><th>Экземпляр</th><th>Где хранится</th><th>destroy</th></tr>
+<tr><td><code>singleton</code> (по умолчанию)</td><td>один на контейнер (не на JVM!)</td><td><code>singletonObjects</code></td><td>при закрытии контекста</td></tr>
+<tr><td><code>prototype</code></td><td>новый на каждый <code>getBean</code>/внедрение</td><td>не хранится</td><td>не вызывается — контейнер забывает объект</td></tr>
+<tr><td><code>request</code></td><td>один на HTTP-запрос</td><td>атрибуты <code>HttpServletRequest</code> через <code>RequestContextHolder</code> (ThreadLocal)</td><td>по окончании запроса</td></tr>
+<tr><td><code>session</code></td><td>один на HTTP-сессию</td><td>атрибуты <code>HttpSession</code></td><td>при инвалидации сессии</td></tr>
+<tr><td><code>application</code></td><td>один на <code>ServletContext</code></td><td>атрибут ServletContext</td><td>при остановке</td></tr>
+</table></div>
+<p>Свой scope регистрируется через <code>ConfigurableBeanFactory.registerScope(name, Scope)</code>. Например, в Spring есть, но не зарегистрирован по умолчанию, <code>SimpleThreadScope</code>; в Spring Cloud — <code>refresh</code> scope.</p>
+<h3>Проблема «узкий scope внутри широкого»</h3>
+<p>Зависимости singleton-а внедряются один раз, при его создании. Если внедрить prototype или request-бин напрямую, singleton навсегда получит один экземпляр. Решения:</p>
+<pre data-title="Три способа получать свежий экземпляр"><code class="java">// 1. ObjectProvider — явное получение при каждом вызове
+@Service class Exporter {
+    private final ObjectProvider&lt;CsvWriter&gt; writers;            // CsvWriter — @Scope("prototype")
+    Exporter(ObjectProvider&lt;CsvWriter&gt; writers) { this.writers = writers; }
+    void export() { CsvWriter w = writers.getObject(); /* новый объект */ }
+}
+
+// 2. @Lookup — контейнер переопределяет метод в CGLIB-подклассе
+@Service abstract class Exporter2 {
+    @Lookup protected abstract CsvWriter writer();
+}
+
+// 3. Scoped proxy — внедряется прокси, который на каждый вызов ищет объект в текущем scope
+@Component
+@RequestScope                     // = @Scope(value = "request", proxyMode = ScopedProxyMode.TARGET_CLASS)
+class RequestContextData { String tenantId; }
+
+@Service class TenantService {
+    private final RequestContextData data;   // на самом деле прокси; data.tenantId берётся из текущего запроса
+    TenantService(RequestContextData data) { this.data = data; }
+}</code></pre>
+<div class="callout warn">Обращение к request-scoped прокси вне потока HTTP-запроса (в <code>@Async</code>, в <code>@Scheduled</code>, в отдельном потоке пула) даёт <code>IllegalStateException: No thread-bound request found</code> — scope хранится в ThreadLocal потока запроса.</div>
+
+<h2 id="cycles"><span class="h-num">3.4</span>Циклические зависимости и три уровня кэша</h2>
+<p><code>DefaultSingletonBeanRegistry</code> хранит singleton-ы в трёх картах:</p>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Поле</th><th>Содержимое</th></tr>
+<tr><td>1</td><td><code>singletonObjects</code></td><td>полностью готовые бины</td></tr>
+<tr><td>2</td><td><code>earlySingletonObjects</code></td><td>ранние ссылки, уже выданные кому-то, но бин ещё не доинициализирован</td></tr>
+<tr><td>3</td><td><code>singletonFactories</code></td><td>фабрики <code>() -&gt; getEarlyBeanReference(bean)</code>, которые могут выдать раннюю ссылку — при необходимости уже обёрнутую в прокси</td></tr>
+</table></div>
+<p>Зачем третий уровень, а не сразу второй? Ранняя ссылка должна быть <b>тем же объектом</b>, который в итоге окажется в контексте. Если бин будет обёрнут в AOP-прокси, то и в цикл нужно отдать прокси. Фабрика вызывает <code>SmartInstantiationAwareBeanPostProcessor.getEarlyBeanReference</code> — auto-proxy creator создаёт прокси заранее и запоминает, что этот бин уже обёрнут. Но делает это только если ссылка действительно понадобилась: без цикла прокси создаётся обычным путём.</p>
+
+<div class="widget stepper" id="cy">
+  <div class="widget-title">Симулятор: A ↔ B через поля (field injection)</div>
+  <p class="hint"><code>class A { @Autowired B b; }</code> и <code>class B { @Autowired A a; }</code>, <code>spring.main.allow-circular-references=true</code>.</p>
+  <div class="lanes st-stage">
+    <div class="lane node" id="cyCur"><h5>сейчас создаются</h5><div class="items"><span class="chip warn" data-from="1" data-to="9">A</span><span class="chip warn" data-from="4" data-to="7">B</span></div></div>
+    <div class="lane node" id="cyL3"><h5>3 · singletonFactories</h5><div class="items"><span class="chip" data-from="2" data-to="6">A → factory</span><span class="chip" data-from="4" data-to="7">B → factory</span></div></div>
+    <div class="lane node" id="cyL2"><h5>2 · earlySingletonObjects</h5><div class="items"><span class="chip acc" data-from="6" data-to="9">A (ранняя ссылка)</span></div></div>
+    <div class="lane node" id="cyL1"><h5>1 · singletonObjects</h5><div class="items"><span class="chip ok" data-from="7">B</span><span class="chip ok" data-from="9">A</span></div></div>
+  </div>
+  <section class="st-step" data-t="getBean(A)" data-hl="cyCur">
+    <h4>getBean("a")</h4>
+    <p><code>getSingleton("a")</code>: в кэшах ничего нет. Имя добавляется в <code>singletonsCurrentlyInCreation</code>, вызывается конструктор A без аргументов.</p>
+  </section>
+  <section class="st-step" data-t="A: ранняя фабрика в L3" data-hl="cyL3">
+    <h4>addSingletonFactory("a", …)</h4>
+    <p>Так как A — singleton, циклы разрешены и A сейчас в создании, в кэш 3-го уровня кладётся фабрика ранней ссылки. Сам объект A пока «сырой»: поле <code>b == null</code>.</p>
+  </section>
+  <section class="st-step" data-t="A.populate → нужен B">
+    <h4>populateBean(a)</h4>
+    <p><code>AutowiredAnnotationBeanPostProcessor</code> пытается внедрить поле <code>b</code> → <code>getBean("b")</code>.</p>
+  </section>
+  <section class="st-step" data-t="getBean(B), фабрика B" data-hl="cyCur cyL3">
+    <h4>getBean("b")</h4>
+    <p>B создаётся конструктором, помечается «в создании», его фабрика тоже уходит в кэш 3-го уровня. Начинается <code>populateBean(b)</code>: нужно поле <code>a</code> → <code>getBean("a")</code>.</p>
+  </section>
+  <section class="st-step" data-t="Повторный запрос A">
+    <h4>getSingleton("a", allowEarlyReference=true)</h4>
+    <p>Нет в L1. A числится «в создании» — значит, это цикл. Ищем в L2 — пусто. Берём фабрику из L3.</p>
+  </section>
+  <section class="st-step" data-t="Фабрика → ранняя ссылка в L2" data-hl="cyL2 cyL3">
+    <h4>singletonFactory.getObject()</h4>
+    <p>Фабрика вызывает <code>getEarlyBeanReference</code>: если A должен быть проксирован (например, на нём <code>@Transactional</code>), auto-proxy creator создаёт прокси прямо сейчас. Результат переносится в L2, фабрика удаляется из L3. B получает ссылку на A — <b>ещё не инициализированный</b>: <code>@PostConstruct</code> у A пока не вызывался.</p>
+  </section>
+  <section class="st-step" data-t="B готов" data-hl="cyL1">
+    <h4>initializeBean(b) → addSingleton("b")</h4>
+    <p>B проходит Aware/BPP/init и попадает в L1, удаляется из L2/L3 и из «в создании».</p>
+  </section>
+  <section class="st-step" data-t="Возврат к A">
+    <h4>populateBean(a) завершён → initializeBean(a)</h4>
+    <p>A получает готовый B. Затем инициализация: <code>@PostConstruct</code>, init-методы, <code>postProcessAfterInitialization</code>. Auto-proxy creator видит, что A уже был обёрнут при выдаче ранней ссылки, и второй прокси не создаёт.</p>
+  </section>
+  <section class="st-step" data-t="A готов, проверка" data-hl="cyL1">
+    <h4>addSingleton("a") + проверка согласованности</h4>
+    <p>Если ранняя ссылка выдавалась, Spring сверяет: итоговый объект A после всех BPP — тот же, что ранняя ссылка? Если какой-то BPP подменил объект, не поддержав <code>getEarlyBeanReference</code> (типичный случай — <code>@Async</code>), старт падает: <code>BeanCurrentlyInCreationException: Bean with name 'a' has been injected into other beans [b] in its raw version as part of a circular reference, but has eventually been wrapped</code>.</p>
+  </section>
+</div>
+
+<div class="grid-2">
+  <div class="card"><h4>Конструкторы: цикл не разрешается</h4><p>Чтобы положить раннюю ссылку в L3, объект должен уже существовать. При <code>A(B b)</code> и <code>B(A a)</code> ни один конструктор вызвать нельзя → <code>BeanCurrentlyInCreationException: Requested bean is currently in creation: Is there an unresolvable circular reference or an asynchronous initialization dependency?</code></p></div>
+  <div class="card"><h4>Spring Boot 2.6+: циклы запрещены</h4><p><code>spring.main.allow-circular-references=false</code> по умолчанию — даже полевой цикл падает на старте с отчётом «The dependencies of some of the beans in the application context form a cycle». Включать обратно — временная мера.</p></div>
+</div>
+<div class="callout ok"><span class="c-title">Как правильно разрывать цикл</span>
+<b>1. Перепроектировать</b>: вынести общую логику в третий бин, от которого зависят оба. Цикл почти всегда означает смешение ответственностей. <b>2. События</b>: A публикует событие, B на него подписан — прямая зависимость исчезает. <b>3. <code>@Lazy</code> на параметре конструктора</b> или <code>ObjectProvider&lt;B&gt;</code>: вместо B внедряется ленивый прокси, B создаётся при первом вызове.
+</div>
+
+<h2 id="factorybean"><span class="h-num">3.5</span>FactoryBean</h2>
+<p><code>FactoryBean&lt;T&gt;</code> — бин, который сам является фабрикой другого объекта. <code>getBean("x")</code> вернёт результат <code>getObject()</code>, а <code>getBean("&amp;x")</code> — саму фабрику. Так интегрируются библиотеки со сложной сборкой: <code>JpaRepositoryFactoryBean</code> (каждый репозиторий Spring Data), <code>LocalContainerEntityManagerFactoryBean</code>, <code>SqlSessionFactoryBean</code> из MyBatis.</p>
+<pre><code class="java">class CryptoKeyFactoryBean implements FactoryBean&lt;SecretKey&gt; {
+    @Override public SecretKey getObject() throws Exception {
+        return KeyGenerator.getInstance("AES").generateKey();
+    }
+    @Override public Class&lt;?&gt; getObjectType() { return SecretKey.class; } // нужен для поиска по типу без создания
+    @Override public boolean isSingleton() { return true; }               // результат кэшируется в factoryBeanObjectCache
+}</code></pre>
+<p>Не путайте с <code>BeanFactory</code> — это контейнер. <code>FactoryBean</code> — бин внутри контейнера.</p>
+
+<h2 id="quiz"><span class="h-num">3.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="3"><p>В каком порядке вызываются колбэки инициализации?</p><ul><li>afterPropertiesSet → @PostConstruct → init-method</li><li>init-method → @PostConstruct → afterPropertiesSet</li><li>@PostConstruct → init-method → afterPropertiesSet</li><li>@PostConstruct → afterPropertiesSet → init-method</li></ul><div class="why">@PostConstruct вызывается в <code>postProcessBeforeInitialization</code> (CommonAnnotationBeanPostProcessor), затем <code>invokeInitMethods</code>: сначала InitializingBean, потом пользовательский init-method.</div></div>
+<div class="mcq" data-ok="1"><p>Prototype-бин внедрён в singleton через конструктор. Сколько экземпляров prototype увидит singleton за время работы?</p><ul><li>Новый на каждый вызов метода singleton-а</li><li>Один — внедрение произошло один раз при создании singleton-а</li><li>Новый на каждый HTTP-запрос</li><li>Ноль, будет ошибка старта</li></ul><div class="why">Scope влияет на то, что происходит при запросе бина у контейнера. Внедрение — один запрос. Чтобы получать новые экземпляры, нужен ObjectProvider, @Lookup или scoped proxy.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужен третий уровень кэша, если есть earlySingletonObjects?</p><ul><li>Чтобы раннюю ссылку можно было при необходимости сразу обернуть в прокси, и только если цикл действительно возник</li><li>Для хранения prototype-бинов</li><li>Для потокобезопасности</li><li>Для бинов с @Lazy</li></ul><div class="why">Фабрика в L3 откладывает решение: <code>getEarlyBeanReference</code> вызывается только при реальном цикле и отдаёт тот объект (возможно, прокси), который окажется в контексте.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему @Transactional-метод, вызванный из @PostConstruct, работает без транзакции?</summary><div class="a"><p>@PostConstruct выполняется в postProcessBeforeInitialization на исходном объекте; прокси создаётся позже, в postProcessAfterInitialization. Плюс вызов идёт через <code>this</code>, мимо прокси. Решение — <code>ApplicationReadyEvent</code>/<code>ApplicationRunner</code> или <code>SmartInitializingSingleton</code>, где вызывать метод через внедрённый бин, или <code>TransactionTemplate</code>.</p></div></details>
+<details class="q"><summary>Объясните разрешение циклической зависимости через три кэша.</summary><div class="a"><p>A создаётся конструктором, фабрика ранней ссылки — в L3. При внедрении нужен B; B создаётся, при внедрении нужен A → getSingleton находит A «в создании», вызывает фабрику из L3, кладёт результат (возможно, прокси) в L2. B доинициализируется и уходит в L1, затем A получает B, инициализируется и уходит в L1. Для конструкторов не работает: объекта ещё нет.</p></div></details>
+<details class="q"><summary>Как request-scoped бин попадает в singleton-контроллер и остаётся корректным?</summary><div class="a"><p>Внедряется scoped proxy (CGLIB-подкласс), а не сам объект. Каждый вызов метода прокси делает <code>beanFactory.getBean("scopedTarget.name")</code>, а <code>RequestScope</code> ищет экземпляр в атрибутах текущего запроса через ThreadLocal <code>RequestContextHolder</code>; при отсутствии — создаёт и кладёт туда.</p></div></details>
+<details class="q"><summary>Почему для prototype не вызывается @PreDestroy?</summary><div class="a"><p>Контейнер не хранит ссылки на prototype-экземпляры после выдачи — он не знает, когда объект больше не нужен. Освобождение ресурсов — ответственность того, кто получил объект (или своего BPP, отслеживающего такие объекты).</p></div></details>
+<details class="q"><summary>В каком порядке уничтожаются singleton-ы?</summary><div class="a"><p>В обратном порядке зависимостей (контейнер ведёт карту <code>dependentBeanMap</code>): бин уничтожается раньше бинов, от которых зависит. До этого публикуется ContextClosedEvent и останавливаются SmartLifecycle-бины по убыванию phase.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

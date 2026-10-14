@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · AOP и прокси</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · КОНТЕЙНЕР</div>
+  <h1>AOP и прокси</h1>
+  <p class="lead">Транзакции, кэширование, <code>@Async</code>, безопасность методов, ретраи, репозитории Spring Data — всё это прокси. Прокси стоит между вызывающим кодом и вашим объектом и выполняет цепочку перехватчиков до и после настоящего метода. Почти все «магические» баги Spring (транзакция не откатилась, кэш не сработал, <code>@Async</code> выполнился синхронно) объясняются тем, что вызов прошёл мимо прокси.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">JDK Proxy / CGLIB</span><span class="tag">MethodInterceptor</span><span class="tag">self-invocation</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="terms"><span class="h-num">4.1</span>Термины AOP</h2>
+<div class="table-wrap"><table>
+<tr><th>Термин</th><th>Значение</th><th>В Spring</th></tr>
+<tr><td>Join point</td><td>точка выполнения, куда можно вставить логику</td><td>только <b>вызов метода бина</b> (AspectJ умеет ещё поля, конструкторы, static)</td></tr>
+<tr><td>Pointcut</td><td>предикат, выбирающий join points</td><td><code>Pointcut</code> = <code>ClassFilter</code> + <code>MethodMatcher</code>; выражения AspectJ</td></tr>
+<tr><td>Advice</td><td>что выполнить</td><td>почти всегда <code>MethodInterceptor</code> (around)</td></tr>
+<tr><td>Advisor</td><td>пара pointcut + advice</td><td><code>PointcutAdvisor</code>; каждый метод <code>@Aspect</code> превращается в advisor</td></tr>
+<tr><td>Target</td><td>исходный объект</td><td>ваш бин</td></tr>
+<tr><td>Proxy</td><td>объект-обёртка, через который идут вызовы</td><td>JDK dynamic proxy или CGLIB-подкласс</td></tr>
+<tr><td>Weaving</td><td>встраивание advice в код</td><td>Spring AOP — во время выполнения через прокси; AspectJ — при компиляции или загрузке класса</td></tr>
+</table></div>
+
+<h2 id="proxies"><span class="h-num">4.2</span>Два вида прокси</h2>
+<div class="vs neutral">
+<pre data-title="JDK dynamic proxy — реализует интерфейсы"><code class="java">OrderService proxy = (OrderService) Proxy.newProxyInstance(
+    cl, new Class&lt;?&gt;[]{ OrderService.class },
+    (p, method, args) -&gt; {
+        System.out.println("before " + method.getName());
+        Object r = method.invoke(target, args);   // настоящий вызов
+        System.out.println("after");
+        return r;
+    });
+// proxy instanceof OrderService     → true
+// proxy instanceof OrderServiceImpl → false!</code></pre>
+<pre data-title="CGLIB — генерирует подкласс"><code class="java">// Spring генерирует примерно такой класс в рантайме:
+class OrderServiceImpl$$SpringCGLIB$$0 extends OrderServiceImpl {
+    MethodInterceptor interceptor;
+    @Override public Order place(Cart c) {
+        return (Order) interceptor.intercept(this, PLACE_METHOD,
+                new Object[]{c}, PLACE_PROXY);
+    }
+    // final, private, static методы переопределить нельзя
+}</code></pre>
+</div>
+<div class="table-wrap"><table>
+<tr><th></th><th>JDK dynamic proxy</th><th>CGLIB</th></tr>
+<tr><td>Требования</td><td>у класса есть интерфейс</td><td>класс не <code>final</code> (конструктор не вызывается: экземпляр прокси создаётся через Objenesis)</td></tr>
+<tr><td>Перехватываются</td><td>методы интерфейсов</td><td>все переопределяемые: public, protected, package-private (не private, final, static)</td></tr>
+<tr><td>Тип прокси</td><td>реализует интерфейсы; внедрять по классу нельзя</td><td>подкласс; внедрять можно и по классу, и по интерфейсу</td></tr>
+<tr><td>По умолчанию</td><td>в «чистом» Spring при наличии интерфейса</td><td>в Spring Boot всегда (<code>spring.aop.proxy-target-class=true</code>)</td></tr>
+</table></div>
+<p>Выбор делает <code>DefaultAopProxyFactory.createAopProxy</code>: если <code>proxyTargetClass=true</code>, или нет интерфейсов, или есть только маркерные интерфейсы Spring — CGLIB; иначе JDK (но целевой класс, который сам является интерфейсом или JDK-прокси, всё равно проксируется JDK-способом). Boot выбрал CGLIB по умолчанию, чтобы внедрение по конкретному классу не ломалось от появления <code>@Transactional</code>.</p>
+<div class="callout warn"><span class="c-title">У CGLIB-прокси пустые поля</span>
+Экземпляр прокси создаётся через Objenesis — <b>без вызова конструктора</b>. Поля прокси-объекта не инициализированы, все данные живут в target. Пока вызов перехватывается, это незаметно. Но <code>final</code>-метод не переопределён, выполняется на самом прокси — и его обращение к полям даёт <code>null</code> и <code>NullPointerException</code>.
+</div>
+
+<h2 id="creation"><span class="h-num">4.3</span>Как Spring решает обернуть бин</h2>
+<p><code>@EnableAspectJAutoProxy</code> (в Boot включается автоконфигурацией <code>AopAutoConfiguration</code>) регистрирует <code>AnnotationAwareAspectJAutoProxyCreator</code> — это <code>BeanPostProcessor</code>. В <code>postProcessAfterInitialization</code> каждого бина он вызывает <code>wrapIfNecessary</code>:</p>
+<div class="flow">
+  <div class="node"><b>findCandidateAdvisors</b><small>бины-Advisor (транзакции, кэш, @Async…) + advisors из классов @Aspect</small></div><span class="to">→</span>
+  <div class="node"><b>findAdvisorsThatCanApply</b><small>ClassFilter, затем MethodMatcher по каждому методу класса</small></div><span class="to">→</span>
+  <div class="node"><b>sortAdvisors</b><small>@Order / Ordered</small></div><span class="to">→</span>
+  <div class="node acc"><b>ProxyFactory.getProxy</b><small>пустой список → бин возвращается как есть</small></div>
+</div>
+<p>Сами инфраструктурные классы (Advisor, Advice, AopInfrastructureBean) не проксируются. Решения кэшируются: для каждого класса подходящие advisors вычисляются один раз.</p>
+
+<h2 id="invoke"><span class="h-num">4.4</span>Как выполняется вызов через прокси</h2>
+<p>Прокси хранит <code>AdvisedSupport</code> — конфигурацию: target, список advisors, интерфейсы. При вызове метода он получает цепочку перехватчиков для этого метода (кэшируется в <code>methodCache</code>) и создаёт <code>ReflectiveMethodInvocation</code> (для CGLIB — <code>CglibMethodInvocation</code>). Это паттерн «цепочка ответственности»: каждый перехватчик решает, вызывать ли <code>proceed()</code>.</p>
+<pre data-title="ReflectiveMethodInvocation.proceed() — суть"><code class="java">public Object proceed() throws Throwable {
+    if (currentInterceptorIndex == interceptors.size() - 1) {
+        return invokeJoinpoint();                 // конец цепочки: method.invoke(target, args)
+    }
+    MethodInterceptor next = interceptors.get(++currentInterceptorIndex);
+    return next.invoke(this);                     // перехватчик сам вызовет proceed() — или нет
+}
+
+// Так выглядит любой around-перехватчик, например упрощённый TransactionInterceptor:
+public Object invoke(MethodInvocation mi) throws Throwable {
+    TransactionStatus tx = tm.getTransaction(def);
+    try {
+        Object result = mi.proceed();             // дальше по цепочке и в целевой метод
+        tm.commit(tx);
+        return result;
+    } catch (RuntimeException | Error e) {
+        tm.rollback(tx);
+        throw e;
+    }
+}</code></pre>
+<div class="flow">
+  <div class="node info"><b>Caller</b></div><span class="to">→</span>
+  <div class="node acc"><b>Proxy</b></div><span class="to">→</span>
+  <div class="node"><b>SecurityInterceptor</b><small>@PreAuthorize</small></div><span class="to">→</span>
+  <div class="node"><b>TransactionInterceptor</b><small>begin … commit/rollback</small></div><span class="to">→</span>
+  <div class="node"><b>CacheInterceptor</b><small>hit → вернуть без вызова</small></div><span class="to">→</span>
+  <div class="node ok"><b>target.method()</b></div>
+</div>
+<p>Порядок перехватчиков определяется порядком advisors. Транзакционный advisor по умолчанию имеет <code>Ordered.LOWEST_PRECEDENCE</code>, его можно поменять через <code>@EnableTransactionManagement(order = ...)</code>. Важный практический случай: ретрай должен быть <b>снаружи</b> транзакции, иначе повтор пойдёт в уже помеченной на откат транзакции.</p>
+
+<h2 id="aspect"><span class="h-num">4.5</span>Свой аспект</h2>
+<pre data-title="Замер времени методов, помеченных @Timed"><code class="java">@Target(ElementType.METHOD) @Retention(RetentionPolicy.RUNTIME)
+public @interface Timed { String value(); }
+
+@Aspect
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)        // самый внешний — замеряет и транзакцию
+class TimingAspect {
+    private final MeterRegistry registry;
+    TimingAspect(MeterRegistry registry) { this.registry = registry; }
+
+    @Around("@annotation(timed)")          // параметр связывается с аннотацией метода
+    Object time(ProceedingJoinPoint pjp, Timed timed) throws Throwable {
+        Timer.Sample s = Timer.start(registry);
+        try {
+            return pjp.proceed();
+        } finally {
+            s.stop(registry.timer(timed.value(), "method", pjp.getSignature().getName()));
+        }
+    }
+}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Pointcut</th><th>Выбирает</th></tr>
+<tr><td><code>execution(* com.shop..*Service.*(..))</code></td><td>все методы классов, чьё имя заканчивается на Service, в пакете com.shop и подпакетах</td></tr>
+<tr><td><code>within(com.shop.web..*)</code></td><td>все методы классов в пакете</td></tr>
+<tr><td><code>@annotation(com.shop.Timed)</code></td><td>методы с аннотацией</td></tr>
+<tr><td><code>@within(org.springframework.stereotype.Service)</code></td><td>методы классов с аннотацией</td></tr>
+<tr><td><code>bean(*Repository)</code></td><td>бины по имени (только Spring AOP)</td></tr>
+<tr><td><code>args(java.util.UUID, ..)</code></td><td>по типам аргументов в рантайме</td></tr>
+</table></div>
+<p>Виды advice: <code>@Before</code>, <code>@AfterReturning</code>, <code>@AfterThrowing</code>, <code>@After</code> (finally), <code>@Around</code>. Внутри одного аспекта с Spring 5.2.7 порядок приоритета: <code>@Around</code> → <code>@Before</code> → <code>@After</code> → <code>@AfterReturning</code>/<code>@AfterThrowing</code>; фактически <code>@After</code> (finally) выполняется после <code>@AfterReturning</code>/<code>@AfterThrowing</code> того же аспекта. Между аспектами — по <code>@Order</code>: меньшее значение — внешний слой (первым входит, последним выходит).</p>
+
+<h2 id="limits"><span class="h-num">4.6</span>Когда прокси не срабатывает</h2>
+<pre data-title="Self-invocation — самая частая ошибка" class="bad-code"><code class="java">@Service
+class InvoiceService {
+    public void generateAll(List&lt;Long&gt; ids) {
+        for (long id : ids) generate(id);           // this.generate(id) — вызов мимо прокси!
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void generate(long id) { /* ожидаем отдельную транзакцию на каждый счёт — её не будет */ }
+}</code></pre>
+<p>Внешний код вызывает <code>proxy.generateAll()</code>. Прокси передаёт вызов в target, и внутри target <code>this</code> — это target, а не прокси. Перехватчики видят только вызовы, пришедшие через ссылку на прокси.</p>
+
+<div class="widget" id="px">
+  <div class="widget-title">Симулятор: сработает ли @Transactional</div>
+  <div class="controls">
+    <label>тип прокси<select id="pxType"><option value="cglib">CGLIB (по умолчанию в Boot)</option><option value="jdk">JDK dynamic proxy</option></select></label>
+    <label>метод<select id="pxMod"><option value="iface">public, объявлен в интерфейсе</option><option value="pub">public, не в интерфейсе</option><option value="prot">protected / package-private</option><option value="priv">private</option><option value="final">public final</option><option value="static">public static</option></select></label>
+    <label>как вызывается<select id="pxCall"><option value="ext">из другого бина через внедрённую ссылку</option><option value="self">this.method() из другого метода того же класса</option><option value="selfproxy">через self-ссылку на прокси (ObjectProvider / @Lazy self)</option><option value="ctx">AopContext.currentProxy() (exposeProxy=true)</option></select></label>
+  </div>
+  <div class="flow" id="pxFlow">
+    <div class="node info" id="pxN1"><b>Caller</b></div><span class="to">→</span>
+    <div class="node" id="pxN2"><b>Proxy</b></div><span class="to">→</span>
+    <div class="node" id="pxN3"><b>TransactionInterceptor</b></div><span class="to">→</span>
+    <div class="node" id="pxN4"><b>target.method()</b></div>
+  </div>
+  <div class="verdict" id="pxOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var t = $("pxType").value, m = $("pxMod").value, c = $("pxCall").value, ok = false, warn = false, msg;
+    var reach = true; // вызов доходит до target
+    if (m === "static") msg = "Статический метод не принадлежит объекту: ни JDK-прокси, ни CGLIB не могут его перехватить. Аннотация игнорируется.";
+    else if (c === "self") msg = "Вызов через this идёт напрямую в target, минуя прокси. Транзакции не будет при любом типе прокси и модификаторе.";
+    else if (t === "jdk" && m !== "iface") {
+      reach = false;
+      msg = "JDK-прокси реализует только интерфейсы. Методы, которых нет в интерфейсе, через прокси вызвать нельзя: ссылка имеет тип интерфейса. А внедрение по классу реализации упадёт с BeanNotOfRequiredTypeException.";
+    }
+    else if (t === "jdk") { ok = true; msg = "Метод интерфейса: InvocationHandler (JdkDynamicAopProxy) перехватывает вызов. Модификатор final в классе реализации не мешает — прокси не наследует класс."; }
+    else if (m === "priv") msg = "private-метод нельзя переопределить в подклассе — CGLIB его не перехватывает. Кроме того, вызвать private снаружи можно только изнутри класса, то есть через this.";
+    else if (m === "final") { warn = true; msg = "final-метод не переопределён в CGLIB-подклассе — выполняется код самого прокси-объекта. Его поля не инициализированы (Objenesis не вызывает конструктор), поэтому обращение к зависимостям даст NullPointerException. Транзакции нет."; }
+    else if (m === "prot") { ok = true; msg = "С Spring 6.0 @Transactional на protected и package-private методах работает при CGLIB-проксировании (раньше — только public). Но вызывать их снаружи можно только из того же пакета — на практике лучше public."; }
+    else { ok = true; msg = "CGLIB-подкласс переопределил метод: вызов → DynamicAdvisedInterceptor → цепочка → TransactionInterceptor → target."; }
+    if (ok && c === "selfproxy") msg += " Self-ссылка указывает на прокси, поэтому даже внутренний вызов проходит через перехватчики. Работает, но это признак, что метод стоит вынести в отдельный бин.";
+    if (ok && c === "ctx") msg += " AopContext.currentProxy() достаёт прокси из ThreadLocal; требует @EnableAspectJAutoProxy(exposeProxy = true) и привязывает код к Spring AOP.";
+    var direct = c === "self" || m === "static";
+    $("pxN2").className = "node " + (direct ? "off" : (reach ? "was" : "stop"));
+    $("pxN3").className = "node " + (ok ? "hl" : "off");
+    $("pxN4").className = "node " + (reach ? (warn ? "stop" : "ok") : "off");
+    var o = $("pxOut"); o.className = "verdict " + (ok ? "ok" : (warn ? "warn" : "bad"));
+    o.innerHTML = "<b>" + (ok ? "Транзакция будет. " : "Транзакции не будет. ") + "</b>" + msg;
+  }
+  ["pxType", "pxMod", "pxCall"].forEach(function (id) { $(id).addEventListener("change", run); });
+  run();
+})();
+</script>
+
+<div class="callout ok"><span class="c-title">Как починить self-invocation</span>
+<b>Лучший способ</b> — вынести метод в отдельный бин (<code>InvoiceGenerator</code>): вызов пойдёт через его прокси. <b>Допустимо</b>: внедрить себя же (<code>@Lazy InvoiceService self</code> или <code>ObjectProvider&lt;InvoiceService&gt;</code>) и звать <code>self.generate()</code>. Для транзакций — <code>TransactionTemplate</code> вместо аннотации. <b>Тяжёлая артиллерия</b>: AspectJ weaving (<code>@EnableTransactionManagement(mode = AdviceMode.ASPECTJ)</code>) встраивает логику в байткод, прокси не нужен.
+</div>
+
+<h2 id="where"><span class="h-num">4.7</span>Что в Spring построено на прокси</h2>
+<div class="table-wrap"><table>
+<tr><th>Возможность</th><th>Перехватчик / механизм</th></tr>
+<tr><td><code>@Transactional</code></td><td><code>TransactionInterceptor</code></td></tr>
+<tr><td><code>@Cacheable</code>, <code>@CacheEvict</code></td><td><code>CacheInterceptor</code></td></tr>
+<tr><td><code>@Async</code></td><td><code>AnnotationAsyncExecutionInterceptor</code> — добавляется отдельным BPP (<code>AsyncAnnotationBeanPostProcessor</code>), а не auto-proxy creator'ом; поэтому не дружит с ранними ссылками в циклах</td></tr>
+<tr><td><code>@PreAuthorize</code>, <code>@Secured</code></td><td><code>AuthorizationManagerBeforeMethodInterceptor</code></td></tr>
+<tr><td><code>@Validated</code> на классе + <code>@Valid</code>/<code>@NotNull</code> на параметрах</td><td><code>MethodValidationInterceptor</code></td></tr>
+<tr><td><code>@Retryable</code>, <code>@ConcurrencyLimit</code> (Spring 7, в ядре)</td><td>перехватчики <code>org.springframework.resilience</code></td></tr>
+<tr><td>Репозитории Spring Data</td><td>прокси над интерфейсом с <code>QueryExecutorMethodInterceptor</code> (тема 12)</td></tr>
+<tr><td><code>@Repository</code></td><td><code>PersistenceExceptionTranslationInterceptor</code></td></tr>
+<tr><td>Scoped proxy, <code>@Lazy</code>-внедрение</td><td>прокси с <code>TargetSource</code>, который достаёт объект при каждом вызове</td></tr>
+</table></div>
+<p>Проверить, прокси ли объект: <code>AopUtils.isAopProxy(bean)</code>, <code>AopUtils.isCglibProxy</code>, класс реального объекта — <code>AopUtils.getTargetClass(bean)</code>. В отладчике класс прокси виден как <code>OrderService$$SpringCGLIB$$0</code>.</p>
+
+<h2 id="quiz"><span class="h-num">4.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Бин OrderServiceImpl implements OrderService с @Transactional, приложение на «чистом» Spring без proxyTargetClass. Внедряем по классу: <code>@Autowired OrderServiceImpl s</code>. Что будет?</p><ul><li>Всё работает</li><li>Внедрится target без прокси</li><li>BeanNotOfRequiredTypeException: прокси реализует интерфейс, но не является OrderServiceImpl</li><li>Создастся второй бин</li></ul><div class="why">Есть интерфейс → JDK-прокси, который не наследует класс реализации. В Spring Boot этого не случится: там CGLIB по умолчанию.</div></div>
+<div class="mcq" data-ok="1"><p>Два аспекта: A с @Order(1) и B с @Order(2), оба @Around. Порядок выполнения?</p><ul><li>B до → A до → метод → A после → B после</li><li>A до → B до → метод → B после → A после</li><li>Неопределён</li><li>Только A — аспект с меньшим порядком отменяет остальные</li></ul><div class="why">Меньший order = более высокий приоритет = внешний слой: входит первым и выходит последним.</div></div>
+<div class="mcq" data-ok="3"><p>Что Spring AOP НЕ может перехватить?</p><ul><li>public-метод бина, вызванный из контроллера</li><li>метод интерфейса репозитория Spring Data</li><li>protected-метод при CGLIB, вызванный из того же пакета</li><li>вызов метода объекта, созданного через new</li></ul><div class="why">Spring AOP работает только для бинов: прокси создаёт BeanPostProcessor контейнера. Объекты из <code>new</code> требуют AspectJ weaving.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как создаётся AOP-прокси для бина? Какие классы участвуют?</summary><div class="a"><p><code>AnnotationAwareAspectJAutoProxyCreator</code> (BeanPostProcessor) в <code>postProcessAfterInitialization</code> → <code>wrapIfNecessary</code>: находит advisors (бины Advisor + методы @Aspect через <code>ReflectiveAspectJAdvisorFactory</code>), фильтрует по pointcut (<code>AopUtils.findAdvisorsThatCanApply</code>), сортирует, создаёт <code>ProxyFactory</code>; <code>DefaultAopProxyFactory</code> выбирает <code>JdkDynamicAopProxy</code> или <code>ObjenesisCglibAopProxy</code>.</p></div></details>
+<details class="q"><summary>Почему self-invocation не проходит через прокси и как это исправить?</summary><div class="a"><p>Прокси — отдельный объект, который делегирует в target. Внутри target <code>this</code> ссылается на target. Исправления: вынести метод в другой бин; self-инъекция прокси; <code>AopContext.currentProxy()</code> с exposeProxy; программный API (<code>TransactionTemplate</code>); AspectJ weaving.</p></div></details>
+<details class="q"><summary>Чем отличаются JDK dynamic proxy и CGLIB? Что выбирает Spring Boot?</summary><div class="a"><p>JDK — реализует интерфейсы через <code>java.lang.reflect.Proxy</code>, перехватывает методы интерфейсов. CGLIB — генерирует подкласс, перехватывает переопределяемые методы, не работает с final-классами/методами, создаёт экземпляр через Objenesis. Boot: <code>spring.aop.proxy-target-class=true</code> → CGLIB всегда.</p></div></details>
+<details class="q"><summary>Чем Spring AOP отличается от AspectJ?</summary><div class="a"><p>Spring AOP — прокси в рантайме, только вызовы методов бинов, проблемы с self-invocation, final, private. AspectJ — изменение байткода (compile-time через ajc или load-time weaving через агент), любые join points (поля, конструкторы, static), любые объекты, без self-invocation-проблем, но сложнее сборка. Spring использует библиотеку AspectJ только для разбора и сопоставления pointcut-ов; выполнение — прокси Spring AOP, без компилятора и weaver-а AspectJ.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

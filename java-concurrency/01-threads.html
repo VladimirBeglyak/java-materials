@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Потоки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · ФУНДАМЕНТ</div>
+  <h1>Потоки: жизненный цикл и API</h1>
+  <p class="lead">Что такое поток на самом деле, как его создать, остановить и дождаться — и почему <code>stop()</code> запрещён, а <code>interrupt()</code> — это просьба, а не приказ.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">java.lang.Thread</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="what"><span class="h-num">1.1</span>Процесс, поток, ядро</h2>
+<p><b>Процесс</b> — изолированное адресное пространство (своя память, файловые дескрипторы). <b>Поток</b> — независимый поток исполнения <i>внутри</i> процесса: свой стек вызовов и регистры (включая program counter), но <b>общая куча</b> со всеми остальными потоками процесса. Именно общая куча делает потоки дешёвыми для обмена данными — и опасными.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 300" role="img" aria-label="Память процесса JVM">
+  <rect x="10" y="10" width="780" height="280" rx="12" class="box"/>
+  <text x="30" y="38" font-weight="700">Процесс JVM</text>
+  <rect x="30" y="56" width="740" height="82" rx="9" class="box-acc"/>
+  <text x="50" y="82" font-weight="700">Heap — общая для всех потоков</text>
+  <text x="50" y="106" class="mono" font-size="13">объекты, массивы, static-поля (в Metaspace/Class) — здесь живут гонки данных</text>
+  <text x="50" y="126" class="mono muted" font-size="12">new Order(), HashMap, AtomicLong ...</text>
+  <g>
+    <rect x="30" y="156" width="230" height="118" rx="9" class="box-info"/>
+    <text x="48" y="180" font-weight="700">Thread «main»</text>
+    <text x="48" y="204" class="mono" font-size="12.5">стек: фреймы методов</text>
+    <text x="48" y="224" class="mono" font-size="12.5">локальные переменные</text>
+    <text x="48" y="244" class="mono" font-size="12.5">PC-регистр</text>
+    <text x="48" y="264" class="mono muted" font-size="12">≈ 1 МБ (-Xss)</text>
+  </g>
+  <g>
+    <rect x="285" y="156" width="230" height="118" rx="9" class="box-info"/>
+    <text x="303" y="180" font-weight="700">Thread «worker-1»</text>
+    <text x="303" y="204" class="mono" font-size="12.5">свой стек</text>
+    <text x="303" y="224" class="mono" font-size="12.5">свои локальные</text>
+    <text x="303" y="244" class="mono" font-size="12.5">свой PC</text>
+  </g>
+  <g>
+    <rect x="540" y="156" width="230" height="118" rx="9" class="box-info"/>
+    <text x="558" y="180" font-weight="700">Thread «worker-2»</text>
+    <text x="558" y="204" class="mono" font-size="12.5">свой стек</text>
+    <text x="558" y="224" class="mono" font-size="12.5">ThreadLocal-карта</text>
+    <text x="558" y="244" class="mono" font-size="12.5">→ ссылки в heap</text>
+  </g>
+</svg>
+<figcaption>Локальная переменная примитивного типа или ссылка — в стеке потока, и её никто не видит. Объект, на который ссылка указывает, — в куче, и его видят все, у кого есть ссылка.</figcaption>
+</figure>
+
+<p>Классический («платформенный») <code>Thread</code> в HotSpot — это <b>1:1 обёртка над потоком ОС</b> (pthread в Linux, Windows thread). Планирует его ядро ОС, а не JVM. Отсюда цена: ~1 МБ зарезервированного стека, системный вызов на создание, переключение контекста через ядро (единицы микросекунд). Поэтому тысячи платформенных потоков — нормально, сотни тысяч — нет. Это ограничение снимают виртуальные потоки (тема 10).</p>
+
+<div class="callout interview"><span class="c-title">Вопрос с собеседования: конкурентность vs параллелизм</span>
+<b>Concurrency</b> — структура программы: несколько задач в процессе выполнения одновременно, их шаги могут чередоваться (даже на одном ядре). <b>Parallelism</b> — свойство исполнения: шаги буквально выполняются одновременно на разных ядрах. Конкурентный код может не быть параллельным, но проблемы видимости и гонок возникают в обоих случаях.
+</div>
+
+<h2 id="create"><span class="h-num">1.2</span>Создание и запуск</h2>
+<pre data-title="ThreadBasics.java"><code class="java">public class ThreadBasics {
+    public static void main(String[] args) throws InterruptedException {
+        // 1. Runnable — задача отделена от механизма исполнения (предпочтительно)
+        Runnable task = () -&gt; System.out.println("run in " + Thread.currentThread().getName());
+
+        Thread t1 = new Thread(task, "worker-1");
+        t1.start();          // создаёт поток ОС, который вызовет run()
+        // t1.run();         // ОШИБКА: выполнится в текущем потоке, нового не будет
+
+        // 2. Builder API (JDK 21+): единый способ для платформенных и виртуальных
+        Thread t2 = Thread.ofPlatform().name("worker-", 2).daemon(false).start(task);
+        Thread t3 = Thread.ofVirtual().name("virt-1").start(task);
+
+        t1.join(); t2.join(); t3.join();  // ждём завершения
+        System.out.println("all done");
+    }
+}</code></pre>
+
+<div class="grid-2">
+  <div class="card"><h4>start() vs run()</h4><p><code>start()</code> можно вызвать <b>один раз</b> — повтор бросит <code>IllegalThreadStateException</code>. <code>run()</code> — обычный метод: вызвали напрямую — никакого параллелизма.</p></div>
+  <div class="card"><h4>Наследовать Thread?</h4><p>Почти никогда. Наследование смешивает «что делать» и «как исполнять». С <code>Runnable</code>/<code>Callable</code> задачу можно отдать в пул, в виртуальный поток, в тест.</p></div>
+</div>
+
+<h2 id="states"><span class="h-num">1.3</span>Состояния потока</h2>
+<p><code>Thread.getState()</code> возвращает одно из шести значений <code>Thread.State</code>. Это состояния <b>с точки зрения JVM</b>: поток в <code>RUNNABLE</code> может в этот момент не исполняться на CPU (ждать квант времени или блокирующий системный вызов чтения сокета).</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 380" role="img" aria-label="Диаграмма состояний потока">
+  <defs>
+    <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
+  </defs>
+  <rect x="20" y="160" width="110" height="50" rx="25" class="box"/><text x="75" y="190" text-anchor="middle" font-weight="700">NEW</text>
+  <rect x="300" y="160" width="160" height="50" rx="25" class="box-ok"/><text x="380" y="190" text-anchor="middle" font-weight="700">RUNNABLE</text>
+  <rect x="640" y="160" width="140" height="50" rx="25" class="box"/><text x="710" y="190" text-anchor="middle" font-weight="700">TERMINATED</text>
+  <rect x="300" y="20" width="160" height="50" rx="25" class="box-bad"/><text x="380" y="50" text-anchor="middle" font-weight="700">BLOCKED</text>
+  <rect x="140" y="300" width="160" height="50" rx="25" class="box-warn"/><text x="220" y="330" text-anchor="middle" font-weight="700">WAITING</text>
+  <rect x="460" y="300" width="190" height="50" rx="25" class="box-warn"/><text x="555" y="330" text-anchor="middle" font-weight="700">TIMED_WAITING</text>
+
+  <path d="M130 185 H296" class="ln" marker-end="url(#a1)"/><text x="213" y="176" text-anchor="middle" class="mono" font-size="12">start()</text>
+  <path d="M460 185 H636" class="ln" marker-end="url(#a1)"/><text x="548" y="176" text-anchor="middle" class="mono" font-size="12">run() завершён</text>
+
+  <path d="M360 160 V74" class="ln" marker-end="url(#a1)"/><text x="355" y="120" text-anchor="end" class="mono" font-size="11.5">вход в занятый</text><text x="355" y="135" text-anchor="end" class="mono" font-size="11.5">synchronized</text>
+  <path d="M400 74 V156" class="ln" marker-end="url(#a1)"/><text x="406" y="120" class="mono" font-size="11.5">монитор</text><text x="406" y="135" class="mono" font-size="11.5">освободился</text>
+
+  <path d="M320 210 L250 296" class="ln" marker-end="url(#a1)"/>
+  <text x="120" y="244" class="mono" font-size="11.5">wait(), join(),</text><text x="120" y="259" class="mono" font-size="11.5">park(), lock()*</text>
+  <path d="M235 300 L330 214" class="ln-dash" marker-end="url(#a1)"/>
+  <text x="270" y="290" class="mono muted" font-size="11">notify / unpark</text>
+
+  <path d="M440 210 L520 296" class="ln" marker-end="url(#a1)"/>
+  <text x="520" y="244" class="mono" font-size="11.5">sleep(n), wait(n),</text><text x="520" y="259" class="mono" font-size="11.5">parkNanos, join(n)</text>
+  <path d="M540 300 L452 214" class="ln-dash" marker-end="url(#a1)"/>
+</svg>
+<figcaption>* Поток, ждущий <code>ReentrantLock.lock()</code>, находится в <b>WAITING</b> (через <code>LockSupport.park</code>), а не в BLOCKED. BLOCKED — только ожидание входа в <code>synchronized</code>. Это частый вопрос на собеседовании и важная деталь при чтении thread dump.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<tr><th>Состояние</th><th>Как попасть</th><th>Как выйти</th></tr>
+<tr><td><b>NEW</b></td><td>объект создан, <code>start()</code> не вызван</td><td><code>start()</code></td></tr>
+<tr><td><b>RUNNABLE</b></td><td>исполняется или готов к исполнению (включая блокирующий I/O на уровне ОС)</td><td>любой переход ниже</td></tr>
+<tr><td><b>BLOCKED</b></td><td>ждёт монитор для входа в <code>synchronized</code> (или повторного входа после <code>wait</code>)</td><td>монитор освобождён и захвачен</td></tr>
+<tr><td><b>WAITING</b></td><td><code>Object.wait()</code>, <code>Thread.join()</code>, <code>LockSupport.park()</code></td><td><code>notify/notifyAll</code>, завершение потока, <code>unpark</code>, interrupt</td></tr>
+<tr><td><b>TIMED_WAITING</b></td><td>то же с таймаутом + <code>Thread.sleep</code></td><td>таймаут или событие выше</td></tr>
+<tr><td><b>TERMINATED</b></td><td><code>run()</code> завершился (нормально или исключением)</td><td>— (перезапуск невозможен)</td></tr>
+</table></div>
+
+<h2 id="interrupt"><span class="h-num">1.4</span>Прерывание: кооперативная отмена</h2>
+<p>В Java нет безопасного способа «убить» поток. <code>Thread.stop()</code> освобождал все мониторы посреди операции и оставлял объекты в полуизменённом состоянии; в JDK 20+ он всегда бросает <code>UnsupportedOperationException</code>. Вместо этого — <b>прерывание</b>: у каждого потока есть флаг <i>interrupted</i>, а код сам решает, как на него реагировать.</p>
+
+<div class="grid-2">
+  <div class="card"><h4>Если поток заблокирован</h4><p>В <code>sleep</code>, <code>wait</code>, <code>join</code>, <code>BlockingQueue.take</code>, <code>lockInterruptibly</code> — он просыпается с <code>InterruptedException</code>, и <b>флаг сбрасывается</b>.</p></div>
+  <div class="card"><h4>Если поток считает</h4><p>Ничего не происходит, кроме установки флага. Код должен сам проверять <code>Thread.currentThread().isInterrupted()</code>.</p></div>
+</div>
+
+<pre data-title="CancellableWorker.java" class="good-code"><code class="java">public final class CancellableWorker implements Runnable {
+    private final BlockingQueue&lt;String&gt; queue;
+
+    public CancellableWorker(BlockingQueue&lt;String&gt; queue) { this.queue = queue; }
+
+    @Override
+    public void run() {
+        try {
+            while (!Thread.currentThread().isInterrupted()) {   // проверка для CPU-работы
+                String job = queue.take();                        // блокирующий вызов — сам реагирует
+                process(job);
+            }
+        } catch (InterruptedException e) {
+            // Мы владеем этим потоком и выходим из run() — это и есть «обработка».
+            Thread.currentThread().interrupt(); // восстанавливаем флаг для кода выше по стеку
+        } finally {
+            cleanup();
+        }
+    }
+    private void process(String job) { /* ... */ }
+    private void cleanup() { /* закрыть ресурсы */ }
+}</code></pre>
+
+<div class="callout bad"><span class="c-title">Антипаттерн: проглотить прерывание</span>
+<pre class="bad-code"><code class="java">try { Thread.sleep(1000); } catch (InterruptedException e) { /* ignore */ }</code></pre>
+После этого флаг сброшен, и вызывающий код (например, пул при <code>shutdownNow()</code>) никогда не узнает, что поток просили остановиться. Правило: либо <b>пробросьте</b> <code>InterruptedException</code> выше, либо <b>восстановите флаг</b> <code>Thread.currentThread().interrupt()</code>.
+</div>
+
+<p>Методы: <code>t.interrupt()</code> — выставить флаг; <code>t.isInterrupted()</code> — прочитать; статический <code>Thread.interrupted()</code> — прочитать <b>и сбросить</b> флаг текущего потока (легко ошибиться).</p>
+
+<h2 id="join"><span class="h-num">1.5</span>join, sleep, yield, daemon, priority</h2>
+<div class="table-wrap"><table>
+<tr><th>API</th><th>Что делает</th><th>Подводные камни</th></tr>
+<tr><td><code>t.join()</code></td><td>ждёт завершения <code>t</code></td><td>Даёт <b>happens-before</b>: все записи потока <code>t</code> видны после возврата из <code>join</code>. Реализован через <code>wait()</code> на объекте потока — не синхронизируйтесь на объектах <code>Thread</code>.</td></tr>
+<tr><td><code>Thread.sleep(ms)</code></td><td>усыпляет текущий поток</td><td><b>Не отпускает мониторы</b>. Не даёт никаких гарантий видимости. Не используйте для «ожидания, пока другой поток что-то сделает».</td></tr>
+<tr><td><code>Thread.yield()</code></td><td>подсказка планировщику</td><td>Может ничего не делать. В продакшн-коде почти не нужен; <code>Thread.onSpinWait()</code> — для спин-циклов.</td></tr>
+<tr><td><code>setDaemon(true)</code></td><td>JVM не ждёт этот поток при выходе</td><td>Ставится <b>до</b> <code>start()</code>. Daemon-поток обрывается без <code>finally</code> — не пишите им в файлы/БД.</td></tr>
+<tr><td><code>setPriority</code></td><td>подсказка ОС</td><td>На Linux без прав по умолчанию игнорируется. Не строите на нём корректность.</td></tr>
+</table></div>
+
+<h2 id="exceptions"><span class="h-num">1.6</span>Исключения в потоках</h2>
+<p>Исключение, вылетевшее из <code>run()</code>, <b>не попадает</b> в поток, который вызвал <code>start()</code>. Поток просто умирает, а стек печатается в <code>System.err</code> обработчиком по умолчанию. В продакшене это значит: исключение пропадёт мимо логов.</p>
+<pre><code class="java">Thread.setDefaultUncaughtExceptionHandler((thread, ex) -&gt;
+        log.error("Uncaught in {}", thread.getName(), ex));
+
+Thread t = new Thread(() -&gt; { throw new IllegalStateException("boom"); });
+t.setUncaughtExceptionHandler((th, ex) -&gt; metrics.increment("worker.crash"));
+t.start();</code></pre>
+<div class="callout warn"><span class="c-title">Важно для пулов</span>
+Задача, отправленная через <code>executor.submit()</code>, не вызывает UncaughtExceptionHandler: исключение «упаковывается» в <code>Future</code> и всплывёт только на <code>future.get()</code> как <code>ExecutionException</code>. Если <code>get()</code> никто не вызовет — ошибка исчезнет молча. С <code>execute()</code> обработчик сработает. Подробно — в теме 08.
+</div>
+
+<h2 id="threadlocal"><span class="h-num">1.7</span>ThreadLocal и thread confinement</h2>
+<p>Самый простой способ избежать гонки — <b>не разделять данные</b>. Thread confinement: объект доступен только одному потоку. Варианты: локальные переменные (stack confinement), <code>ThreadLocal</code>, передача владения через очередь.</p>
+<pre data-title="ThreadLocal: классический пример"><code class="java">// SimpleDateFormat не потокобезопасен — даём каждому потоку свой экземпляр
+private static final ThreadLocal&lt;SimpleDateFormat&gt; FMT =
+        ThreadLocal.withInitial(() -&gt; new SimpleDateFormat("yyyy-MM-dd"));
+
+String format(Date d) { return FMT.get().format(d); }
+// В современном коде: DateTimeFormatter — неизменяемый и потокобезопасный, ThreadLocal не нужен.</code></pre>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 170" role="img" aria-label="Как устроен ThreadLocal">
+  <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="20" y="20" width="200" height="130" rx="9" class="box-info"/>
+  <text x="40" y="46" font-weight="700">Thread A</text>
+  <text x="40" y="72" class="mono" font-size="12.5">threadLocals:</text>
+  <rect x="40" y="84" width="160" height="50" rx="6" class="box"/>
+  <text x="52" y="105" class="mono" font-size="12">FMT → fmtA</text>
+  <text x="52" y="124" class="mono" font-size="12">CTX → userA</text>
+  <rect x="300" y="45" width="200" height="80" rx="9" class="box-acc"/>
+  <text x="400" y="78" text-anchor="middle" font-weight="700">ThreadLocal FMT</text>
+  <text x="400" y="100" text-anchor="middle" class="mono" font-size="12">ключ (weak ref)</text>
+  <rect x="580" y="20" width="200" height="130" rx="9" class="box-info"/>
+  <text x="600" y="46" font-weight="700">Thread B</text>
+  <text x="600" y="72" class="mono" font-size="12.5">threadLocals:</text>
+  <rect x="600" y="84" width="160" height="50" rx="6" class="box"/>
+  <text x="612" y="105" class="mono" font-size="12">FMT → fmtB</text>
+  <path d="M296 85 H205" class="ln-dash" marker-end="url(#a2)"/>
+  <path d="M504 85 H595" class="ln-dash" marker-end="url(#a2)"/>
+</svg>
+<figcaption>Значения хранятся <b>в самом потоке</b> (<code>Thread.threadLocals</code>), а ThreadLocal — лишь ключ. Поэтому значение живёт, пока жив поток.</figcaption>
+</figure>
+
+<div class="callout bad"><span class="c-title">Утечка в пулах</span>
+Потоки пула живут вечно, значит и их ThreadLocal-значения тоже. Если положить в ThreadLocal контекст запроса (userId, транзакцию, MDC) и не вызвать <code>remove()</code> в <code>finally</code>, следующая задача на этом потоке увидит <b>чужие данные</b>. В финтехе это инцидент безопасности, а не просто утечка памяти. Для виртуальных потоков и structured concurrency используйте <code>ScopedValue</code> (тема 10).
+</div>
+<pre class="good-code"><code class="java">CONTEXT.set(requestContext);
+try {
+    handle(request);
+} finally {
+    CONTEXT.remove();  // обязательно
+}</code></pre>
+
+<h2 id="lab"><span class="h-num">1.8</span>Практика</h2>
+<ol class="steps">
+  <li>Создайте поток, который в цикле инкрементирует счётчик без sleep, и прервите его из main через 100 мс. Почему он не останавливается? Добавьте проверку флага.</li>
+  <li>Замените проверку флага на <code>Thread.sleep(10)</code> внутри цикла и <code>catch</code> с пустым телом. Объясните, почему поток снова не останавливается.</li>
+  <li>Запустите 3 потока, каждый бросает исключение. Установите default handler и убедитесь, что все три залогированы. Повторите через <code>ExecutorService.submit</code> — что изменилось?</li>
+  <li>Снимите thread dump (<code>jstack &lt;pid&gt;</code> или <code>jcmd &lt;pid&gt; Thread.print</code>) программы, где один поток в <code>sleep</code>, второй в <code>synchronized</code>, третий в <code>lock.lock()</code>. Найдите в выводе состояния из таблицы выше.</li>
+</ol>
+
+<h2 id="sim"><span class="h-num">1.9</span>Интерактив: автомат состояний потока</h2>
+<div class="widget" id="tsW">
+  <div class="widget-title">Симулятор Thread.State</div>
+  <p class="hint">Управляйте потоком <code>worker</code>. Доступны только действия, возможные в текущем состоянии; внизу — то, что показал бы <code>worker.getState()</code> и thread dump.</p>
+  <div class="flow">
+    <div class="node" id="tsNEW"><b>NEW</b></div><span class="to">→</span>
+    <div class="node" id="tsRUNNABLE"><b>RUNNABLE</b></div><span class="to">⇄</span>
+    <div class="node" id="tsBLOCKED"><b>BLOCKED</b></div>
+    <div class="node" id="tsWAITING"><b>WAITING</b></div>
+    <div class="node" id="tsTIMED_WAITING"><b>TIMED_WAITING</b></div><span class="to">→</span>
+    <div class="node" id="tsTERMINATED"><b>TERMINATED</b></div>
+  </div>
+  <div class="controls" id="tsBtns"></div>
+  <div class="log" id="tsLog"></div>
+</div>
+<script>
+(function () {
+  var st, log, why;
+  var T = {
+    NEW: [["start()", "RUNNABLE", "JVM создаёт системный поток и передаёт его планировщику ОС. Повторный start() → IllegalThreadStateException."], ["run() напрямую", "NEW", "Ошибка новичка: run() выполнится в ТЕКУЩЕМ потоке как обычный метод, новый поток не создан."]],
+    RUNNABLE: [["synchronized(lock) — монитор занят", "BLOCKED", "Поток стоит в очереди на вход в монитор. interrupt() его НЕ разбудит."], ["lock.wait() / other.join() / LockSupport.park()", "WAITING", "Ждёт без таймаута: notify, завершения другого потока или unpark."], ["Thread.sleep(1000) / wait(500) / parkNanos", "TIMED_WAITING", "Ждёт с таймаутом. sleep не отпускает удерживаемые мониторы!"], ["блокирующее чтение из сокета", "RUNNABLE", "Для JVM поток по-прежнему RUNNABLE, хотя в ОС он спит в системном вызове. В thread dump: RUNNABLE + socketRead0."], ["run() завершился", "TERMINATED", "Нормальный возврат или непойманное исключение (оно уйдёт в UncaughtExceptionHandler)."]],
+    BLOCKED: [["владелец монитора вышел из synchronized", "RUNNABLE", "Поток захватил монитор и продолжает работу."], ["interrupt()", "BLOCKED", "Флаг прерывания установлен, но поток остаётся BLOCKED: вход в synchronized не прерываем. Для прерываемого ожидания — lock.lockInterruptibly()."]],
+    WAITING: [["notify() / notifyAll() на том же объекте", "BLOCKED", "После пробуждения из wait поток должен заново захватить монитор — он переходит в BLOCKED, а не сразу в RUNNABLE."], ["unpark(worker) / join завершился", "RUNNABLE", "Ожидание окончено."], ["interrupt()", "RUNNABLE", "wait/join бросают InterruptedException и СБРАСЫВАЮТ флаг прерывания; park просто возвращается с установленным флагом."]],
+    TIMED_WAITING: [["таймаут истёк", "RUNNABLE", "Поток снова готов к выполнению (после wait — сначала захват монитора)."], ["interrupt()", "RUNNABLE", "sleep бросает InterruptedException, флаг сброшен. Пустой catch здесь «съедает» запрос на остановку."]],
+    TERMINATED: [["start()", "TERMINATED", "IllegalThreadStateException: поток нельзя запустить повторно. Нужен новый объект Thread — или пул."]]
+  };
+  var dump = { NEW: "(потока ещё нет в дампе)", RUNNABLE: '"worker" #21 prio=5 tid=0x… nid=0x… runnable\n   java.lang.Thread.State: RUNNABLE', BLOCKED: '"worker" #21 … waiting for monitor entry\n   java.lang.Thread.State: BLOCKED (on object monitor)\n\t- waiting to lock <0x00000007ab12> (a java.lang.Object)', WAITING: '"worker" #21 … in Object.wait()\n   java.lang.Thread.State: WAITING (on object monitor)\n\t- waiting on <0x00000007ab12> (a java.lang.Object)', TIMED_WAITING: '"worker" #21 … waiting on condition\n   java.lang.Thread.State: TIMED_WAITING (sleeping)', TERMINATED: "(завершённого потока нет в дампе)" };
+  var $ = function (id) { return document.getElementById(id); };
+  function render() {
+    Object.keys(T).forEach(function (k) { $("ts" + k).className = "node " + (k === st ? "hl" : "off"); });
+    var box = $("tsBtns"); box.innerHTML = "";
+    T[st].forEach(function (a) { var b = document.createElement("button"); b.className = "btn"; b.type = "button"; b.textContent = a[0]; b.addEventListener("click", function () { log.unshift(st + " —[" + a[0] + "]→ " + a[1] + ": " + a[2]); st = a[1]; render(); }); box.appendChild(b); });
+    var r = document.createElement("button"); r.className = "btn"; r.type = "button"; r.textContent = "↺ new Thread"; r.addEventListener("click", function () { st = "NEW"; log = ["new Thread(task, \"worker\") — объект создан, системного потока ещё нет"]; render(); }); box.appendChild(r);
+    $("tsLog").textContent = "getState() = " + st + "\n" + dump[st] + "\n\n" + log.slice(0, 6).join("\n");
+  }
+  st = "NEW"; log = ["new Thread(task, \"worker\") — объект создан, системного потока ещё нет"]; render();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">1.10</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Поток заблокирован в <code>inputStream.read()</code> на сокете. Какое состояние покажет getState()?</p><ul><li>BLOCKED</li><li>WAITING</li><li>RUNNABLE — состояния Java не отражают блокировку в системном вызове</li><li>TIMED_WAITING</li></ul><div class="why">BLOCKED — только ожидание монитора. I/O-ожидание JVM считает выполнением нативного кода.</div></div>
+<div class="mcq" data-ok="1"><p>Что делает <code>thread.interrupt()</code>?</p><ul><li>Немедленно останавливает поток</li><li>Устанавливает флаг прерывания; блокирующие методы (sleep, wait, join) реагируют InterruptedException, остальной код должен проверять флаг сам</li><li>Убивает поток в ОС</li><li>Приостанавливает до resume()</li></ul><div class="why">Отмена в Java кооперативная. Поток сам решает, когда и как завершиться.</div></div>
+<div class="mcq" data-ok="0"><p>Что нужно сделать в <code>catch (InterruptedException e)</code>, если метод не может пробросить исключение?</p><ul><li>Восстановить флаг: Thread.currentThread().interrupt(), и завершить работу</li><li>Оставить catch пустым</li><li>Вызвать System.exit</li><li>Повторить sleep</li></ul><div class="why">Исключение сбрасывает флаг. Не восстановив его, вы скрываете запрос на остановку от кода выше — пул не сможет корректно завершиться.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что разделяют потоки одного процесса, а что у каждого своё?</summary><div class="a"><p>Общее: куча (все объекты), статические поля, загруженные классы, открытые файлы/сокеты процесса. Своё: стек вызовов (фреймы, локальные переменные, ссылки), program counter, набор ThreadLocal-значений, состояние прерывания. Поэтому локальная переменная потокобезопасна, а объект по ссылке из неё — нет, если ссылка «утекла» в другой поток.</p></div></details>
+<details class="q"><summary>В каком состоянии поток, ожидающий ReentrantLock.lock()? А ожидающий synchronized?</summary><div class="a"><p><code>lock()</code> → WAITING (реализован через <code>LockSupport.park</code>). <code>synchronized</code> → BLOCKED. В thread dump у первого будет <code>parking to wait for &lt;...ReentrantLock$NonfairSync&gt;</code>, у второго — <code>waiting to lock &lt;0x...&gt;</code>.</p></div></details>
+<details class="q"><summary>Почему stop() убрали, и как правильно остановить поток?</summary><div class="a"><p><code>stop()</code> бросал <code>ThreadDeath</code> в произвольной точке и отпускал все мониторы — инварианты защищённых объектов могли остаться нарушенными, и другие потоки видели «полусостояние». Правильно — кооперативно: <code>interrupt()</code> + код, который проверяет флаг и реагирует на <code>InterruptedException</code>; либо volatile-флаг; в пулах — <code>shutdownNow()</code> или <code>future.cancel(true)</code>, которые сами вызывают interrupt.</p></div></details>
+<details class="q"><summary>Что произойдёт с флагом прерывания после того, как sleep() бросил InterruptedException?</summary><div class="a"><p>Флаг будет <b>сброшен</b>. Поэтому, если вы не пробрасываете исключение дальше, нужно восстановить его: <code>Thread.currentThread().interrupt()</code>. Иначе код выше по стеку не узнает об отмене.</p></div></details>
+<details class="q"><summary>Гарантирует ли join() видимость записей другого потока?</summary><div class="a"><p>Да. По JMM: все действия в потоке T happens-before успешного возврата из <code>T.join()</code> в другом потоке. Поэтому после <code>join()</code> можно без volatile читать результаты, записанные T в обычные поля.</p></div></details>
+<details class="q"><summary>Почему ThreadLocal + пул потоков — источник багов? Как защититься?</summary><div class="a"><p>Значение хранится в объекте Thread, а потоки пула переиспользуются. Без <code>remove()</code> следующая задача получит значение предыдущей (утечка контекста, а при больших объектах — памяти; в контейнерах приложений ещё и ClassLoader leak). Защита: всегда <code>try/finally { remove(); }</code>, обёртка-декоратор для задач, либо <code>ScopedValue</code> с ограниченной областью действия.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Конкурентные коллекции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ИНСТРУМЕНТЫ</div>
+  <h1>Конкурентные коллекции</h1>
+  <p class="lead">Коллекции, которые сами отвечают за потокобезопасность — и при этом масштабируются. Главное здесь — понять <b>какие операции атомарны</b>, а какие нет, и как <code>ConcurrentHashMap</code> добивается параллельной записи.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">ConcurrentHashMap</span><span class="tag">BlockingQueue</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="landscape"><span class="h-num">7.1</span>Три поколения</h2>
+<div class="grid-3">
+  <div class="card"><h4>Synchronized (JDK 1.0–1.2)</h4><p><code>Vector</code>, <code>Hashtable</code>, <code>Collections.synchronizedXxx</code>. Один лок на всё. Итерация требует внешнего лока. Пропускная способность ≈ одного потока.</p></div>
+  <div class="card"><h4>Concurrent (JDK 5+)</h4><p><code>ConcurrentHashMap</code>, <code>ConcurrentLinkedQueue</code>, <code>ConcurrentSkipListMap</code>. Тонкие локи / CAS, атомарные составные операции, слабо согласованные итераторы.</p></div>
+  <div class="card"><h4>Copy-on-write и очереди</h4><p><code>CopyOnWriteArrayList</code> для «читают всегда, пишут редко»; семейство <code>BlockingQueue</code> для передачи данных между потоками.</p></div>
+</div>
+
+<h2 id="chm"><span class="h-num">7.2</span>ConcurrentHashMap изнутри (JDK 8+)</h2>
+<p>В JDK 7 карта делилась на 16 сегментов-локов. С JDK 8 устройство другое — и спрашивают именно его:</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 330" role="img" aria-label="Структура ConcurrentHashMap">
+  <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="20" y="22" font-weight="700">volatile Node[] table</text>
+  <g font-size="12" class="mono">
+    <rect x="20" y="34" width="90" height="40" rx="5" class="box"/><text x="65" y="59" text-anchor="middle">[0] null</text>
+    <rect x="20" y="78" width="90" height="40" rx="5" class="box-info"/><text x="65" y="103" text-anchor="middle">[1]</text>
+    <rect x="20" y="122" width="90" height="40" rx="5" class="box"/><text x="65" y="147" text-anchor="middle">[2] null</text>
+    <rect x="20" y="166" width="90" height="40" rx="5" class="box-ok"/><text x="65" y="191" text-anchor="middle">[3]</text>
+    <rect x="20" y="210" width="90" height="40" rx="5" class="box-warn"/><text x="65" y="235" text-anchor="middle">[4]</text>
+    <rect x="20" y="254" width="90" height="40" rx="5" class="box"/><text x="65" y="279" text-anchor="middle">…</text>
+  </g>
+  <rect x="150" y="80" width="120" height="36" rx="6" class="box-info"/><text x="210" y="103" text-anchor="middle" class="mono" font-size="12">Node k1</text>
+  <rect x="300" y="80" width="120" height="36" rx="6" class="box-info"/><text x="360" y="103" text-anchor="middle" class="mono" font-size="12">Node k7</text>
+  <path d="M110 98 H146" class="ln" marker-end="url(#g1)"/><path d="M270 98 H296" class="ln" marker-end="url(#g1)"/>
+  <text x="440" y="96" font-size="12.5">список; запись — synchronized(первый узел бакета)</text>
+  <text x="440" y="114" font-size="12.5" class="muted">лок на <tspan font-weight="700">один</tspan> бакет, не на таблицу</text>
+
+  <rect x="150" y="168" width="120" height="36" rx="6" class="box-ok"/><text x="210" y="191" text-anchor="middle" class="mono" font-size="12">TreeBin</text>
+  <path d="M110 186 H146" class="ln" marker-end="url(#g1)"/>
+  <text x="290" y="184" font-size="12.5">≥ 8 узлов в бакете и таблица ≥ 64 → красно-чёрное дерево</text>
+  <text x="290" y="202" font-size="12.5" class="muted">защита от плохих hashCode: O(log n) вместо O(n)</text>
+
+  <rect x="150" y="212" width="160" height="36" rx="6" class="box-warn"/><text x="230" y="235" text-anchor="middle" class="mono" font-size="12">ForwardingNode</text>
+  <path d="M110 230 H146" class="ln" marker-end="url(#g1)"/>
+  <text x="330" y="228" font-size="12.5">идёт resize: бакет уже перенесён в nextTable</text>
+  <text x="330" y="246" font-size="12.5" class="muted">пишущий поток <tspan font-weight="700">помогает</tspan> переносить (helpTransfer)</text>
+
+  <text x="140" y="58" font-size="12.5">пустой бакет → вставка одним CAS, без лока</text>
+  <text x="20" y="318" font-size="12.5" class="muted">Чтение (get) никогда не блокируется: volatile-чтение элементов таблицы + volatile поля val/next в Node.</text>
+</svg>
+</figure>
+<ul>
+  <li><b>Null запрещён</b> и в ключах, и в значениях: иначе <code>get(k) == null</code> неоднозначно (нет ключа или значение null), а проверить <code>containsKey</code> атомарно с <code>get</code> нельзя.</li>
+  <li><b>Итераторы слабо согласованные</b> (weakly consistent): не бросают <code>ConcurrentModificationException</code>, отражают состояние на какой-то момент во время обхода, могут увидеть или не увидеть параллельные изменения.</li>
+  <li><b><code>size()</code> — оценка</b> под конкурентной записью (счётчик на <code>CounterCell[]</code>, как LongAdder). Для больших карт — <code>mappingCount()</code> (long).</li>
+</ul>
+
+<h3>Атомарные составные операции — главное, что нужно уметь</h3>
+<pre data-title="Неправильно: check-then-act на CHM всё равно гонка" class="bad-code"><code class="java">if (!map.containsKey(k)) map.put(k, create(k));      // два потока создадут оба
+Integer old = map.get(word); map.put(word, old == null ? 1 : old + 1);  // потеря инкрементов</code></pre>
+<pre data-title="Правильно" class="good-code"><code class="java">ConcurrentHashMap&lt;String, Long&gt; counts = new ConcurrentHashMap&lt;&gt;();
+counts.merge(word, 1L, Long::sum);                         // атомарный счётчик
+
+ConcurrentHashMap&lt;String, LongAdder&gt; hot = new ConcurrentHashMap&lt;&gt;();
+hot.computeIfAbsent(word, k -&gt; new LongAdder()).increment(); // ещё лучше под высокой нагрузкой
+
+Map&lt;Long, Client&gt; cache = new ConcurrentHashMap&lt;&gt;();
+Client c = cache.computeIfAbsent(id, this::loadClient);    // загрузка ровно один раз на ключ
+
+map.compute(k, (key, v) -&gt; v == null ? init() : v.next()); // произвольное атомарное обновление
+map.putIfAbsent(k, v);  map.replace(k, expected, newV);  map.remove(k, expected);</code></pre>
+
+<div class="callout bad"><span class="c-title">Ловушки compute*/merge</span>
+<ul style="margin:6px 0 0">
+<li>Функция выполняется <b>под локом бакета</b>. Медленная функция (HTTP, запрос в БД) блокирует запись во все ключи этого бакета, а при resize — может тормозить и больше. Для дорогих загрузок кладите в карту <code>CompletableFuture</code> (см. Memoizer в теме 12) или используйте Caffeine.</li>
+<li><b>Нельзя менять ту же карту</b> изнутри функции (<code>computeIfAbsent</code>, внутри которого снова <code>computeIfAbsent</code> на этой карте) — в JDK 9+ это <code>IllegalStateException: Recursive update</code>, в JDK 8 мог быть вечный цикл.</li>
+<li>Функция должна быть короткой и без побочных эффектов, видимых другим потокам.</li>
+</ul></div>
+
+<h3>Bulk-операции</h3>
+<p><code>forEach</code>, <code>search</code>, <code>reduce</code> с порогом параллелизма — выполняются в <code>ForkJoinPool.commonPool()</code>:</p>
+<pre><code class="java">long total = balances.reduceValuesToLong(1_000, BigDecimal::longValue, 0L, Long::sum);
+String vip = clients.search(1_000, (id, c) -&gt; c.isVip() ? c.name() : null);</code></pre>
+
+<h2 id="cow"><span class="h-num">7.3</span>CopyOnWriteArrayList / Set</h2>
+<p>Каждая модификация копирует весь массив под локом и публикует новую ссылку через volatile. Чтение и итерация — без локов по неизменяемому снимку; итератор никогда не бросает CME и не видит изменений, сделанных после его создания.</p>
+<div class="grid-2">
+  <div class="card"><h4>✔ Идеально</h4><p>Списки слушателей/подписчиков, конфигурация маршрутов, whitelist — сотни чтений на одну запись, маленький размер.</p></div>
+  <div class="card"><h4>✘ Катастрофа</h4><p>Частые записи или большой список: каждая вставка — O(n) копирование и мусор для GC. <code>add</code> в цикле на 100 000 элементов = квадратичная сложность.</p></div>
+</div>
+
+<h2 id="queues"><span class="h-num">7.4</span>BlockingQueue: передача данных между потоками</h2>
+<p>Основа паттерна producer–consumer и сердце <code>ThreadPoolExecutor</code>. Четыре стиля API на каждую операцию:</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>Исключение</th><th>Спец. значение</th><th>Блокирует</th><th>Таймаут</th></tr>
+<tr><td>Вставка</td><td><code>add(e)</code></td><td><code>offer(e)</code> → false</td><td><code>put(e)</code></td><td><code>offer(e, t, u)</code></td></tr>
+<tr><td>Извлечение</td><td><code>remove()</code></td><td><code>poll()</code> → null</td><td><code>take()</code></td><td><code>poll(t, u)</code></td></tr>
+<tr><td>Просмотр</td><td><code>element()</code></td><td><code>peek()</code></td><td>—</td><td>—</td></tr>
+</table></div>
+
+<div class="table-wrap"><table>
+<tr><th>Реализация</th><th>Устройство</th><th>Когда</th></tr>
+<tr><td><code>ArrayBlockingQueue</code></td><td>кольцевой массив, <b>один</b> лок, два Condition; ограничена</td><td>предсказуемая память, явный backpressure</td></tr>
+<tr><td><code>LinkedBlockingQueue</code></td><td>связный список, <b>два</b> лока (putLock / takeLock) — producer и consumer не мешают друг другу; по умолчанию ёмкость <code>Integer.MAX_VALUE</code>!</td><td>высокая пропускная способность; всегда задавайте ёмкость</td></tr>
+<tr><td><code>SynchronousQueue</code></td><td>ёмкость 0: <code>put</code> ждёт, пока кто-то сделает <code>take</code> (рукопожатие)</td><td><code>newCachedThreadPool</code>: задача сразу отдаётся потоку или создаётся новый</td></tr>
+<tr><td><code>PriorityBlockingQueue</code></td><td>двоичная куча, неограниченная</td><td>задачи с приоритетом</td></tr>
+<tr><td><code>DelayQueue</code></td><td>элемент доступен только после истечения задержки</td><td>таймауты, отложенные повторы</td></tr>
+<tr><td><code>LinkedTransferQueue</code></td><td>lock-free, <code>transfer()</code> ждёт получателя</td><td>высокопроизводительная передача</td></tr>
+<tr><td><code>ConcurrentLinkedQueue</code> (не Blocking)</td><td>lock-free очередь Майкла–Скотта</td><td>неблокирующий обмен; ожидание — на вашей стороне</td></tr>
+</table></div>
+
+<pre data-title="Producer–consumer с остановкой через «ядовитую пилюлю»" class="good-code"><code class="java">public final class Pipeline {
+    private static final Payment POISON = new Payment(-1, BigDecimal.ZERO);
+    private final BlockingQueue&lt;Payment&gt; queue = new ArrayBlockingQueue&lt;&gt;(1_000); // backpressure
+
+    void produce(Iterable&lt;Payment&gt; source) throws InterruptedException {
+        for (Payment p : source) queue.put(p);   // блокируется, если consumer не успевает
+        queue.put(POISON);                        // сигнал конца (по одной пилюле на consumer)
+    }
+
+    void consume() throws InterruptedException {
+        while (true) {
+            Payment p = queue.take();
+            if (p == POISON) return;              // сравнение по ссылке
+            process(p);
+        }
+    }
+    private void process(Payment p) { /* ... */ }
+    record Payment(long id, BigDecimal amount) {}
+}</code></pre>
+<p>Передача объекта через очередь даёт HB (<code>put</code> HB <code>take</code>), поэтому producer может заполнить обычные поля объекта до <code>put</code>, а consumer — читать их без синхронизации, <b>если producer после этого объект не трогает</b> (передача владения). Пачками забирайте через <code>drainTo(list, max)</code> — меньше захватов лока.</p>
+
+<h2 id="skiplist"><span class="h-num">7.5</span>ConcurrentSkipListMap / Set</h2>
+<p>Конкурентный аналог <code>TreeMap</code>: упорядоченная карта на skip list с CAS, O(log n), без локов. Нужна, когда требуется сортировка и диапазоны (<code>headMap</code>, <code>ceilingKey</code>) под конкурентной записью: стакан заявок, окна по времени, планировщики.</p>
+
+<h2 id="choose"><span class="h-num">7.6</span>Шпаргалка выбора</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Выбор</th></tr>
+<tr><td>Кэш / счётчики по ключу</td><td><code>ConcurrentHashMap</code> + <code>computeIfAbsent</code>/<code>merge</code>; для кэша с вытеснением — Caffeine</td></tr>
+<tr><td>Сортированная карта под конкурентной записью</td><td><code>ConcurrentSkipListMap</code></td></tr>
+<tr><td>Слушатели, конфиг</td><td><code>CopyOnWriteArrayList</code> или volatile-ссылка на <code>List.copyOf</code></td></tr>
+<tr><td>Producer–consumer с ограничением</td><td><code>ArrayBlockingQueue</code> / <code>LinkedBlockingQueue(cap)</code></td></tr>
+<tr><td>Неблокирующая очередь</td><td><code>ConcurrentLinkedQueue</code> / <code>ConcurrentLinkedDeque</code></td></tr>
+<tr><td>Нужна согласованная операция над несколькими ключами</td><td>ни одна из коллекций не поможет — внешний лок или неизменяемый снимок</td></tr>
+</table></div>
+
+<h2 id="sim"><span class="h-num">7.7</span>Интерактив: атомарно ли это действие над ConcurrentHashMap</h2>
+<p>Каждый метод <code>ConcurrentHashMap</code> потокобезопасен. Но последовательность из двух потокобезопасных вызовов — уже нет. Выберите фрагмент кода, который выполняют одновременно много потоков:</p>
+<div class="widget" id="chW">
+  <div class="widget-title">Проверка составных операций</div>
+  <div class="controls"><label>код<select id="chCase" style="max-width:100%">
+    <option value="getput">if (!map.containsKey(k)) map.put(k, create());</option>
+    <option value="pia">map.putIfAbsent(k, create());</option>
+    <option value="cia">map.computeIfAbsent(k, key -&gt; create());</option>
+    <option value="inc">map.put(k, map.get(k) + 1);</option>
+    <option value="merge">map.merge(k, 1, Integer::sum);</option>
+    <option value="adder">map.computeIfAbsent(k, x -&gt; new LongAdder()).increment();</option>
+    <option value="size">if (map.size() &lt; 100) map.put(k, v);</option>
+    <option value="iter">for (var e : map.entrySet()) { … } пока другие потоки пишут</option>
+    <option value="recursive">map.computeIfAbsent(a, k -&gt; map.computeIfAbsent(b, …))</option>
+    <option value="slow">map.compute(k, (key, old) -&gt; httpClient.fetch(key));</option>
+    <option value="mutable">map.get(k).add(item);  // значение — ArrayList</option>
+  </select></label></div>
+  <div class="verdict" id="chOut"></div>
+</div>
+<script>
+(function () {
+  var A = {
+    getput: ["bad", "Гонка check-then-act: два потока одновременно видят «ключа нет», оба вызывают create() и оба делают put — второй затирает первый. Если create() создаёт соединение или запускает задачу, появится дубликат."],
+    pia: ["warn", "Вставка атомарна, значение в карте будет одно. Но create() вычисляется ДО вызова, в каждом потоке — лишние объекты создаются и выбрасываются. Плохо, если создание дорогое или имеет побочные эффекты."],
+    cia: ["ok", "Атомарно: функция вызывается не более одного раза на ключ, остальные потоки дождутся результата. Идиома ленивой инициализации и кэша."],
+    inc: ["bad", "Потерянные обновления: get и put — два отдельных вызова, между ними другой поток успевает записать своё значение."],
+    merge: ["ok", "Атомарное «прочитать-изменить-записать» под блокировкой бакета. Каноничный счётчик слов."],
+    adder: ["ok", "Быстрее merge под высокой конкуренцией: карта блокируется только при создании счётчика, а инкременты идут в LongAdder без блокировки бакета."],
+    size: ["bad", "size() — оценка в момент вызова, и между проверкой и put проходит время. Лимит будет превышен. Для ограниченной структуры нужен общий лок или готовый кэш (Caffeine)."],
+    iter: ["ok", "Итераторы слабо согласованы (weakly consistent): не бросают ConcurrentModificationException, видят состояние на момент создания или более позднее, каждый элемент — не более одного раза. Но это не снимок: часть параллельных изменений будет видна, часть нет."],
+    recursive: ["bad", "Изменение карты изнутри функции compute/computeIfAbsent запрещено. Если a и b попадут в один бакет — IllegalStateException: Recursive update (а до Java 9 — бесконечный цикл)."],
+    slow: ["bad", "Функция выполняется под блокировкой бакета: все потоки, чьи ключи попали в тот же бакет, ждут HTTP-вызов. Функции в compute* должны быть короткими и без I/O. Для долгих вычислений — карта CompletableFuture: computeIfAbsent(k, x -> supplyAsync(...))."],
+    mutable: ["bad", "Карта потокобезопасна, а значение ArrayList — нет: два потока портят список. Потокобезопасность контейнера не распространяется на содержимое. Варианты: неизменяемые значения с заменой через compute, CopyOnWriteArrayList, ConcurrentLinkedQueue."]
+  };
+  var s = document.getElementById("chCase"), o = document.getElementById("chOut");
+  function run() { var a = A[s.value]; o.className = "verdict " + a[0]; o.innerHTML = "<b>" + { ok: "Корректно. ", warn: "Корректно, но с оговоркой. ", bad: "Ошибка. " }[a[0]] + "</b>" + SG.esc(a[1]); }
+  s.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">7.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как ConcurrentHashMap (Java 8+) обеспечивает потокобезопасность записи?</p><ul><li>Один общий лок на всю таблицу</li><li>16 сегментов с ReentrantLock</li><li>CAS для пустого бакета и synchronized на первом узле занятого бакета</li><li>Копирование таблицы при каждой записи</li></ul><div class="why">Сегменты были в Java 7. Сейчас гранулярность — один бакет, а чтение вообще без блокировок (volatile-чтение узлов).</div></div>
+<div class="mcq" data-ok="1"><p>Для чего подходит CopyOnWriteArrayList?</p><ul><li>Для очереди задач с частыми вставками</li><li>Для редко изменяемых списков, которые часто читают и обходят: слушатели, конфигурация</li><li>Для хранения больших объёмов данных</li><li>Для сортировки</li></ul><div class="why">Каждая запись копирует весь массив — O(n). Зато итерация идёт по неизменяемому снимку без блокировок.</div></div>
+<div class="mcq" data-ok="0"><p>Почему ConcurrentHashMap не допускает null в качестве ключа и значения?</p><ul><li>В конкурентной среде get(k) == null был бы неоднозначен: «ключа нет» или «значение null» — а проверить вторым вызовом нельзя атомарно</li><li>Так исторически сложилось, причин нет</li><li>null нельзя хэшировать</li><li>Для экономии памяти</li></ul><div class="why">В HashMap неоднозначность снимается containsKey, но здесь между двумя вызовами карта может измениться.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как ConcurrentHashMap в JDK 8+ обеспечивает параллельную запись?</summary><div class="a"><p>Вставка в пустой бакет — CAS без лока. В непустой — <code>synchronized</code> на первом узле бакета: блокируется только этот бакет. Чтение без локов через volatile. Resize кооперативный: таблица переносится частями, перенесённые бакеты помечаются <code>ForwardingNode</code>, и потоки, пришедшие писать, помогают переносу. Длинные цепочки превращаются в красно-чёрные деревья.</p></div></details>
+<details class="q"><summary>Почему в ConcurrentHashMap нельзя класть null?</summary><div class="a"><p>Чтобы <code>get</code> однозначно сообщал «ключа нет». В однопоточной HashMap можно уточнить через <code>containsKey</code>, а в конкурентной между <code>get</code> и <code>containsKey</code> карта может измениться, и неоднозначность не разрешить.</p></div></details>
+<details class="q"><summary>Что не так с computeIfAbsent(id, this::loadFromRemoteService)?</summary><div class="a"><p>Удалённый вызов выполняется под локом бакета: другие записи в этот бакет ждут, пока сервис ответит; при таймаутах — каскадная деградация. Решение: хранить <code>CompletableFuture&lt;V&gt;</code> (функция только создаёт future, загрузка идёт вне лока) или специализированный кэш.</p></div></details>
+<details class="q"><summary>Почему new LinkedBlockingQueue&lt;&gt;() опасна в продакшене?</summary><div class="a"><p>Ёмкость по умолчанию <code>Integer.MAX_VALUE</code>, то есть очередь фактически неограничена. Если consumer медленнее producer'а, очередь растёт до OutOfMemoryError, а задержка обработки растёт неограниченно. Всегда задавайте ёмкость — это и есть backpressure.</p></div></details>
+<details class="q"><summary>Видит ли итератор CopyOnWriteArrayList элементы, добавленные после его создания?</summary><div class="a"><p>Нет. Итератор держит ссылку на массив-снимок на момент создания. Добавления создают новый массив, итератор продолжает обходить старый. Методы <code>remove</code> итератора не поддерживаются (<code>UnsupportedOperationException</code>).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

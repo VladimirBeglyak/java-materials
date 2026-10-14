@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Выделение памяти: TLAB, escape analysis</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.eden { display: flex; height: 46px; border: 1.5px solid var(--line); border-radius: 8px; overflow: hidden; margin: 10px 0; background: var(--bg-sunk); }
+.eden i { display: block; height: 100%; border-right: 1px solid var(--bg); font: 10px var(--font-mono); color: var(--fg); text-align: center; overflow: hidden; }
+.eden i.t0 { background: var(--accent-soft); } .eden i.t1 { background: var(--info-soft); } .eden i.t2 { background: var(--ok-soft); }
+.eden i.used { box-shadow: inset 0 -14px 0 rgba(0,0,0,.12); }
+</style>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ПАМЯТЬ</div>
+  <h1>Выделение памяти: TLAB, escape analysis</h1>
+  <p class="lead"><code>new</code> в Java дешевле, чем <code>malloc</code> в C: обычно это сдвиг указателя в собственном буфере потока — около десятка машинных инструкций без синхронизации. А часть объектов JIT вообще не создаёт, разложив их поля по регистрам. Разбираем быстрый и медленный путь выделения, TLAB, большие объекты, escape analysis со скалярной заменой — и почему темп выделения памяти определяет частоту сборок мусора.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">bump pointer</span><span class="tag">TLAB</span><span class="tag">медленный путь</span><span class="tag">humongous</span><span class="tag">escape analysis</span><span class="tag">allocation rate</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="fast"><span class="h-num">11.1</span>Быстрый путь: bump pointer в TLAB</h2>
+<p>Каждый поток получает в eden свой <b>TLAB</b> (Thread-Local Allocation Buffer) — кусок от килобайт до мегабайт. Выделение объекта: проверить, что <code>top + size ≤ end</code>, вернуть <code>top</code>, сдвинуть <code>top</code>. Ни блокировок, ни атомарных операций — буфер принадлежит одному потоку. Затем записать заголовок и обнулить поля (или всю TLAB заранее).</p>
+<pre data-title="так выглядит new Point() в JIT-коде (псевдокод)"><code class="txt">obj = thread.tlab_top
+new_top = obj + 24                    ; размер Point известен при компиляции
+if new_top &gt; thread.tlab_end: goto slow_path
+thread.tlab_top = new_top
+[obj+0] = mark (unlocked, no hash)    ; заголовок
+[obj+8] = klass(Point)
+[obj+12..24] = 0                      ; поля по умолчанию — затем конструктор (часто встроен)</code></pre>
+
+<div class="widget" id="tlW">
+  <div class="widget-title">Eden, поделённый на TLAB трёх потоков</div>
+  <div class="controls">
+    <label>поток<select id="tlT"><option value="0">T0</option><option value="1">T1</option><option value="2">T2</option></select></label>
+    <label>размер объекта, КБ<select id="tlS"><option value="0.03">32 Б (мелкий)</option><option value="1">1 КБ</option><option value="40">40 КБ (не помещается в остаток TLAB)</option><option value="3000">3 МБ (огромный)</option></select></label>
+    <button class="btn primary" type="button" id="tlA">new</button>
+    <button class="btn" type="button" id="tlA10">×50</button>
+    <button class="btn" type="button" id="tlR">Сначала</button>
+  </div>
+  <div class="eden" id="tlE"></div>
+  <div class="out" id="tlOut"></div>
+  <div class="log" id="tlLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var EDEN = 1024, TLAB = 64, chunks, cur, log, fast, slow, waste, outside, gcs;
+  function reset() { chunks = []; cur = [null, null, null]; log = ["eden " + EDEN + " КБ, начальный TLAB " + TLAB + " КБ"]; fast = slow = waste = outside = gcs = 0; draw(); }
+  function usedEden() { return chunks.reduce(function (s, c) { return s + c.size; }, 0); }
+  function newTlab(t) {
+    if (usedEden() + TLAB > EDEN) { gc(); }
+    var c = { t: t, size: TLAB, top: 0 }; chunks.push(c); cur[t] = c; return c;
+  }
+  function gc() { gcs++; log.push("eden заполнен → молодая сборка: живые объекты скопированы в survivor, eden очищен целиком"); chunks = []; cur = [null, null, null]; }
+  function alloc(t, kb) {
+    var c = cur[t];
+    if (kb > TLAB / 2 && kb < EDEN / 2) { slow++; outside += kb; if (usedEden() + kb > EDEN) gc(); chunks.push({ t: "x", size: kb, top: kb }); log.push("T" + t + ": объект " + kb + " КБ больше половины TLAB → выделен прямо в eden (медленный путь, CAS на общем указателе)"); return; }
+    if (kb >= EDEN / 2) { slow++; log.push("T" + t + ": огромный объект " + kb + " КБ → сразу в старое поколение (в G1 — humongous-регионы), минуя eden"); return; }
+    if (!c) { c = newTlab(t); slow++; log.push("T" + t + ": нет TLAB → медленный путь: выдать новую TLAB " + TLAB + " КБ"); }
+    if (c.top + kb > c.size) { waste += c.size - c.top; log.push("T" + t + ": TLAB заполнена (остаток " + (c.size - c.top).toFixed(1) + " КБ — потерян, заполняется «пустым» объектом) → новая TLAB"); slow++; c = newTlab(t); }
+    c.top += kb; fast++;
+  }
+  function draw() {
+    $("tlE").innerHTML = chunks.map(function (c) { var w = c.size / EDEN * 100; return '<i class="' + (c.t === "x" ? "" : "t" + c.t) + (c.top >= c.size ? " used" : "") + '" style="width:' + w + '%" title="' + (c.t === "x" ? "объект вне TLAB" : "TLAB T" + c.t + ": " + c.top.toFixed(1) + "/" + c.size + " КБ") + '">' + (c.t === "x" ? "obj" : "T" + c.t + " " + Math.round(c.top / c.size * 100) + "%") + "</i>"; }).join("");
+    $("tlOut").textContent = "занято eden: " + usedEden().toFixed(0) + " / " + EDEN + " КБ;  быстрых выделений: " + fast + ", медленных путей: " + slow + ", потеряно в хвостах TLAB: " + waste.toFixed(1) + " КБ, молодых сборок: " + gcs;
+    $("tlLog").textContent = log.slice(-8).join("\n"); $("tlLog").scrollTop = 1e6;
+  }
+  function act(n) { var t = +$("tlT").value, kb = +$("tlS").value; for (var i = 0; i < n; i++) alloc(t, kb); draw(); }
+  $("tlA").addEventListener("click", function () { act(1); }); $("tlA10").addEventListener("click", function () { act(50); });
+  $("tlR").addEventListener("click", reset); reset();
+})();
+</script>
+<ul>
+  <li>Размер TLAB подстраивается под каждый поток (<code>ResizeTLAB</code>): активно выделяющий поток получает большие буферы.</li>
+  <li>Медленный путь — вызов в рантайм JVM: новая TLAB, выделение в общем eden с CAS, а если eden кончился — сборка мусора.</li>
+  <li><b>Большие объекты</b>: в G1 объект больше половины региона — <i>humongous</i>, выделяется в старом поколении сразу целыми регионами; массивы на десятки мегабайт — частая причина неожиданных полных сборок.</li>
+</ul>
+
+<h2 id="escape"><span class="h-num">11.2</span>Escape analysis и скалярная замена</h2>
+<p>C2 анализирует, может ли объект «сбежать» из метода (после встраивания вызываемых методов). Если нет — объекта в куче может не быть вообще: его поля становятся локальными переменными в регистрах (<b>scalar replacement</b>), а блокировки на нём снимаются (<b>lock elision</b>).</p>
+<div class="widget" id="eaW">
+  <div class="widget-title">Сбежит ли объект?</div>
+  <div class="controls"><label>код<select id="eaS" class="wide">
+    <option value="local">точка, используемая только внутри метода</option>
+    <option value="return">объект возвращается из метода</option>
+    <option value="field">объект записывается в поле или коллекцию</option>
+    <option value="call">передаётся в метод, который JIT встроил</option>
+    <option value="callmega">передаётся в метод, который не встроен (слишком большой/мегаморфный)</option>
+    <option value="iter">итератор for-each по ArrayList</option>
+    <option value="sb">StringBuilder внутри метода + toString()</option>
+    <option value="branch">объект создаётся в одной из веток и сливается в φ (Java ≤ 22)</option>
+  </select></label></div>
+  <pre style="margin:0"><code class="java" id="eaC"></code></pre>
+  <div class="verdict" id="eaV"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    local: ["double dist(int x1, int y1, int x2, int y2) {\n    Point d = new Point(x2 - x1, y2 - y1);\n    return Math.sqrt(d.x * d.x + d.y * d.y);\n}", "ok", "NoEscape: объект не покидает метод → скалярная замена: d.x и d.y живут в регистрах, new не выполняется. Выделений памяти — ноль."],
+    "return": ["Point mid(Point a, Point b) {\n    return new Point((a.x + b.x) / 2, (a.y + b.y) / 2);\n}", "warn", "Сбегает через return. Но если mid() встроен в вызывающий метод, где результат не сбегает, анализ проводится после встраивания — и объект снова может исчезнуть."],
+    field: ["void track(int x, int y) {\n    history.add(new Point(x, y));\n}", "bad", "GlobalEscape: объект достижим из кучи — выделяется обязательно."],
+    call: ["int area(int w, int h) {\n    Rect r = new Rect(w, h);\n    return r.area();          // маленький метод — встроен\n}", "ok", "После встраивания r.area() объект не сбегает → скалярная замена."],
+    callmega: ["int area(Shape s) {\n    Box b = new Box(s);\n    return renderer.process(b);   // большой или мегаморфный — не встроен\n}", "bad", "ArgEscape: объект передан в неизвестный код — JIT не может доказать, что ссылка не сохранится. Выделение остаётся (но синхронизация на нём может быть снята, если известно, что ссылку не публикуют в другие потоки)."],
+    iter: ["long sum(ArrayList<Integer> list) {\n    long s = 0;\n    for (Integer v : list) s += v;   // new ArrayList.Itr()\n    return s;\n}", "ok", "Итератор обычно скалярно заменяется: hasNext/next встраиваются, Itr не сбегает. Поэтому for-each по ArrayList в горячем коде не создаёт мусора."],
+    sb: ["String key(String a, int b) {\n    StringBuilder sb = new StringBuilder();\n    sb.append(a).append(':').append(b);\n    return sb.toString();\n}", "warn", "StringBuilder и его внутренний массив часто не устраняются целиком (массив растёт, методы большие), но toString копирует результат. Для конкатенации предпочтительнее обычный «+» (indy, тема 04)."],
+    branch: ["Point p = flag ? new Point(1, 2) : new Point(3, 4);\nreturn p.x + p.y;", "warn", "Исторически объекты, сливающиеся в одну переменную из разных веток, мешали скалярной замене. В новых JDK (улучшения EA в C2 для слияний, Java 23+) это частично решено — проверяйте профилировщиком аллокаций."]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var d = D[$("eaS").value]; $("eaC").textContent = d[0]; $("eaV").className = "verdict " + d[1]; $("eaV").textContent = d[2]; }
+  $("eaS").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Не рассчитывайте вслепую</span>
+Escape analysis работает только в C2 (и Graal), только для горячего кода, после встраивания, и для небольших объектов (массивы ограниченного размера). В интерпретаторе и C1 всё выделяется. Проверка — профилировщик аллокаций (JFR <code>jdk.ObjectAllocationSample</code>, <code>async-profiler -e alloc</code>) и JMH с <code>-prof gc</code>.
+</div>
+
+<h2 id="rate"><span class="h-num">11.3</span>Темп выделения определяет частоту сборок</h2>
+<div class="widget" id="arW">
+  <div class="widget-title">Как часто будет молодая сборка</div>
+  <div class="controls">
+    <label>запросов в секунду<input type="number" id="arQ" value="2000" min="1"></label>
+    <label>КБ мусора на запрос<input type="number" id="arK" value="300" min="1"></label>
+    <label>размер молодого поколения, МБ<input type="number" id="arY" value="512" min="16"></label>
+  </div>
+  <div class="out" id="arOut"></div>
+  <div class="verdict" id="arV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var q = Math.max(1, +$("arQ").value), k = Math.max(1, +$("arK").value), y = Math.max(16, +$("arY").value), rate = q * k / 1024, every = y / rate;
+    $("arOut").textContent = "темп выделения: " + rate.toFixed(0) + " МБ/с (" + (rate / 1024).toFixed(2) + " ГБ/с)\nмолодая сборка каждые ≈ " + (every < 1 ? (every * 1000).toFixed(0) + " мс" : every.toFixed(1) + " с") + "\nобъект, живущий дольше ~" + (every * 2).toFixed(1) + " с (пару сборок), скорее всего доживёт до старого поколения";
+    $("arV").className = "verdict " + (every < 0.5 ? "bad" : every < 3 ? "warn" : "ok");
+    $("arV").textContent = every < 0.5 ? "Сборки чаще двух раз в секунду: заметная доля CPU уходит на GC, растут хвосты задержек. Сокращайте мусор (буферы, DTO-копии, логирование, boxing) или увеличивайте молодое поколение." : every < 3 ? "Частые, но обычно короткие сборки. Следите за продвижением в старое поколение." : "Комфортная частота молодых сборок.";
+  }
+  ["arQ", "arK", "arY"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<p>Молодая сборка копирует только <b>живые</b> объекты, поэтому её стоимость зависит не от объёма мусора, а от количества выживших. Много короткоживущего мусора — дёшево; много объектов «средней» жизни (кэши на секунды, большие батчи) — дорого: они копируются по нескольку раз и засоряют старое поколение.</p>
+
+<h2 id="quiz"><span class="h-num">11.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему выделение объекта в Java обычно не требует синхронизации между потоками?</p><ul><li>Объекты выделяются в стеке</li><li>JVM блокирует кучу целиком</li><li>Каждый поток выделяет в своём TLAB простым сдвигом указателя</li><li>Выделение происходит при компиляции</li></ul><div class="why">Синхронизация нужна только на медленном пути — при получении новой TLAB.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое скалярная замена?</p><ul><li>JIT не создаёт объект, который не покидает метод, а держит его поля в регистрах/локальных переменных</li><li>Замена объектов на примитивы в исходном коде</li><li>Сжатие указателей</li><li>Перемещение объекта в старое поколение</li></ul><div class="why">Работает в C2 после встраивания.</div></div>
+<div class="mcq" data-ok="3"><p>От чего в первую очередь зависит время молодой сборки в копирующем сборщике?</p><ul><li>От размера eden</li><li>От объёма мусора</li><li>От числа классов</li><li>От количества выживших объектов, которые надо скопировать</li></ul><div class="why">Мёртвые объекты не трогаются вовсе.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как найти, кто создаёт больше всего мусора?</summary><div class="a"><p>JFR (событие jdk.ObjectAllocationSample — стектрейсы выделений с весом) и JDK Mission Control; async-profiler в режиме alloc (флеймграф аллокаций); в тестах — JMH с -prof gc (байт на операцию). Затем смотреть горячие места: boxing в коллекциях, копирования строк, сериализация, логирование с конкатенацией, создание DTO и стримов в циклах.</p></div></details>
+<details class="q"><summary>Стоит ли делать пулы объектов, чтобы «не нагружать GC»?</summary><div class="a"><p>Для обычных объектов — нет: выделение в TLAB дешевле, чем взятие из пула с синхронизацией, а долгоживущие объекты пула ухудшают работу поколенческого GC (ссылки из старого поколения в молодое, барьеры). Пулы оправданы для дорогих в создании ресурсов (соединения, потоки), больших буферов (особенно direct) и в системах с жёсткими требованиями к задержкам после измерений.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Логи GC, настройка и OutOfMemoryError</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+#trSvg { width: 100%; max-width: 640px; display: block; margin: 8px auto; }
+#trSvg polyline { fill: none; stroke-width: 2; }
+#trSvg .used { stroke: var(--info); } #trSvg .after { stroke: var(--bad); } #trSvg .max { stroke: var(--fg-muted); stroke-dasharray: 5 4; }
+#trSvg text { font: 11px var(--font-mono); fill: var(--fg-muted); }
+</style>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · СБОРКА МУСОРА</div>
+  <h1>Логи GC, настройка и OutOfMemoryError</h1>
+  <p class="lead">Настройка GC начинается не с флагов, а с измерений: что говорит лог, как меняется занятость кучи после сборок, сколько времени уходит на паузы. Учимся читать строки лога G1 и ZGC, отличать утечку от маленькой кучи по графику, разбираем каждый вид <code>OutOfMemoryError</code> с порядком действий и анализ дампа кучи.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">-Xlog:gc</span><span class="tag">чтение логов</span><span class="tag">утечка vs мало кучи</span><span class="tag">виды OOM</span><span class="tag">heap dump</span><span class="tag">MAT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="logging"><span class="h-num">14.1</span>Включить логи GC (всегда, в продакшене)</h2>
+<pre data-title="унифицированное журналирование (Java 9+), ротация файлов"><code class="txt">-Xlog:gc*,safepoint:file=/var/log/app/gc.log:time,uptime,level,tags:filecount=10,filesize=50m
+# gc        — одна строка на сборку (кратко)
+# gc*       — фазы, размеры поколений, возраст объектов
+# safepoint — время до safepoint и длительность пауз
+# анализ: GCeasy, GCViewer, JDK Mission Control (по JFR)</code></pre>
+<p>Накладные расходы ничтожны, а без лога разбор инцидента «у нас были задержки ночью» превращается в гадание.</p>
+
+<h2 id="decode"><span class="h-num">14.2</span>Расшифровка строк лога</h2>
+<div class="widget" id="lgW">
+  <div class="widget-title">Что написано в строке лога</div>
+  <div class="controls"><label>строка<select id="lgS" class="wide">
+    <option value="0">G1: молодая пауза</option>
+    <option value="1">G1: смешанная пауза</option>
+    <option value="2">G1: конкурентная пометка</option>
+    <option value="3">G1: to-space exhausted</option>
+    <option value="4">G1: Full GC</option>
+    <option value="5">G1: humongous allocation</option>
+    <option value="6">ZGC: цикл молодого поколения</option>
+    <option value="7">ZGC: allocation stall</option>
+  </select></label></div>
+  <pre style="margin:0"><code class="txt" id="lgL"></code></pre>
+  <div class="verdict" id="lgV"></div>
+</div>
+<script>
+(function () {
+  var L = [
+    ["[2026-10-10T14:02:11.512+0300][842.117s][info][gc] GC(318) Pause Young (Normal) (G1 Evacuation Pause) 1843M->412M(4096M) 23.418ms", "ok", "Сборка №318, молодая пауза из-за заполнения eden. До сборки занято 1843 МБ, после — 412 МБ, вся куча 4096 МБ. Пауза 23 мс. Главная метрика здоровья — «после» (412M): если от сборки к сборке растёт, данные копятся в old."],
+    ["[info][gc] GC(325) Pause Young (Mixed) (G1 Evacuation Pause) 2210M->1180M(4096M) 41.902ms", "ok", "Смешанная пауза: вместе с молодыми регионами эвакуированы old-регионы с наибольшим мусором после конкурентной пометки. Освобождено ~1 ГБ."],
+    ["[info][gc] GC(319) Concurrent Mark Cycle\n[info][gc] GC(319) Pause Remark 2050M->2050M(4096M) 6.214ms\n[info][gc] GC(319) Pause Cleanup 2050M->2044M(4096M) 0.512ms\n[info][gc] GC(319) Concurrent Mark Cycle 812.554ms", "ok", "Цикл конкурентной пометки (запустился при достижении IHOP): почти всё — параллельно с приложением (812 мс), короткие паузы remark и cleanup. После него пойдут смешанные сборки."],
+    ["[info][gc] GC(402) Pause Young (Normal) (G1 Evacuation Pause) (Evacuation Failure: Allocation) 3990M->3950M(4096M) 412.033ms", "bad", "Эвакуация не смогла найти свободные регионы, куда копировать (to-space exhausted / evacuation failure). Пауза резко выросла, куча почти полна. Следом обычно Full GC. Причины: мало кучи, утечка, поздний старт пометки (снизьте IHOP или увеличьте G1ReservePercent)."],
+    ["[info][gc] GC(403) Pause Full (G1 Compaction Pause) 3950M->3720M(4096M) 2873.115ms", "bad", "Полная сборка с уплотнением всей кучи: 2,9 секунды остановки и освобождено всего 230 МБ — живых данных почти на всю кучу. Это предвестник OutOfMemoryError: Java heap space. Смотрите тренд «после GC» и делайте дамп кучи."],
+    ["[info][gc] GC(210) Pause Young (Concurrent Start) (G1 Humongous Allocation) 1500M->1320M(4096M) 18.551ms", "warn", "Сборка инициирована выделением humongous-объекта (больше половины региона). Частые такие строки — признак больших массивов (буферы, byte[] ответов, огромные коллекции). Увеличьте -XX:G1HeapRegionSize или уменьшите размер объектов."],
+    ["[info][gc] GC(85) Minor Collection (Allocation Rate) 6144M(75%)->1890M(23%) 0.089s\n[info][gc,phases] GC(85) y: Pause Mark Start 0.012ms ... y: Pause Relocate Start 0.009ms", "ok", "Generational ZGC: молодой цикл запущен из-за темпа выделения. Длительность цикла 89 мс — но это конкурентная работа; паузы (Pause Mark Start, Mark End, Relocate Start) — сотые доли миллисекунды."],
+    ["[info][gc] Allocation Stall (http-nio-8080-exec-17) 41.210ms", "bad", "ZGC не успел освободить память: поток ждал 41 мс — фактически пауза для этого запроса. Нужно больше запаса кучи, меньше темп выделения или больше ConcGCThreads."]
+  ];
+  var $ = function (i) { return document.getElementById(i); };
+  function run() { var l = L[+$("lgS").value]; $("lgL").textContent = l[0]; $("lgV").className = "verdict " + l[1]; $("lgV").textContent = l[2]; }
+  $("lgS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="trend"><span class="h-num">14.3</span>Утечка или мало кучи: смотрим на «занято после GC»</h2>
+<div class="widget" id="trW">
+  <div class="widget-title">Занятость кучи за несколько часов</div>
+  <div class="controls"><label>сценарий<select id="trS"><option value="ok">здоровое приложение</option><option value="leak">утечка памяти</option><option value="small">куча мала для рабочего набора</option><option value="spike">всплеск нагрузки (батч)</option></select></label></div>
+  <svg id="trSvg" viewBox="0 0 640 220" role="img" aria-label="График занятости кучи"><g id="trG"></g></svg>
+  <div class="hint">синяя пила — занятость кучи; красная линия — занятость сразу после сборок (живые данные); пунктир — Xmx</div>
+  <div class="verdict" id="trV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = $("trS").value, pts = [], after = [], live = 30, t = 0, x;
+    for (var i = 0; i < 26; i++) {
+      if (s === "leak") live = 30 + i * 2.4; if (s === "small") live = 78 + Math.sin(i) * 3; if (s === "spike") live = i > 10 && i < 16 ? 60 : 30;
+      var top = Math.min(97, live + (s === "small" ? 14 : 40)); x = 20 + i * 23;
+      pts.push(x + "," + (200 - live * 1.8), (x + 20) + "," + (200 - top * 1.8)); after.push(x + "," + (200 - live * 1.8));
+    }
+    $("trG").innerHTML = '<polyline class="max" points="20,20 620,20"/><text x="24" y="16">Xmx</text><polyline class="used" points="' + pts.join(" ") + '"/><polyline class="after" points="' + after.join(" ") + '"/><text x="24" y="214">время →</text>';
+    var v = $("trV");
+    if (s === "ok") { v.className = "verdict ok"; v.textContent = "Пила стабильна, уровень «после GC» горизонтален: живые данные не растут. Всё в порядке."; }
+    else if (s === "leak") { v.className = "verdict bad"; v.textContent = "Уровень «после GC» монотонно растёт — объекты не освобождаются. Это утечка: увеличение кучи лишь отсрочит OOM. Снимите два дампа с интервалом и сравните гистограммы, найдите в MAT, что удерживает растущие объекты."; }
+    else if (s === "small") { v.className = "verdict warn"; v.textContent = "Уровень «после GC» стабилен, но близко к пределу: сборки очень частые, пила мелкая, CPU уходит на GC. Это не утечка — рабочему набору тесно. Увеличьте кучу (или сократите кэши)."; }
+    else { v.className = "verdict ok"; v.textContent = "Временный подъём живых данных во время батча и возврат после него — нормальное поведение. Убедитесь, что пик помещается в кучу с запасом."; }
+  }
+  $("trS").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="oom"><span class="h-num">14.4</span>Виды OutOfMemoryError</h2>
+<div class="table-wrap"><table>
+<tr><th>Сообщение</th><th>Что исчерпано</th><th>Что делать</th></tr>
+<tr><td><code>Java heap space</code></td><td>куча: объект не поместился даже после полной сборки</td><td>дамп кучи (<code>-XX:+HeapDumpOnOutOfMemoryError</code>), анализ доминаторов; утечка или недостаточный Xmx</td></tr>
+<tr><td><code>GC overhead limit exceeded</code></td><td>Parallel GC: &gt;98% времени на GC и &lt;2% освобождено</td><td>то же, что heap space — куча почти полна живыми данными</td></tr>
+<tr><td><code>Metaspace</code> / <code>Compressed class space</code></td><td>метаданные классов</td><td>утечка загрузчиков (тема 07), генерация классов; <code>VM.classloader_stats</code></td></tr>
+<tr><td><code>Direct buffer memory</code></td><td>MaxDirectMemorySize</td><td>утечка или кэш direct-буферов (Netty), редкие GC при большой куче; NMT</td></tr>
+<tr><td><code>unable to create native thread</code></td><td>потоки ОС (лимит процессов, память)</td><td>пулы без ограничений, утечка потоков; jcmd Thread.print</td></tr>
+<tr><td><code>Requested array size exceeds VM limit</code></td><td>массив больше ~2³¹ элементов</td><td>баг или неверный размер (часто из данных)</td></tr>
+<tr><td><code>Cannot reserve … bytes of direct buffer memory</code>, отсутствие ошибки и kill -9</td><td>память контейнера</td><td>OOM killer: тема 09 и 22</td></tr>
+</table></div>
+<pre data-title="готовность к OOM в продакшене"><code class="txt">-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps/        # дамп при OOM (место на диске ≈ размер кучи)
+-XX:+ExitOnOutOfMemoryError                                       # упасть и перезапуститься, а не жить в полусломанном состоянии
+-XX:OnOutOfMemoryError="/opt/notify.sh %p"                        # хук
+jcmd &lt;pid&gt; GC.heap_dump /dumps/live.hprof                         # дамп по требованию (живые объекты: пауза!)
+jcmd &lt;pid&gt; GC.class_histogram | head -30                          # быстро: какие классы занимают кучу</code></pre>
+
+<h2 id="dump"><span class="h-num">14.5</span>Анализ дампа кучи</h2>
+<div class="widget stepper" id="mtSim">
+  <div class="widget-title">Поиск утечки в Eclipse MAT</div>
+  <div class="flow st-stage">
+    <div class="node" id="mt1"><b>Leak Suspects</b></div><span class="to">→</span>
+    <div class="node" id="mt2"><b>Dominator tree</b></div><span class="to">→</span>
+    <div class="node" id="mt3"><b>Retained size</b></div><span class="to">→</span>
+    <div class="node" id="mt4"><b>Path to GC roots</b></div><span class="to">→</span>
+    <div class="node" id="mt5"><b>Код</b></div>
+  </div>
+  <section class="st-step" data-t="Отчёт Leak Suspects" data-hl="mt1" data-log="Problem Suspect 1: one instance of java.util.concurrent.ConcurrentHashMap loaded by app occupies 2.9 GB (78%)"><p>Открываем .hprof (нужна память ≈ размеру дампа). Автоматический отчёт сразу указывает подозреваемого: одна ConcurrentHashMap удерживает 78% кучи.</p></section>
+  <section class="st-step" data-t="Дерево доминаторов" data-hl="mt2" data-log="dominator tree: ConcurrentHashMap → Node[] → 4.1M × SessionContext"><p>Объект A <b>доминирует</b> над B, если любой путь от корней к B проходит через A. Дерево доминаторов показывает, что именно освободится при удалении объекта.</p></section>
+  <section class="st-step" data-t="Shallow и retained" data-hl="mt3" data-log="shallow heap 64 B, retained heap 2.9 GB"><p><b>Shallow size</b> — размер самого объекта (у HashMap — десятки байт). <b>Retained size</b> — всё, что освободится вместе с ним. Сортируйте по retained.</p></section>
+  <section class="st-step" data-t="Путь к корням" data-hl="mt4" data-log="path to GC roots: class SessionRegistry → static field SESSIONS → ConcurrentHashMap"><p>«Path to GC Roots (exclude weak/soft references)» — кто держит объект: статическое поле <code>SessionRegistry.SESSIONS</code>.</p></section>
+  <section class="st-step" data-t="Исправление" data-hl="mt5" data-log="причина: сессии кладутся в статическую map при логине и не удаляются при логауте/таймауте → Caffeine с expireAfterAccess"><p>Причина в коде: записи добавляются и никогда не удаляются. Типичные утечки: статические коллекции-кэши без ограничения, слушатели без отписки, ThreadLocal в пулах, незакрытые ресурсы, неограниченные очереди. Исправление — ограниченный кэш (Caffeine), явное удаление, WeakReference там, где уместно (тема 15).</p></section>
+</div>
+
+<h2 id="tuning"><span class="h-num">14.6</span>Порядок настройки</h2>
+<ol class="steps">
+  <li><b>Цель</b>: что важно — p99 задержек, пропускная способность, память? Без цели настройка бессмысленна.</li>
+  <li><b>Размер кучи</b> — главная ручка: живые данные × 2–4 для G1/ZGC; проверить по «после GC».</li>
+  <li><b>Выбор сборщика</b> (тема 13) под цель.</li>
+  <li><b>Цель паузы</b> G1: <code>-XX:MaxGCPauseMillis</code> (не ставьте нереально малой — G1 уменьшит молодое поколение и будет собирать слишком часто).</li>
+  <li><b>Сократить мусор</b> в коде — часто эффективнее любых флагов.</li>
+  <li>Тонкие флаги (<code>G1NewSizePercent</code>, <code>InitiatingHeapOccupancyPercent</code>, <code>ConcGCThreads</code>) — только по данным лога и с повторным замером.</li>
+</ol>
+
+<h2 id="quiz"><span class="h-num">14.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>По какому признаку в логах GC отличить утечку от слишком маленькой кучи?</p><ul><li>По длине пауз</li><li>По тренду занятости после сборок: при утечке он растёт, при малой куче стабилен у предела</li><li>По числу потоков GC</li><li>Никак</li></ul><div class="why">Живые данные (после GC) — главный индикатор.</div></div>
+<div class="mcq" data-ok="3"><p>Что такое retained size в анализе дампа?</p><ul><li>Размер объекта без ссылок</li><li>Размер класса в metaspace</li><li>Объём, занимаемый строками</li><li>Объём памяти, который освободится, если объект станет недостижим (всё, над чем он доминирует)</li></ul><div class="why">Shallow — сам объект, retained — его «империя».</div></div>
+<div class="mcq" data-ok="0"><p>OutOfMemoryError: unable to create native thread — что увеличивать?</p><ul><li>Ничего из размеров кучи: проблема в числе потоков ОС — ищите неограниченные пулы и утечку потоков, проверьте лимиты процессов</li><li>-Xmx</li><li>MaxMetaspaceSize</li><li>-Xss</li></ul><div class="why">Увеличение Xss даже ухудшит ситуацию.</div></div>
+<div class="mcq" data-ok="2"><p>Зачем в продакшене <code>-XX:+ExitOnOutOfMemoryError</code>?</p><ul><li>Чтобы ускорить GC</li><li>Чтобы сохранить дамп</li><li>После OOM состояние приложения непредсказуемо (потоки умерли, кэши частично заполнены) — лучше упасть и быть перезапущенным оркестратором</li><li>Чтобы отключить OOM</li></ul><div class="why">В связке с HeapDumpOnOutOfMemoryError.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите ваш порядок действий при OutOfMemoryError: Java heap space в продакшене.</summary><div class="a"><p>Стабилизировать: перезапуск (ExitOnOutOfMemoryError + оркестратор), при необходимости временно больше памяти. Собрать данные: дамп кучи (HeapDumpOnOutOfMemoryError), логи GC за период (тренд «после GC»), метрики нагрузки. Анализ: Leak Suspects и дерево доминаторов в MAT, путь к GC roots, сравнение гистограмм двух моментов. Определить: утечка (найти и исправить код) или рост рабочего набора/всплеск (увеличить кучу, ограничить кэши, стримить большие данные вместо загрузки в память). Добавить алерт на «heap after GC».</p></div></details>
+<details class="q"><summary>Почему System.gc() в коде — плохая идея?</summary><div class="a"><p>Это запрос полной сборки с остановкой (в G1 — Full GC или, с -XX:+ExplicitGCInvokesConcurrent, конкурентный цикл): длинная пауза в произвольный момент, обычно без пользы, так как JVM сама знает, когда собирать. Встречается в библиотеках (старые версии для освобождения direct-буферов, RMI каждый час). Можно отключить -XX:+DisableExplicitGC, но осторожно с direct-памятью.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

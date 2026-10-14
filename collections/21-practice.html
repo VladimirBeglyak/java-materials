@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Практикум и собеседование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ПРАКТИКА</div>
+  <h1>Практикум и собеседование</h1>
+  <p class="lead">Закрепление курса: восемь задач на коллекции и итераторы с подсказками и разобранными решениями (их любят давать на собеседованиях), тренажёр из 32 вопросов о внутреннем устройстве с сохранением прогресса и итоговый тест.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">8 задач</span><span class="tag">32 вопроса</span><span class="tag">итоговый тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="tasks"><span class="h-num">21.1</span>Задачи</h2>
+<div class="quiz">
+<details class="q"><summary>1. Итератор, «расплющивающий» список списков: <code>[[1, 2], [], [3], [4, 5]]</code> → 1, 2, 3, 4, 5. Должен корректно пропускать пустые списки и поддерживать remove().</summary><div class="a">
+<pre><code class="java">final class FlatIterator&lt;T&gt; implements Iterator&lt;T&gt; {
+    private final Iterator&lt;? extends List&lt;T&gt;&gt; outer;
+    private Iterator&lt;T&gt; inner = Collections.emptyIterator();
+    private Iterator&lt;T&gt; last;                                   // кому делегировать remove
+    FlatIterator(List&lt;? extends List&lt;T&gt;&gt; lists) { outer = lists.iterator(); }
+    public boolean hasNext() {
+        while (!inner.hasNext() &amp;&amp; outer.hasNext()) inner = outer.next().iterator();   // идемпотентно: только продвигает к непустому
+        return inner.hasNext();
+    }
+    public T next() {
+        if (!hasNext()) throw new NoSuchElementException();
+        last = inner; return inner.next();
+    }
+    public void remove() {
+        if (last == null) throw new IllegalStateException();
+        last.remove(); last = null;
+    }
+}</code></pre><p>Ключевые моменты: пропуск пустых списков в цикле hasNext, NoSuchElementException, remove через итератор того подсписка, из которого был взят элемент.</p></div></details>
+<details class="q"><summary>2. LRU-кэш на O(1) для get и put без LinkedHashMap.</summary><div class="a"><p>HashMap&lt;K, Node&gt; + собственный двусвязный список с фиктивными head/tail. get: найти узел, вынуть из списка, вставить перед tail. put: обновить существующий (и переместить) или создать новый перед tail; при size &gt; capacity удалить узел после head и из карты. Короткий вариант — LinkedHashMap(cap, 0.75f, true) с removeEldestEntry (тема 10).</p></div></details>
+<details class="q"><summary>3. Топ-k самых частых слов в потоке из миллионов слов.</summary><div class="a"><pre><code class="java">Map&lt;String, Integer&gt; freq = new HashMap&lt;&gt;();
+for (String w : words) freq.merge(w, 1, Integer::sum);                       // O(n)
+PriorityQueue&lt;Map.Entry&lt;String, Integer&gt;&gt; heap =
+    new PriorityQueue&lt;&gt;(Map.Entry.comparingByValue());                        // мин-куча по частоте
+for (var e : freq.entrySet()) { heap.offer(e); if (heap.size() &gt; k) heap.poll(); }   // O(m log k)
+List&lt;String&gt; top = heap.stream().sorted(Map.Entry.&lt;String, Integer&gt;comparingByValue().reversed())
+                       .map(Map.Entry::getKey).toList();</code></pre><p>Альтернатива для приблизительного ответа на огромных потоках — Count-Min Sketch + куча.</p></div></details>
+<details class="q"><summary>4. Сгруппировать анаграммы: ["eat","tea","tan","ate","nat","bat"].</summary><div class="a"><pre><code class="java">Map&lt;String, List&lt;String&gt;&gt; groups = new HashMap&lt;&gt;();
+for (String w : words) {
+    char[] c = w.toCharArray(); Arrays.sort(c);
+    groups.computeIfAbsent(new String(c), k -&gt; new ArrayList&lt;&gt;()).add(w);   // ключ — отсортированные буквы
+}
+// или: words.stream().collect(groupingBy(w -&gt; sortChars(w)))</code></pre><p>Ключ — канонический вид (отсортированные буквы или массив частот 26 букв как строка).</p></div></details>
+<details class="q"><summary>5. Слить k отсортированных списков в один.</summary><div class="a"><pre><code class="java">record Head(int value, Iterator&lt;Integer&gt; rest) {}
+PriorityQueue&lt;Head&gt; pq = new PriorityQueue&lt;&gt;(Comparator.comparingInt(Head::value));
+for (List&lt;Integer&gt; l : lists) { var it = l.iterator(); if (it.hasNext()) pq.add(new Head(it.next(), it)); }
+List&lt;Integer&gt; out = new ArrayList&lt;&gt;();
+while (!pq.isEmpty()) {
+    Head h = pq.poll(); out.add(h.value());
+    if (h.rest().hasNext()) pq.add(new Head(h.rest().next(), h.rest()));
+}   // O(N log k)</code></pre></div></details>
+<details class="q"><summary>6. Первый неповторяющийся символ в строке за один проход по строке.</summary><div class="a"><p>LinkedHashMap&lt;Character, Integer&gt; со счётчиками (merge), затем первая запись со значением 1 — порядок вставки сохраняется. Для потока символов — LinkedHashSet кандидатов + HashSet повторившихся: при повторе удалить из кандидатов; ответ — <code>candidates.getFirst()</code> (Java 21).</p></div></details>
+<details class="q"><summary>7. Найти, есть ли в массиве два числа с суммой target, за O(n).</summary><div class="a"><pre><code class="java">Set&lt;Integer&gt; seen = new HashSet&lt;&gt;();
+for (int x : a) {
+    if (seen.contains(target - x)) return true;   // O(1) в среднем
+    seen.add(x);
+}
+return false;
+// с индексами — Map&lt;Integer, Integer&gt; значение → индекс</code></pre></div></details>
+<details class="q"><summary>8. Реализуйте BoundedBlockingQueue на ArrayDeque.</summary><div class="a"><pre><code class="java">final class BoundedQueue&lt;T&gt; {
+    private final Deque&lt;T&gt; items = new ArrayDeque&lt;&gt;(); private final int cap;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition notFull = lock.newCondition(), notEmpty = lock.newCondition();
+    BoundedQueue(int cap) { this.cap = cap; }
+    void put(T t) throws InterruptedException {
+        lock.lock();
+        try { while (items.size() == cap) notFull.await(); items.addLast(t); notEmpty.signal(); }
+        finally { lock.unlock(); }
+    }
+    T take() throws InterruptedException {
+        lock.lock();
+        try { while (items.isEmpty()) notEmpty.await(); T t = items.removeFirst(); notFull.signal(); return t; }
+        finally { lock.unlock(); }
+    }
+}</code></pre><p>Условие в цикле while (ложные пробуждения), две Condition — так устроена ArrayBlockingQueue.</p></div></details>
+</div>
+
+<h2 id="trainer"><span class="h-num">21.2</span>Тренажёр вопросов</h2>
+<div class="widget" id="trW">
+  <div class="widget-title">Ответьте вслух, затем проверьте</div>
+  <div class="controls"><label>тема<select id="trF"><option value="all">все</option></select></label><label>показывать<select id="trM"><option value="todo">невыученные</option><option value="all">все</option></select></label><span class="st-count" id="trP"></span></div>
+  <div class="verdict" id="trQ"></div>
+  <div class="out" id="trA" style="display:none"></div>
+  <div class="controls"><button class="btn" type="button" id="trShow">Показать ответ</button><button class="btn primary" type="button" id="trOk">✔ Знаю</button><button class="btn" type="button" id="trNo">↻ Повторить</button><button class="btn" type="button" id="trReset">Сбросить</button></div>
+</div>
+<script>
+(function () {
+  var Q = [
+    ["Основы", "Иерархия Collections Framework и почему Map не Collection.", "Iterable → Collection → List / Set / Queue (Deque), SortedSet/NavigableSet, SequencedCollection (21); Map отдельно с SortedMap/NavigableMap/SequencedMap. Map — отображение, а не группа элементов; доступ к коллекциям через keySet/values/entrySet."],
+    ["Основы", "Контракт Iterator.", "hasNext без побочных эффектов; next возвращает элемент или бросает NoSuchElementException; remove — один раз после next, иначе IllegalStateException; по умолчанию UnsupportedOperationException."],
+    ["Основы", "Во что компилируется for-each?", "Для Iterable — цикл с iterator(), hasNext(), next() и checkcast; для массива — индексный цикл. Итератор скрыт, поэтому удалить элемент через него нельзя."],
+    ["Основы", "Как работает fail-fast?", "Коллекция увеличивает modCount при структурных изменениях; итератор запоминает expectedModCount и сравнивает в next/remove; несовпадение → ConcurrentModificationException. Best effort, не гарантия для многопоточности."],
+    ["Основы", "Почему удаление предпоследнего элемента в for-each не бросает CME?", "После удаления size уменьшается и становится равным cursor — hasNext возвращает false, next с проверкой не вызывается; последний элемент молча пропущен."],
+    ["Основы", "Fail-fast, снимок и слабо согласованный итератор.", "Fail-fast (ArrayList, HashMap) — CME при изменении; снимок (CopyOnWriteArrayList) — обход копии массива, без remove; слабо согласованный (ConcurrentHashMap, ConcurrentLinkedQueue) — без CME, изменения после создания могут быть видны или нет."],
+    ["Основы", "Контракт equals/hashCode и что будет при нарушении.", "Равные объекты — равные хэши; при нарушении HashMap/HashSet не находят элементы и допускают дубликаты. Ключи должны быть неизменяемыми."],
+    ["Основы", "Что значит «сравнение согласовано с equals»?", "compare(a, b) == 0 ⇔ a.equals(b). TreeSet/TreeMap используют только компаратор: BigDecimal 1.0 и 1.00 — разные для HashSet, один элемент для TreeSet."],
+    ["Списки", "Как растёт ArrayList и почему add амортизированно O(1)?", "Пустой массив → 10 при первом add → рост в 1,5 раза с копированием. Суммарно копирований < 3n, на одно добавление — константа."],
+    ["Списки", "ArrayList против LinkedList.", "ArrayList: O(1) по индексу, вставка в середину — сдвиг memmove, компактность и локальность. LinkedList: узлы по 24 Б, O(n) по индексу, плохой кэш. Почти всегда ArrayList; для очередей — ArrayDeque."],
+    ["Списки", "Как устроен ArrayDeque?", "Кольцевой буфер с индексами head и tail, O(1) на обоих концах без сдвигов, рост с «распрямлением» кольца, null запрещён. Лучший стек и очередь."],
+    ["Списки", "Что такое subList и в чём опасность?", "Представление на часть списка: изменения видны в обе стороны; структурное изменение исходного списка в обход представления — CME; хранение представления держит весь большой список."],
+    ["Списки", "Какой алгоритм сортировки у list.sort и Arrays.sort(int[])?", "Объекты — TimSort (стабильный, адаптивный, O(n) на упорядоченных данных); примитивы — Dual-Pivot Quicksort (нестабильный, без доп. памяти)."],
+    ["Списки", "Что возвращает binarySearch при отсутствии ключа?", "−(точка вставки) − 1; список должен быть отсортирован тем же компаратором."],
+    ["Хеш", "Как HashMap вычисляет корзину?", "hash = h ^ (h >>> 16), где h = key.hashCode(); индекс = (n − 1) & hash; n — степень двойки."],
+    ["Хеш", "Что происходит при resize HashMap?", "Таблица удваивается; каждая цепочка делится по биту hash & oldCap на «lo» (остаётся в i) и «hi» (переходит в i + oldCap) с сохранением порядка, хэши не пересчитываются."],
+    ["Хеш", "Когда корзина HashMap становится деревом?", "Цепочка > 8 и таблица ≥ 64 корзин (иначе resize); обратно в список при ≤ 6. Защита от худшего случая и hash flooding."],
+    ["Хеш", "Почему new HashMap<>(n) не «на n элементов»?", "Аргумент — ёмкость таблицы; порог 0.75; для n элементов нужна ёмкость ≥ n/0.75 — HashMap.newHashMap(n) (Java 19)."],
+    ["Хеш", "Как сделать LRU-кэш на LinkedHashMap?", "Конструктор с accessOrder = true и removeEldestEntry, возвращающий size() > max. Не потокобезопасен: даже get меняет порядок."],
+    ["Хеш", "EnumSet и EnumMap — как устроены?", "EnumSet — биты в long (≤ 64 констант) или long[]; EnumMap — массив по ordinal. Быстрее и компактнее хеш-структур."],
+    ["Хеш", "Чем IdentityHashMap отличается от HashMap?", "Сравнение ключей по ==, identityHashCode, открытая адресация с линейным пробированием в одном массиве ключей и значений. Для обхода графов объектов."],
+    ["Упорядоченные", "Как устроен TreeMap и какие гарантии?", "Красно-чёрное дерево: высота ≤ 2·log₂(n+1), O(log n) на поиск, вставку, удаление; NavigableMap: floor/ceiling/higher/lower, head/tail/subMap-представления."],
+    ["Упорядоченные", "Как устроен PriorityQueue?", "Двоичная мин-куча в массиве: дети 2i+1, 2i+2; offer — siftUp O(log n), poll — siftDown O(log n), peek O(1), heapify O(n); итерация не по приоритету."],
+    ["Упорядоченные", "Как найти top-k из n?", "Мин-куча размера k: O(n log k) времени, O(k) памяти."],
+    ["Неизменяемость", "List.of против Collections.unmodifiableList.", "List.of — неизменяемая копия, null запрещены (даже contains(null) → NPE). unmodifiableList — представление: изменения исходного списка видны."],
+    ["Неизменяемость", "stream.toList() против Collectors.toList().", "toList() — неизменяемый, допускает null; Collectors.toList() — фактически ArrayList без гарантий."],
+    ["Неизменяемость", "Почему порядок Set.of меняется между запусками?", "Позиции в открытой адресации ImmutableCollections зависят от SALT, вычисляемого при старте JVM — чтобы на порядок не полагались."],
+    ["Итерация", "Что такое Spliterator?", "Итератор с возможностью деления (trySplit), оценкой размера и характеристиками (SIZED, ORDERED, DISTINCT…); основа стримов и параллельного обхода."],
+    ["Итерация", "Почему parallelStream по LinkedList неэффективен?", "Список нельзя поделить без обхода: части формируются партиями копированием в массивы, несбалансированно; ArrayList делится пополам за O(1)."],
+    ["Итерация", "Как течёт стрим?", "Лениво, по одному элементу через все стадии; короткое замыкание (limit, findFirst, anyMatch) останавливает обход; sorted и distinct — операции с состоянием, sorted — барьер."],
+    ["Конкурентность", "Как ConcurrentHashMap обеспечивает потокобезопасность?", "CAS для пустой корзины, synchronized на голове корзины, volatile-чтение без блокировок, распределённый счётчик размера, совместный resize через ForwardingNode, деревья в корзинах; null запрещены."],
+    ["Конкурентность", "Когда CopyOnWriteArrayList?", "Чтений и обходов намного больше, чем записей (слушатели): итераторы — снимки без блокировок; каждая запись копирует массив O(n)."]
+  ];
+  var $ = function (i) { return document.getElementById(i); }, K = "col-trainer-known", known = {}, cur = -1;
+  try { known = JSON.parse(localStorage.getItem(K) || "{}"); } catch (e) {}
+  var topics = Q.map(function (q) { return q[0]; }).filter(function (t, i, a) { return a.indexOf(t) === i; });
+  $("trF").innerHTML += topics.map(function (t) { return "<option>" + t + "</option>"; }).join("");
+  function save() { try { localStorage.setItem(K, JSON.stringify(known)); } catch (e) {} }
+  function pool() { var f = $("trF").value, m = $("trM").value; return Q.map(function (q, i) { return i; }).filter(function (i) { return (f === "all" || Q[i][0] === f) && (m === "all" || !known[i]); }); }
+  function next() {
+    var p = pool(); $("trA").style.display = "none"; $("trP").textContent = "выучено " + Object.keys(known).length + " из " + Q.length;
+    if (!p.length) { cur = -1; $("trQ").className = "verdict ok"; $("trQ").textContent = "В этой выборке всё выучено."; return; }
+    var c = p.filter(function (i) { return i !== cur; }); cur = (c.length ? c : p)[Math.floor(Math.random() * (c.length || p.length))];
+    $("trQ").className = "verdict"; $("trQ").textContent = "[" + Q[cur][0] + "] " + Q[cur][1];
+  }
+  $("trShow").addEventListener("click", function () { if (cur < 0) return; $("trA").textContent = Q[cur][2]; $("trA").style.display = ""; });
+  $("trOk").addEventListener("click", function () { if (cur >= 0) { known[cur] = 1; save(); } next(); });
+  $("trNo").addEventListener("click", function () { if (cur >= 0) { delete known[cur]; save(); } next(); });
+  $("trReset").addEventListener("click", function () { known = {}; save(); next(); });
+  ["trF", "trM"].forEach(function (i) { $(i).addEventListener("change", next); });
+  next();
+})();
+</script>
+
+<h2 id="final"><span class="h-num">21.3</span>Итоговый тест</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какая коллекция лучше всего подходит для стека в однопоточном коде?</p><ul><li>Stack</li><li>ArrayDeque</li><li>LinkedList</li><li>Vector</li></ul><div class="why">Кольцевой буфер без синхронизации и без узлов.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт: <code>for (var e : map.entrySet()) if (e.getValue() == 0) map.remove(e.getKey());</code> для HashMap?</p><ul><li>Всё корректно</li><li>Удалится только первый ключ</li><li>Ошибка компиляции</li><li>Скорее всего ConcurrentModificationException; правильно — map.values().removeIf(v -&gt; v == 0)</li></ul><div class="why">Удаление в обход итератора.</div></div>
+<div class="mcq" data-ok="0"><p>Почему в HashMap ёмкость — степень двойки?</p><ul><li>Индекс корзины вычисляется битовой маской, а при удвоении узлы делятся по одному биту хэша</li><li>Так экономится память</li><li>Этого требует equals</li><li>Для совместимости с Hashtable</li></ul><div class="why">Плюс перемешивание старших битов для качества младших.</div></div>
+<div class="mcq" data-ok="2"><p>Какую сложность даёт TreeMap.floorKey?</p><ul><li>O(1)</li><li>O(n)</li><li>O(log n)</li><li>O(n log n)</li></ul><div class="why">Один спуск по сбалансированному дереву.</div></div>
+<div class="mcq" data-ok="1"><p>Что гарантирует <code>Collections.unmodifiableList(list)</code>?</p><ul><li>Что список никогда не изменится</li><li>Что его нельзя изменить через эту обёртку; изменения исходного списка видны</li><li>Глубокую неизменяемость элементов</li><li>Потокобезопасность</li></ul><div class="why">Для неизменяемости — List.copyOf.</div></div>
+
+</div></main>
+</div>
+</body>
+</html>

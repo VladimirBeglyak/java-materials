@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Практикум и собеседование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ПРАКТИКА</div>
+  <h1>Практикум и собеседование</h1>
+  <p class="lead">Закрепление всего курса: десять задач на SQL с автоматической проверкой в браузерной базе, разбор типовых производственных ситуаций и вопросы, которые задают на собеседованиях бэкенд-разработчикам про реляционные базы, — с ответами.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">10 задач SQL</span><span class="tag">автопроверка</span><span class="tag">кейсы</span><span class="tag">собеседование</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="tasks"><span class="h-num">21.1</span>Задачи с автопроверкой</h2>
+<p>База магазина из темы 01: <code>customers(id, name, city, email, created_at)</code>, <code>products(id, name, category, price)</code>, <code>orders(id, customer_id, status, created_at)</code>, <code>order_items(order_id, product_id, qty, price)</code>. Проверка сравнивает ваш результат с эталонным: число столбцов и значения (имена столбцов не важны; порядок строк важен, только если сказано в задаче).</p>
+<div class="widget" id="tkW">
+  <div class="widget-title">Задача</div>
+  <div class="controls"><label>номер<select id="tkSel"></select></label><span class="st-count" id="tkScore"></span></div>
+  <div class="verdict" id="tkTask"></div>
+  <textarea id="tkSql" spellcheck="false"></textarea>
+  <div class="controls">
+    <button class="btn primary" type="button" id="tkRun">▶ Проверить (Ctrl+Enter)</button>
+    <button class="btn" type="button" id="tkHint">Подсказка</button>
+    <button class="btn" type="button" id="tkSol">Показать решение</button>
+    <button class="btn" type="button" id="tkNext">Следующая →</button>
+  </div>
+  <div id="tkOut"></div>
+</div>
+<script>
+(function () {
+  var T = [
+    ["Имена клиентов из Минска.", false, "WHERE city = …", "SELECT name FROM customers WHERE city = 'Минск';"],
+    ["Сумма каждого заказа: (order_id, total), по возрастанию order_id. Сумма = Σ qty × price позиций.", true, "GROUP BY order_id", "SELECT order_id, sum(qty * price) AS total\nFROM order_items GROUP BY order_id ORDER BY order_id;"],
+    ["Имена клиентов, у которых нет ни одного заказа.", false, "NOT EXISTS или LEFT JOIN … WHERE o.id IS NULL", "SELECT c.name FROM customers c\nWHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);"],
+    ["Выручка по категориям (category, revenue) только по заказам в статусах paid и shipped, по убыванию выручки.", true, "JOIN order_items → orders и products; WHERE status IN (…)", "SELECT p.category, sum(oi.qty * oi.price) AS revenue\nFROM order_items oi\nJOIN orders o ON o.id = oi.order_id\nJOIN products p ON p.id = oi.product_id\nWHERE o.status IN ('paid', 'shipped')\nGROUP BY p.category ORDER BY revenue DESC;"],
+    ["Каждый клиент и число его заказов (name, cnt), включая клиентов без заказов (cnt = 0).", false, "LEFT JOIN и count(o.id), а не count(*)", "SELECT c.name, count(o.id) AS cnt\nFROM customers c LEFT JOIN orders o ON o.customer_id = c.id\nGROUP BY c.id, c.name;"],
+    ["Название второго по цене товара (если цены совпадут — все такие товары).", false, "dense_rank() OVER (ORDER BY price DESC)", "SELECT name FROM (\n  SELECT name, dense_rank() OVER (ORDER BY price DESC) AS r FROM products\n) WHERE r = 2;"],
+    ["Нарастающий итог выручки по заказам: (order_id, created_at, total, running_total) в порядке created_at.", true, "сначала сумма заказа, затем sum(total) OVER (ORDER BY created_at)", "WITH t AS (\n  SELECT o.id AS order_id, o.created_at, sum(oi.qty * oi.price) AS total\n  FROM orders o JOIN order_items oi ON oi.order_id = o.id\n  GROUP BY o.id, o.created_at\n)\nSELECT order_id, created_at, total,\n       sum(total) OVER (ORDER BY created_at) AS running_total\nFROM t ORDER BY created_at;"],
+    ["Имена клиентов, покупавших товары и категории «электроника», и категории «продукты».", false, "GROUP BY клиент HAVING count(DISTINCT category) = 2 при фильтре по двум категориям", "SELECT c.name FROM customers c\nJOIN orders o ON o.customer_id = c.id\nJOIN order_items oi ON oi.order_id = o.id\nJOIN products p ON p.id = oi.product_id\nWHERE p.category IN ('электроника', 'продукты')\nGROUP BY c.id, c.name\nHAVING count(DISTINCT p.category) = 2;"],
+    ["Последний (по created_at) заказ каждого клиента: (customer_id, order_id).", false, "row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC)", "SELECT customer_id, id AS order_id FROM (\n  SELECT o.*, row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn\n  FROM orders o\n) WHERE rn = 1;"],
+    ["Заказы, сумма которых больше средней суммы заказа: (order_id, total).", false, "CTE с суммами заказов и сравнение с (SELECT avg(total) FROM …)", "WITH t AS (\n  SELECT order_id, sum(qty * price) AS total FROM order_items GROUP BY order_id\n)\nSELECT order_id, total FROM t WHERE total > (SELECT avg(total) FROM t);"]
+  ];
+  var $ = function (i) { return document.getElementById(i); }, SQLp = null, solved = {}, cur = 0, drafts = {};
+  var schema = (document.getElementById("shopSchema") || {}).textContent || "";
+  try { solved = JSON.parse(localStorage.getItem("rdb-practice-solved") || "{}"); } catch (e) {}
+  function load() {
+    if (SQLp) return SQLp;
+    SQLp = new Promise(function (res, rej) {
+      var base = "https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/";
+      function go() { window.initSqlJs({ locateFile: function (f) { return base + f; } }).then(res, rej); }
+      if (window.initSqlJs) return go();
+      var s = document.createElement("script"); s.src = base + "sql-wasm.js"; s.onload = go;
+      s.onerror = function () { SQLp = null; rej(new Error("Не удалось загрузить sql.js — нужен доступ к cdn.jsdelivr.net")); };
+      document.head.appendChild(s);
+    });
+    return SQLp;
+  }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+  function norm(v) { return v === null ? "∅" : typeof v === "number" ? String(Math.round(v * 100) / 100) : String(v); }
+  function rows(r) { return r ? r.values.map(function (row) { return row.map(norm).join("¦"); }) : []; }
+  function table(r) {
+    if (!r) return '<div class="hint">запрос не вернул строк</div>';
+    return '<div class="table-wrap"><table><tr>' + r.columns.map(function (c) { return "<th>" + esc(c) + "</th>"; }).join("") + "</tr>" + r.values.slice(0, 50).map(function (row) { return "<tr>" + row.map(function (v) { return "<td>" + (v === null ? "NULL" : esc(v)) + "</td>"; }).join("") + "</tr>"; }).join("") + "</table></div>";
+  }
+  function exec(SQL, q) { var db = new SQL.Database(); db.run(schema); try { var r = db.exec(q); return r[r.length - 1] || null; } finally { db.close(); } }
+  function score() { var n = Object.keys(solved).length; $("tkScore").textContent = "решено " + n + " из " + T.length; }
+  function show(i) {
+    drafts[cur] = $("tkSql").value; cur = i; var t = T[i];
+    $("tkSel").value = i;
+    $("tkTask").className = "verdict" + (solved[i] ? " ok" : "");
+    $("tkTask").textContent = (solved[i] ? "✔ " : "") + (i + 1) + ". " + t[0] + (t[1] ? " (порядок строк важен)" : "");
+    $("tkSql").value = drafts[i] || "SELECT ";
+    $("tkOut").innerHTML = "";
+  }
+  function check() {
+    var t = T[cur], q = $("tkSql").value;
+    $("tkOut").innerHTML = '<div class="hint">загрузка SQLite…</div>';
+    load().then(function (SQL) {
+      var mine, ref;
+      try { mine = exec(SQL, q); } catch (e) { $("tkOut").innerHTML = '<div class="verdict bad">Ошибка: ' + esc(e.message) + "</div>"; return; }
+      ref = exec(SQL, t[3]);
+      var a = rows(mine), b = rows(ref), cols = (mine ? mine.columns.length : 0) === (ref ? ref.columns.length : 0);
+      if (!t[1]) { a = a.slice().sort(); b = b.slice().sort(); }
+      var ok = cols && a.length === b.length && a.every(function (x, k) { return x === b[k]; });
+      var msg = ok ? "✔ Верно!" : !cols ? "✘ Другое число столбцов: ожидается " + (ref ? ref.columns.length : 0) + "." : a.length !== b.length ? "✘ Ожидается строк: " + b.length + ", у вас: " + a.length + "." : "✘ Строки отличаются" + (t[1] ? " (проверьте и порядок)." : ".");
+      if (ok) { solved[cur] = 1; try { localStorage.setItem("rdb-practice-solved", JSON.stringify(solved)); } catch (e) {} score(); $("tkTask").className = "verdict ok"; }
+      $("tkOut").innerHTML = '<div class="verdict ' + (ok ? "ok" : "bad") + '">' + msg + "</div>" + table(mine);
+    }, function (e) { $("tkOut").innerHTML = '<div class="verdict bad">' + esc(e.message) + "</div>"; });
+  }
+  $("tkSel").innerHTML = T.map(function (t, i) { return '<option value="' + i + '">Задача ' + (i + 1) + "</option>"; }).join("");
+  $("tkSel").addEventListener("change", function () { show(+$("tkSel").value); });
+  $("tkRun").addEventListener("click", check);
+  $("tkSql").addEventListener("keydown", function (e) { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); check(); } });
+  $("tkHint").addEventListener("click", function () { $("tkOut").innerHTML = '<div class="verdict">Подсказка: ' + esc(T[cur][2]) + "</div>"; });
+  $("tkSol").addEventListener("click", function () { $("tkSql").value = T[cur][3]; $("tkOut").innerHTML = '<div class="verdict warn">Эталонное решение подставлено — нажмите «Проверить», чтобы увидеть результат.</div>'; });
+  $("tkNext").addEventListener("click", function () { show((cur + 1) % T.length); });
+  document.addEventListener("DOMContentLoaded", function () { schema = document.getElementById("shopSchema").textContent; });
+  score(); show(0);
+})();
+</script>
+
+<h2 id="cases"><span class="h-num">21.2</span>Производственные ситуации</h2>
+<div class="quiz">
+<details class="q"><summary>После релиза p99 запроса списка заказов вырос с 20 мс до 2 с. С чего начать?</summary><div class="a"><p>Сравнить планы до и после (auto_explain, pg_stat_statements по queryid): изменился запрос (ORM сгенерировал другой SQL, добавился OR/функция, N+1) или план (статистика, новый индекс отвлёк планировщик, рост данных). EXPLAIN (ANALYZE, BUFFERS) на продовых данных с «тяжёлыми» параметрами. Быстрое смягчение — откат релиза; затем исправление: индекс под новый запрос, переписывание, ANALYZE (темы 08–09).</p></div></details>
+<details class="q"><summary>Диск базы заполнился на 95% за ночь, данных больше не стало.</summary><div class="a"><p>Проверить <code>pg_wal</code>: упал <code>archive_command</code> или неактивный слот репликации держит WAL (pg_stat_archiver, pg_replication_slots). Проверить временные файлы (огромная сортировка/хэш, log_temp_files). Проверить раздувание горячих таблиц из-за долгой транзакции. Действия: починить архив/удалить мёртвый слот, завершить виновную сессию, освободить место; затем алерты на эти причины (темы 10, 14, 15, 19).</p></div></details>
+<details class="q"><summary>Периодические ошибки «deadlock detected» при массовом обновлении статусов.</summary><div class="a"><p>Две задачи обновляют пересекающиеся наборы строк в разном порядке. Решение: обрабатывать порциями в едином порядке (ORDER BY id) с предварительным <code>SELECT … ORDER BY id FOR UPDATE</code> или <code>SKIP LOCKED</code>, чтобы задачи не пересекались; повтор при 40P01; проверить внешние ключи без индексов (тема 13).</p></div></details>
+<details class="q"><summary>«Иногда» продаётся товар, которого нет на складе.</summary><div class="a"><p>Гонка «проверить остаток → списать» в READ COMMITTED (потерянное обновление или write skew). Исправить атомарным <code>UPDATE … SET qty = qty − n WHERE id = ? AND qty &gt;= n</code> с проверкой числа строк, или FOR UPDATE, или оптимистической блокировкой; добавить <code>CHECK (qty &gt;= 0)</code> как последнюю линию защиты (тема 12).</p></div></details>
+<details class="q"><summary>Миграция с индексом прошла на стейдже за секунду, а на проде положила сервис на 20 минут.</summary><div class="a"><p>Обычный CREATE INDEX блокирует запись на время построения; на стейдже — тысячи строк, на проде — сотни миллионов. Использовать CREATE INDEX CONCURRENTLY вне транзакции, lock_timeout, линтер миграций, проверку на копии продовых объёмов (тема 18).</p></div></details>
+</div>
+
+<h2 id="interview"><span class="h-num">21.3</span>Вопросы с собеседований</h2>
+<div class="quiz">
+<details class="q"><summary>Что такое ACID? Какая буква обеспечивается каким механизмом в PostgreSQL?</summary><div class="a"><p>Атомарность — статус транзакции в pg_xact и правила видимости MVCC (версии прерванной транзакции невидимы). Согласованность — ограничения (PK, FK, CHECK, UNIQUE, EXCLUDE) и триггеры, плюс логика приложения. Изоляция — MVCC-снимки и блокировки строк, SSI для SERIALIZABLE. Долговечность — WAL и fsync при коммите, репликация для защиты от потери сервера.</p></div></details>
+<details class="q"><summary>Чем кластерный индекс отличается от некластерного?</summary><div class="a"><p>В кластерном индексе (InnoDB, SQL Server) листья содержат сами строки — таблица упорядочена по ключу; он один на таблицу. Некластерный хранит ключ и ссылку на строку (в InnoDB — значение первичного ключа, в PostgreSQL — ctid). В PostgreSQL все индексы некластерные; команда CLUSTER упорядочивает таблицу однократно, порядок не поддерживается.</p></div></details>
+<details class="q"><summary>Почему индекс может не использоваться, хотя он есть?</summary><div class="a"><p>Условие отбирает большую долю строк (полный просмотр дешевле); функция или приведение типа над столбцом; LIKE с ведущим %; нет левого префикса составного индекса; неверная статистика; несовпадение типов параметра и столбца; collation для LIKE; маленькая таблица; generic plan для подготовленного выражения; OR по разным столбцам.</p></div></details>
+<details class="q"><summary>Что такое N+1 и как его найти и исправить в Spring Data JPA?</summary><div class="a"><p>Загрузка списка одним запросом и связей — отдельным запросом на каждый элемент. Найти: логирование SQL/статистика Hibernate (число запросов на HTTP-запрос), pg_stat_statements (calls), тесты с подсчётом запросов. Исправить: JOIN FETCH / @EntityGraph, batch fetch size, DTO-проекции, двухшаговая загрузка для пагинации.</p></div></details>
+<details class="q"><summary>OFFSET-пагинация медленная на дальних страницах. Почему и что делать?</summary><div class="a"><p>OFFSET N заставляет прочитать и отбросить N строк. Keyset-пагинация: <code>WHERE (created_at, id) &lt; (:c, :i) ORDER BY created_at DESC, id DESC LIMIT 20</code> с индексом (created_at, id) — стоимость постоянна и нет дублей при вставках.</p></div></details>
+<details class="q"><summary>Как работает MVCC и что такое VACUUM?</summary><div class="a"><p>UPDATE/DELETE создают новые версии и помечают старые номером транзакции; снимок определяет, какие версии видимы. Читатели не блокируют писателей. Старые версии, невидимые никому, удаляет VACUUM (также обновляет visibility map и замораживает старые xid против wraparound). Долгие транзакции мешают очистке.</p></div></details>
+<details class="q"><summary>Какие уровни изоляции вы знаете и какой выбрать?</summary><div class="a"><p>READ UNCOMMITTED (в PG = READ COMMITTED), READ COMMITTED (снимок на запрос; по умолчанию), REPEATABLE READ (снимок на транзакцию; в PG — snapshot isolation, защищает и от фантомов, но не от write skew), SERIALIZABLE (SSI, требует повторов). Для OLTP — READ COMMITTED + атомарные операции и явные блокировки; отчёты — REPEATABLE READ; сложные инварианты — SERIALIZABLE с повтором.</p></div></details>
+<details class="q"><summary>Как избежать deadlock-ов?</summary><div class="a"><p>Единый порядок захвата ресурсов, короткие транзакции, блокировать заранее всё нужное (SELECT … ORDER BY id FOR UPDATE), индексы на внешних ключах, повтор при 40P01, NOWAIT/SKIP LOCKED там, где ожидание не нужно.</p></div></details>
+<details class="q"><summary>Как масштабировать реляционную базу?</summary><div class="a"><p>По порядку: оптимизация запросов и индексов, вертикальное масштабирование, пулы соединений и кэширование, реплики для чтения (с учётом лага), партиционирование больших таблиц, разделение по сервисам/доменам, шардинг или распределённая SQL-база. Запись масштабируется только шардингом.</p></div></details>
+<details class="q"><summary>Что такое WAL и зачем он нужен?</summary><div class="a"><p>Журнал предзаписи: каждое изменение сначала описывается в последовательном журнале, при коммите сбрасывается только журнал. Обеспечивает долговечность и восстановление после сбоя, служит основой репликации, PITR и логического декодирования (CDC).</p></div></details>
+<details class="q"><summary>Нормализация vs денормализация — когда что?</summary><div class="a"><p>Нормализация (до 3НФ) — по умолчанию для OLTP: нет аномалий обновления, каждый факт в одном месте. Денормализация — осознанно для чтения: агрегаты, счётчики, материализованные представления, копии для поиска и аналитики, с явным механизмом синхронизации (транзакция, триггер, событие) и пониманием, какой источник главный.</p></div></details>
+<details class="q"><summary>UUID или bigint для первичного ключа?</summary><div class="a"><p>bigint (IDENTITY/последовательность) — компактный и быстрый, но выдаётся базой и перечислим. UUID v4 — генерируется где угодно, но случайный порядок вредит B-tree (кэш, разделения страниц, WAL). Компромисс — UUID v7 или Snowflake: глобально уникальны и почти монотонны. Наружу можно отдавать отдельный публичный идентификатор.</p></div></details>
+</div>
+
+<h2 id="final"><span class="h-num">21.4</span>Итоговый тест</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что из перечисленного НЕ даёт реплика?</p><ul><li>Переключение при отказе primary</li><li>Разгрузку чтения</li><li>Защиту от ошибочного DELETE</li><li>Копию данных на другом сервере</li></ul><div class="why">Ошибки реплицируются; нужен PITR.</div></div>
+<div class="mcq" data-ok="0"><p>Таблица быстро растёт при постоянном числе строк, autovacuum работает. Первое, что проверить?</p><ul><li>Долгие транзакции, idle in transaction и слоты репликации, удерживающие горизонт</li><li>Размер shared_buffers</li><li>Число индексов</li><li>Версию JDBC-драйвера</li></ul><div class="why">VACUUM не может удалить версии, которые кто-то ещё может видеть.</div></div>
+<div class="mcq" data-ok="3"><p>Какой индекс нужен для <code>WHERE tenant_id = ? AND created_at &gt; ? ORDER BY created_at</code>?</p><ul><li>(created_at)</li><li>(created_at, tenant_id)</li><li>Два отдельных индекса</li><li>(tenant_id, created_at)</li></ul><div class="why">Равенство первым, затем диапазон/сортировка.</div></div>
+<div class="mcq" data-ok="1"><p>Почему COMMIT в PostgreSQL быстрый, хотя данные «на диске»?</p><ul><li>Данные пишутся только в память</li><li>Сбрасывается только последовательный журнал WAL; страницы данных пишутся позже</li><li>COMMIT асинхронный по умолчанию</li><li>Страницы пишутся параллельно</li></ul><div class="why">WAL — ключ к долговечности без случайной записи.</div></div>
+<div class="mcq" data-ok="2"><p>Как безопасно добавить NOT NULL к столбцу таблицы на 1 млрд строк?</p><ul><li>ALTER COLUMN SET NOT NULL в обычной миграции</li><li>Пересоздать таблицу</li><li>CHECK (col IS NOT NULL) NOT VALID → VALIDATE → SET NOT NULL → DROP CHECK</li><li>Это невозможно без простоя</li></ul><div class="why">Проверенный CHECK позволяет SET NOT NULL без полного скана под эксклюзивной блокировкой.</div></div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900), (7,'Монитор','электроника',32000);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'), (104,3,'cancelled','2026-07-02'),
+  (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'), (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500), (104,6,3,900),
+  (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800), (107,5,2,600), (108,1,1,93000);
+</script>
+</div></main>
+</div>
+</body>
+</html>

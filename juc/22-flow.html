@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Flow API и SubmissionPublisher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="22">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · СОВРЕМЕННЫЙ API</div>
+  <h1>Flow API и SubmissionPublisher</h1>
+  <p class="lead"><code>java.util.concurrent.Flow</code> (Java 9) — четыре интерфейса стандарта Reactive Streams: издатель, подписчик, подписка и процессор. Главная идея — <b>противодавление</b>: подписчик сам говорит, сколько элементов готов принять (<code>request(n)</code>), и быстрый источник не может завалить медленного получателя. В JDK есть готовый издатель <code>SubmissionPublisher</code> с буфером на каждого подписчика. Симулятор покажет, что происходит с быстрым издателем и медленным подписчиком при разных стратегиях.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Reactive Streams</span><span class="tag">request(n)</span><span class="tag">противодавление</span><span class="tag">SubmissionPublisher</span><span class="tag">submit vs offer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="protocol"><span class="h-num">22.1</span>Протокол</h2>
+<pre data-title="java.util.concurrent.Flow"><code class="java">public final class Flow {
+    public interface Publisher&lt;T&gt; { void subscribe(Subscriber&lt;? super T&gt; s); }
+    public interface Subscriber&lt;T&gt; {
+        void onSubscribe(Subscription s);   // ровно один раз, первым
+        void onNext(T item);                // не больше, чем запрошено через request
+        void onError(Throwable t);          // терминальный сигнал
+        void onComplete();                  // терминальный сигнал
+    }
+    public interface Subscription { void request(long n); void cancel(); }
+    public interface Processor&lt;T, R&gt; extends Subscriber&lt;T&gt;, Publisher&lt;R&gt; {}
+}
+// правила (сокращённо из спецификации Reactive Streams): сигналы подписчику последовательны (не параллельны);
+// после onError/onComplete — ничего; request(n ≤ 0) → onError(IllegalArgumentException); request можно вызывать из onNext.</code></pre>
+<div class="flow">
+  <div class="node acc"><b>subscribe(s)</b></div><span class="to">→</span>
+  <div class="node info"><b>onSubscribe(subscription)</b></div><span class="to">→</span>
+  <div class="node"><b>request(n)</b><small>спрос</small></div><span class="to">→</span>
+  <div class="node ok"><b>onNext × ≤ n</b></div><span class="to">→</span>
+  <div class="node"><b>request(m) …</b></div><span class="to">→</span>
+  <div class="node warn"><b>onComplete / onError</b></div>
+</div>
+
+<h2 id="sim"><span class="h-num">22.2</span>Симулятор противодавления</h2>
+<div class="widget" id="bpW">
+  <div class="widget-title">Издатель 10 эл./тик, подписчик обрабатывает 3 эл./тик, буфер подписчика 16</div>
+  <div class="controls">
+    <label>подписчик запрашивает<select id="bpR"><option value="one">request(1) после каждого onNext</option><option value="batch">request(8) пачками, когда осталось ≤ 4</option><option value="max">request(Long.MAX_VALUE) в onSubscribe</option></select></label>
+    <label>издатель отправляет<select id="bpP"><option value="submit">submit(item) — блокируется при полном буфере</option><option value="offer">offer(item, onDrop) — отбрасывает</option></select></label>
+    <button class="btn primary" type="button" id="bpGo">10 тиков</button>
+    <button class="btn" type="button" id="bpR2">↺</button>
+  </div>
+  <div id="bpBars"></div>
+  <div class="out" id="bpOut"></div>
+  <div class="verdict" id="bpV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, buf, demand, produced, delivered, dropped, blockedTicks, ticks, memory;
+  function reset() { buf = 0; demand = 0; produced = 0; delivered = 0; dropped = 0; blockedTicks = 0; ticks = 0; memory = 0; draw(); }
+  function tick() {
+    var r = $("bpR").value, p = $("bpP").value, CAP = 16, PROD = 10, CONS = 3;
+    if (ticks === 0) demand = r === "one" ? 1 : r === "batch" ? 8 : Infinity;
+    ticks++;
+    // издатель кладёт в буфер подписчика
+    var room = CAP - buf, want = PROD;
+    if (p === "submit") { var put = Math.min(want, room); buf += put; produced += put; if (put < want) blockedTicks++; }
+    else { var put2 = Math.min(want, room); buf += put2; produced += want; dropped += want - put2; }
+    // доставка из буфера по спросу
+    var canDeliver = Math.min(buf, demand === Infinity ? buf : demand, CONS);
+    if (r === "max") { memory = Math.max(memory, buf); }
+    buf -= canDeliver; delivered += canDeliver;
+    if (demand !== Infinity) { demand -= canDeliver; if (r === "one") demand += canDeliver; else if (demand <= 4) demand += 8; }
+  }
+  function draw() {
+    $("bpBars").innerHTML = '<div style="display:flex;justify-content:space-between;font-size:13.5px"><b>буфер подписчика</b><span style="font-family:var(--font-mono)">' + buf + ' / 16</span></div><div class="bar ' + (buf >= 16 ? "bad" : "") + '"><i style="width:' + (buf / 16 * 100) + '%"></i></div>';
+    $("bpOut").textContent = "тиков: " + ticks + "   отправлено издателем: " + produced + "   доставлено onNext: " + delivered + "   отброшено: " + dropped + "\nтиков, когда submit блокировал поток издателя: " + blockedTicks;
+    var v = $("bpV"), p = $("bpP").value;
+    if (!ticks) { v.className = "verdict"; v.textContent = "Нажмите «10 тиков»."; return; }
+    if (p === "submit") { v.className = "verdict ok"; v.textContent = "submit блокирует издателя, когда буфер подписчика полон: издатель вынужденно замедляется до скорости потребителя (3 эл./тик). Это и есть противодавление: ни потери данных, ни роста памяти."; }
+    else { v.className = "verdict warn"; v.textContent = "offer не блокирует: при полном буфере элемент отбрасывается (обработчик onDrop может повторить попытку). Подходит для телеметрии, где свежие данные важнее полных. Отброшено " + dropped + " из " + produced + "."; }
+    if ($("bpR").value === "one") v.textContent += " request(1) на каждый элемент — максимум контроля, но больше накладных сигналов; на практике запрашивают пачками.";
+  }
+  $("bpGo").addEventListener("click", function () { for (var i = 0; i < 10; i++) tick(); draw(); });
+  $("bpR2").addEventListener("click", reset); ["bpR", "bpP"].forEach(function (i) { $(i).addEventListener("change", reset); });
+  reset();
+})();
+</script>
+
+<h2 id="submission"><span class="h-num">22.3</span>SubmissionPublisher</h2>
+<pre data-title="издатель и подписчик на JDK"><code class="java">try (SubmissionPublisher&lt;Event&gt; pub = new SubmissionPublisher&lt;&gt;(executor, 256)) {   // буфер 256 на подписчика
+    pub.subscribe(new Flow.Subscriber&lt;&gt;() {
+        Flow.Subscription sub;
+        public void onSubscribe(Flow.Subscription s) { sub = s; s.request(32); }
+        int received;
+        public void onNext(Event e) { handle(e); if (++received % 16 == 0) sub.request(16); }   // подпитываем спрос
+        public void onError(Throwable t) { log.error("stream failed", t); }
+        public void onComplete() { log.info("done"); }
+    });
+    events.forEach(pub::submit);                      // блокирует при полном буфере самого медленного подписчика
+}                                                     // close() → onComplete всем подписчикам
+// pub.consume(e -&gt; …) — подписаться функцией с неограниченным спросом; возвращает CompletableFuture&lt;Void&gt;</code></pre>
+<ul>
+  <li>Каждому подписчику — свой буфер и свой поток доставки из executor (по умолчанию commonPool); медленный подписчик не тормозит быстрых при <code>offer</code>, но тормозит издателя при <code>submit</code>.</li>
+  <li>Исключение в onNext отменяет подписку и вызывает onError.</li>
+  <li>Flow — это только интерфейсы. Операторы (map, filter, flatMap, retry, окна) дают библиотеки: Project Reactor, RxJava, Mutiny; адаптеры — <code>JdkFlowAdapter</code>, <code>FlowAdapters</code> (reactive-streams). <code>java.net.http.HttpClient</code> использует Flow для тел запросов и ответов.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">22.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько элементов может отправить издатель подписчику после request(10)?</p><ul><li>Сколько угодно</li><li>Ровно 10, обязательно</li><li>Не больше 10 (до следующих request)</li><li>Один</li></ul><div class="why">Спрос копится: request(5) + request(5) = 10.</div></div>
+<div class="mcq" data-ok="0"><p>Чем submit отличается от offer у SubmissionPublisher?</p><ul><li>submit блокирует при полном буфере подписчика, offer — отбрасывает элемент (с обработчиком отказа)</li><li>Ничем</li><li>offer блокирует</li><li>submit отправляет всем, offer — одному</li></ul><div class="why">Выбор между противодавлением и потерей.</div></div>
+<div class="mcq" data-ok="3"><p>Может ли издатель вызвать onNext после onComplete?</p><ul><li>Да</li><li>Только с одним элементом</li><li>Только при ошибке</li><li>Нет: onComplete и onError — терминальные сигналы</li></ul><div class="why">Нарушение — ошибка реализации издателя.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Нужна ли реактивщина, если есть виртуальные потоки?</summary><div class="a"><p>Для обычного запрос–ответ с блокирующими вызовами виртуальные потоки дают ту же масштабируемость с простым императивным кодом. Реактивные потоки остаются полезными для настоящих потоков данных: стриминг событий с противодавлением, комбинирование бесконечных источников, окна и буферизация, WebSocket/SSE, интеграция с реактивными драйверами. Противодавление в императивном коде на виртуальных потоках — ограниченные BlockingQueue и Semaphore.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

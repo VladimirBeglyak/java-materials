@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Распределённый SQL и NewSQL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · ТИПЫ ХРАНИЛИЩ</div>
+  <h1>Распределённый SQL и NewSQL</h1>
+  <p class="lead">Можно ли получить SQL и ACID-транзакции, но масштабировать запись горизонтально и пережить потерю целого региона без потери данных? Да — Spanner, CockroachDB, YugabyteDB, TiDB делают именно это, а Citus и Vitess шардируют PostgreSQL и MySQL. Цена — физика: каждая запись проходит консенсус по сети. Разбираем устройство (диапазоны, Raft, распределённые транзакции), задержки в мультирегионе, особенности схемы и когда это оправдано.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">Raft</span><span class="tag">диапазоны</span><span class="tag">распределённые транзакции</span><span class="tag">мультирегион</span><span class="tag">Citus/Vitess</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="arch"><span class="h-num">14.1</span>Устройство</h2>
+<div class="flow col">
+  <div class="node acc"><b>SQL-слой (любой узел)</b><small>разбор, планирование с учётом расположения данных, координация транзакции</small></div><span class="to">↓</span>
+  <div class="node info"><b>Распределённое KV: таблицы и индексы = отсортированные ключи</b><small>ключ «/orders/primary/1001» → строка; пространство ключей нарезано на диапазоны (ranges/tablets/regions) по ~64–512 МБ</small></div><span class="to">↓</span>
+  <div class="node ok"><b>Каждый диапазон — группа Raft из 3–5 реплик</b><small>лидер (leaseholder) принимает запись, она считается зафиксированной после записи большинством; при падении — новый лидер за секунды</small></div><span class="to">↓</span>
+  <div class="node"><b>Локальный движок хранения: RocksDB/Pebble (LSM)</b><small>на каждом узле</small></div>
+</div>
+<p>Диапазоны автоматически делятся при росте и переносятся между узлами для баланса — шардинг прозрачен для приложения. Транзакция, затрагивающая несколько диапазонов, использует двухфазную фиксацию поверх Raft и MVCC с отметками времени (TrueTime с атомными часами в Spanner, гибридные логические часы в CockroachDB/YugabyteDB).</p>
+
+<h2 id="raft"><span class="h-num">14.2</span>Запись через консенсус</h2>
+<div class="widget stepper" id="rfSim">
+  <div class="widget-title">INSERT в диапазон с репликами в трёх зонах</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Зона A (лидер)</h5><div class="items"><span class="chip" id="rA">журнал Raft</span></div></div>
+    <div class="lane"><h5>Зона B</h5><div class="items"><span class="chip" id="rB">журнал Raft</span></div></div>
+    <div class="lane"><h5>Зона C</h5><div class="items"><span class="chip" id="rC">журнал Raft</span></div></div>
+  </div>
+  <section class="st-step" data-t="Запрос к лидеру" data-hl="rA" data-log="шлюз → leaseholder диапазона /orders/1000-2000 в зоне A"><p>SQL-узел определяет диапазон ключа и отправляет запись его лидеру.</p></section>
+  <section class="st-step" data-t="Репликация" data-hl="rA rB rC" data-log="лидер дописывает запись в свой журнал и рассылает AppendEntries в B и C"><p>Лидер добавляет запись в журнал и параллельно отправляет репликам.</p></section>
+  <section class="st-step" data-t="Большинство" data-hl="rA rB" data-log="B подтвердила (RTT ~1 мс) → 2 из 3 = кворум → запись зафиксирована"><p>Как только большинство (лидер + одна реплика) записало — запись зафиксирована. Медленная или упавшая зона C не задерживает ответ.</p></section>
+  <section class="st-step" data-t="Отказ зоны" data-hl="rB rC" data-log="зона A недоступна → B и C выбирают нового лидера (секунды) → запись продолжается, потерь нет"><p>При потере зоны оставшиеся две выбирают нового лидера; всё подтверждённое есть у большинства — RPO = 0. Ценой одной сетевой задержки до ближайшей реплики на каждую запись.</p></section>
+</div>
+
+<h2 id="latency"><span class="h-num">14.3</span>Физика мультирегиона</h2>
+<div class="widget" id="mrW">
+  <div class="widget-title">Задержка записи в зависимости от размещения реплик</div>
+  <div class="controls"><label>размещение<select id="mrP" class="wide">
+    <option value="zones">3 зоны одного региона (Франкфурт)</option>
+    <option value="eu">3 региона Европы (Франкфурт, Амстердам, Варшава)</option>
+    <option value="world">3 континента (Франкфурт, Вирджиния, Сингапур)</option>
+    <option value="world5">5 регионов: 2 в Европе, 2 в США, 1 в Азии</option>
+  </select></label><label>клиент находится<select id="mrC"><option value="eu">в Европе</option><option value="us">в США</option><option value="asia">в Азии</option></select></label></div>
+  <div class="out" id="mrOut"></div>
+  <div class="verdict" id="mrV"></div>
+</div>
+<script>
+(function () {
+  var FROM_FRA = { fra: 1.5, ams: 8, waw: 20, lon: 15, va: 90, ore: 150, sg: 160 }, CLIENT = { eu: 5, us: 90, asia: 160 };
+  var P = { zones: [["fra", "fra", "fra"], 1.5], eu: [["fra", "ams", "waw"], 0], world: [["fra", "va", "sg"], 0], world5: [["fra", "lon", "va", "ore", "sg"], 0] };
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var p = P[$("mrP").value], reps = p[0], c = $("mrC").value, leader = reps[0], zones = $("mrP").value === "zones";
+    var others = reps.slice(1).map(function (r) { return FROM_FRA[r]; }).sort(function (a, b) { return a - b; });
+    var need = Math.floor(reps.length / 2), quorum = others[need - 1];
+    var toLeader = c === "eu" && zones ? 1 : CLIENT[c];
+    var total = toLeader + quorum + 1;
+    $("mrOut").textContent = "реплики: " + reps.join(", ") + " (лидер " + leader + ")\nклиент → лидер: ~" + toLeader + " мс\nлидер → кворум (" + (need + 1) + " из " + reps.length + "): ~" + quorum + " мс\nзапись ≈ " + total.toFixed(0) + " мс; транзакция из 5 последовательных записей ≈ " + (total * 5).toFixed(0) + " мс\nпереживёт потерю: " + ($("mrP").value === "zones" ? "одной зоны" : (reps.length - need - 1) + " региона");
+    $("mrV").className = "verdict " + (total < 20 ? "ok" : total < 120 ? "warn" : "bad");
+    $("mrV").textContent = total < 20 ? "Задержка как у обычной базы с синхронной репликой; защита от потери зоны." : total < 120 ? "Каждая запись стоит десятки миллисекунд. Проектируйте транзакции короткими и размещайте лидеров данных рядом с пользователями (regional by row)." : "Межконтинентальный кворум: сотни миллисекунд на запись. Оправдано только для действительно глобальных данных; данные пользователей держите в их регионе.";
+  }
+  ["mrP", "mrC"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>Приёмы: <b>regional by row</b> — у строки есть регион, и её лидер живёт там же (пользователи Европы пишут быстро в Европе); <b>global tables</b> — справочники, которые читаются отовсюду быстро, а пишутся медленно; <b>follower reads</b> — чтение слегка устаревших данных с ближайшей реплики.</p>
+
+<h2 id="schema"><span class="h-num">14.4</span>Особенности схемы</h2>
+<ul>
+  <li><b>Последовательные ключи создают горячую точку</b>: все вставки идут в последний диапазон на одном лидере. Используйте UUID (случайные здесь — правильно!) или hash-sharded индексы.</li>
+  <li><b>Совместное размещение</b>: дочерние строки рядом с родителем (interleaving в Spanner, colocation в YugabyteDB, распределённые таблицы по tenant_id в Citus) — JOIN и транзакции внутри одного диапазона/узла.</li>
+  <li><b>Транзакции дороже</b> и чаще прерываются конфликтами: обязательны повторы (SERIALIZABLE по умолчанию в CockroachDB).</li>
+  <li><b>Совместимость</b> с PostgreSQL/MySQL — по протоколу и большей части SQL, но не по всем расширениям, триггерам и поведению планировщика. Проверяйте ORM и миграции.</li>
+</ul>
+
+<h2 id="sharding"><span class="h-num">14.5</span>Шардирование знакомой базы: Citus и Vitess</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Citus (PostgreSQL)</th><th>Vitess (MySQL)</th><th>Распределённый SQL</th></tr>
+<tr><td>Подход</td><td>расширение: таблицы распределены по ключу между узлами-PostgreSQL</td><td>прокси-слой над множеством MySQL, шардинг по vindex</td><td>новая СУБД со своим хранилищем и консенсусом</td></tr>
+<tr><td>Лучше всего</td><td>мультиарендные SaaS (по tenant_id), аналитика в реальном времени</td><td>огромные веб-нагрузки (YouTube, Slack, GitHub)</td><td>глобальные системы, автоматический ребаланс, RPO 0</td></tr>
+<tr><td>Транзакции между шардами</td><td>есть (2PC), дороже</td><td>ограниченно</td><td>прозрачно</td></tr>
+<tr><td>Экосистема</td><td>весь PostgreSQL на узлах</td><td>MySQL-инструменты</td><td>своя, частичная совместимость</td></tr>
+</table></div>
+
+<h2 id="when"><span class="h-num">14.6</span>Когда оправдано</h2>
+<div class="grid-2">
+  <div class="card"><h4>Да</h4><ul><li>Запись и данные выросли за пределы одного сервера, а SQL и транзакции нужны.</li><li>Требование RPO = 0 и автоматического переживания потери зоны/региона.</li><li>Пользователи в разных регионах, требования к размещению данных (резидентность).</li></ul></div>
+  <div class="card"><h4>Нет</h4><ul><li>Данные и нагрузка помещаются в один PostgreSQL с репликами — так у большинства.</li><li>Критична задержка каждой операции в единицы миллисекунд при межрегиональном размещении.</li><li>Нужны специфичные расширения PostgreSQL.</li></ul></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">14.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему в CockroachDB/Spanner рекомендуют UUID вместо последовательного bigint для первичного ключа?</p><ul><li>bigint не поддерживается</li><li>UUID короче</li><li>Последовательные ключи направляют все вставки в последний диапазон — горячая точка на одном узле</li><li>Для совместимости с JPA</li></ul><div class="why">Случайность распределяет запись по диапазонам и узлам.</div></div>
+<div class="mcq" data-ok="0"><p>Реплики в Франкфурте, Вирджинии и Сингапуре. Почему запись медленная?</p><ul><li>Фиксация требует подтверждения большинства, а ближайшая реплика — за океаном (~90 мс туда-обратно)</li><li>Неверные индексы</li><li>Мало памяти</li><li>Raft пишет на все реплики последовательно</li></ul><div class="why">Скорость света не оптимизируется.</div></div>
+<div class="mcq" data-ok="3"><p>Что даёт Citus для мультиарендного SaaS?</p><ul><li>Отказ от PostgreSQL</li><li>Автоматический мультирегион</li><li>Документную модель</li><li>Распределение таблиц по tenant_id между узлами: запросы одного арендатора локальны, а масштаб — горизонтальный</li></ul><div class="why">Совместное размещение данных арендатора — ключ к производительности.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Глобальный сервис платежей: пользователи в ЕС, США и Азии, данные ЕС должны храниться в ЕС. Как бы вы организовали хранение?</summary><div class="a"><p>Распределённая SQL-база с размещением строк по региону (regional by row / геопартиционирование): строки пользователя и его платежей — с лидером и репликами в его регионе (RPO 0 при потере зоны, быстрые записи), справочники — global tables. Межрегиональные операции редки и допустимо медленнее. Альтернатива — отдельные региональные кластеры PostgreSQL с маршрутизацией по пользователю и асинхронной сводкой для глобальной аналитики.</p></div></details>
+<details class="q"><summary>Чем распределённый SQL отличается от «PostgreSQL + реплики»?</summary><div class="a"><p>Запись масштабируется горизонтально (каждый диапазон имеет своего лидера на разных узлах), фиксация через консенсус даёт RPO 0 и автоматическое переключение без внешнего оркестратора, данные автоматически перераспределяются. Цена — сетевая задержка на запись, более дорогие транзакции между диапазонами, неполная совместимость, сложнее отладка производительности.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

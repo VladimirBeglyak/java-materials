@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · I/O, NIO, сериализация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · ПЛАТФОРМА ИЗНУТРИ</div>
+  <h1>I/O, NIO, сериализация</h1>
+  <p class="lead">Ввод-вывод в Java — три поколения API: потоки байтов и символов из <code>java.io</code>, каналы и буферы из <code>java.nio</code> и удобный класс <code>Files</code>. Нужно понимать, чем байты отличаются от символов, зачем нужна буферизация и почему встроенную сериализацию объектов считают ошибкой проектирования.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">InputStream</span><span class="tag">Files</span><span class="tag">ByteBuffer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="streams"><span class="h-num">13.1</span>Байтовые и символьные потоки</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Байтовые</th><th>Символьные</th></tr>
+<tr><td>Базовые классы</td><td><code>InputStream</code>, <code>OutputStream</code></td><td><code>Reader</code>, <code>Writer</code></td></tr>
+<tr><td>Единица данных</td><td>Байт</td><td>Символ (<code>char</code>)</td></tr>
+<tr><td>Для чего</td><td>Любые данные: изображения, архивы, сеть</td><td>Текст</td></tr>
+<tr><td>Файл</td><td><code>FileInputStream</code></td><td><code>FileReader</code></td></tr>
+<tr><td>Буферизация</td><td><code>BufferedInputStream</code></td><td><code>BufferedReader</code> (+ <code>readLine</code>)</td></tr>
+<tr><td>Мост между ними</td><td colspan="2"><code>InputStreamReader</code> и <code>OutputStreamWriter</code> — превращают байты в символы по заданной <b>кодировке</b></td></tr>
+</table></div>
+<p>Классы <code>java.io</code> построены по шаблону «декоратор»: каждый оборачивает другой поток и добавляет одну возможность.</p>
+<pre><code class="java">try (var reader = new BufferedReader(                 // + буфер и readLine()
+        new InputStreamReader(                        // байты → символы
+            new GZIPInputStream(                      // + распаковка
+                new FileInputStream("data.csv.gz")),  // источник байтов
+            StandardCharsets.UTF_8))) {
+    String line;
+    while ((line = reader.readLine()) != null) process(line);
+}   // закрытие внешнего потока закрывает всю цепочку</code></pre>
+<div class="callout bad"><span class="c-title">Две обязательные вещи</span>
+<ul>
+  <li><b>Кодировка — всегда явно.</b> <code>new FileReader(file)</code> и <code>new InputStreamReader(in)</code> без кодировки берут системную; до Java 18 она зависела от ОС (<a href="03-strings.html#encoding">тема 03</a>).</li>
+  <li><b>Закрытие — только через try-with-resources.</b> Незакрытый поток — утечка файлового дескриптора; через некоторое время процесс получит <code>Too many open files</code> (<a href="06-exceptions.html#twr">тема 06</a>).</li>
+</ul>
+</div>
+
+<h2 id="buffering"><span class="h-num">13.2</span>Буферизация</h2>
+<p>Вызов <code>read()</code> у <code>FileInputStream</code> — системный вызов: переход в ядро ОС ради одного байта. Чтение мегабайтного файла побайтно — миллион таких переходов.</p>
+<pre class="bad-code"><code class="java">try (var in = new FileInputStream(file)) {
+    int b;
+    while ((b = in.read()) != -1) { … }       // системный вызов на каждый байт
+}</code></pre>
+<pre class="good-code"><code class="java">try (var in = new BufferedInputStream(new FileInputStream(file))) {
+    int b;
+    while ((b = in.read()) != -1) { … }       // читает из буфера 8 КБ; обращение к ОС — раз в 8192 байта
+}
+try (var in = Files.newInputStream(path); var out = Files.newOutputStream(target)) {
+    in.transferTo(out);                        // Java 9: скопировать поток целиком
+}
+byte[] all = in.readAllBytes();                // Java 9: только для заведомо небольших данных</code></pre>
+<p>Для записи действует то же самое, плюс обязанность сбросить буфер: данные в <code>BufferedWriter</code> попадают в файл при заполнении буфера, <code>flush()</code> или закрытии. Забытое закрытие — усечённый файл.</p>
+
+<h2 id="files"><span class="h-num">13.3</span>Files и Path</h2>
+<p>Класс <code>java.nio.file.Files</code> (Java 7, дополнен в 11) закрывает большинство повседневных задач одной строкой и сообщает об ошибках исключениями с понятной причиной — в отличие от <code>java.io.File</code>, методы которого возвращают <code>false</code> без объяснений.</p>
+<pre><code class="java">Path path = Path.of("data", "orders.csv");                      // вместо new File(...)
+
+String text = Files.readString(path);                           // UTF-8 по умолчанию — у Files так было всегда
+List&lt;String&gt; lines = Files.readAllLines(path);                  // весь файл в память
+Files.writeString(path, text, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+
+try (Stream&lt;String&gt; stream = Files.lines(path)) {               // лениво, построчно — для больших файлов
+    long errors = stream.filter(l -&gt; l.contains("ERROR")).count();
+}                                                               // стрим держит открытый файл — закрывать обязательно
+
+try (Stream&lt;Path&gt; tree = Files.walk(dir)) {                     // обход дерева каталогов
+    tree.filter(Files::isRegularFile).filter(p -&gt; p.toString().endsWith(".log")).forEach(this::archive);
+}
+
+Files.createDirectories(dir);
+Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING);
+Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);</code></pre>
+<div class="callout ok"><span class="c-title">Атомарная запись файла</span>
+Если процесс упадёт посреди записи, файл останется наполовину записанным, и читатель получит мусор. Надёжный приём: записать во временный файл <b>в том же каталоге</b>, затем переименовать с <code>ATOMIC_MOVE</code>. Переименование в пределах одной файловой системы атомарно: читатели видят либо старую версию, либо новую целиком.
+</div>
+<p><b>Большие файлы</b> читают потоково — <code>Files.lines</code>, <code>BufferedReader</code>, <code>InputStream</code> с буфером. <code>readAllBytes</code> и <code>readAllLines</code> на файле в несколько гигабайт закончатся <code>OutOfMemoryError</code>.</p>
+
+<h2 id="nio"><span class="h-num">13.4</span>NIO: каналы и буферы</h2>
+<p>В <code>java.nio</code> данные читаются не «из потока по байту», а <b>блоками в буфер</b> через <b>канал</b>. Это ближе к тому, как работает ОС, и открывает три возможности: память вне кучи, передачу без копирования и неблокирующий режим.</p>
+<figure class="diagram">
+<svg viewBox="0 0 800 220" role="img" aria-label="Состояние ByteBuffer: position и limit после allocate, put и flip">
+  <g class="mono" font-size="12.5">
+    <text x="20" y="48" font-weight="700">allocate(8)</text>
+    <text x="20" y="112" font-weight="700">put × 3</text>
+    <text x="20" y="176" font-weight="700">flip()</text>
+  </g>
+  <g>
+    <rect x="150" y="28" width="50" height="30" class="box"/><rect x="200" y="28" width="50" height="30" class="box"/><rect x="250" y="28" width="50" height="30" class="box"/><rect x="300" y="28" width="50" height="30" class="box"/><rect x="350" y="28" width="50" height="30" class="box"/><rect x="400" y="28" width="50" height="30" class="box"/><rect x="450" y="28" width="50" height="30" class="box"/><rect x="500" y="28" width="50" height="30" class="box"/>
+    <rect x="150" y="92" width="50" height="30" class="box-ok"/><rect x="200" y="92" width="50" height="30" class="box-ok"/><rect x="250" y="92" width="50" height="30" class="box-ok"/><rect x="300" y="92" width="50" height="30" class="box"/><rect x="350" y="92" width="50" height="30" class="box"/><rect x="400" y="92" width="50" height="30" class="box"/><rect x="450" y="92" width="50" height="30" class="box"/><rect x="500" y="92" width="50" height="30" class="box"/>
+    <rect x="150" y="156" width="50" height="30" class="box-ok"/><rect x="200" y="156" width="50" height="30" class="box-ok"/><rect x="250" y="156" width="50" height="30" class="box-ok"/><rect x="300" y="156" width="50" height="30" class="box"/><rect x="350" y="156" width="50" height="30" class="box"/><rect x="400" y="156" width="50" height="30" class="box"/><rect x="450" y="156" width="50" height="30" class="box"/><rect x="500" y="156" width="50" height="30" class="box"/>
+  </g>
+  <g class="mono" font-size="11.5" font-weight="700">
+    <text x="150" y="74">▲P</text><text x="538" y="74">▲L</text>
+    <text x="300" y="138">▲P</text><text x="538" y="138">▲L</text>
+    <text x="150" y="202">▲P</text><text x="300" y="202">▲L</text>
+  </g>
+  <g font-size="12.5">
+    <text x="590" y="48">position = 0, limit = 8</text>
+    <text x="590" y="104">position = 3, limit = 8</text><text x="590" y="122" class="muted">режим записи в буфер</text>
+    <text x="590" y="168">position = 0, limit = 3</text><text x="590" y="186" class="muted">режим чтения из буфера</text>
+  </g>
+</svg>
+<figcaption><code>position</code> — следующая ячейка для чтения или записи, <code>limit</code> — граница. <code>flip()</code> переключает буфер с записи на чтение; <code>clear()</code> — обратно. Забытый <code>flip()</code> — самая частая ошибка при работе с NIO.</figcaption>
+</figure>
+<pre><code class="java">try (FileChannel in = FileChannel.open(src, StandardOpenOption.READ);
+     FileChannel out = FileChannel.open(dst, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+
+    ByteBuffer buf = ByteBuffer.allocateDirect(64 * 1024);
+    while (in.read(buf) != -1) {         // канал ЗАПИСЫВАЕТ в буфер
+        buf.flip();                      // буфер готов к чтению
+        while (buf.hasRemaining()) out.write(buf);
+        buf.clear();                     // буфер готов к записи
+    }
+
+}
+// альтернатива циклу: in.transferTo(0, in.size(), out) — ОС копирует сама, минуя память приложения (zero-copy)</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Возможность</th><th>Что даёт</th><th>Где применяется</th></tr>
+<tr><td><b>Прямые буферы</b> <code>allocateDirect</code></td><td>Память вне кучи: ОС читает и пишет в неё без промежуточной копии; сборщик мусора её не перемещает</td><td>Сетевые фреймворки (Netty), драйверы. Ограничение — <code>-XX:MaxDirectMemorySize</code></td></tr>
+<tr><td><b>Zero-copy</b> <code>transferTo</code></td><td>Данные идут с диска в сокет внутри ядра, минуя память приложения</td><td>Раздача файлов; на этом основана скорость Kafka</td></tr>
+<tr><td><b>Отображение в память</b> <code>channel.map(...)</code></td><td>Файл выглядит как массив в памяти; страницы подгружает ОС</td><td>Большие индексы, базы данных, Lucene</td></tr>
+<tr><td><b>Неблокирующий режим</b> + <code>Selector</code></td><td>Один поток обслуживает тысячи соединений, получая события готовности</td><td>Netty, Tomcat NIO, WebFlux</td></tr>
+</table></div>
+<p>В прикладном коде каналы и селекторы почти не встречаются напрямую — ими пользуются фреймворки. Как устроена неблокирующая сеть — в <a href="../computer-networks/12-java-networking.html">«Компьютерных сетях», тема 12</a>. С появлением виртуальных потоков обычный блокирующий код снова масштабируется на тысячи соединений (<a href="../java-concurrency/10-virtual-threads.html">Java Concurrency, тема 10</a>).</p>
+
+<h2 id="serialization"><span class="h-num">13.5</span>Сериализация Java</h2>
+<p>Встроенный механизм превращает граф объектов в поток байтов и обратно. Чтобы класс участвовал, достаточно реализовать маркерный интерфейс <code>Serializable</code>.</p>
+<pre><code class="java">class Session implements Serializable {
+    @Serial private static final long serialVersionUID = 1L;
+
+    private final String userId;
+    private transient String token;      // transient — не сохраняется; после чтения будет null
+    private static int created;          // static — принадлежит классу, в поток не попадает
+}
+
+try (var out = new ObjectOutputStream(Files.newOutputStream(path))) { out.writeObject(session); }
+try (var in = new ObjectInputStream(Files.newInputStream(path))) { var s = (Session) in.readObject(); }</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Вопрос</th><th>Ответ</th></tr>
+<tr><td>Вызывается ли конструктор при чтении?</td><td><b>Нет.</b> Объект создаётся в обход конструктора и инициализаторов полей; вызывается только конструктор без параметров ближайшего <i>несериализуемого</i> предка. Проверки из конструктора не выполняются</td></tr>
+<tr><td>Зачем <code>serialVersionUID</code>?</td><td>Версия формата класса. При несовпадении — <code>InvalidClassException</code>. Если не объявить, вычисляется из структуры класса, и любое изменение (даже добавление метода) делает старые данные нечитаемыми</td></tr>
+<tr><td>Поле несериализуемого типа?</td><td><code>NotSerializableException</code> при записи; помечают <code>transient</code></td></tr>
+<tr><td>Как сохранить единственность синглтона?</td><td>Метод <code>readResolve()</code>, возвращающий существующий экземпляр; либо <code>enum</code></td></tr>
+<tr><td>Как управлять форматом?</td><td>Приватные <code>writeObject</code>/<code>readObject</code> или интерфейс <code>Externalizable</code></td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Почему её не используют в новом коде</span>
+<ul>
+  <li><b>Безопасность.</b> Чтение потока создаёт объекты произвольных классов из classpath и вызывает их методы. Цепочки таких вызовов («гаджеты») в популярных библиотеках позволяли выполнить произвольный код на сервере, принявшем данные от недоверенного источника. Это целый класс уязвимостей; главный архитектор Java назвал сериализацию «ужасной ошибкой».</li>
+  <li><b>Хрупкость.</b> Формат — это приватные поля класса. Любой рефакторинг ломает совместимость с ранее записанными данными.</li>
+  <li><b>Обход инвариантов.</b> Конструктор не вызывается — можно получить объект в состоянии, которое код создать не позволяет.</li>
+  <li><b>Только Java.</b> Другой язык эти данные не прочитает.</li>
+</ul>
+</div>
+<p><b>Что использовать</b>: JSON (Jackson) для API и конфигурации; Protobuf или Avro со схемой — для сообщений и хранения. Если сериализация Java неизбежна (старые протоколы, некоторые кэши), ограничьте допустимые классы фильтром <code>ObjectInputFilter</code> и никогда не десериализуйте данные из недоверенного источника. Записи сериализуются безопаснее: объект восстанавливается через канонический конструктор со всеми проверками.</p>
+
+<h2 id="lab"><span class="h-num">13.6</span>Интерактив: ByteBuffer — position, limit, capacity</h2>
+<p>Главная трудность NIO — один и тот же буфер используется и для записи, и для чтения, а режим переключается вручную. Три указателя: <b>capacity</b> (размер, не меняется), <b>limit</b> (граница доступного), <b>position</b> (следующая ячейка).</p>
+<div class="widget" id="bbW">
+  <div class="widget-title">Симулятор ByteBuffer.allocate(8)</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="put">put(byte)</button>
+    <button class="btn primary" type="button" data-a="flip">flip()</button>
+    <button class="btn primary" type="button" data-a="get">get()</button>
+    <button class="btn" type="button" data-a="rewind">rewind()</button>
+    <button class="btn" type="button" data-a="compact">compact()</button>
+    <button class="btn" type="button" data-a="clear">clear()</button>
+    <button class="btn" type="button" data-a="scenario">сценарий: записать 3 → flip → прочитать 2 → compact</button>
+  </div>
+  <div class="buckets" id="bbCells" style="grid-template-columns:repeat(8,minmax(0,1fr))"></div>
+  <div class="out" id="bbState"></div>
+  <div class="log" id="bbLog"></div>
+</div>
+<script>
+(function () {
+  var cap = 8, data, pos, lim, next, log;
+  var $ = function (id) { return document.getElementById(id); };
+  function init() { data = new Array(cap).fill(null); pos = 0; lim = cap; next = 65; log = ["allocate(8): position = 0, limit = capacity = 8 — режим записи"]; }
+  function act(a, quiet) {
+    if (a === "put") { if (pos >= lim) log.unshift("put → BufferOverflowException: position достиг limit"); else { data[pos] = String.fromCharCode(next++); log.unshift("put('" + data[pos] + "') в ячейку " + pos + ", position → " + (pos + 1)); pos++; } }
+    else if (a === "get") { if (pos >= lim) log.unshift("get → BufferUnderflowException: читать больше нечего (position == limit)"); else { log.unshift("get() → '" + (data[pos] === null ? "\\0" : data[pos]) + "' из ячейки " + pos + ", position → " + (pos + 1) + (data[pos] === null ? "   ← мусор! забыли flip() после записи" : "")); pos++; } }
+    else if (a === "flip") { lim = pos; pos = 0; log.unshift("flip(): limit = position (" + lim + "), position = 0 — переключение запись → чтение"); }
+    else if (a === "rewind") { pos = 0; log.unshift("rewind(): position = 0, limit не меняется — перечитать заново"); }
+    else if (a === "clear") { pos = 0; lim = cap; log.unshift("clear(): position = 0, limit = capacity. Данные НЕ стираются, просто считаются свободным местом"); }
+    else if (a === "compact") { var rest = data.slice(pos, lim); for (var i = 0; i < cap; i++) data[i] = i < rest.length ? rest[i] : data[i]; pos = rest.length; lim = cap; log.unshift("compact(): непрочитанные " + rest.length + " байт сдвинуты в начало, position = " + pos + ", limit = capacity — можно дописывать"); }
+    else if (a === "scenario") { init(); ["put", "put", "put", "flip", "get", "get", "compact"].forEach(function (x) { act(x, true); }); }
+    if (!quiet) render();
+  }
+  function render() {
+    var h = "";
+    for (var i = 0; i < cap; i++) {
+      var marks = (i === pos ? "P" : "") + (i === lim ? "L" : "");
+      h += '<div class="bucket ' + (i >= pos && i < lim ? "used" : "") + '" style="text-align:center;min-height:52px"><b>' + i + "</b><br>" + (data[i] === null ? "·" : data[i]) + (marks ? '<br><span style="color:var(--accent);font-weight:700">' + marks + "</span>" : "") + "</div>";
+    }
+    $("bbCells").innerHTML = h;
+    $("bbState").textContent = "position = " + pos + "   limit = " + lim + (lim === cap ? " (= capacity)" : "") + "   capacity = " + cap + "   remaining() = " + (lim - pos) + "\nЗелёные ячейки — диапазон [position, limit), с которым работает следующая операция.";
+    $("bbLog").textContent = log.slice(0, 14).join("\n");
+  }
+  document.querySelectorAll("#bbW [data-a]").forEach(function (b) { b.addEventListener("click", function () { act(b.getAttribute("data-a")); }); });
+  init(); render();
+})();
+</script>
+<pre data-title="Канонический цикл копирования канал → канал"><code class="java">ByteBuffer buf = ByteBuffer.allocateDirect(64 * 1024);
+while (in.read(buf) != -1) {        // канал ПИШЕТ в буфер
+    buf.flip();                     // → режим чтения
+    while (buf.hasRemaining()) out.write(buf);   // канал ЧИТАЕТ из буфера; write может записать не всё
+    buf.clear();                    // → режим записи
+}
+// На практике проще: Files.copy(src, dst) или in.transferTo(out) — без копирования через пользовательскую память.</code></pre>
+
+<h2 id="quiz"><span class="h-num">13.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Зачем нужен BufferedInputStream поверх FileInputStream?</p><ul><li>Он шифрует данные</li><li>Чтение по одному байту без буфера — системный вызов на каждый байт; буфер читает блоками по 8 КБ</li><li>Он нужен для текстовых файлов</li><li>Без него файл нельзя закрыть</li></ul><div class="why">Системный вызов стоит сотни наносекунд–микросекунды. Буферизация сокращает их число на три порядка.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает flip() у ByteBuffer?</p><ul><li>Разворачивает порядок байтов</li><li>Очищает буфер</li><li>Устанавливает limit = position и position = 0: переключает буфер с записи на чтение</li><li>Удваивает ёмкость</li></ul><div class="why">Забытый flip — самая частая ошибка NIO: чтение начнётся с текущей позиции и вернёт мусор или ничего.</div></div>
+<div class="mcq" data-ok="0"><p>Почему встроенная сериализация Java (Serializable) считается опасной?</p><ul><li>Десериализация недоверенных данных позволяет выполнить произвольный код через цепочки гаджетов; формат хрупок к изменениям классов</li><li>Она слишком медленная для любых задач</li><li>Она не поддерживает коллекции</li><li>Она удалена из JDK</li></ul><div class="why">Для обмена данными используют JSON, Protobuf, Avro. Если Serializable неизбежна — ObjectInputFilter и serialVersionUID.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем InputStream отличается от Reader и как перейти от одного к другому?</summary><div class="a"><p><code>InputStream</code> читает байты, <code>Reader</code> — символы. Переход — <code>InputStreamReader</code>, которому передают кодировку: он декодирует последовательность байтов в символы. Без явной кодировки результат зависит от окружения.</p></div></details>
+<details class="q"><summary>Почему чтение файла через FileInputStream.read() в цикле медленное?</summary><div class="a"><p>Каждый вызов — системный вызов и переход в ядро ради одного байта. <code>BufferedInputStream</code> читает блоками по 8 КБ и отдаёт байты из памяти; количество системных вызовов сокращается в тысячи раз.</p></div></details>
+<details class="q"><summary>Что делает flip() у ByteBuffer?</summary><div class="a"><p>Переключает буфер из режима записи в режим чтения: <code>limit</code> становится равным текущей <code>position</code> (конец записанных данных), а <code>position</code> — нулю. Без него чтение начнётся с места, где закончилась запись, и вернёт пустоту или мусор.</p></div></details>
+<details class="q"><summary>Как записать файл так, чтобы читатели никогда не увидели его наполовину записанным?</summary><div class="a"><p>Записать во временный файл в том же каталоге, закрыть его и переименовать в целевое имя с <code>StandardCopyOption.ATOMIC_MOVE</code>. Переименование внутри одной файловой системы атомарно.</p></div></details>
+<details class="q"><summary>Вызывается ли конструктор при десериализации объекта?</summary><div class="a"><p>Конструктор самого сериализуемого класса — нет; поля заполняются напрямую из потока, а <code>transient</code>-поля получают значения по умолчанию. Вызывается конструктор без параметров первого несериализуемого класса в цепочке предков. Поэтому проверки из конструктора не защищают от некорректных данных в потоке.</p></div></details>
+<details class="q"><summary>Почему встроенная сериализация опасна?</summary><div class="a"><p>При чтении создаются объекты любых доступных классов и выполняется их код (<code>readObject</code>, <code>readResolve</code>, а затем <code>hashCode</code>, <code>compare</code> и т. п.). Специально составленный поток запускает цепочку вызовов, приводящую к выполнению произвольных команд. Защита — не принимать сериализованные объекты извне и использовать форматы данных без исполняемого поведения.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

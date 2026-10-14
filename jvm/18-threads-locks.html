@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Потоки, safepoints и блокировки в JVM</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ИСПОЛНЕНИЕ</div>
+  <h1>Потоки, safepoints и блокировки в JVM</h1>
+  <p class="lead">Как Java-поток связан с потоком ОС и виртуальным потоком, почему «пауза GC 5 мс» иногда превращается в 500 мс ожидания safepoint, как JVM реализует <code>synchronized</code> — от бесплатной блокировки без конкуренции до нативного монитора с очередями, и что изменилось с удалением biased locking и приходом виртуальных потоков. Это нижний уровень того, что в пособии по конкурентности описано с точки зрения API.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">потоки ОС</span><span class="tag">safepoint</span><span class="tag">time-to-safepoint</span><span class="tag">handshakes</span><span class="tag">ObjectMonitor</span><span class="tag">виртуальные потоки</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="threads"><span class="h-num">18.1</span>Потоки JVM и ОС</h2>
+<ul>
+  <li>Платформенный поток Java = один поток ОС (1:1), планирует его ядро. Объект <code>java.lang.Thread</code> связан с нативной структурой <code>JavaThread</code>, у которой свой стек, TLAB, состояние для safepoint, список удерживаемых блокировок.</li>
+  <li>Состояние потока JVM (<code>_thread_in_Java</code>, <code>_thread_in_vm</code>, <code>_thread_in_native</code>, <code>_thread_blocked</code>) определяет, как с ним взаимодействует safepoint: поток в нативном коде или заблокированный уже «безопасен» — он не может трогать кучу без проверки.</li>
+  <li><b>Виртуальные потоки</b> (Java 21): M:N — миллионы виртуальных потоков на небольшом пуле потоков-носителей (ForkJoinPool). При блокирующей операции виртуальный поток <b>размонтируется</b>: его кадры копируются в кучу, носитель берёт другой поток.</li>
+</ul>
+
+<h2 id="safepoint"><span class="h-num">18.2</span>Safepoint и время до него</h2>
+<p>Некоторые операции требуют, чтобы все Java-потоки остановились в точках, где JVM знает расположение всех ссылок: паузы GC, деоптимизация части кода, перераспределение смещений, некоторые операции jcmd и JVMTI, перекомпоновка классов. Механизм: VM Thread «отравляет» страницу опроса; каждый поток в скомпилированном коде периодически читает её (на выходах из методов и обратных переходах циклов) и, получив сигнал, останавливается. Пауза, которую видит приложение, = <b>время до safepoint</b> (пока последний поток доберётся) + сама операция.</p>
+<div class="widget" id="spW">
+  <div class="widget-title">Сколько ждать, пока все потоки остановятся</div>
+  <div class="checks col" id="spC"></div>
+  <div class="controls"><label>длительность самой операции GC, мс<input type="number" id="spO" value="8" min="0"></label></div>
+  <div class="rows" id="spR"></div>
+  <div class="verdict" id="spV"></div>
+</div>
+<script>
+(function () {
+  var T = [
+    ["20 потоков обрабатывают HTTP-запросы (обычный код)", 0.05, "опрос на выходах из методов и обратных переходах — микросекунды"],
+    ["Поток в JNI / нативном вызове (сжатие, криптография)", 0, "уже «безопасен»: при возврате в Java сам остановится"],
+    ["Поток заблокирован на I/O или synchronized", 0, "уже безопасен"],
+    ["Поток копирует большой массив (System.arraycopy 1 ГБ)", 180, "интринсик без опросов внутри — дойдёт до safepoint только по окончании копирования"],
+    ["Поток в counted-цикле for (int i…) по огромному массиву без вызовов", 6, "исторически C2 убирал опрос из «счётных» циклов → секунды; с JDK 10 loop strip mining оставляет опрос каждые ~1000 итераций"],
+    ["Поток в page fault: обращение к выгруженной (swap) или ещё не тронутой памяти", 50, "ОС подгружает страницу — поток не может отреагировать"]
+  ];
+  var $ = function (i) { return document.getElementById(i); };
+  $("spC").innerHTML = T.map(function (t, i) { return '<label><input type="checkbox" data-i="' + i + '"' + (i < 3 ? " checked" : "") + "> " + t[0] + "</label>"; }).join("");
+  function run() {
+    var on = [].map.call($("spC").querySelectorAll("input:checked"), function (c) { return +c.getAttribute("data-i"); }), op = Math.max(0, +$("spO").value);
+    var tts = on.reduce(function (m, i) { return Math.max(m, T[i][1]); }, 0), slow = on.filter(function (i) { return T[i][1] === tts && tts > 1; })[0];
+    $("spR").innerHTML = on.map(function (i) { return '<div class="row' + (T[i][1] === tts && tts > 1 ? "" : " win") + '"><span>' + (T[i][1] > 1 ? "⏳" : "✔") + "</span><span>" + T[i][0] + "<br><small>" + T[i][2] + '</small></span><span style="font-family:var(--font-mono);text-align:right">' + T[i][1] + " мс</span></div>"; }).join("");
+    $("spV").className = "verdict " + (tts > op ? "bad" : "ok");
+    $("spV").textContent = "Время до safepoint ≈ " + tts + " мс + операция " + op + " мс = пауза " + (tts + op).toFixed(1) + " мс для всех потоков. " + (tts > op ? "Ожидание safepoint дольше самой сборки! Лог GC покажет " + op + " мс, а пользователи увидят " + (tts + op).toFixed(0) + " мс — смотрите -Xlog:safepoint («Reaching safepoint: … ns»)." : "Потоки останавливаются быстро.");
+  }
+  $("spC").addEventListener("change", run); $("spO").addEventListener("input", run); run();
+})();
+</script>
+<pre data-title="диагностика"><code class="txt">-Xlog:safepoint
+# [info][safepoint] Safepoint "G1CollectForAllocation", Time since last: 812345678 ns,
+#   Reaching safepoint: 182034567 ns, At safepoint: 8123456 ns, Total: 190158023 ns
+# JFR: jdk.SafepointBegin / jdk.SafepointStateSynchronization; async-profiler --ttsp</code></pre>
+<div class="callout info"><span class="c-title">Handshakes</span>
+С JDK 10 многие операции, которым раньше нужен был глобальный safepoint (снятие biased-блокировки, деоптимизация отдельных кадров, сбор стека одного потока), выполняются через <b>handshake</b> — остановку только нужного потока. Это одна из причин, почему ZGC и Shenandoah достигают коротких пауз: тяжёлая работа — конкурентно, синхронизация — точечно.
+</div>
+
+<h2 id="monitor"><span class="h-num">18.3</span>Как устроен synchronized</h2>
+<div class="widget stepper" id="lkSim">
+  <div class="widget-title">Жизнь блокировки объекта</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Mark word объекта</h5><div class="items"><span class="chip" id="lk0">unlocked …01</span><span class="chip off" id="lk1">locked …00</span><span class="chip off" id="lk2">monitor ptr …10</span></div></div>
+    <div class="lane"><h5>Поток A</h5><div class="items"><span class="chip" id="lkA">lock-stack: [obj]</span></div></div>
+    <div class="lane"><h5>ObjectMonitor</h5><div class="items"><span class="chip off" id="lkOwner">owner</span><span class="chip off" id="lkEntry">EntryList / cxq</span><span class="chip off" id="lkWait">WaitSet</span></div></div>
+    <div class="lane"><h5>Поток B</h5><div class="items"><span class="chip off" id="lkB">ждёт</span></div></div>
+  </div>
+  <section class="st-step" data-t="Без конкуренции" data-hl="lk0 lk1 lkA" data-log="A: monitorenter → CAS mark ..01 → ..00, obj в lock-stack потока A (lightweight locking, JDK 21+)"><p>Поток A входит в <code>synchronized(obj)</code>. Конкуренции нет: одна атомарная CAS меняет биты mark word, объект добавляется в маленький стек блокировок потока (lightweight locking, по умолчанию с Java 23; раньше — запись блокировки в кадре стека). Стоимость — единицы наносекунд. Повторный вход тем же потоком (рекурсия) — без CAS.</p></section>
+  <section class="st-step" data-t="Конкуренция: спин" data-hl="lkB lk1" data-log="B: monitorenter → CAS не удался → короткое адаптивное вращение (spin), вдруг A скоро выйдет"><p>Поток B пытается войти — занято. Сначала он немного <b>вращается</b> (adaptive spinning): если A держит блокировку микросекунды, дешевле подождать в цикле, чем засыпать.</p></section>
+  <section class="st-step" data-t="Раздувание" data-hl="lk2 lkOwner lkEntry lkB" data-log="spin не помог → inflate: создаётся ObjectMonitor, mark = ptr | 10; B паркуется в очереди cxq/EntryList"><p>Не дождался — блокировка <b>раздувается</b>: создаётся нативный <code>ObjectMonitor</code> (владелец, счётчик рекурсии, очереди), mark word указывает на него. B паркуется в очереди и засыпает (park → futex в ОС). В дампе потоков: <code>BLOCKED (on object monitor)</code>, «waiting to lock &lt;0x…&gt;».</p></section>
+  <section class="st-step" data-t="wait()" data-hl="lkWait lkA" data-log="A: obj.wait() → освобождает монитор, уходит в WaitSet (WAITING); B становится владельцем"><p>A вызывает <code>obj.wait()</code>: отпускает монитор полностью и уходит в <b>WaitSet</b> (состояние WAITING). Владельцем становится B. <code>wait</code> всегда раздувает блокировку — у лёгкой блокировки нет очередей.</p></section>
+  <section class="st-step" data-t="notify()" data-hl="lkWait lkEntry" data-log="B: obj.notify() → A переносится из WaitSet в очередь входа; проснётся, когда B выйдет из synchronized"><p>B вызывает <code>notify()</code>: A переносится из WaitSet в очередь входа — но продолжит, только снова захватив монитор после выхода B. Поэтому условие после <code>wait</code> всегда перепроверяют в цикле.</p></section>
+  <section class="st-step" data-t="Сдувание" data-hl="lk0" data-log="монитор долго не используется → при safepoint/фоновой очистке deflation: mark снова unlocked"><p>Неиспользуемые мониторы периодически <b>сдуваются</b> обратно (фоновым потоком, раньше — в safepoint), и следующий вход снова идёт по быстрому пути.</p></section>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Изменение</th><th>Версия</th><th>Почему важно</th></tr>
+<tr><td>Biased locking удалён</td><td>отключён в 15, удалён в 18</td><td>экономил CAS для однопоточных блокировок (Vector, StringBuffer), но отзыв требовал safepoint; современные CPU делают CAS дёшево</td></tr>
+<tr><td>Lightweight locking (lock-stack)</td><td>21 (опция), по умолчанию с 23</td><td>не нужно хранить указатель в mark word — основа для компактных заголовков</td></tr>
+<tr><td>synchronized не прикалывает виртуальный поток</td><td>24 (JEP 491)</td><td>раньше блокировка внутри synchronized закрепляла (pin) носитель — виртуальные потоки с synchronized-кодом теряли масштабируемость; до 24 — заменяйте на ReentrantLock</td></tr>
+</table></div>
+
+<h2 id="vthreads"><span class="h-num">18.4</span>Виртуальные потоки изнутри</h2>
+<p>Виртуальный поток — объект <code>VirtualThread</code> с продолжением (<code>Continuation</code>). Монтирование — запуск продолжения на потоке-носителе; при блокировке (сокет, <code>LockSupport.park</code>, <code>Thread.sleep</code>, с Java 24 — и <code>synchronized</code>) продолжение <b>отдаёт управление</b> (yield): кадры стека копируются в кучу (<code>StackChunk</code>), носитель освобождается. Когда операция завершается, продолжение ставится в очередь планировщика и монтируется на любом свободном носителе, копируя «горячую» часть стека обратно (лениво).</p>
+<pre data-title="наблюдать"><code class="txt">-Djdk.tracePinnedThreads=full                # (до Java 24) стек при закреплении носителя
+jcmd &lt;pid&gt; Thread.dump_to_file -format=json threads.json   # дамп с виртуальными потоками
+# JFR: jdk.VirtualThreadPinned, jdk.VirtualThreadSubmitFailed</code></pre>
+
+<h2 id="quiz"><span class="h-num">18.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Лог GC показывает паузу 5 мс, а запросы стоят 300 мс в тот же момент. Самая вероятная причина?</p><ul><li>Ошибка в логе</li><li>Медленная сеть</li><li>Долгое время до safepoint: какой-то поток долго не доходил до точки остановки</li><li>Слишком маленький eden</li></ul><div class="why">Смотрите «Reaching safepoint» в -Xlog:safepoint.</div></div>
+<div class="mcq" data-ok="0"><p>Когда synchronized-блокировка «раздувается» в ObjectMonitor?</p><ul><li>При конкуренции, которую не решило короткое вращение, или при вызове wait()</li><li>При каждом входе</li><li>Только при сборке мусора</li><li>Никогда</li></ul><div class="why">Без конкуренции — дешёвая CAS-блокировка в заголовке.</div></div>
+<div class="mcq" data-ok="1"><p>Почему поток, выполняющий JNI-вызов, не задерживает safepoint?</p><ul><li>JNI-код останавливается сигналом</li><li>В нативном коде поток не может обращаться к куче напрямую; при возврате в Java он сам проверит флаг и остановится</li><li>JNI запрещён во время GC</li><li>Он задерживает</li></ul><div class="why">Состояние _thread_in_native считается безопасным.</div></div>
+<div class="mcq" data-ok="3"><p>Что изменилось для виртуальных потоков в Java 24 (JEP 491)?</p><ul><li>Они стали платформенными</li><li>Отменён ForkJoinPool</li><li>Запрещён synchronized</li><li>Блокировка внутри synchronized больше не закрепляет поток-носитель</li></ul><div class="why">До 24 рекомендовали ReentrantLock в коде под виртуальные потоки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните разницу между BLOCKED и WAITING в дампе потоков на уровне JVM.</summary><div class="a"><p>BLOCKED — поток пытается войти в synchronized (monitorenter) и стоит в очереди входа ObjectMonitor, потому что владелец — другой поток. WAITING/TIMED_WAITING — поток сам отпустил монитор вызовом wait() и находится в WaitSet, либо припаркован через LockSupport.park (так ждут ReentrantLock, очереди, CompletableFuture.get) — тогда в дампе «parking to wait for &lt;…&gt;».</p></div></details>
+<details class="q"><summary>Какие операции в JVM требуют глобального safepoint сегодня?</summary><div class="a"><p>Паузы GC (в разной степени для разных сборщиков: у ZGC — короткие), некоторые операции jcmd (GC.heap_dump, GC.class_histogram), переопределение классов (агенты, HotSwap), некоторые виды деоптимизации и очистки, переключение режимов JVMTI. Многие другие (снятие стека одного потока, деоптимизация кадров отдельного потока) переведены на handshakes.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

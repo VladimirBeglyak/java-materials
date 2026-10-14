@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · MVCC: версии строк</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.mv-sess { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 12px 0; }
+.mv-sess .lane .controls { margin: 6px 0 0; }
+.mv-state { font: 12.5px var(--font-mono); color: var(--fg-muted); min-height: 2.6em; }
+.mv-vis-yes { color: var(--ok); font-weight: 700; }
+.mv-vis-no { color: var(--fg-muted); }
+@media (max-width: 640px) { .mv-sess { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ТРАНЗАКЦИИ И КОНКУРЕНТНОСТЬ</div>
+  <h1>MVCC: версии строк</h1>
+  <p class="lead">Многоверсионное управление конкурентным доступом: читатели не блокируют писателей, писатели не блокируют читателей. Каждое изменение создаёт новую версию строки, а каждая транзакция видит ту версию, которая соответствует её снимку. В песочнице с двумя сессиями вы увидите это своими глазами — и поймёте, откуда берутся мёртвые строки и почему опасны долгие транзакции.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">xmin/xmax</span><span class="tag">снимок</span><span class="tag">видимость</span><span class="tag">pg_xact</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="idea"><span class="h-num">11.1</span>Идея: не перезаписывать, а добавлять версию</h2>
+<p>Без MVCC читатель должен ждать, пока писатель закончит (иначе увидит незафиксированные данные), а писатель — пока читатели прочитают. При тысячах запросов в секунду это очереди на каждой популярной строке. MVCC решает иначе: UPDATE не меняет строку на месте, а создаёт <b>новую версию</b>; старая остаётся для тех, кому она ещё нужна.</p>
+<div class="grid-2">
+  <div class="card"><h4>Что даёт</h4><p>Чтение никогда не ждёт записи. Отчёт на час видит согласованное состояние на момент начала, не мешая OLTP. ROLLBACK мгновенный — просто пометить транзакцию прерванной.</p></div>
+  <div class="card"><h4>Чем платим</h4><p>Старые версии занимают место, пока их не уберёт VACUUM (тема 14). Долгая транзакция не даёт убирать мусор во всей базе. Две записи одной строки всё равно конфликтуют — блокировка строки (тема 13).</p></div>
+</div>
+
+<h2 id="versions"><span class="h-num">11.2</span>Версия строки и снимок</h2>
+<p>Как мы видели в теме 05, у каждой версии есть <code>xmin</code> (кто создал) и <code>xmax</code> (кто удалил или заменил). Номер транзакции (xid) выдаётся при первой записи; читающие транзакции обходятся виртуальным номером.</p>
+<p><b>Снимок (snapshot)</b> — три вещи: <code>xmin</code> снимка (все транзакции раньше уже завершены), <code>xmax</code> снимка (первый ещё не выданный номер — всё, что начнётся позже, невидимо) и список <code>xip</code> — транзакции, активные в момент снимка. Версия видна, если:</p>
+<ol>
+  <li>её <code>xmin</code> — это я, либо транзакция, зафиксированная <b>до</b> снимка (номер &lt; xmax снимка, не в списке активных, статус «committed»);</li>
+  <li>и её <code>xmax</code> пуст, либо принадлежит прерванной транзакции, либо транзакции, невидимой для снимка (ещё активной или начавшейся позже).</li>
+</ol>
+<pre data-title="посмотреть снимок и номер своей транзакции"><code class="sql">BEGIN;
+SELECT pg_current_xact_id_if_assigned();   -- NULL: пока ничего не писали
+UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+SELECT pg_current_xact_id();                -- 742
+SELECT pg_current_snapshot();               -- 738:742:738,740  (xmin:xmax:активные)
+SELECT xmin, xmax, * FROM accounts WHERE id = 1;
+COMMIT;</code></pre>
+
+<h2 id="playground"><span class="h-num">11.3</span>Песочница: две сессии и одна строка</h2>
+<div class="widget" id="mvW">
+  <div class="widget-title">MVCC вживую: accounts(id = 1, balance)</div>
+  <div class="controls">
+    <label>уровень изоляции обеих сессий<select id="mvIso"><option value="rc">READ COMMITTED</option><option value="rr">REPEATABLE READ</option></select></label>
+    <button class="btn" type="button" id="mvReset">↺ Сначала</button>
+  </div>
+  <div class="mv-sess">
+    <div class="lane"><h5>Сессия A</h5><div class="mv-state" id="mvStA"></div><div class="controls" data-s="A"></div></div>
+    <div class="lane"><h5>Сессия B</h5><div class="mv-state" id="mvStB"></div><div class="controls" data-s="B"></div></div>
+  </div>
+  <div class="table-wrap"><table id="mvTbl"></table></div>
+  <div class="log" id="mvLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var X, next, V, S, log;
+  function reset() {
+    X = { 100: "c" }; next = 101; V = [{ xmin: 100, xmax: 0, bal: 100 }]; log = ["строка создана транзакцией 100 (зафиксирована): balance = 100"];
+    S = { A: { xid: null, snap: null, pend: null }, B: { xid: null, snap: null, pend: null } }; draw();
+  }
+  function iso() { return $("mvIso").value; }
+  function snapNow() { var act = []; for (var k in X) if (X[k] === "a") act.push(+k); return { xmax: next, act: act }; }
+  function seen(x, sn, me) { return x === me || (X[x] === "c" && x < sn.xmax && sn.act.indexOf(x) < 0); }
+  function vis(v, sn, me) { return seen(v.xmin, sn, me) && !(v.xmax && seen(v.xmax, sn, me)); }
+  function stmtSnap(s) { var z = S[s]; if (iso() === "rr" && z.snap) return z.snap; z.snap = snapNow(); return z.snap; }
+  function st(x) { return x ? x + (X[x] === "c" ? " ✔" : X[x] === "r" ? " ✘" : " …") : "0"; }
+  function other(s) { return s === "A" ? "B" : "A"; }
+  function begin(s) { var z = S[s]; z.xid = next++; X[z.xid] = "a"; z.snap = null; log.push(s + ": BEGIN → xid " + z.xid + (iso() === "rr" ? " (снимок будет взят первым запросом)" : "")); }
+  function ensure(s) { if (!S[s].xid) begin(s); }
+  function select(s) {
+    ensure(s); var z = S[s], sn = stmtSnap(s), v = V.filter(function (v) { return vis(v, sn, z.xid); })[0];
+    log.push(s + ": SELECT balance → " + (v ? v.bal : "нет строки") + "   [снимок: xmax " + sn.xmax + (sn.act.length ? ", активны " + sn.act.join(",") : "") + "]");
+  }
+  function update(s, sn) {
+    ensure(s); var z = S[s]; sn = sn || stmtSnap(s);
+    var v = V.filter(function (v) { return vis(v, sn, z.xid); })[0];
+    if (!v) { log.push(s + ": UPDATE 0 — строка не видна"); return; }
+    while (v.xmax && X[v.xmax] !== "r" && v.xmax !== z.xid) {
+      if (X[v.xmax] === "a") { z.pend = sn; log.push(s + ": UPDATE … ждёт: версию уже изменяет незавершённая транзакция " + v.xmax + " (блокировка строки)"); return; }
+      if (iso() === "rr") { X[z.xid] = "r"; log.push(s + ": ERROR: could not serialize access due to concurrent update — транзакция " + z.xid + " прервана, приложение должно повторить её целиком"); z.xid = null; z.snap = null; return; }
+      var nv = V.filter(function (w) { return w.xmin === v.xmax; })[0];
+      log.push(s + ": READ COMMITTED: версия заменена зафиксированной " + v.xmax + " → перечитываю новейшую (balance " + nv.bal + ") и применяю UPDATE к ней");
+      v = nv;
+    }
+    if (v.xmin === z.xid && v.xmax === 0) { v.bal += 10; log.push(s + ": UPDATE своей же версии → balance " + v.bal); return; }
+    v.xmax = z.xid; V.push({ xmin: z.xid, xmax: 0, bal: v.bal + 10 });
+    log.push(s + ": UPDATE balance = balance + 10 → старой версии xmax = " + z.xid + ", новая версия (xmin " + z.xid + ") balance " + (v.bal + 10));
+  }
+  function finish(s, ok) {
+    var z = S[s]; if (!z.xid) { log.push(s + ": нет открытой транзакции"); return; }
+    X[z.xid] = ok ? "c" : "r"; log.push(s + ": " + (ok ? "COMMIT" : "ROLLBACK") + " → транзакция " + z.xid + (ok ? " зафиксирована" : " прервана: её версии невидимы всем, это мусор для VACUUM"));
+    z.xid = null; z.snap = null;
+    var o = S[other(s)]; if (o.pend) { var sn = o.pend; o.pend = null; log.push(other(s) + ": блокировка освобождена, UPDATE продолжается"); update(other(s), sn); }
+  }
+  function act(s, a) {
+    if (S[s].pend) return;
+    if (a === "begin") { if (S[s].xid) log.push(s + ": транзакция уже открыта"); else begin(s); }
+    else if (a === "select") select(s); else if (a === "update") update(s); else finish(s, a === "commit");
+    draw();
+  }
+  function draw() {
+    ["A", "B"].forEach(function (s) {
+      var z = S[s];
+      $("mvSt" + s).textContent = z.xid ? "xid " + z.xid + (z.pend ? " — ЖДЁТ блокировку" : " — в транзакции") + (z.snap && iso() === "rr" ? "\nснимок: xmax " + z.snap.xmax + (z.snap.act.length ? ", активны " + z.snap.act.join(",") : "") : "") : "нет транзакции (SELECT/UPDATE откроют её)";
+      var c = document.querySelector('#mvW .controls[data-s="' + s + '"]');
+      c.innerHTML = ["begin:BEGIN", "select:SELECT", "update:UPDATE +10", "commit:COMMIT", "rollback:ROLLBACK"].map(function (p) { p = p.split(":"); return '<button class="btn' + (p[0] === "update" ? " primary" : "") + '" type="button" data-a="' + p[0] + '"' + (z.pend ? " disabled" : "") + ">" + p[1] + "</button>"; }).join("");
+    });
+    function seesNow(s) { var z = S[s], sn = z.snap && iso() === "rr" ? z.snap : snapNow(); return function (v) { return vis(v, sn, z.xid); }; }
+    var a = seesNow("A"), b = seesNow("B");
+    $("mvTbl").innerHTML = "<tr><th>версия</th><th>xmin</th><th>xmax</th><th>balance</th><th>видит A</th><th>видит B</th></tr>" + V.map(function (v, i) {
+      function y(f) { return f(v) ? '<span class="mv-vis-yes">да</span>' : '<span class="mv-vis-no">нет</span>'; }
+      return "<tr><td>(0," + (i + 1) + ")</td><td>" + st(v.xmin) + "</td><td>" + st(v.xmax) + "</td><td>" + v.bal + "</td><td>" + y(a) + "</td><td>" + y(b) + "</td></tr>";
+    }).join("");
+    $("mvLog").textContent = log.slice(-14).join("\n"); $("mvLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll('#mvW .controls[data-s]').forEach(function (c) { c.addEventListener("click", function (e) { var b = e.target.closest("button"); if (b && !b.disabled) act(c.getAttribute("data-s"), b.getAttribute("data-a")); }); });
+  $("mvReset").addEventListener("click", reset); $("mvIso").addEventListener("change", reset);
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Сценарии, которые стоит прокрутить</span>
+<b>1. Читатель не ждёт:</b> A: UPDATE → B: SELECT (видит 100, не ждёт) → A: COMMIT → B: SELECT (READ COMMITTED: 110).<br>
+<b>2. Неповторяемое чтение:</b> то же при REPEATABLE READ — B после коммита A продолжает видеть 100, пока не завершит свою транзакцию.<br>
+<b>3. Конфликт записи:</b> A: UPDATE → B: UPDATE (ждёт) → A: COMMIT. В READ COMMITTED B перечитает 110 и запишет 120; в REPEATABLE READ получит ошибку сериализации. Попробуйте вместо COMMIT сделать ROLLBACK у A.<br>
+<b>4. Мусор:</b> посчитайте строки таблицы с «нет/нет» — это мёртвые версии, которые никто уже не увидит.
+</div>
+
+<h2 id="clog"><span class="h-num">11.4</span>Статусы транзакций и hint bits</h2>
+<p>Чтобы проверить «зафиксирована ли транзакция 742», PostgreSQL смотрит в <b>pg_xact</b> (раньше — clog): по 2 бита статуса на транзакцию (в процессе, зафиксирована, прервана). Чтобы не ходить туда при каждом чтении, первый прочитавший строку процесс ставит в заголовке кортежа <b>hint bits</b> «xmin committed». Следствие, которое удивляет: первый SELECT после массовой загрузки <b>пишет</b> на диск — проставляет hint bits (и генерирует WAL, если включены контрольные суммы).</p>
+
+<h2 id="horizon"><span class="h-num">11.5</span>Горизонт: почему долгие транзакции вредны всем</h2>
+<p>Мёртвую версию можно удалить, только если её не может увидеть <b>ни одна</b> активная транзакция. Граница — самый старый <code>xmin</code> среди всех снимков в базе (и слотов репликации, и реплик с <code>hot_standby_feedback</code>). Одна транзакция, открытая час назад, запрещает VACUUM убирать любые версии, умершие за этот час, во <b>всех</b> таблицах.</p>
+<div class="table-wrap"><table>
+<tr><th>Кто держит горизонт</th><th>Как найти</th></tr>
+<tr><td>Долгий запрос или отчёт</td><td><code>pg_stat_activity</code>: <code>now() - xact_start</code></td></tr>
+<tr><td>«idle in transaction» — приложение открыло транзакцию и ушло делать HTTP-вызов</td><td><code>state = 'idle in transaction'</code>; защита: <code>idle_in_transaction_session_timeout</code></td></tr>
+<tr><td>Забытый слот репликации</td><td><code>pg_replication_slots</code>: <code>xmin</code>, <code>catalog_xmin</code>, неактивный слот</td></tr>
+<tr><td>Реплика с hot_standby_feedback и долгим запросом</td><td><code>pg_stat_replication.backend_xmin</code></td></tr>
+<tr><td>Подготовленная (2PC) транзакция</td><td><code>pg_prepared_xacts</code></td></tr>
+</table></div>
+<pre data-title="самые старые транзакции"><code class="sql">SELECT pid, usename, state, now() - xact_start AS age, backend_xmin, left(query, 60)
+FROM pg_stat_activity
+WHERE backend_xmin IS NOT NULL
+ORDER BY age(backend_xmin) DESC LIMIT 5;</code></pre>
+<div class="callout warn"><span class="c-title">Типичный инцидент</span>
+Spring-метод с <code>@Transactional</code> вызывает внешний сервис, который «завис» на 10 минут. Всё это время соединение в состоянии idle in transaction держит горизонт, таблицы с частыми UPDATE пухнут, запросы замедляются. Правило: никаких сетевых вызовов внутри транзакции, таймауты на всё.
+</div>
+
+<h2 id="innodb"><span class="h-num">11.6</span>MVCC в InnoDB и Oracle</h2>
+<p>Там в таблице лежит только последняя версия строки, а для старых снимков версия реконструируется из <b>undo-журнала</b> (сегмента отката). Плюсы: таблица не пухнет от UPDATE, нет VACUUM. Минусы: долгий снимок заставляет хранить и проходить длинные цепочки undo (рост undo-пространства, медленное чтение старой версии), откат большой транзакции — долгий, так как надо применить undo. Проблема долгих транзакций остаётся в любой MVCC-системе — меняется только место, где копится мусор.</p>
+
+<h2 id="quiz"><span class="h-num">11.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Транзакция A изменила строку и ещё не зафиксирована. Что увидит SELECT транзакции B?</p><ul><li>Будет ждать завершения A</li><li>Новое значение</li><li>Старую версию: версия A не видна, так как A активна в снимке B</li><li>Ошибку</li></ul><div class="why">Читатели не ждут писателей — в этом суть MVCC.</div></div>
+<div class="mcq" data-ok="0"><p>Две транзакции READ COMMITTED делают <code>UPDATE … SET balance = balance + 10</code> одной строки. Что произойдёт?</p><ul><li>Вторая ждёт первую, затем перечитывает новейшую версию и прибавляет к ней: итог +20</li><li>Обе прибавят к исходному значению: итог +10</li><li>Вторая получит ошибку сериализации</li><li>Возникнет deadlock</li></ul><div class="why">Атомарный UPDATE с выражением от текущего значения безопасен в READ COMMITTED. Опасен «прочитал в приложении — записал вычисленное».</div></div>
+<div class="mcq" data-ok="3"><p>Почему транзакция, открытая 2 часа, вредит таблицам, к которым она даже не обращалась?</p><ul><li>Она блокирует все таблицы</li><li>Она занимает все соединения</li><li>Она держит WAL в памяти</li><li>Её снимок может требовать старые версии в любой таблице, и VACUUM не удаляет версии новее её горизонта</li></ul><div class="why">Горизонт общий для базы (для обычных таблиц — для всего кластера).</div></div>
+<div class="mcq" data-ok="1"><p>Почему первый SELECT по только что загруженной таблице может писать на диск?</p><ul><li>Он строит индекс</li><li>Он проставляет hint bits в заголовках кортежей, чтобы следующие чтения не ходили в pg_xact</li><li>Он запускает VACUUM FULL</li><li>Он пишет статистику в таблицу</li></ul><div class="why">Hint bits пачкают страницы, и их нужно записать.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните MVCC на собеседовании за минуту.</summary><div class="a"><p>Каждое изменение создаёт новую версию строки с номером создавшей транзакции; удаление помечает версию номером удалившей. Каждый запрос (READ COMMITTED) или каждая транзакция (REPEATABLE READ) работает со снимком — списком транзакций, зафиксированных к моменту снимка — и видит только версии, созданные ими и не удалённые ими. Поэтому чтение не блокирует запись и наоборот. Конфликтуют только две записи одной строки — через блокировку строки. Цена — старые версии, которые убирает VACUUM, и вред от долгих транзакций.</p></div></details>
+<details class="q"><summary>Как обнаружить и предотвратить «idle in transaction»?</summary><div class="a"><p>Обнаружить: <code>pg_stat_activity</code> с <code>state = 'idle in transaction'</code> и большим <code>now() - state_change</code>; метрика в мониторинге. Предотвратить: не делать внешних вызовов и долгой обработки внутри @Transactional, держать транзакции короткими, ставить <code>idle_in_transaction_session_timeout</code> (например, 60 с) и <code>statement_timeout</code>, следить за утечками соединений в пуле (leakDetectionThreshold в HikariCP).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

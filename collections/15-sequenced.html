@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Sequenced Collections (Java 21)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · НЕИЗМЕНЯЕМОСТЬ И ПОРЯДОК</div>
+  <h1>Sequenced Collections (Java 21)</h1>
+  <p class="lead">25 лет в Java не было общего способа взять «последний элемент» коллекции: у <code>List</code> — <code>get(size() − 1)</code>, у <code>Deque</code> — <code>getLast()</code>, у <code>SortedSet</code> — <code>last()</code>, а у <code>LinkedHashSet</code> — только перебор до конца. JEP 431 ввёл интерфейсы с определённым порядком встречи — <code>SequencedCollection</code>, <code>SequencedSet</code>, <code>SequencedMap</code> — с единым API для обоих концов и обратным представлением <code>reversed()</code>.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">JEP 431</span><span class="tag">encounter order</span><span class="tag">getFirst/getLast</span><span class="tag">reversed()</span><span class="tag">SequencedMap</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="api"><span class="h-num">15.1</span>Новые интерфейсы</h2>
+<pre data-title="JEP 431"><code class="java">interface SequencedCollection&lt;E&gt; extends Collection&lt;E&gt; {
+    SequencedCollection&lt;E&gt; reversed();          // представление в обратном порядке
+    void addFirst(E e);  void addLast(E e);
+    E getFirst();        E getLast();            // пустая → NoSuchElementException
+    E removeFirst();     E removeLast();
+}
+interface SequencedSet&lt;E&gt; extends SequencedCollection&lt;E&gt;, Set&lt;E&gt; { SequencedSet&lt;E&gt; reversed(); }
+interface SequencedMap&lt;K, V&gt; extends Map&lt;K, V&gt; {
+    SequencedMap&lt;K, V&gt; reversed();
+    Map.Entry&lt;K, V&gt; firstEntry();  lastEntry();  pollFirstEntry();  pollLastEntry();
+    V putFirst(K k, V v);  V putLast(K k, V v);
+    SequencedSet&lt;K&gt; sequencedKeySet();  SequencedCollection&lt;V&gt; sequencedValues();  SequencedSet&lt;Entry&lt;K, V&gt;&gt; sequencedEntrySet();
+}
+// встроены в иерархию: List и Deque → SequencedCollection; LinkedHashSet, SortedSet → SequencedSet;
+// LinkedHashMap, SortedMap → SequencedMap. HashSet и HashMap — нет: у них нет определённого порядка.</code></pre>
+
+<h2 id="matrix"><span class="h-num">15.2</span>Как ведут себя операции</h2>
+<div class="widget" id="sqW">
+  <div class="widget-title">Операция на разных коллекциях</div>
+  <div class="controls">
+    <label>коллекция<select id="sqC"><option value="al">ArrayList [b, c]</option><option value="dq">ArrayDeque [b, c]</option><option value="lhs">LinkedHashSet [b, c]</option><option value="ts">TreeSet [b, c]</option><option value="lof">List.of(b, c)</option><option value="lhm">LinkedHashMap {b=2, c=3}</option><option value="tm">TreeMap {b=2, c=3}</option></select></label>
+    <label>операция<select id="sqO"><option value="getLast">getLast() / lastEntry()</option><option value="addFirst">addFirst(a) / putFirst(a, 1)</option><option value="addFirstDup">addFirst(c) / putFirst(c, 9) — уже есть</option><option value="removeLast">removeLast() / pollLastEntry()</option><option value="reversed">reversed()</option></select></label>
+  </div>
+  <div class="verdict" id="sqV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var R = {
+    al: { getLast: ["ok", "c"], addFirst: ["ok", "[a, b, c] — вставка в начало (O(n) сдвиг)"], addFirstDup: ["ok", "[c, b, c] — у списка дубликаты разрешены"], removeLast: ["ok", "c, список [b]"], reversed: ["ok", "[c, b] — представление; изменения через него видны в исходном списке, reversed().add(x) добавит в начало исходного"] },
+    dq: { getLast: ["ok", "c (как и раньше)"], addFirst: ["ok", "[a, b, c]"], addFirstDup: ["ok", "[c, b, c]"], removeLast: ["ok", "c"], reversed: ["ok", "[c, b] — представление Deque в обратном порядке"] },
+    lhs: { getLast: ["ok", "c — раньше требовал обхода всего множества"], addFirst: ["ok", "[a, b, c] — новое: вставка в начало порядка"], addFirstDup: ["ok", "[c, b] — существующий элемент ПЕРЕМЕЩАЕТСЯ в начало"], removeLast: ["ok", "c, множество [b]"], reversed: ["ok", "[c, b]"] },
+    ts: { getLast: ["ok", "c (= last())"], addFirst: ["bad", "UnsupportedOperationException: позиция определяется компаратором, вставить «в начало» нельзя"], addFirstDup: ["bad", "UnsupportedOperationException"], removeLast: ["ok", "c (= pollLast())"], reversed: ["ok", "[c, b] (= descendingSet())"] },
+    lof: { getLast: ["ok", "c"], addFirst: ["bad", "UnsupportedOperationException — неизменяемый"], addFirstDup: ["bad", "UnsupportedOperationException"], removeLast: ["bad", "UnsupportedOperationException"], reversed: ["ok", "[c, b] — неизменяемое представление"] },
+    lhm: { getLast: ["ok", "lastEntry() = c=3 (неизменяемая копия записи)"], addFirst: ["ok", "putFirst(a, 1): {a=1, b=2, c=3}"], addFirstDup: ["ok", "putFirst(c, 9): {c=9, b=2} — ключ перемещён в начало, значение заменено"], removeLast: ["ok", "pollLastEntry() = c=3, карта {b=2}"], reversed: ["ok", "{c=3, b=2} — представление"] },
+    tm: { getLast: ["ok", "lastEntry() = c=3"], addFirst: ["bad", "putFirst → UnsupportedOperationException: порядок задан ключами"], addFirstDup: ["bad", "UnsupportedOperationException"], removeLast: ["ok", "pollLastEntry() = c=3"], reversed: ["ok", "{c=3, b=2} (= descendingMap())"] }
+  };
+  function run() { var r = R[$("sqC").value][$("sqO").value]; $("sqV").className = "verdict " + r[0]; $("sqV").textContent = r[1]; }
+  ["sqC", "sqO"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="before"><span class="h-num">15.3</span>До и после</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>До Java 21</th><th>Java 21+</th></tr>
+<tr><td>Последний элемент списка</td><td><code>list.get(list.size() - 1)</code></td><td><code>list.getLast()</code></td></tr>
+<tr><td>Последний в LinkedHashSet</td><td>обход: <code>for (x : set) last = x;</code></td><td><code>set.getLast()</code></td></tr>
+<tr><td>Первая запись LinkedHashMap</td><td><code>map.entrySet().iterator().next()</code></td><td><code>map.firstEntry()</code></td></tr>
+<tr><td>Обход списка с конца</td><td><code>ListIterator</code> с <code>previous()</code> или копия + <code>Collections.reverse</code></td><td><code>for (x : list.reversed())</code> — без копии</td></tr>
+<tr><td>Удалить самый старый элемент LinkedHashMap</td><td>итератор entrySet + remove</td><td><code>map.pollFirstEntry()</code></td></tr>
+</table></div>
+<p>Новые обёртки: <code>Collections.unmodifiableSequencedCollection/Set/Map</code>. Совместимость: если ваш класс реализует <code>List</code> и <code>Deque</code> одновременно (как LinkedList) или уже имел метод <code>getFirst()</code> с другим возвращаемым типом — при переходе на Java 21 возможны конфликты компиляции.</p>
+
+<h2 id="quiz"><span class="h-num">15.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какие коллекции НЕ являются SequencedCollection?</p><ul><li>ArrayList и LinkedList</li><li>TreeSet и LinkedHashSet</li><li>HashSet и PriorityQueue</li><li>ArrayDeque</li></ul><div class="why">У них нет определённого порядка встречи.</div></div>
+<div class="mcq" data-ok="0"><p>Что сделает <code>linkedHashSet.addFirst(x)</code>, если x уже есть в множестве?</p><ul><li>Переместит x в начало</li><li>Ничего</li><li>Бросит исключение</li><li>Добавит дубликат</li></ul><div class="why">Так же putFirst у LinkedHashMap перемещает ключ.</div></div>
+<div class="mcq" data-ok="3"><p>Что вернёт <code>list.reversed()</code>?</p><ul><li>Новый перевёрнутый список-копию</li><li>Тот же список, перевёрнутый на месте</li><li>Неизменяемую копию</li><li>Представление: изменения через него отражаются в исходном списке</li></ul><div class="why">Без копирования данных.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Зачем понадобилось вводить SequencedCollection, если у List и Deque уже были нужные методы?</summary><div class="a"><p>Не было общего типа для «коллекции с порядком»: нельзя было написать метод, принимающий и List, и LinkedHashSet, и Deque, и использовать их первый/последний элемент; у LinkedHashSet и LinkedHashMap не было эффективного доступа к последнему элементу и обратного обхода. Новые интерфейсы объединили существующие методы и добавили недостающие, включая обратные представления.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

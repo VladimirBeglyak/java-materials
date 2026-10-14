@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · WebFilter, кодеки и лимиты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · WEBFLUX</div>
+  <h1>WebFilter, кодеки и лимиты</h1>
+  <p class="lead">WebFilter — единственное место для сквозной логики в WebFlux: логирование, идентификатор запроса, аутентификация, изменение запроса и ответа. Кодеки превращают байты в объекты и обратно и защищают от огромных тел лимитом в 256 КБ, о котором узнают по <code>DataBufferLimitException</code> в проде. Разбираем порядок фильтров, типичные ошибки и настройку кодеков для сервера и WebClient.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">WebFilter</span><span class="tag">@Order</span><span class="tag">exchange.mutate()</span><span class="tag">beforeCommit</span><span class="tag">Encoder / Decoder</span><span class="tag">max-in-memory-size</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="filter"><span class="h-num">13.1</span>Устройство WebFilter</h2>
+<pre data-title="Фильтр с логикой до и после обработки" class="good-code"><code class="java">@Component
+@Order(Ordered.HIGHEST_PRECEDENCE + 10)
+class AccessLogFilter implements WebFilter {
+    public Mono&lt;Void&gt; filter(ServerWebExchange ex, WebFilterChain chain) {
+        long start = System.nanoTime();                                   // «до» — при сборке/подписке
+        ServerWebExchange mutated = ex.mutate()
+            .request(r -&gt; r.header("X-Request-Id", UUID.randomUUID().toString()))
+            .build();                                                     // запрос неизменяем — только mutate
+        mutated.getResponse().beforeCommit(() -&gt; {                        // последний шанс поменять заголовки
+            mutated.getResponse().getHeaders().add("X-Took-Ms", ms(start));
+            return Mono.empty();
+        });
+        return chain.filter(mutated)                                      // ВСЕГДА возвращать результат
+            .doFinally(sig -&gt; log.info("{} {} {} {}ms ({})",
+                ex.getRequest().getMethod(), ex.getRequest().getPath(),
+                ex.getResponse().getStatusCode(), ms(start), sig));       // «после» — complete/error/cancel
+    }
+}</code></pre>
+
+<h2 id="chain"><span class="h-num">13.2</span>Симулятор цепочки фильтров</h2>
+<div class="widget" id="wfW">
+  <div class="widget-title">Фильтры: RequestId (−100) → Auth (−50) → AccessLog (0) → контроллер</div>
+  <div class="controls">
+    <label><input type="checkbox" id="wfTok" checked> в запросе есть валидный токен</label>
+    <label>Вариант AccessLog<select id="wfBug">
+      <option value="ok">return chain.filter(ex).doFinally(...)</option>
+      <option value="lost">chain.filter(ex); return Mono.empty();</option>
+      <option value="sub">chain.filter(ex).subscribe(); return Mono.empty();</option>
+      <option value="hdr">добавляет заголовок после chain.filter(...).then(...)</option>
+      <option value="block">вызывает tokenService.validate(t).block()</option>
+    </select></label>
+  </div>
+  <div class="log" id="wfLog"></div>
+  <div class="verdict" id="wfV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var tok = $("wfTok").checked, bug = $("wfBug").value, L = [], cls = "ok", msg;
+    L.push("→ RequestId: exchange.mutate() + X-Request-Id; return chain.filter(...)");
+    if (!tok) {
+      L.push("→ Auth: нет токена → response.setStatusCode(401); return response.setComplete()");
+      L.push("  (chain.filter не вызван — AccessLog и контроллер не выполняются)");
+      L.push("← RequestId: complete");
+      $("wfLog").textContent = L.join("\n"); $("wfV").className = "verdict warn";
+      $("wfV").textContent = "Короткое замыкание: фильтр сам завершает ответ и не вызывает цепочку. Обратите внимание: AccessLog с order 0 этот запрос не залогирует — логирующие фильтры ставят раньше аутентификации."; return;
+    }
+    L.push("→ Auth: токен валиден → contextWrite(securityContext); return chain.filter(...)");
+    if (bug === "ok") { L.push("→ AccessLog: start=t0; return chain.filter(ex).doFinally(...)", "→ UserController.get(42) → Mono<User>", "← кодирование ответа, 200, beforeCommit-хуки", "← AccessLog.doFinally: GET /api/users/42 200 12ms (onComplete)", "← Auth, ← RequestId: complete"); msg = "Каждый фильтр возвращает Mono из chain.filter — вся цепочка является одним конвейером, подписку на который делает сервер."; }
+    if (bug === "lost") { L.push("→ AccessLog: chain.filter(ex) — Mono создан и выброшен", "  контроллер НЕ вызван: на конвейер никто не подписался", "← ответ: 200, пустое тело"); cls = "bad"; msg = "Классическая ошибка: результат chain.filter не возвращён. Конвейер собран, но не подписан — запрос «проходит» с пустым ответом 200, контроллер не вызывается."; }
+    if (bug === "sub") { L.push("→ AccessLog: chain.filter(ex).subscribe() — отдельная подписка", "← сервер получил Mono.empty() → завершает ответ: 200, пустое тело", "  …параллельно контроллер пишет в уже завершённый ответ → IllegalStateException / обрыв"); cls = "bad"; msg = "subscribe() внутри фильтра отрывает обработку от жизненного цикла запроса: сервер считает запрос завершённым, ошибки и отмена теряются. В WebFlux почти никогда не нужно вызывать subscribe() самому."; }
+    if (bug === "hdr") { L.push("→ AccessLog: return chain.filter(ex).then(Mono.fromRunnable(() -> headers.add(\"X-Took\", ...)))", "→ UserController → тело записано → ответ зафиксирован (committed)", "← AccessLog: headers.add → UnsupportedOperationException (ReadOnlyHttpHeaders)"); cls = "bad"; msg = "После записи тела заголовки уже отправлены — ответ committed, заголовки только для чтения. Менять заголовки нужно до chain.filter или в response.beforeCommit(...)."; }
+    if (bug === "block") { L.push("→ AccessLog: tokenService.validate(t).block()", "  IllegalStateException: block()/blockFirst()/blockLast() are blocking, which is not supported in thread reactor-http-nio-3"); cls = "bad"; msg = "Фильтр выполняется в event loop. Reactor запрещает block() в NonBlocking-потоках. Нужно встроить вызов в цепочку: return tokenService.validate(t).flatMap(ok -> chain.filter(ex))."; }
+    $("wfLog").textContent = L.join("\n"); $("wfV").className = "verdict " + cls; $("wfV").textContent = msg;
+  }
+  $("wfTok").addEventListener("change", run); $("wfBug").addEventListener("change", run); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">Порядок фильтров</span>
+Фильтры-бины сортируются по <code>@Order</code>/<code>Ordered</code>. Ориентиры: HTTP-наблюдаемость встроена в HttpWebHandlerAdapter (с 6.1; ServerHttpObservationFilter удалён в 7.0) и охватывает все фильтры, <code>WebFilterChainProxy</code> Spring Security — <code>-100</code>. Фильтры, которым нужен пользователь, ставьте после безопасности; логирование и request id — до неё.
+</div>
+
+<h2 id="codecs"><span class="h-num">13.3</span>Кодеки</h2>
+<div class="table-wrap"><table>
+<tr><th>Тип / медиатип</th><th>Encoder / Decoder</th></tr>
+<tr><td>application/json, application/*+json</td><td>JacksonJsonEncoder/Decoder — Jackson 3 (Spring 7; Jackson2JsonEncoder устарел), Kotlin — KotlinSerializationJson</td></tr>
+<tr><td>application/x-ndjson, text/event-stream</td><td>те же Jackson-кодеки, построчно; ServerSentEventHttpMessageWriter</td></tr>
+<tr><td>application/x-protobuf</td><td>ProtobufEncoder/Decoder</td></tr>
+<tr><td>text/plain, String</td><td>CharSequenceEncoder, StringDecoder (умеет разбивать по строкам)</td></tr>
+<tr><td>byte[], ByteBuffer, DataBuffer, Resource</td><td>соответствующие кодеки; Resource — zero-copy через файловый регион</td></tr>
+<tr><td>multipart/form-data</td><td>DefaultPartHttpMessageReader, PartEventHttpMessageReader</td></tr>
+</table></div>
+
+<h2 id="limits"><span class="h-num">13.4</span>Лимит буферизации</h2>
+<div class="widget" id="lmW">
+  <div class="widget-title">Пройдёт ли тело запроса?</div>
+  <div class="controls">
+    <label>Размер тела, КБ<input type="number" id="lmS" value="400" min="1"></label>
+    <label>spring.http.codecs.max-in-memory-size<select id="lmL"><option value="256">по умолчанию (256KB)</option><option value="1024">1MB</option><option value="10240">10MB</option><option value="-1">-1 (без лимита)</option></select></label>
+    <label>Как читается<select id="lmT">
+      <option value="mono">@RequestBody Mono&lt;Dto&gt; (JSON-объект)</option>
+      <option value="flux">@RequestBody Flux&lt;Dto&gt; (NDJSON, 1000 строк)</option>
+      <option value="string">@RequestBody String</option>
+      <option value="buf">Flux&lt;DataBuffer&gt; / FilePart.transferTo</option>
+    </select></label>
+  </div>
+  <div class="verdict" id="lmV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var s = Math.max(1, +$("lmS").value), l = +$("lmL").value, t = $("lmT").value, v = $("lmV"), need = t === "flux" ? s / 1000 : t === "buf" ? 0 : s;
+    var lim = l < 0 ? Infinity : l;
+    if (t === "buf") { v.className = "verdict ok"; v.textContent = "Поток буферов не агрегируется — лимит не применяется, память ограничена размером чанков (обычно до 8–64 КБ на чанк). Так принимают файлы любого размера."; return; }
+    if (need > lim) { v.className = "verdict bad"; v.textContent = "DataBufferLimitException: Exceeded limit on max bytes to buffer : " + (l * 1024) + ". На сервере это 413: в Spring 6.2 — PayloadTooLargeException, с 7.0 — ContentTooLargeException (раньше — 500). Декодер " + (t === "flux" ? "собирает одну строку NDJSON (" + need.toFixed(1) + " КБ)" : "собирает всё тело (" + s + " КБ)") + " в памяти, а лимит " + l + " КБ."; return; }
+    v.className = "verdict " + (l < 0 ? "warn" : "ok");
+    v.textContent = (t === "flux" ? "Лимит применяется к каждому элементу отдельно (" + need.toFixed(1) + " КБ на строку), а не ко всему телу — потоковое чтение экономит память." : "Тело (" + s + " КБ) целиком собирается в памяти до декодирования — укладывается в лимит.") + (l < 0 ? " Без лимита один злонамеренный запрос в гигабайт исчерпает кучу — так делать не стоит." : "");
+  }
+  ["lmS", "lmL", "lmT"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<pre data-title="Настройка кодеков сервера и WebClient"><code class="java">// сервер: spring.http.codecs.max-in-memory-size=2MB или
+@Configuration
+class CodecConfig implements WebFluxConfigurer {
+    public void configureHttpMessageCodecs(ServerCodecConfigurer c) {
+        c.defaultCodecs().maxInMemorySize(2 * 1024 * 1024);
+        c.defaultCodecs().jacksonJsonDecoder(new JacksonJsonDecoder(customJsonMapper));   // Jackson 3
+    }
+}
+// WebClient — свой лимит! Boot-овский WebClient.Builder учитывает spring.http.codecs.*,
+// а WebClient.create() — нет
+WebClient client = WebClient.builder()
+    .codecs(c -&gt; c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024))
+    .build();</code></pre>
+
+<h2 id="quiz"><span class="h-num">13.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Фильтр вызывает <code>chain.filter(ex);</code> и возвращает <code>Mono.empty()</code>. Что будет?</p><ul><li>Всё работает</li><li>Ошибка компиляции</li><li>Контроллер не вызовется: на результат chain.filter никто не подписался</li><li>Контроллер вызовется дважды</li></ul><div class="why">Нужно return chain.filter(ex).</div></div>
+<div class="mcq" data-ok="0"><p>Как добавить заголовок ответа с временем обработки?</p><ul><li>В response.beforeCommit(...) или до chain.filter</li><li>В doFinally после chain.filter</li><li>В @ExceptionHandler</li><li>Через ThreadLocal</li></ul><div class="why">После записи тела заголовки неизменяемы.</div></div>
+<div class="mcq" data-ok="3"><p>WebClient получает JSON в 3 МБ и падает с DataBufferLimitException, хотя spring.http.codecs.max-in-memory-size=10MB. Почему?</p><ul><li>Лимит сервера меньше</li><li>JSON нельзя больше 1 МБ</li><li>Нужен retry</li><li>WebClient создан через WebClient.create(), не через Boot-овский WebClient.Builder</li></ul><div class="why">Только автоконфигурированный билдер применяет spring.http.codecs.*.</div></div>
+<div class="mcq" data-ok="1"><p>Как изменить запрос в фильтре (добавить заголовок)?</p><ul><li>request.getHeaders().add(...)</li><li>exchange.mutate().request(r -&gt; r.header(...)).build()</li><li>Нельзя</li><li>Через HttpServletRequestWrapper</li></ul><div class="why">Заголовки запроса только для чтения; mutate создаёт декоратор.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как залогировать тело запроса в WebFilter?</summary><div class="a"><p>Тело — Flux&lt;DataBuffer&gt;, который можно прочитать один раз. Нужно декорировать запрос: <code>ServerHttpRequestDecorator</code> с переопределённым <code>getBody()</code>, который через <code>doOnNext</code> копирует байты в лог (с лимитом размера!) и пропускает буферы дальше. Альтернатива — <code>DataBufferUtils.join(body)</code> и подмена тела закэшированным буфером, но это буферизация всего тела в памяти. Не логируйте тела с персональными данными и не забывайте освобождать буферы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

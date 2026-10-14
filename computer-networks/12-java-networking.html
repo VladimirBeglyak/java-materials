@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Сеть в Java-бэкенде</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ИНЖЕНЕРИЯ · РОАДМАП s6</div>
+  <h1>Сеть в Java-бэкенде</h1>
+  <p class="lead">Всё предыдущее — в применении к коду: модели ввода-вывода, пулы соединений, правильная иерархия таймаутов, ретраи без «шторма» и типовые продакшен-аварии, которые начинаются в сети, а заканчиваются в логах сервиса.</p>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">связь с Java Concurrency, темы 08–10</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="io"><span class="h-num">12.1</span>Модели ввода-вывода</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 270" role="img" aria-label="Блокирующий и неблокирующий ввод-вывод">
+  <defs><marker id="j1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="20" y="22" font-weight="700">Поток на соединение (блокирующий)</text>
+  <g font-size="11.5" class="mono">
+    <rect x="20" y="36" width="90" height="28" rx="5" class="box"/><text x="65" y="54" text-anchor="middle">conn 1</text>
+    <rect x="20" y="70" width="90" height="28" rx="5" class="box"/><text x="65" y="88" text-anchor="middle">conn 2</text>
+    <rect x="20" y="104" width="90" height="28" rx="5" class="box"/><text x="65" y="122" text-anchor="middle">conn N</text>
+    <rect x="160" y="36" width="190" height="28" rx="5" class="box-info"/><text x="255" y="54" text-anchor="middle">thread 1: read() ждёт</text>
+    <rect x="160" y="70" width="190" height="28" rx="5" class="box-info"/><text x="255" y="88" text-anchor="middle">thread 2: read() ждёт</text>
+    <rect x="160" y="104" width="190" height="28" rx="5" class="box-info"/><text x="255" y="122" text-anchor="middle">thread N: read() ждёт</text>
+  </g>
+  <path d="M110 50 H156" class="ln" marker-end="url(#j1)"/><path d="M110 84 H156" class="ln" marker-end="url(#j1)"/><path d="M110 118 H156" class="ln" marker-end="url(#j1)"/>
+  <text x="20" y="160" font-size="12" class="muted">Просто. 10 000 соединений = 10 000 платформенных</text>
+  <text x="20" y="176" font-size="12" class="muted">потоков. Виртуальные потоки снимают это ограничение.</text>
+
+  <text x="420" y="22" font-weight="700">Event loop (NIO, Netty)</text>
+  <g font-size="11.5" class="mono">
+    <rect x="420" y="36" width="80" height="28" rx="5" class="box"/><text x="460" y="54" text-anchor="middle">conn 1</text>
+    <rect x="420" y="70" width="80" height="28" rx="5" class="box"/><text x="460" y="88" text-anchor="middle">conn 2</text>
+    <rect x="420" y="104" width="80" height="28" rx="5" class="box"/><text x="460" y="122" text-anchor="middle">conn N</text>
+    <rect x="540" y="56" width="120" height="56" rx="8" class="box-acc"/><text x="600" y="80" text-anchor="middle">Selector</text><text x="600" y="98" text-anchor="middle" font-size="10.5">epoll / kqueue</text>
+    <rect x="690" y="56" width="90" height="56" rx="8" class="box-ok"/><text x="735" y="80" text-anchor="middle">1 поток</text><text x="735" y="98" text-anchor="middle" font-size="10.5">на ядро</text>
+  </g>
+  <path d="M500 50 L536 70" class="ln" marker-end="url(#j1)"/><path d="M500 84 H536" class="ln" marker-end="url(#j1)"/><path d="M500 118 L536 100" class="ln" marker-end="url(#j1)"/><path d="M660 84 H686" class="ln" marker-end="url(#j1)"/>
+  <text x="420" y="160" font-size="12" class="muted">ОС сообщает, какие сокеты готовы к чтению/записи;</text>
+  <text x="420" y="176" font-size="12" class="muted">один поток обслуживает тысячи соединений.</text>
+  <text x="420" y="192" font-size="12" fill="var(--bad)">Правило: никогда не блокировать event loop.</text>
+  <rect x="20" y="214" width="760" height="44" rx="8" class="box"/>
+  <text x="40" y="234" font-size="12.5">Tomcat (по умолчанию) — пул потоков на запрос поверх NIO-коннектора · WebFlux/Reactor Netty — event loop · Spring MVC</text>
+  <text x="40" y="250" font-size="12.5">на виртуальных потоках — блокирующий код с масштабом event loop · JDK HttpClient — асинхронный внутри, sendAsync() → CompletableFuture</text>
+</svg>
+</figure>
+
+<pre data-title="Минимальный TCP-сервер и клиент: блокирующий API на виртуальных потоках"><code class="java">public final class EchoServer {
+    public static void main(String[] args) throws IOException {
+        try (ServerSocket server = new ServerSocket()) {
+            server.setReuseAddress(true);
+            server.bind(new InetSocketAddress("0.0.0.0", 7000), 1024);   // backlog = accept queue
+            try (ExecutorService exec = Executors.newVirtualThreadPerTaskExecutor()) {
+                while (true) {
+                    Socket s = server.accept();
+                    exec.submit(() -&gt; handle(s));
+                }
+            }
+        }
+    }
+
+    private static void handle(Socket s) {
+        try (s;
+             BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+             Writer out = new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8)) {
+            s.setSoTimeout(30_000);              // read timeout: клиент молчит 30 с — закрываем
+            s.setTcpNoDelay(true);
+            String line;
+            while ((line = in.readLine()) != null) {
+                out.write(line + "\n");
+                out.flush();
+            }
+        } catch (SocketTimeoutException e) {
+            // простаивающий клиент — освобождаем ресурсы
+        } catch (IOException e) {
+            // Connection reset и т.п. — клиент ушёл
+        }
+    }
+}
+
+final class EchoClient {
+    static String call(String host, String msg) throws IOException {
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress(host, 7000), 2_000);   // connect timeout
+            s.setSoTimeout(5_000);                                 // read timeout
+            s.getOutputStream().write((msg + "\n").getBytes(StandardCharsets.UTF_8));
+            return new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8)).readLine();
+        }
+    }
+}</code></pre>
+
+<h2 id="pools"><span class="h-num">12.2</span>Пулы соединений</h2>
+<p>Новое соединение к сервису в соседнем регионе стоит DNS + TCP (1 RTT) + TLS (1 RTT) + медленный старт + CPU на криптографию, а после закрытия ещё 60 с занимает эфемерный порт в TIME_WAIT. Пул превращает это в одноразовую цену.</p>
+<div class="table-wrap"><table>
+<tr><th>Параметр</th><th>Зачем</th><th>Типичная ошибка</th></tr>
+<tr><td>max total / max per route</td><td>ограничить нагрузку на downstream</td><td>Apache HttpClient по умолчанию — небольшое число соединений на маршрут: под нагрузкой потоки ждут в пуле</td></tr>
+<tr><td>acquire / pool timeout</td><td>сколько ждать свободного соединения</td><td>нет таймаута → потоки висят бесконечно</td></tr>
+<tr><td>idle timeout / eviction</td><td>закрывать простаивающие</td><td>больше, чем idle timeout сервера/NAT → «протухшие» соединения</td></tr>
+<tr><td>max lifetime</td><td>перебалансировка, смена DNS, ротация сертификатов</td><td>бесконечная жизнь соединений</td></tr>
+<tr><td>validation</td><td>проверка соединения перед выдачей</td><td>дорогой SQL-запрос перед каждым использованием</td></tr>
+</table></div>
+
+<div class="callout bad"><span class="c-title">Правило idle-таймаутов</span>
+<b>Клиент должен закрывать простаивающее соединение раньше, чем сервер или любой промежуточный узел.</b> Иначе клиент берёт из пула соединение, которое сервер только что закрыл, и получает <code>Connection reset</code> / <code>NoHttpResponseException</code>, а прокси — 502. Пример цепочки: keep-alive клиента 30 с &lt; балансировщик 60 с &lt; сервер (Tomcat <code>keepAliveTimeout</code>) 65 с. Для MySQL: <code>maxLifetime</code> HikariCP должен быть на несколько секунд меньше <code>wait_timeout</code> сервера и таймаутов прокси/файрвола между ними.
+</div>
+
+<h2 id="timeouts"><span class="h-num">12.3</span>Таймауты: полная карта</h2>
+<figure class="diagram">
+<svg viewBox="0 0 800 160" role="img" aria-label="Виды таймаутов">
+  <g font-size="11.5">
+    <rect x="20" y="30" width="80" height="34" rx="5" class="box"/><text x="60" y="51" text-anchor="middle">pool acquire</text>
+    <rect x="100" y="30" width="70" height="34" rx="5" class="box"/><text x="135" y="51" text-anchor="middle">DNS</text>
+    <rect x="170" y="30" width="90" height="34" rx="5" class="box-info"/><text x="215" y="51" text-anchor="middle">connect</text>
+    <rect x="260" y="30" width="90" height="34" rx="5" class="box-info"/><text x="305" y="51" text-anchor="middle">TLS</text>
+    <rect x="350" y="30" width="90" height="34" rx="5" class="box-warn"/><text x="395" y="51" text-anchor="middle">write</text>
+    <rect x="440" y="30" width="200" height="34" rx="5" class="box-acc"/><text x="540" y="51" text-anchor="middle">ожидание ответа / read</text>
+    <rect x="640" y="30" width="140" height="34" rx="5" class="box-warn"/><text x="710" y="51" text-anchor="middle">чтение тела</text>
+  </g>
+  <path d="M20 84 H780" stroke="var(--accent)" stroke-width="2"/><text x="400" y="102" text-anchor="middle" font-size="12.5" fill="var(--accent)">общий таймаут запроса (deadline) — должен покрывать всё</text>
+  <text x="20" y="132" font-size="12.5">read timeout — это пауза <tspan font-weight="700">между байтами</tspan>, а не на весь ответ: сервер, отдающий по байту в 20 с, не нарушит readTimeout 30 с</text>
+  <text x="20" y="150" font-size="12.5">никогда. Поэтому нужен общий дедлайн (HttpClient request timeout, CompletableFuture.orTimeout, gRPC deadline).</text>
+</svg>
+</figure>
+<pre data-title="JDK HttpClient: явные таймауты и один экземпляр на приложение"><code class="java">public final class RatesClient {
+    private final HttpClient http = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_2)          // откатится на 1.1, если сервер не умеет
+            .connectTimeout(Duration.ofMillis(500))
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .build();                                     // создаётся один раз: внутри пул соединений
+
+    public String fetch(URI uri) throws IOException, InterruptedException {
+        HttpRequest req = HttpRequest.newBuilder(uri)
+                .timeout(Duration.ofSeconds(2))           // до получения заголовков ответа
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+        HttpResponse&lt;String&gt; resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) throw new IOException("status " + resp.statusCode());
+        return resp.body();
+    }
+}</code></pre>
+<div class="callout info"><span class="c-title">Иерархия таймаутов в цепочке вызовов</span>
+Вызывающий ждёт <b>дольше</b>, чем вызываемый тратит на свою работу вместе с его собственными вызовами: <code>gateway 10 с &gt; сервис A 8 с &gt; сервис B 3 с &gt; БД 2 с</code>. Если наоборот, верхний уровень сдаётся и повторяет запрос, пока нижние всё ещё работают над первым, — двойная нагрузка. Лучше всего передавать <b>оставшийся бюджет</b> (дедлайн) вниз по цепочке, как делает gRPC.
+</div>
+
+<h2 id="retries"><span class="h-num">12.4</span>Ретраи без шторма</h2>
+<ol class="steps">
+  <li>Повторять только <b>идемпотентные</b> операции или с ключом идемпотентности (тема 10).</li>
+  <li>Повторять только <b>временные</b> ошибки: connect timeout, reset, 502/503/504, 429 (с учётом <code>Retry-After</code>). Не повторять 400, 401, 404, 422.</li>
+  <li><b>Экспоненциальная пауза с jitter</b>: <code>sleep = random(0, min(cap, base · 2^attempt))</code>. Без jitter тысячи клиентов повторяют синхронно — волны нагрузки.</li>
+  <li><b>Ретраить на одном уровне</b>. 3 попытки на каждом из 4 уровней = 3⁴ = 81 запрос к БД на один пользовательский клик.</li>
+  <li><b>Retry budget и circuit breaker</b> (Resilience4j): не больше ~10% дополнительных запросов на ретраи; при массовых отказах — быстрый отказ, а не добивание лежащего сервиса.</li>
+</ol>
+
+<h2 id="incidents"><span class="h-num">12.5</span>Типовые аварии</h2>
+<div class="table-wrap"><table>
+<tr><th>Симптом</th><th>Причина</th><th>Лечение</th></tr>
+<tr><td><code>Cannot assign requested address</code>, пики connect timeout</td><td>исчерпаны эфемерные порты: много коротких соединений, TIME_WAIT</td><td>пулы и keep-alive; расширить <code>ip_local_port_range</code>; больше IP на NAT</td></tr>
+<tr><td><code>Too many open files</code></td><td>лимит дескрипторов (<code>ulimit -n</code>) или утечка сокетов (CLOSE_WAIT)</td><td>закрывать ресурсы; поднять лимит осознанно</td></tr>
+<tr><td>Редкие <code>Connection reset</code> на первом запросе после паузы</td><td>сервер/балансировщик/NAT закрыл простаивающее соединение раньше пула</td><td>idle timeout клиента меньше серверного; ретрай идемпотентных; проверка соединений</td></tr>
+<tr><td>Запросы висят, потоки заняты, CPU низкий</td><td>нет read/общего таймаута; исчерпан пул соединений</td><td>таймауты везде; метрики пула; bulkhead</td></tr>
+<tr><td>Задержка ровно +5 с периодически (Kubernetes)</td><td>потеря UDP-ответа DNS (гонка conntrack при параллельных A/AAAA) → повтор через 5 с</td><td>NodeLocal DNSCache, <code>single-request-reopen</code>, меньше ndots</td></tr>
+<tr><td>Kafka-консьюмер периодически переподключается</td><td>idle-соединения к брокеру рвутся NAT/балансировщиком</td><td><code>connections.max.idle.ms</code> меньше таймаутов по пути; не ставить L4-балансировщик перед брокерами</td></tr>
+</table></div>
+
+<h2 id="checklist"><span class="h-num">12.6</span>Чек-лист любого исходящего вызова</h2>
+<ol class="steps">
+  <li>Клиент создаётся один раз и переиспользует соединения.</li>
+  <li>Заданы connect, read и общий таймаут; ожидание в пуле ограничено.</li>
+  <li>Idle timeout и max lifetime соединений меньше серверных и сетевых.</li>
+  <li>Ретраи только идемпотентных и временных ошибок, с jitter, на одном уровне.</li>
+  <li>Circuit breaker и bulkhead для внешних зависимостей.</li>
+  <li>Метрики: время ответа p50/p99, ошибки по типам, занятость пула, время ожидания соединения.</li>
+  <li>Тело ответа всегда читается или закрывается — иначе соединение не вернётся в пул.</li>
+  <li>Блокирующие вызовы не выполняются в event loop (Netty, WebFlux).</li>
+</ol>
+
+<h2 id="sim"><span class="h-num">12.7</span>Интерактив: шторм ретраев и бюджет таймаутов</h2>
+<div class="widget" id="rsW">
+  <div class="widget-title">Симулятор: цепочка сервисов под сбоем</div>
+  <p class="hint">Запрос проходит цепочку <code>gateway → A → B → C → БД</code>. Нижний сервис начал отвечать ошибками. Каждый уровень повторяет неудачные вызовы.</p>
+  <div class="controls">
+    <label>уровней с ретраями<input type="number" id="rsDepth" value="3" min="1" max="5"></label>
+    <label>попыток на уровне<input type="number" id="rsTries" value="3" min="1" max="6"></label>
+    <label>доля ошибок внизу, %<input type="number" id="rsFail" value="100" min="0" max="100"></label>
+    <label>таймаут одного вызова, мс<input type="number" id="rsTo" value="1000" min="10" style="width:90px"></label>
+    <label>стратегия<select id="rsMode" style="max-width:100%"><option value="naive">ретраи на каждом уровне, без пауз</option><option value="edge">ретраи только на одном уровне</option><option value="budget">бюджет ретраев 10% + circuit breaker</option></select></label>
+  </div>
+  <div class="out" id="rsOut"></div>
+  <div class="verdict" id="rsV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var d = Math.min(5, Math.max(1, +$("rsDepth").value)), t = Math.min(6, Math.max(1, +$("rsTries").value)), f = Math.min(100, Math.max(0, +$("rsFail").value)) / 100, to = Math.max(10, +$("rsTo").value), m = $("rsMode").value;
+    function attempts(depth) { var perLevel = 0; for (var k = 0; k < t; k++) perLevel += Math.pow(f, k); return Math.pow(perLevel, depth); }
+    var mult, worst, L = [];
+    if (m === "naive") { mult = attempts(d); worst = to * Math.pow(t, d); L.push("Каждый уровень при ошибке повторяет вызов до " + t + " раз, а нижестоящий делает то же самое.", "Запросов к нижнему сервису на один запрос пользователя: (1 + p + p² …)^" + d + " = ×" + mult.toFixed(1) + (f === 1 ? "  = " + t + "^" + d : ""), "Худшее время ответа пользователю: " + t + "^" + d + " × " + to + " мс = " + (worst / 1000).toFixed(1) + " с"); }
+    else if (m === "edge") { mult = attempts(1); worst = to * t; L.push("Повторяет только один уровень (ближайший к сбою или самый верхний), остальные пробрасывают ошибку.", "Запросов к нижнему сервису: ×" + mult.toFixed(1), "Худшее время: " + t + " × " + to + " мс = " + (worst / 1000).toFixed(1) + " с"); }
+    else { mult = 1 + Math.min(0.1, f); worst = to * 2; L.push("Ретраи ограничены бюджетом: не более 10% от числа обычных запросов.", "При массовом сбое circuit breaker размыкается, и вызовы отклоняются сразу, без ожидания таймаута.", "Запросов к нижнему сервису: ×" + mult.toFixed(2) + ", время ответа при разомкнутом breaker — миллисекунды"); }
+    $("rsOut").textContent = L.join("\n");
+    var v = $("rsV"), cls = mult > 5 ? "bad" : (mult > 2 ? "warn" : "ok"), msg;
+    if (cls === "bad") msg = "Шторм ретраев: сервису, которому и так плохо, приходит в " + mult.toFixed(0) + " раз больше запросов. Он не может восстановиться даже после исчезновения первопричины — система сама держит себя в аварии (метастабильный отказ). Плюс все потоки верхних сервисов висят в ожидании по " + (worst / 1000).toFixed(0) + " с.";
+    else if (cls === "warn") msg = "Умеренное усиление нагрузки. Добавьте экспоненциальную паузу со случайным разбросом (jitter), чтобы повторы не приходили синхронными волнами.";
+    else msg = "Нагрузка на сбойный сервис почти не растёт. Дополнительно: общий дедлайн запроса передаётся вниз (осталось 300 мс — не начинай вызов на 1 с), ретраятся только идемпотентные операции и только ошибки, которые имеет смысл повторять (503, таймаут соединения), но не 4xx.";
+    v.className = "verdict " + cls; v.textContent = msg;
+  }
+  document.querySelectorAll("#rsW input, #rsW select").forEach(function (e) { e.addEventListener("input", run); e.addEventListener("change", run); });
+  run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">12.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>У HTTP-клиента задан только connect timeout. Сервер принял соединение и перестал отвечать. Что произойдёт?</p><ul><li>Сработает connect timeout</li><li>Соединение закроется через 30 секунд</li><li>Поток будет ждать ответ бесконечно: нужен ещё read (response) timeout</li><li>Клиент автоматически повторит запрос</li></ul><div class="why">Таймауты разные: на установку соединения, на получение соединения из пула, на чтение, на весь запрос. Нужны все.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем к паузе между ретраями добавляют jitter?</p><ul><li>Для экономии памяти</li><li>Чтобы клиенты, получившие ошибку одновременно, не повторяли запросы синхронными волнами</li><li>Чтобы увеличить число попыток</li><li>Для шифрования</li></ul><div class="why">Без разброса все клиенты возвращаются в один момент и снова перегружают сервис.</div></div>
+<div class="mcq" data-ok="0"><p>Пул HTTP-соединений на 50, сервис-получатель стал отвечать за 10 с вместо 100 мс. Что случится с вызывающим сервисом?</p><ul><li>Все 50 соединений будут заняты, остальные потоки встанут в очередь за соединением и исчерпают пул потоков — сбой распространится вверх</li><li>Ничего</li><li>Пул вырастет автоматически</li><li>Запросы пойдут в обход пула</li></ul><div class="why">Каскадный отказ. Защита: короткие таймауты, таймаут ожидания соединения из пула, bulkhead, circuit breaker.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое read timeout и почему его недостаточно?</summary><div class="a"><p>Максимальная пауза между поступлением данных из сокета. Сервер, который медленно, но регулярно шлёт байты, никогда его не нарушит, и запрос может длиться бесконечно. Нужен общий дедлайн на весь запрос.</p></div></details>
+<details class="q"><summary>Как связаны idle timeout пула клиента и keep-alive timeout сервера?</summary><div class="a"><p>Клиентский должен быть меньше. Иначе есть окно, когда сервер уже закрыл соединение, а клиент берёт его из пула и получает reset или пустой ответ.</p></div></details>
+<details class="q"><summary>Почему 3 ретрая — это может быть 81 запрос?</summary><div class="a"><p>Если повторяет каждый уровень цепочки из четырёх сервисов, число попыток перемножается: 3 × 3 × 3 × 3. Под нагрузкой это превращает частичную деградацию в полный отказ. Ретраи должны быть на одном уровне (обычно ближе к клиенту) с бюджетом.</p></div></details>
+<details class="q"><summary>Сервис делает 2 000 запросов в секунду к партнёрскому API без пула. Какие проблемы вы ожидаете?</summary><div class="a"><p>На каждый запрос — TCP и TLS рукопожатия (лишние 2 RTT и CPU), медленный старт, TIME_WAIT на 60 с: 2 000 × 60 = 120 000 занятых портов при ~28 000 эфемерных → исчерпание портов и ошибки подключения. Плюс нагрузка на NAT-шлюз. Решение — пул с keep-alive.</p></div></details>
+<details class="q"><summary>Почему в Reactor Netty нельзя вызывать JDBC в обработчике запроса?</summary><div class="a"><p>Обработчик выполняется в потоке event loop, который обслуживает тысячи соединений. Блокирующий вызов останавливает их все. Блокирующий код выносится на <code>Schedulers.boundedElastic()</code> или используется неблокирующий драйвер (R2DBC); альтернатива — MVC на виртуальных потоках.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

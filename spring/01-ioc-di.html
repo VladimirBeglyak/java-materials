@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · IoC, DI и контейнер</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · КОНТЕЙНЕР</div>
+  <h1>IoC, DI и контейнер</h1>
+  <p class="lead">Spring — это прежде всего контейнер: объект, который по описаниям (BeanDefinition) создаёт ваши объекты, связывает их зависимостями и управляет их жизнью. Всё остальное — MVC, транзакции, Security, Boot — построено как расширения этого контейнера. Поймёте контейнер — остальное перестанет быть магией.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">BeanFactory</span><span class="tag">ApplicationContext</span><span class="tag">@Autowired</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">1.1</span>Инверсия управления: какую проблему решаем</h2>
+<p>Без контейнера каждый класс сам создаёт свои зависимости. Класс знает не только <i>что</i> ему нужно, но и <i>как</i> это собрать: какой драйвер, какой URL, какой пул. Подменить реализацию в тесте или в другом окружении нельзя, не меняя код.</p>
+<div class="vs">
+<pre data-title="Без IoC: класс собирает зависимости сам" class="bad-code"><code class="java">class OrderService {
+    private final OrderRepository repo =
+        new JdbcOrderRepository(
+            new HikariDataSource(cfg("jdbc:pg://prod")));
+    private final PaymentClient payments =
+        new StripeClient(System.getenv("KEY"));
+    // тест без настоящей БД и Stripe не написать
+}</code></pre>
+<pre data-title="С IoC: зависимости приходят снаружи" class="good-code"><code class="java">@Service
+class OrderService {
+    private final OrderRepository repo;
+    private final PaymentClient payments;
+
+    OrderService(OrderRepository repo, PaymentClient payments) {
+        this.repo = repo;          // кто и как создал —
+        this.payments = payments;  // не забота этого класса
+    }
+}</code></pre>
+</div>
+<p><b>Inversion of Control (IoC)</b> — принцип: управление созданием и связыванием объектов передаётся внешнему механизму («не звоните нам, мы вам позвоним»). <b>Dependency Injection (DI)</b> — конкретный способ реализовать IoC: зависимости передаются через конструктор, сеттер или поле. Альтернативный способ IoC — Service Locator (<code>context.getBean(...)</code> внутри бизнес-кода) — в Spring считается анти-паттерном: класс снова зависит от инфраструктуры.</p>
+<div class="callout info"><span class="c-title">Термины</span>
+<b>Бин (bean)</b> — объект, жизненным циклом которого управляет контейнер. Объект, созданный через <code>new</code> в вашем коде, бином не является: контейнер о нём не знает, не внедрит в него зависимости и не обернёт в прокси (значит, на нём не сработают <code>@Transactional</code>, <code>@Async</code>, <code>@Cacheable</code>).
+</div>
+
+<h2 id="container"><span class="h-num">1.2</span>Устройство контейнера: BeanFactory и ApplicationContext</h2>
+<p>В Spring два уровня контейнера. <code>BeanFactory</code> — минимальный интерфейс «дай бин по имени/типу». <code>ApplicationContext</code> — надстройка для приложений: события, ресурсы, i18n, окружение, автоматическая регистрация пост-процессоров. Реальную работу в обоих случаях делает один класс — <code>DefaultListableBeanFactory</code>.</p>
+
+<figure class="diagram">
+<svg viewBox="0 0 820 330" role="img" aria-label="Иерархия интерфейсов контейнера Spring">
+  <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="300" y="10" width="220" height="40" rx="8" class="box"/><text x="410" y="35" text-anchor="middle" class="mono" font-size="13">BeanFactory</text>
+  <rect x="40" y="86" width="220" height="40" rx="8" class="box"/><text x="150" y="111" text-anchor="middle" class="mono" font-size="12.5">ListableBeanFactory</text>
+  <rect x="300" y="86" width="220" height="40" rx="8" class="box"/><text x="410" y="111" text-anchor="middle" class="mono" font-size="12.5">HierarchicalBeanFactory</text>
+  <rect x="560" y="86" width="230" height="40" rx="8" class="box"/><text x="675" y="111" text-anchor="middle" class="mono" font-size="12.5">AutowireCapableBeanFactory</text>
+  <rect x="20" y="170" width="380" height="56" rx="8" class="box-acc"/><text x="210" y="194" text-anchor="middle" class="mono" font-size="13" font-weight="600">ApplicationContext</text>
+  <text x="210" y="214" text-anchor="middle" font-size="12" class="muted">+ MessageSource, ApplicationEventPublisher, ResourcePatternResolver, Environment</text>
+  <rect x="440" y="170" width="360" height="56" rx="8" class="box-info"/><text x="620" y="194" text-anchor="middle" class="mono" font-size="12.5">ConfigurableListableBeanFactory</text>
+  <text x="620" y="214" text-anchor="middle" font-size="12" class="muted">+ BeanDefinitionRegistry (регистрация описаний)</text>
+  <rect x="440" y="266" width="360" height="48" rx="8" class="box-ok"/><text x="620" y="295" text-anchor="middle" class="mono" font-size="13" font-weight="600">DefaultListableBeanFactory</text>
+  <rect x="20" y="266" width="380" height="48" rx="8" class="box-warn"/><text x="210" y="287" text-anchor="middle" class="mono" font-size="12">AnnotationConfigApplicationContext</text>
+  <text x="210" y="304" text-anchor="middle" class="mono" font-size="11.5">Boot: AnnotationConfigServletWebServer…Context</text>
+  <path d="M150 86 L340 54" class="ln" marker-end="url(#a1)"/><path d="M410 86 V54" class="ln" marker-end="url(#a1)"/><path d="M675 86 L480 54" class="ln" marker-end="url(#a1)"/>
+  <path d="M150 170 V130" class="ln" marker-end="url(#a1)"/><path d="M330 170 L400 130" class="ln" marker-end="url(#a1)"/>
+  <path d="M560 170 L230 130" class="ln-dash"/><path d="M620 170 V130" class="ln" marker-end="url(#a1)"/>
+  <path d="M210 266 V230" class="ln" marker-end="url(#a1)"/><path d="M620 266 V230" class="ln" marker-end="url(#a1)"/>
+  <path d="M400 290 H436" class="ln-acc" marker-end="url(#a1)"/><text x="418" y="282" text-anchor="middle" font-size="11" class="muted">делегирует</text>
+</svg>
+<figcaption>ApplicationContext не наследует реализацию фабрики, а держит внутри экземпляр <code>DefaultListableBeanFactory</code> и делегирует ему <code>getBean</code>. Его можно получить: <code>context.getBeanFactory()</code>.</figcaption>
+</figure>
+
+<div class="table-wrap"><table>
+<tr><th>Возможность</th><th>BeanFactory</th><th>ApplicationContext</th></tr>
+<tr><td>Создание бинов, DI</td><td>да</td><td>да</td></tr>
+<tr><td>Когда создаются singleton-бины</td><td>лениво, при первом <code>getBean</code></td><td><b>все сразу</b> при старте (<code>preInstantiateSingletons</code>) — ошибки конфигурации видны на запуске, а не в 3 часа ночи</td></tr>
+<tr><td><code>BeanPostProcessor</code>, <code>BeanFactoryPostProcessor</code></td><td>регистрировать вручную</td><td>находит и регистрирует автоматически</td></tr>
+<tr><td>События, <code>@EventListener</code></td><td>нет</td><td>да</td></tr>
+<tr><td>Environment, профили, <code>@Value</code> с плейсхолдерами</td><td>частично</td><td>да</td></tr>
+<tr><td>i18n (<code>MessageSource</code>), ресурсы <code>classpath*:</code></td><td>нет</td><td>да</td></tr>
+</table></div>
+<p>Внутри фабрики три главные структуры: <code>beanDefinitionMap</code> (имя → <code>BeanDefinition</code>, «рецепт» бина), <code>singletonObjects</code> (имя → готовый экземпляр) и индекс по типам для поиска кандидатов. Об устройстве <code>BeanDefinition</code> и о том, как контекст заполняется, — тема 02.</p>
+
+<h2 id="config"><span class="h-num">1.3</span>Как описать бины: четыре способа</h2>
+<pre data-title="1. Сканирование компонентов"><code class="java">@Configuration
+@ComponentScan("com.shop")            // ищет классы с @Component и мета-аннотациями
+class AppConfig { }
+
+@Service                              // = @Component с семантикой «сервисный слой»
+class OrderService { /* ... */ }
+
+@Repository                           // + трансляция исключений БД в DataAccessException
+class JdbcOrderRepository implements OrderRepository { /* ... */ }</code></pre>
+<pre data-title="2. Java-конфигурация: @Bean — для чужих классов и сложной сборки"><code class="java">@Configuration
+class InfraConfig {
+    @Bean(destroyMethod = "close")
+    HikariDataSource dataSource(DbProperties p) {      // параметры метода — тоже DI
+        var ds = new HikariDataSource();
+        ds.setJdbcUrl(p.url());
+        ds.setMaximumPoolSize(p.poolSize());
+        return ds;
+    }
+
+    @Bean
+    JdbcTemplate jdbcTemplate(DataSource ds) { return new JdbcTemplate(ds); }
+}</code></pre>
+<pre data-title="3. Программная регистрация (GenericApplicationContext, Spring 7: BeanRegistrar)"><code class="java">var ctx = new GenericApplicationContext();
+ctx.registerBean(Clock.class, Clock::systemUTC);
+ctx.registerBean("orderService", OrderService.class);   // конструктор разрешится автоматически
+ctx.refresh();
+
+// Spring Framework 7: BeanRegistrar — программная регистрация с условиями, дружит с AOT
+class MyRegistrar implements BeanRegistrar {
+    public void register(BeanRegistry registry, Environment env) {
+        if (env.matchesProfiles("dev")) registry.registerBean("clock", Clock.class, s -&gt; s.supplier(c -&gt; Clock.systemUTC()));
+    }
+}</code></pre>
+<p>Четвёртый способ — XML (<code>&lt;bean class="..."/&gt;</code>) — встречается в старых проектах; механизм тот же: XML читается в <code>BeanDefinition</code>.</p>
+<div class="callout warn"><span class="c-title">Компонент или @Bean?</span>
+<code>@Component</code> — для <b>своих</b> классов, у которых одна очевидная реализация. <code>@Bean</code> — для классов из библиотек (их нельзя пометить аннотацией), для бинов, которым нужна нетривиальная сборка, и когда нужно несколько бинов одного класса с разной настройкой (два <code>DataSource</code>, два <code>RestClient</code>).
+</div>
+
+<h2 id="injection"><span class="h-num">1.4</span>Способы внедрения</h2>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Плюсы</th><th>Минусы</th></tr>
+<tr><td><b>Конструктор</b> (рекомендуется)</td><td>поля <code>final</code>, объект всегда полностью собран; зависимости видны в сигнатуре; тест — просто <code>new</code>; цикл зависимостей сразу падает (это хорошо)</td><td>длинный конструктор — но это сигнал, что класс делает слишком много</td></tr>
+<tr><td>Сеттер</td><td>опциональные зависимости, перенастройка</td><td>объект может быть недособран; изменяемость</td></tr>
+<tr><td>Поле (<code>@Autowired</code> на поле)</td><td>коротко</td><td>нельзя <code>final</code>; без контейнера (в юнит-тесте) поле останется <code>null</code>; скрывает число зависимостей; внедрение через рефлексию</td></tr>
+</table></div>
+<p>С Spring 4.3 при <b>единственном</b> конструкторе <code>@Autowired</code> писать не нужно. При нескольких конструкторах контейнер возьмёт помеченный <code>@Autowired</code>, а если такого нет — конструктор без аргументов. Это решает <code>AutowiredAnnotationBeanPostProcessor.determineCandidateConstructors</code>.</p>
+<pre data-title="Рекомендуемая форма: record-подобный сервис, Lombok не обязателен"><code class="java">@Service
+class CheckoutService {
+    private final CartRepository carts;
+    private final PricingPolicy pricing;
+    private final ObjectProvider&lt;FraudCheck&gt; fraud;   // опциональная зависимость
+
+    CheckoutService(CartRepository carts, PricingPolicy pricing, ObjectProvider&lt;FraudCheck&gt; fraud) {
+        this.carts = carts; this.pricing = pricing; this.fraud = fraud;
+    }
+
+    Order checkout(long cartId) {
+        Cart cart = carts.find(cartId);
+        fraud.ifAvailable(f -&gt; f.verify(cart));        // бина нет — шаг пропускается
+        return pricing.apply(cart);
+    }
+}</code></pre>
+
+<h2 id="resolve"><span class="h-num">1.5</span>Как контейнер выбирает, какой бин внедрить</h2>
+<p>Точка внедрения описывается <code>DependencyDescriptor</code> (тип, generics, аннотации, имя параметра/поля). Её разрешает <code>DefaultListableBeanFactory.doResolveDependency</code>:</p>
+<ol class="steps">
+  <li><b>Особые типы.</b> <code>Optional&lt;T&gt;</code>, <code>ObjectProvider&lt;T&gt;</code>, <code>Provider&lt;T&gt;</code> — обёртка, разрешение откладывается. <code>List&lt;T&gt;</code>, <code>Set</code>, <code>Map&lt;String,T&gt;</code>, массивы — внедряются <b>все</b> кандидаты (List отсортирован по <code>@Order</code>/<code>Ordered</code>).</li>
+  <li><b>Поиск по типу</b> (<code>findAutowireCandidates</code>): все бины, совместимые по типу с учётом generics, у которых <code>autowireCandidate=true</code>. Если в точке есть <code>@Qualifier("x")</code> — остаются только бины с таким квалификатором <i>или с таким именем</i>.</li>
+  <li><b>0 кандидатов</b> → <code>NoSuchBeanDefinitionException</code> (если зависимость обязательная).</li>
+  <li><b>1 кандидат</b> → внедряется.</li>
+  <li><b>Несколько</b> (<code>determineAutowireCandidate</code>): единственный <code>@Primary</code> → он; если <code>@Primary</code> нет, но ровно один кандидат без <code>@Fallback</code> (6.2+) — он; иначе бин, <b>имя которого совпадает с именем поля/параметра</b>; иначе бин с наивысшим приоритетом, то есть с <b>наименьшим</b> значением <code>@Priority</code>. Не получилось выбрать → <code>NoUniqueBeanDefinitionException</code>.</li>
+</ol>
+<div class="callout info">До Spring 6.2 <code>@Priority</code> проверялся раньше совпадения по имени. Совпадение по имени работает, только если компилятор сохранил имена параметров (<code>-parameters</code>; Spring Boot включает этот флаг в своих плагинах сборки). Без него в 6.1+ Spring больше не читает имена из отладочной информации — именная стратегия молча перестаёт работать.</div>
+
+<div class="widget" id="aw">
+  <div class="widget-title">Симулятор: какой бин получит точка внедрения</div>
+  <p class="hint">Контекст: интерфейс <code>PaymentGateway</code> и три реализации. Включайте и выключайте бины и аннотации — алгоритм <code>doResolveDependency</code> покажет каждый шаг.</p>
+  <div class="controls">
+    <label>тип точки<select id="awKind"><option value="one">PaymentGateway</option><option value="opt">Optional&lt;PaymentGateway&gt;</option><option value="list">List&lt;PaymentGateway&gt;</option></select></label>
+    <label>имя параметра<select id="awName"><option>gateway</option><option>stripeGateway</option><option>paypalGateway</option><option>mockGateway</option></select></label>
+    <label>@Qualifier<select id="awQ"><option value="">нет</option><option>stripeGateway</option><option value="fast">fast</option><option>yandexGateway</option></select></label>
+  </div>
+  <div class="rows" id="awBeans"></div>
+  <div class="log" id="awLog"></div>
+  <div class="verdict" id="awOut"></div>
+</div>
+<script>
+(function () {
+  var beans = [
+    { name: "stripeGateway", on: true, primary: false, fallback: false, q: "", prio: 10 },
+    { name: "paypalGateway", on: true, primary: false, fallback: false, q: "fast", prio: 5 },
+    { name: "mockGateway", on: false, primary: false, fallback: true, q: "", prio: 20 }
+  ];
+  var $ = function (id) { return document.getElementById(id); };
+  function rows() {
+    $("awBeans").innerHTML = beans.map(function (b, i) {
+      return '<div class="row" style="grid-template-columns:minmax(0,1fr)"><div class="checks" style="margin:0">' +
+        '<label><input type="checkbox" data-i="' + i + '" data-f="on"' + (b.on ? " checked" : "") + '><b style="font-family:var(--font-mono);font-size:13px">' + b.name + "</b></label>" +
+        '<label><input type="checkbox" data-i="' + i + '" data-f="primary"' + (b.primary ? " checked" : "") + ">@Primary</label>" +
+        '<label><input type="checkbox" data-i="' + i + '" data-f="fallback"' + (b.fallback ? " checked" : "") + ">@Fallback</label>" +
+        '<span style="font-size:13px;color:var(--fg-muted)">' + (b.q ? '@Qualifier("' + b.q + '") · ' : "") + "@Priority(" + b.prio + ")</span></div></div>";
+    }).join("");
+    $("awBeans").querySelectorAll("input").forEach(function (c) {
+      c.addEventListener("change", function () { beans[+c.dataset.i][c.dataset.f] = c.checked; run(); });
+    });
+  }
+  function run() {
+    var kind = $("awKind").value, name = $("awName").value, q = $("awQ").value, log = [], out, cls = "ok";
+    var c = beans.filter(function (b) { return b.on; });
+    log.push("1. findAutowireCandidates(PaymentGateway): по типу найдено " + c.length + (c.length ? " → " + c.map(function (b) { return b.name; }).join(", ") : ""));
+    if (q) {
+      c = c.filter(function (b) { return b.q === q || b.name === q; });
+      log.push("2. @Qualifier(\"" + q + "\"): остаются бины с этим квалификатором или именем → " + (c.map(function (b) { return b.name; }).join(", ") || "никого"));
+    }
+    if (kind === "list") {
+      var sorted = c.slice();
+      out = "Внедрён список из " + c.length + " элементов: [" + sorted.map(function (b) { return b.name; }).join(", ") + "]. Для коллекций выбор не нужен — приходят все кандидаты (порядок задают @Order/Ordered, иначе — порядок регистрации). Пустой результат даёт исключение, если зависимость обязательна; @Autowired(required=false) или ObjectProvider это смягчают.";
+      if (!c.length) { cls = "bad"; out = "Кандидатов нет → NoSuchBeanDefinitionException (пустой List не внедряется, если зависимость обязательна)."; }
+    } else if (!c.length) {
+      if (kind === "opt") { cls = "warn"; out = "Optional.empty() — бина нет, но точка необязательная. Без Optional было бы NoSuchBeanDefinitionException: expected at least 1 bean which qualifies as autowire candidate."; }
+      else { cls = "bad"; out = "NoSuchBeanDefinitionException: No qualifying bean of type 'PaymentGateway' available. Контекст не стартует."; }
+    } else if (c.length === 1) {
+      log.push("→ единственный кандидат");
+      out = "Внедрён " + c[0].name + ".";
+    } else {
+      log.push("3. Кандидатов несколько → determineAutowireCandidate");
+      var nonFb = c.filter(function (b) { return !b.fallback; });
+      var prim = c.filter(function (b) { return b.primary; });
+      if (prim.length > 1) { cls = "bad"; log.push("   @Primary: " + prim.length + " бина"); out = "NoUniqueBeanDefinitionException: more than one 'primary' bean found among candidates [" + prim.map(function (b) { return b.name; }).join(", ") + "]."; }
+      else if (prim.length === 1) { log.push("   @Primary → " + prim[0].name); out = "Внедрён " + prim[0].name + " — помечен @Primary."; }
+      else {
+        log.push("   @Primary: нет");
+        if (nonFb.length === 1 && nonFb.length < c.length) { log.push("   остальные кандидаты помечены @Fallback"); out = "Внедрён " + nonFb[0].name + " — единственный кандидат без @Fallback (проверяется сразу после @Primary, до сопоставления по имени)."; }
+        else {
+          var byName = c.filter(function (b) { return b.name === name; });
+          if (byName.length) { log.push("   имя параметра '" + name + "' совпадает с именем бина"); out = "Внедрён " + byName[0].name + " — совпало имя параметра. Хрупко: переименование параметра меняет поведение."; }
+          else {
+            log.push("   совпадения по имени '" + name + "' нет");
+            var top = c.slice().sort(function (a, b) { return a.prio - b.prio; });
+            log.push("   @Priority: " + top.map(function (b) { return b.name + "=" + b.prio; }).join(", ") + " (меньше значение — выше приоритет)");
+            if (top[0].prio < top[1].prio) { out = "Внедрён " + top[0].name + " — наивысший приоритет, то есть наименьшее значение @Priority (jakarta.annotation.Priority). Встречается редко; явный @Qualifier или @Primary читается лучше."; }
+            else { cls = "bad"; out = "NoUniqueBeanDefinitionException: Multiple beans found with the same highest priority (" + top[0].prio + ") among candidates: [" + top.filter(function (b) { return b.prio === top[0].prio; }).map(function (b) { return b.name; }).join(", ") + "]"; }
+          }
+        }
+      }
+      if (kind === "opt" && cls === "bad") out += " Optional не спасает от неоднозначности — исключение то же.";
+    }
+    $("awLog").textContent = log.join("\n");
+    var o = $("awOut"); o.className = "verdict " + cls; o.textContent = out;
+  }
+  ["awKind", "awName", "awQ"].forEach(function (id) { $(id).addEventListener("change", run); });
+  rows(); run();
+})();
+</script>
+<p><b>Попробуйте:</b> (1) Включите <code>mockGateway</code> и уберите у него <code>@Fallback</code> — три кандидата и ни один не выбран. (2) Поставьте <code>@Primary</code> двум бинам. (3) Выберите имя параметра <code>paypalGateway</code> — именная стратегия. (4) Квалификатор <code>yandexGateway</code> и тип <code>Optional</code>.</p>
+
+<h2 id="special"><span class="h-num">1.6</span>Коллекции, generics, ObjectProvider, @Lazy</h2>
+<pre data-title="Стратегии: внедрить все реализации и выбирать по ключу"><code class="java">interface PaymentGateway { String code(); Receipt pay(Money m); }
+
+@Service
+class PaymentRouter {
+    private final Map&lt;String, PaymentGateway&gt; byCode;
+
+    PaymentRouter(List&lt;PaymentGateway&gt; all) {                // все бины этого типа
+        this.byCode = all.stream().collect(toMap(PaymentGateway::code, g -&gt; g));
+    }
+    // Альтернатива: Map&lt;String, PaymentGateway&gt; — ключ = имя бина
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>Generics как квалификатор</h4><p>Бины <code>Repository&lt;User&gt;</code> и <code>Repository&lt;Order&gt;</code> различаются по параметру типа: точка <code>Repository&lt;User&gt; users</code> получит нужный без <code>@Qualifier</code>. Работает через <code>ResolvableType</code>.</p></div>
+  <div class="card"><h4>ObjectProvider&lt;T&gt;</h4><p>Ленивое и опциональное получение: <code>getIfAvailable()</code>, <code>getIfUnique()</code>, <code>orderedStream()</code>. Каждый вызов <code>getObject()</code> для prototype даёт новый экземпляр — так singleton получает свежий prototype (тема 03).</p></div>
+  <div class="card"><h4>@Lazy на точке внедрения</h4><p>Внедряется не бин, а <b>прокси</b>, который при первом вызове метода достанет настоящий бин. Используется, чтобы разорвать цикл в конструкторах или отложить дорогую инициализацию.</p></div>
+  <div class="card"><h4>@Value</h4><p>Внедряет значение из Environment или результат SpEL: <code>@Value("${app.timeout:5s}") Duration timeout</code>. Строка конвертируется в тип через <code>ConversionService</code>. Для групп настроек лучше <code>@ConfigurationProperties</code> (тема 08).</p></div>
+</div>
+
+<h2 id="stereotypes"><span class="h-num">1.7</span>Стереотипы и мета-аннотации</h2>
+<p>Сканер (<code>ClassPathBeanDefinitionScanner</code>) ищет классы, помеченные <code>@Component</code> <b>прямо или через мета-аннотацию</b>. <code>@Service</code>, <code>@Repository</code>, <code>@Controller</code>, <code>@Configuration</code> сами помечены <code>@Component</code>. Сканер читает байткод через ASM и не загружает классы, пока не решит, что класс подходит, — поэтому сканирование тысяч классов идёт быстро.</p>
+<div class="table-wrap"><table>
+<tr><th>Аннотация</th><th>Что добавляет кроме регистрации</th></tr>
+<tr><td><code>@Component</code></td><td>ничего — базовый стереотип</td></tr>
+<tr><td><code>@Service</code></td><td>ничего технического, только смысл: «бизнес-логика»</td></tr>
+<tr><td><code>@Repository</code></td><td><code>PersistenceExceptionTranslationPostProcessor</code> оборачивает бин в прокси, который переводит <code>SQLException</code>/исключения JPA в иерархию <code>DataAccessException</code></td></tr>
+<tr><td><code>@Controller</code> / <code>@RestController</code></td><td><code>RequestMappingHandlerMapping</code> регистрирует методы с <code>@RequestMapping</code> как обработчики HTTP</td></tr>
+<tr><td><code>@Configuration</code></td><td>класс обрабатывается <code>ConfigurationClassPostProcessor</code>, по умолчанию подменяется CGLIB-подклассом (тема 02)</td></tr>
+</table></div>
+<pre data-title="Своя составная аннотация"><code class="java">@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Service
+@Transactional(readOnly = true)
+public @interface ReadOnlyService {
+    @AliasFor(annotation = Service.class, attribute = "value")
+    String value() default "";        // имя бина пробрасывается в @Service
+}</code></pre>
+<p>Имя бина по умолчанию — имя класса с маленькой буквы (<code>OrderService</code> → <code>orderService</code>; <code>URLParser</code> → <code>URLParser</code>, если первые две буквы заглавные), для <code>@Bean</code> — имя метода. Два бина с одинаковым именем: в Spring Boot по умолчанию <code>spring.main.allow-bean-definition-overriding=false</code> → ошибка старта.</p>
+
+<h2 id="quiz"><span class="h-num">1.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Чем ApplicationContext принципиально отличается от BeanFactory при старте?</p><ul><li>ApplicationContext не поддерживает prototype-бины</li><li>BeanFactory создаёт бины через рефлексию, а ApplicationContext — через CGLIB</li><li>ApplicationContext сразу создаёт все не-ленивые singleton-бины и сам регистрирует пост-процессоры</li><li>Ничем, это синонимы</li></ul><div class="why">Метод <code>refresh()</code> контекста вызывает <code>preInstantiateSingletons()</code> и автоматически находит <code>BeanPostProcessor</code>/<code>BeanFactoryPostProcessor</code> среди бинов. Голая фабрика создаёт бины лениво, а пост-процессоры нужно добавлять руками.</div></div>
+<div class="mcq" data-ok="1"><p>Два бина PaymentGateway, ни одного @Primary, поле называется <code>paypalGateway</code>. Что будет (Spring 6.2)?</p><ul><li>NoUniqueBeanDefinitionException</li><li>Внедрится бин с именем paypalGateway</li><li>Внедрится первый зарегистрированный</li><li>Внедрится null</li></ul><div class="why">Совпадение имени точки внедрения с именем бина — одна из стратегий выбора среди нескольких кандидатов. Она работает, если имена параметров доступны (для полей — всегда).</div></div>
+<div class="mcq" data-ok="3"><p>Почему на объекте, созданном через <code>new OrderService(...)</code>, не работает @Transactional?</p><ul><li>@Transactional работает только на интерфейсах</li><li>Нужно добавить @EnableTransactionManagement в сам класс</li><li>new создаёт объект без конструктора по умолчанию</li><li>Объект не бин: контейнер не прогнал его через BeanPostProcessor-ы и не обернул в прокси</li></ul><div class="why">Транзакции, кэш, @Async реализуются прокси, которые создаёт <code>BeanPostProcessor</code> при инициализации бина. Объекта из <code>new</code> контейнер не видит.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое IoC и чем DI отличается от Service Locator?</summary><div class="a"><p>IoC — передача управления созданием и связыванием объектов внешнему механизму. DI — зависимости <i>передаются</i> объекту (конструктор/сеттер/поле), объект не знает, откуда они. Service Locator — объект сам <i>запрашивает</i> зависимости у реестра: остаётся зависимость от инфраструктуры, зависимости не видны в API, тестировать сложнее.</p></div></details>
+<details class="q"><summary>Почему внедрение через конструктор предпочтительнее полевого?</summary><div class="a"><p>Неизменяемость (final), гарантия полной инициализации, явный список зависимостей, тестирование без контейнера и рефлексии, ранняя ошибка при циклической зависимости. Полевое внедрение прячет зависимости и оставляет поля null вне контейнера.</p></div></details>
+<details class="q"><summary>Как внедрить все реализации интерфейса и в каком порядке они придут?</summary><div class="a"><p><code>List&lt;T&gt;</code>/<code>Set&lt;T&gt;</code>/<code>T[]</code> или <code>Map&lt;String,T&gt;</code> (ключ — имя бина). Порядок List — по <code>@Order</code>/<code>Ordered</code>/<code>@Priority</code>, без них — порядок регистрации определений. <code>ObjectProvider.orderedStream()</code> — ленивый вариант.</p></div></details>
+<details class="q"><summary>Что делает @Repository кроме регистрации бина?</summary><div class="a"><p>Делает бин кандидатом для <code>PersistenceExceptionTranslationPostProcessor</code>: он оборачивает бин в прокси с <code>PersistenceExceptionTranslationInterceptor</code>, который переводит специфичные исключения (JDBC, JPA, Hibernate) в единую иерархию <code>DataAccessException</code> (например <code>DuplicateKeyException</code>).</p></div></details>
+<details class="q"><summary>Когда @Component, а когда @Bean?</summary><div class="a"><p>@Component — свои классы с единственной естественной реализацией. @Bean — классы сторонних библиотек, сложная сборка, несколько бинов одного класса с разными настройками, условная регистрация в конфигурации.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

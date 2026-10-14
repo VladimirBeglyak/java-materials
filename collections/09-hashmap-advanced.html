@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · HashMap: коллизии, ёмкость, compute/merge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ХЕШ-СТРУКТУРЫ</div>
+  <h1>HashMap: коллизии, ёмкость, compute/merge</h1>
+  <p class="lead">Практическая часть о HashMap: как правильно задать начальную ёмкость (и почему <code>new HashMap&lt;&gt;(1000)</code> не означает «на 1000 элементов»), чем грозят массовые коллизии и атаки hash flooding, и как писать идиоматичный код с <code>computeIfAbsent</code>, <code>merge</code>, <code>getOrDefault</code> вместо цепочек get/put — с песочницей, где видно, как меняется карта.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">tableSizeFor</span><span class="tag">newHashMap(n)</span><span class="tag">hash flooding</span><span class="tag">computeIfAbsent</span><span class="tag">merge</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="capacity"><span class="h-num">9.1</span>Начальная ёмкость</h2>
+<p>Конструктор <code>new HashMap&lt;&gt;(c)</code> принимает <b>ёмкость таблицы</b>, а не ожидаемое число элементов. Ёмкость округляется вверх до степени двойки (<code>tableSizeFor</code>), а таблица растёт, когда элементов больше 75% ёмкости. С Java 19 есть фабрика по числу элементов: <code>HashMap.newHashMap(n)</code> (и <code>HashSet.newHashSet</code>, <code>LinkedHashMap.newLinkedHashMap</code>).</p>
+<div class="widget" id="capW">
+  <div class="widget-title">Сколько будет resize для n элементов?</div>
+  <div class="controls"><label>ожидаемых элементов n<input type="number" id="capN" value="1000" min="1"></label></div>
+  <div class="table-wrap"><table id="capT"></table></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function tsf(c) { var n = 1; while (n < c) n *= 2; return Math.max(1, n); }
+  function sim(initCap, n) { var cap = initCap || 16, res = 0, copies = 0; while (n > cap * 0.75) { copies += Math.floor(cap * 0.75); cap *= 2; res++; } return [cap, res, copies]; }
+  function run() {
+    var n = Math.max(1, +$("capN").value), rows = [
+      ["new HashMap<>()", 16], ["new HashMap<>(" + n + ")", tsf(n)], ["new HashMap<>((int) (n / 0.75f) + 1)", tsf(Math.floor(n / 0.75) + 1)], ["HashMap.newHashMap(" + n + ")   // Java 19+", tsf(Math.ceil(n / 0.75))]
+    ];
+    $("capT").innerHTML = "<tr><th>Создание</th><th>начальная таблица</th><th>итоговая</th><th>resize</th><th>перенесено узлов</th></tr>" + rows.map(function (r) { var s = sim(r[1], n); return "<tr><td><code>" + r[0] + "</code></td><td>" + r[1] + "</td><td>" + s[0] + "</td><td" + (s[1] ? ' style="color:var(--bad)"' : "") + ">" + s[1] + "</td><td>" + s[2].toLocaleString("ru") + "</td></tr>"; }).join("");
+  }
+  $("capN").addEventListener("input", run); run();
+})();
+</script>
+<p>Пример: <code>new HashMap&lt;&gt;(1000)</code> → таблица 1024, порог 768 → при 769-м элементе resize до 2048. Guava <code>Maps.newHashMapWithExpectedSize</code> и Java 19 <code>newHashMap</code> считают правильно.</p>
+
+<h2 id="flooding"><span class="h-num">9.2</span>Коллизии и hash flooding</h2>
+<p>Если злоумышленник может подобрать ключи с одинаковым хэшем (имена параметров HTTP-запроса, поля JSON), он превращает каждую вставку в обход длинной цепочки: n ключей — O(n²). В 2011 году эта атака (hash flooding) клала веб-серверы на многих платформах одним POST-запросом. Ответ Java 8 — деревья в корзинах: худший случай O(n log n) вместо O(n²). Для <code>String</code> коллизии строятся тривиально: <code>"Aa"</code> и <code>"BB"</code>, и все их конкатенации одинаковой длины.</p>
+<div class="widget" id="flW">
+  <div class="widget-title">Цена n вставок с одинаковым хэшем</div>
+  <div class="controls"><label>число ключей с одним хэшем<input type="number" id="flN" value="65536" min="8"></label><label>ключи Comparable (String)<select id="flC"><option value="1">да</option><option value="0">нет</option></select></label></div>
+  <div id="flBars"></div>
+  <div class="verdict" id="flV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(8, +$("flN").value), comp = $("flC").value === "1";
+    var list = n * n / 2, tree = n * Math.log2(n) * (comp ? 1 : 3), norm = n;
+    var ns = 5;  // наносекунд на сравнение
+    function f(x) { var s = x * ns / 1e9; return s < 1 ? (s * 1000).toFixed(1) + " мс" : s.toFixed(1) + " с"; }
+    var mx = list;
+    $("flBars").innerHTML = [["Цепочка-список (Java 7)", list, "bad"], ["Дерево в корзине (Java 8+)" + (comp ? "" : ", без Comparable — сравнение по identityHashCode, хуже"), tree, "warn"], ["Нормальные хэши", norm, "ok"]].map(function (r) { return '<div style="display:flex;justify-content:space-between;gap:8px;font-size:13.5px;flex-wrap:wrap"><b>' + r[0] + '</b><span style="font-family:var(--font-mono)">' + Math.round(r[1]).toExponential(1) + " сравнений ≈ " + f(r[1]) + '</span></div><div class="bar ' + r[2] + '"><i style="width:' + Math.max(0.5, Math.log10(r[1]) / Math.log10(mx) * 100) + '%"></i></div>'; }).join("") + '<div class="hint">шкала логарифмическая</div>';
+    $("flV").className = "verdict warn"; $("flV").textContent = "Деревья смягчают атаку, но не отменяют её: ограничивайте число параметров и полей во входных данных (Tomcat maxParameterCount, Jackson StreamReadConstraints), размер тела запроса.";
+  }
+  ["flN", "flC"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="api"><span class="h-num">9.3</span>Идиоматичный API Map</h2>
+<div class="widget" id="apW">
+  <div class="widget-title">Песочница: обработка слов «a b a c b a d»</div>
+  <div class="controls"><label>задача<select id="apS" class="wide">
+    <option value="count">подсчёт частоты слов</option>
+    <option value="group">группировка индексов по слову (мультикарта)</option>
+    <option value="first">запомнить позицию первого вхождения</option>
+    <option value="last">запомнить позицию последнего вхождения</option>
+    <option value="dec">уменьшить счётчик, удаляя нули</option>
+  </select></label></div>
+  <div class="grid-2"><pre style="margin:0" class="bad-code" data-title="по-старому"><code class="java" id="apOld"></code></pre><pre style="margin:0" class="good-code" data-title="идиоматично"><code class="java" id="apNew"></code></pre></div>
+  <div class="out" id="apOut"></div>
+</div>
+<script>
+(function () {
+  var W = ["a", "b", "a", "c", "b", "a", "d"];
+  var D = {
+    count: ["Integer n = map.get(w);\nif (n == null) map.put(w, 1);\nelse map.put(w, n + 1);   // два поиска", "map.merge(w, 1, Integer::sum);   // один поиск", function (m, w, i) { m[w] = (m[w] || 0) + 1; }, "merge: если ключа нет — кладёт 1, иначе — sum(старое, 1)"],
+    group: ["List<Integer> l = map.get(w);\nif (l == null) { l = new ArrayList<>(); map.put(w, l); }\nl.add(i);", "map.computeIfAbsent(w, k -> new ArrayList<>()).add(i);", function (m, w, i) { (m[w] = m[w] || []).push(i); }, "computeIfAbsent возвращает существующий или только что созданный список"],
+    first: ["if (!map.containsKey(w)) map.put(w, i);", "map.putIfAbsent(w, i);", function (m, w, i) { if (!(w in m)) m[w] = i; }, "putIfAbsent не перезаписывает (но перезапишет значение null!)"],
+    last: ["map.put(w, i);", "map.put(w, i);   // put всегда перезаписывает и возвращает старое значение", function (m, w, i) { m[w] = i; }, "простое put — лучший вариант"],
+    dec: ["Integer n = map.get(w);\nif (n != null) {\n  if (n == 1) map.remove(w); else map.put(w, n - 1);\n}", "map.computeIfPresent(w, (k, n) -> n == 1 ? null : n - 1);   // null из функции = удалить", function (m, w, i) { if (w in m) { if (m[w] === 1) delete m[w]; else m[w]--; } }, "сначала карта заполнена счётчиками {a=3, b=2, c=1, d=1}; возврат null из compute*/merge удаляет запись"]
+  };
+  var $ = function (i) { return document.getElementById(i); };
+  function fmt(m) { return "{" + Object.keys(m).map(function (k) { return k + "=" + (Array.isArray(m[k]) ? "[" + m[k].join(", ") + "]" : m[k]); }).join(", ") + "}"; }
+  function run() {
+    var d = D[$("apS").value], m = $("apS").value === "dec" ? { a: 3, b: 2, c: 1, d: 1 } : {}, lines = [];
+    $("apOld").textContent = "for (int i = 0; i < words.length; i++) {\n  String w = words[i];\n  " + d[0].replace(/\n/g, "\n  ") + "\n}";
+    $("apNew").textContent = "for (int i = 0; i < words.length; i++) {\n  String w = words[i];\n  " + d[1].replace(/\n/g, "\n  ") + "\n}";
+    W.forEach(function (w, i) { d[2](m, w, i); lines.push("i=" + i + " w=" + w + "  →  " + fmt(m)); });
+    $("apOut").textContent = d[3] + "\n\n" + lines.join("\n");
+  }
+  $("apS").addEventListener("change", run); run();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Семантика</th><th>Тонкость</th></tr>
+<tr><td><code>getOrDefault(k, d)</code></td><td>значение или d</td><td>если значение null при наличии ключа — вернёт null</td></tr>
+<tr><td><code>putIfAbsent(k, v)</code></td><td>положить, если нет (или значение null)</td><td>v вычисляется всегда — дорогой объект создастся зря</td></tr>
+<tr><td><code>computeIfAbsent(k, f)</code></td><td>создать значение лениво</td><td>f вернул null — ничего не кладётся; f не должна менять эту же карту (CME в HashMap, взаимоблокировка/IllegalStateException в CHM)</td></tr>
+<tr><td><code>compute(k, (k, v) -&gt; …)</code></td><td>пересчитать из старого (может быть null)</td><td>null из функции удаляет запись</td></tr>
+<tr><td><code>merge(k, v, f)</code></td><td>нет ключа — v, иначе f(старое, v)</td><td>null из f удаляет; v не может быть null</td></tr>
+<tr><td><code>replaceAll((k, v) -&gt; …)</code></td><td>заменить все значения</td><td>не структурное изменение</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">9.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько resize будет у <code>new HashMap&lt;&gt;(1000)</code> при добавлении 1000 элементов?</p><ul><li>0</li><li>3</li><li>1 — таблица 1024, порог 768</li><li>10</li></ul><div class="why">Для n элементов нужна ёмкость ≥ n / 0.75 — используйте newHashMap(n).</div></div>
+<div class="mcq" data-ok="0"><p>Как одной строкой посчитать частоту слов в Map&lt;String, Integer&gt;?</p><ul><li><code>map.merge(w, 1, Integer::sum)</code></li><li><code>map.put(w, map.get(w) + 1)</code></li><li><code>map.putIfAbsent(w, 1)</code></li><li><code>map.compute(w, null)</code></li></ul><div class="why">Вариант с get бросит NPE для нового слова.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт, если функция в compute вернёт null?</p><ul><li>NullPointerException</li><li>В карту запишется null</li><li>Ничего</li><li>Запись с этим ключом будет удалена</li></ul><div class="why">Удобно для «уменьшить и удалить при нуле».</div></div>
+<div class="mcq" data-ok="1"><p>Что защищает HashMap в Java 8 от полной деградации при атаке коллизиями?</p><ul><li>Случайная соль в String.hashCode</li><li>Превращение длинных цепочек в красно-чёрные деревья</li><li>Ограничение размера карты</li><li>Шифрование ключей</li></ul><div class="why">String.hashCode детерминирован и описан в спецификации.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как сгруппировать заказы по клиенту в Map&lt;Long, List&lt;Order&gt;&gt;?</summary><div class="a"><p>Цикл с <code>map.computeIfAbsent(o.customerId(), k -&gt; new ArrayList&lt;&gt;()).add(o)</code> или стрим <code>orders.stream().collect(Collectors.groupingBy(Order::customerId))</code> (тема 17). Если нужен порядок клиентов — <code>groupingBy(..., LinkedHashMap::new, toList())</code> или TreeMap.</p></div></details>
+<details class="q"><summary>Почему опасно изменять HashMap внутри функции computeIfAbsent этой же карты?</summary><div class="a"><p>computeIfAbsent уже нашёл корзину и держит ссылки на структуру; функция, добавляющая элементы (например, рекурсивная мемоизация fib через ту же карту), может вызвать resize — внешний вызов допишет узел в устаревшую таблицу. В Java 9+ HashMap бросает ConcurrentModificationException, ConcurrentHashMap — IllegalStateException «Recursive update» или взаимоблокировку. Решение: обычные get/put или отдельная структура.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Области памяти JVM</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ПАМЯТЬ</div>
+  <h1>Области памяти JVM</h1>
+  <p class="lead">«У сервиса <code>-Xmx2g</code>, а процесс занимает 3,2 ГБ и его убивает OOM killer» — классика. Куча — лишь одна из областей памяти JVM. Разбираем все: стеки потоков и кадры, кучу, metaspace, code cache, direct-буферы, структуры GC и JIT, — какие ошибки возникают в каждой, как увидеть реальное потребление через Native Memory Tracking и как посчитать память процесса до того, как это сделает Kubernetes.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">стек и кадры</span><span class="tag">heap</span><span class="tag">metaspace</span><span class="tag">code cache</span><span class="tag">direct memory</span><span class="tag">NMT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="map"><span class="h-num">9.1</span>Карта памяти процесса</h2>
+<div class="table-wrap"><table>
+<tr><th>Область</th><th>Что там</th><th>Предел</th><th>Ошибка при исчерпании</th></tr>
+<tr><td><b>Стек потока</b></td><td>кадры методов: локальные переменные, стек операндов</td><td><code>-Xss</code> (по умолчанию 1 МБ на Linux x64)</td><td><code>StackOverflowError</code></td></tr>
+<tr><td><b>Куча</b></td><td>все объекты и массивы</td><td><code>-Xmx</code> / <code>MaxRAMPercentage</code></td><td><code>OutOfMemoryError: Java heap space</code>, <code>GC overhead limit exceeded</code></td></tr>
+<tr><td><b>Metaspace</b></td><td>метаданные классов: методы, байткод, пул констант, vtable</td><td>без предела по умолчанию; <code>MaxMetaspaceSize</code></td><td><code>OutOfMemoryError: Metaspace</code></td></tr>
+<tr><td><b>Compressed class space</b></td><td>структуры Klass (на них указывают сжатые указатели объектов)</td><td><code>CompressedClassSpaceSize</code> (1 ГБ)</td><td><code>OutOfMemoryError: Compressed class space</code></td></tr>
+<tr><td><b>Code cache</b></td><td>машинный код JIT, заглушки интерпретатора</td><td><code>ReservedCodeCacheSize</code> (240 МБ)</td><td>предупреждение «CodeCache is full. Compiler has been disabled» — резкое замедление</td></tr>
+<tr><td><b>Direct memory</b></td><td><code>ByteBuffer.allocateDirect</code>, буферы NIO и Netty</td><td><code>MaxDirectMemorySize</code> (= Xmx)</td><td><code>OutOfMemoryError: Direct buffer memory</code></td></tr>
+<tr><td><b>Нативное: GC, JIT, потоки, malloc</b></td><td>remembered sets, card table, данные компилятора, glibc-арены, нативные библиотеки</td><td>нет</td><td>OOM killer ОС / контейнера</td></tr>
+</table></div>
+
+<h2 id="stack"><span class="h-num">9.2</span>Стек потока</h2>
+<p>У каждого платформенного потока свой стек — резервируется <code>-Xss</code> адресного пространства, физически занимается по мере роста. Каждый вызов метода добавляет кадр; в интерпретаторе кадр больше, в JIT-коде — меньше (и встроенные методы кадров не создают вовсе). Поэтому глубина рекурсии до <code>StackOverflowError</code> «плавает» между запусками.</p>
+<div class="widget" id="soW">
+  <div class="widget-title">Глубина рекурсии до StackOverflowError</div>
+  <div class="controls">
+    <label>-Xss<select id="soX"><option value="256">256k</option><option value="512">512k</option><option value="1024" selected>1m (по умолчанию)</option><option value="4096">4m</option></select></label>
+    <label>локальных переменных в методе<input type="number" id="soL" value="4" min="0" max="200"></label>
+    <label>режим<select id="soM"><option value="int">интерпретатор (холодный код)</option><option value="jit">JIT C2</option></select></label>
+  </div>
+  <div class="out" id="soOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var x = +$("soX").value * 1024, l = Math.max(0, +$("soL").value), m = $("soM").value;
+    var frame = m === "int" ? 96 + l * 8 + 6 * 8 : 32 + l * 4, usable = x - 64 * 1024 - 20 * 1024, depth = Math.floor(usable / frame);
+    $("soOut").textContent = "кадр ≈ " + frame + " байт → глубина ≈ " + depth.toLocaleString("ru") + " вызовов" +
+      "\n(за вычетом защитных зон yellow/red/reserved ≈ 80 КБ)" +
+      "\nбесконечная рекурсия всё равно упадёт — Xss лечит только легитимно глубокие алгоритмы (парсеры, обход деревьев); лучше — итерация с явным стеком" +
+      "\n1000 потоков × " + (x / 1024) + " КБ = " + (x * 1000 / 1048576).toFixed(0) + " МБ виртуального адресного пространства (физически — только использованная часть)";
+  }
+  ["soX", "soL", "soM"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout info"><span class="c-title">Виртуальные потоки</span>
+У виртуальных потоков (Java 21) нет фиксированного стека ОС: при блокировке их кадры копируются в кучу как объекты <code>StackChunk</code> и возвращаются на стек потока-носителя при продолжении. Поэтому миллион виртуальных потоков — это память кучи пропорционально реальной глубине их стеков (подробно — в пособии по конкурентности и теме 18).
+</div>
+
+<h2 id="heap"><span class="h-num">9.3</span>Куча</h2>
+<p>Единственная область для объектов (если JIT не убрал выделение — тема 11). <code>-Xms</code> — начальный размер (committed), <code>-Xmx</code> — максимум (reserved). Устройство кучи зависит от сборщика: поколения в Serial/Parallel, регионы в G1 и ZGC (тема 13). Строки, статические поля классов (в зеркалах <code>java.lang.Class</code>) и интернированные строки — тоже в куче с Java 7/8.</p>
+<div class="callout warn"><span class="c-title">Xms = Xmx в продакшене?</span>
+Для серверов часто ставят одинаковыми (или <code>InitialRAMPercentage = MaxRAMPercentage</code>): нет пауз на расширение кучи, предсказуемое потребление, память контейнера всё равно выделена под JVM. Плюс <code>-XX:+AlwaysPreTouch</code> — обойти страницы при старте, чтобы ОС выделила их сразу (медленнее старт, ровнее задержки).
+</div>
+
+<h2 id="metaspace"><span class="h-num">9.4</span>Metaspace и code cache</h2>
+<div class="grid-2">
+  <div class="card"><h4>Metaspace (с Java 8 вместо PermGen)</h4><p>Нативная память под метаданные классов, выделяется блоками на загрузчик и освобождается при выгрузке загрузчика (тема 07). Типично 50–300 МБ для Spring-приложения (20–40 тыс. классов). Рост без остановки — утечка загрузчиков или безостановочная генерация классов (прокси, скрипты, лямбды через <code>defineHiddenClass</code> без выгрузки). Ставьте <code>MaxMetaspaceSize</code>, чтобы утечка была ошибкой JVM, а не OOM killer.</p></div>
+  <div class="card"><h4>Code cache</h4><p>Сегментирован (Java 9+): служебный код, профилированный код C1, оптимизированный код C2. Если переполнится — JIT отключается, новые горячие методы исполняются интерпретатором, а производительность падает в разы без явной ошибки. Мониторьте <code>jcmd &lt;pid&gt; Compiler.codecache</code>; для больших приложений увеличивайте <code>ReservedCodeCacheSize</code>.</p></div>
+</div>
+
+<h2 id="rss"><span class="h-num">9.5</span>Сколько памяти займёт процесс</h2>
+<div class="widget" id="rsW">
+  <div class="widget-title">Калькулятор памяти Java-процесса</div>
+  <div class="controls">
+    <label>-Xmx, МБ<input type="number" id="rsH" value="2048" min="64"></label>
+    <label>классов загружено<input type="number" id="rsC" value="30000" min="1000" step="1000"></label>
+    <label>платформенных потоков<input type="number" id="rsT" value="250" min="10"></label>
+    <label>direct-буферы (Netty и др.), МБ<input type="number" id="rsD" value="128" min="0"></label>
+    <label>GC<select id="rsG"><option value="g1">G1</option><option value="zgc">ZGC</option><option value="par">Parallel</option></select></label>
+    <label>лимит контейнера, МБ<input type="number" id="rsL" value="3072" min="128"></label>
+  </div>
+  <div id="rsBars"></div>
+  <div class="verdict" id="rsV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var h = Math.max(64, +$("rsH").value), c = Math.max(1000, +$("rsC").value), t = Math.max(10, +$("rsT").value), d = Math.max(0, +$("rsD").value), g = $("rsG").value, lim = Math.max(128, +$("rsL").value);
+    var parts = [["Куча (Xmx)", h], ["Metaspace + class space", c * 6.5 / 1024 + 20], ["Code cache", Math.min(240, 30 + c / 1000 * 3)], ["Стеки потоков (фактически ~ 256 КБ на поток)", t * 0.25 + t * 0.06], ["Структуры GC", g === "g1" ? h * 0.06 + 20 : g === "zgc" ? h * 0.04 + 30 : h * 0.02 + 10], ["Direct memory", d], ["JIT-компилятор, символы, прочее нативное", 60 + c / 1000 * 1.2], ["malloc-арены glibc / нативные библиотеки", 60]];
+    var total = parts.reduce(function (s, p) { return s + p[1]; }, 0);
+    $("rsBars").innerHTML = parts.map(function (p) { return '<div style="display:flex;justify-content:space-between;gap:8px;font-size:13.5px"><span>' + p[0] + '</span><span style="font-family:var(--font-mono)">' + Math.round(p[1]) + ' МБ</span></div><div class="bar"><i style="width:' + Math.max(0.5, p[1] / lim * 100) + '%"></i></div>'; }).join("") +
+      '<div style="display:flex;justify-content:space-between;font-size:14px;font-weight:700"><span>Итого (оценка RSS)</span><span style="font-family:var(--font-mono)">' + Math.round(total) + " / " + lim + ' МБ</span></div><div class="bar ' + (total > lim * 0.95 ? "bad" : "ok") + '"><i style="width:' + Math.min(100, total / lim * 100) + '%"></i></div>';
+    var v = $("rsV"), share = h / lim * 100;
+    if (total > lim * 0.95) { v.className = "verdict bad"; v.textContent = "Процесс выйдет за лимит контейнера — OOM killer (exit code 137) без единой строки в логе JVM. Уменьшите кучу до ~" + Math.round(lim - (total - h) - lim * 0.08) + " МБ или поднимите лимит."; }
+    else { v.className = "verdict ok"; v.textContent = "Запас " + Math.round(lim - total) + " МБ. Куча — " + share.toFixed(0) + "% лимита; не-кучевая память ≈ " + Math.round(total - h) + " МБ. Проверьте на реальном процессе через NMT."; }
+  }
+  ["rsH", "rsC", "rsT", "rsD", "rsG", "rsL"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="nmt"><span class="h-num">9.6</span>Native Memory Tracking</h2>
+<pre data-title="включить (накладные расходы ~5–10%) и посмотреть сводку"><code class="txt">java -XX:NativeMemoryTracking=summary -jar app.jar
+jcmd &lt;pid&gt; VM.native_memory summary scale=MB
+
+Native Memory Tracking:
+Total: reserved=4405MB, committed=2817MB
+-                 Java Heap (reserved=2048MB, committed=2048MB)
+-                     Class (reserved=1031MB, committed=187MB)       ← metaspace + class space
+-                    Thread (reserved=258MB, committed=34MB)         ← 252 потока
+-                      Code (reserved=247MB, committed=71MB)
+-                        GC (reserved=158MB, committed=158MB)
+-                  Compiler (reserved=3MB, committed=3MB)
+-                  Internal (reserved=12MB, committed=12MB)
+-                     Other (reserved=131MB, committed=131MB)        ← direct-буферы
+-                    Symbol (reserved=32MB, committed=32MB)
+...
+jcmd &lt;pid&gt; VM.native_memory baseline        # затем через час:
+jcmd &lt;pid&gt; VM.native_memory summary.diff    # что растёт</code></pre>
+<p>Если RSS процесса (<code>ps</code>, метрика контейнера) заметно больше committed NMT — память растёт вне JVM: нативные библиотеки (RocksDB, нативные компрессоры), фрагментация malloc. Помогают <code>MALLOC_ARENA_MAX=2</code> или jemalloc.</p>
+
+<h2 id="quiz"><span class="h-num">9.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Под с лимитом 2 ГБ и <code>-Xmx2g</code> регулярно перезапускается с кодом 137 без ошибок в логе. Почему?</p><ul><li>Ошибка в коде приложения</li><li>Медленный GC</li><li>Процесс использует память и вне кучи (metaspace, стеки, code cache, GC, direct) и превышает лимит — его убивает OOM killer</li><li>Не хватает CPU</li></ul><div class="why">Куча должна составлять 60–75% лимита.</div></div>
+<div class="mcq" data-ok="0"><p>Где хранятся статические поля класса в HotSpot (Java 8+)?</p><ul><li>В куче, в объекте java.lang.Class (зеркале класса)</li><li>В PermGen</li><li>В стеке main</li><li>В code cache</li></ul><div class="why">Метаданные — в metaspace, значения статических полей — в куче.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт при переполнении code cache?</p><ul><li>OutOfMemoryError</li><li>JVM упадёт</li><li>Код будет компилироваться на диск</li><li>JIT отключится, новые горячие методы будут интерпретироваться — заметное замедление без явной ошибки</li></ul><div class="why">Ищите в логе «CodeCache is full».</div></div>
+<div class="mcq" data-ok="1"><p>Чем ограничен объём direct-буферов по умолчанию?</p><ul><li>Ничем</li><li>MaxDirectMemorySize, по умолчанию равным максимальному размеру кучи</li><li>Размером metaspace</li><li>1 ГБ</li></ul><div class="why">Освобождаются, когда GC соберёт объекты ByteBuffer — при большой куче и редких GC буферы копятся.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как выбрать -Xmx для контейнера с лимитом 4 ГБ?</summary><div class="a"><p>Оценить не-кучевую память: metaspace (по числу классов), code cache, потоки, GC-структуры (зависят от сборщика и размера кучи), direct-буферы (Netty, HTTP-клиенты), нативные библиотеки. Обычно это 0,6–1,5 ГБ. Начать с MaxRAMPercentage=70–75, включить NMT на стенде под нагрузкой, сравнить committed и RSS, оставить запас 5–10%. Мониторить RSS контейнера, а не только кучу.</p></div></details>
+<details class="q"><summary>Отличие StackOverflowError от OutOfMemoryError: unable to create native thread.</summary><div class="a"><p>StackOverflowError — один поток исчерпал свой стек (обычно бесконечная или слишком глубокая рекурсия). «Unable to create native thread» — ОС отказала в создании нового потока: лимит процессов/потоков (ulimit -u, pids.max в контейнере), нехватка адресного пространства или памяти под стеки. Лечится не Xss, а сокращением числа потоков (пулы, виртуальные потоки) и лимитами.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · CompletableFuture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ИСПОЛНЕНИЕ ЗАДАЧ</div>
+  <h1>Future и CompletableFuture</h1>
+  <p class="lead">Как описать «сделай A и B параллельно, затем C из их результатов, при ошибке — запасной вариант, но не дольше 300 мс» без блокировок и вложенных колбэков. И, главное, понимать, <b>в каком потоке</b> выполнится каждый шаг.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">CompletionStage</span><span class="tag">fan-out / fan-in</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="future"><span class="h-num">9.1</span>Future: что умеет и чего нет</h2>
+<pre><code class="java">Future&lt;Report&gt; f = executor.submit(() -&gt; buildReport());   // Callable
+Report r = f.get(2, TimeUnit.SECONDS);   // блокирует; TimeoutException / ExecutionException
+f.cancel(true);                          // true → interrupt потока, выполняющего задачу
+f.isDone(); f.state();                   // JDK 19+: RUNNING / SUCCESS / FAILED / CANCELLED</code></pre>
+<p>Ограничения: результат можно получить только блокирующим <code>get</code>; нельзя сказать «когда будет готово — сделай X»; нельзя скомбинировать два Future; нельзя завершить Future извне. <code>CompletableFuture</code> (JDK 8) решает всё это и реализует <code>CompletionStage</code> — конвейер этапов.</p>
+
+<h2 id="create"><span class="h-num">9.2</span>Создание</h2>
+<pre><code class="java">ExecutorService io = Executors.newFixedThreadPool(32, Thread.ofPlatform().name("io-", 0).factory());
+
+CompletableFuture&lt;Client&gt; a = CompletableFuture.supplyAsync(() -&gt; clientRepo.find(id), io); // свой пул!
+CompletableFuture&lt;Void&gt;   b = CompletableFuture.runAsync(() -&gt; audit.log(id), io);
+CompletableFuture&lt;Rate&gt;   c = CompletableFuture.completedFuture(cachedRate);           // уже готов
+CompletableFuture&lt;Rate&gt;   d = CompletableFuture.failedFuture(new IllegalStateException()); // JDK 9
+
+// Мост из колбэк-API: «обещание», которое завершим сами
+CompletableFuture&lt;Response&gt; promise = new CompletableFuture&lt;&gt;();
+httpClient.send(req, new Callback() {
+    public void onSuccess(Response r) { promise.complete(r); }
+    public void onError(Throwable t)  { promise.completeExceptionally(t); }
+});</code></pre>
+<div class="callout warn">Без второго аргумента <code>supplyAsync</code> использует <code>ForkJoinPool.commonPool()</code> (размер ≈ ядер − 1). Для I/O это почти всегда ошибка: несколько медленных вызовов займут весь общий пул JVM.</div>
+
+<h2 id="ops"><span class="h-num">9.3</span>Операции композиции</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Аналог</th><th>Что делает</th></tr>
+<tr><td><code>thenApply(fn)</code></td><td>map</td><td>T → U синхронной функцией</td></tr>
+<tr><td><code>thenCompose(fn)</code></td><td>flatMap</td><td>T → CompletableFuture&lt;U&gt;; без него получится <code>CF&lt;CF&lt;U&gt;&gt;</code></td></tr>
+<tr><td><code>thenAccept / thenRun</code></td><td>doOnNext</td><td>потребить результат / просто выполнить действие</td></tr>
+<tr><td><code>thenCombine(other, bifn)</code></td><td>zip</td><td>дождаться двух независимых и объединить</td></tr>
+<tr><td><code>allOf(cfs...)</code></td><td>when all</td><td><code>CF&lt;Void&gt;</code>, завершается, когда завершились все (результаты забирать из исходных)</td></tr>
+<tr><td><code>anyOf(cfs...)</code></td><td>first</td><td>первый завершившийся (в том числе с ошибкой!)</td></tr>
+<tr><td><code>exceptionally(fn)</code></td><td>onErrorReturn</td><td>ошибка → значение</td></tr>
+<tr><td><code>handle(bifn)</code></td><td>—</td><td>(результат, ошибка) → значение; вызывается всегда</td></tr>
+<tr><td><code>whenComplete(biconsumer)</code></td><td>doFinally</td><td>побочный эффект (лог, метрика), результат не меняет</td></tr>
+<tr><td><code>orTimeout / completeOnTimeout</code></td><td>timeout</td><td>JDK 9: завершить с <code>TimeoutException</code> или значением по умолчанию</td></tr>
+</table></div>
+
+<figure class="diagram">
+<svg viewBox="0 0 800 250" role="img" aria-label="Граф этапов">
+  <defs><marker id="i1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <rect x="20" y="20" width="170" height="44" rx="8" class="box-info"/><text x="105" y="47" text-anchor="middle" class="mono" font-size="12.5">client(id)</text>
+  <rect x="20" y="100" width="170" height="44" rx="8" class="box-info"/><text x="105" y="127" text-anchor="middle" class="mono" font-size="12.5">accounts(id)</text>
+  <rect x="20" y="180" width="170" height="44" rx="8" class="box-info"/><text x="105" y="207" text-anchor="middle" class="mono" font-size="12.5">limits(id) ⏱300ms</text>
+  <rect x="290" y="100" width="170" height="44" rx="8" class="box-acc"/><text x="375" y="120" text-anchor="middle" class="mono" font-size="12.5">allOf / thenCombine</text><text x="375" y="136" text-anchor="middle" font-size="11" class="muted">fan-in</text>
+  <rect x="560" y="100" width="210" height="44" rx="8" class="box-ok"/><text x="665" y="127" text-anchor="middle" class="mono" font-size="12.5">new Dashboard(c, a, l)</text>
+  <rect x="290" y="190" width="170" height="40" rx="8" class="box-warn"/><text x="375" y="215" text-anchor="middle" class="mono" font-size="12">Limits.unknown()</text>
+  <path d="M190 42 L286 116" class="ln" marker-end="url(#i1)"/><path d="M190 122 H286" class="ln" marker-end="url(#i1)"/><path d="M190 202 L286 130" class="ln" marker-end="url(#i1)"/>
+  <path d="M460 122 H556" class="ln" marker-end="url(#i1)"/>
+  <path d="M190 214 H286" class="ln-dash" marker-end="url(#i1)"/><text x="238" y="240" text-anchor="middle" font-size="11" class="muted">completeOnTimeout</text>
+  <text x="560" y="40" font-size="13">Время ответа ≈ max(вызовов),</text><text x="560" y="58" font-size="13">а не их сумма</text>
+</svg>
+</figure>
+
+<pre data-title="Fan-out / fan-in с таймаутами и fallback" class="good-code"><code class="java">public CompletableFuture&lt;Dashboard&gt; dashboard(long clientId) {
+    CompletableFuture&lt;Client&gt; client = CompletableFuture
+            .supplyAsync(() -&gt; clients.find(clientId), io)
+            .orTimeout(500, TimeUnit.MILLISECONDS);                     // обязательное — ошибка по таймауту
+
+    CompletableFuture&lt;List&lt;Account&gt;&gt; accounts = CompletableFuture
+            .supplyAsync(() -&gt; accountsApi.list(clientId), io)
+            .orTimeout(500, TimeUnit.MILLISECONDS);
+
+    CompletableFuture&lt;Limits&gt; limits = CompletableFuture
+            .supplyAsync(() -&gt; limitsApi.get(clientId), io)
+            .completeOnTimeout(Limits.unknown(), 300, TimeUnit.MILLISECONDS) // необязательное — дефолт
+            .exceptionally(ex -&gt; {
+                log.warn("limits unavailable for {}", clientId, ex);
+                return Limits.unknown();
+            });
+
+    return CompletableFuture.allOf(client, accounts, limits)
+            .thenApply(v -&gt; new Dashboard(client.join(), accounts.join(), limits.join())); // join не блокирует: всё уже готово
+}</code></pre>
+
+<pre data-title="Последовательная зависимость: thenCompose"><code class="java">CompletableFuture&lt;Receipt&gt; r = findOrder(orderId)              // CF&lt;Order&gt;
+        .thenCompose(order -&gt; charge(order.paymentId(), order.total()))  // CF&lt;Charge&gt; — асинхронный вызов
+        .thenApply(Receipt::from)                                       // синхронное преобразование
+        .whenComplete((res, ex) -&gt; metrics.record("checkout", ex == null));</code></pre>
+
+<h2 id="threads"><span class="h-num">9.4</span>В каком потоке выполнится колбэк</h2>
+<p>Самая частая неочевидность. Для <b>не-Async</b> методов (<code>thenApply</code>, <code>thenAccept</code>…):</p>
+<div class="grid-2">
+  <div class="card"><h4>Этап ещё не завершён</h4><p>Колбэк регистрируется и выполнится в потоке, который <b>завершит</b> предыдущий этап (поток пула <code>io</code>, или поток, вызвавший <code>complete()</code>, например, I/O-поток HTTP-клиента).</p></div>
+  <div class="card"><h4>Этап уже завершён</h4><p>Колбэк выполнится <b>сразу, в вызывающем потоке</b> — прямо внутри <code>thenApply(...)</code>. Например, в потоке обработки HTTP-запроса или event loop.</p></div>
+</div>
+<p><b>Async</b>-методы (<code>thenApplyAsync(fn, executor)</code>) всегда отправляют колбэк в executor (без аргумента — в commonPool). Правило: тяжёлые или блокирующие колбэки — только через <code>...Async(fn, свойПул)</code>; лёгкие преобразования — обычными методами, без лишних переключений потоков.</p>
+<div class="callout bad"><span class="c-title">Опасно</span>
+Если future завершается из потока event loop (Netty, HTTP-клиент на NIO), то синхронный <code>thenApply</code> с блокирующим вызовом БД выполнится <b>в event loop</b> и заблокирует обработку всех соединений. В Reactor та же проблема решается <code>publishOn</code>/<code>subscribeOn</code>.
+</div>
+
+<h2 id="errors"><span class="h-num">9.5</span>Ошибки</h2>
+<ul>
+  <li>Исключение на этапе пропускает все последующие <code>thenApply/thenAccept</code> до ближайшего <code>exceptionally/handle/whenComplete</code>.</li>
+  <li>Исключение оборачивается в <code>CompletionException</code> при переходе между этапами; в <code>exceptionally</code> обычно стоит развернуть: <code>ex instanceof CompletionException ce ? ce.getCause() : ex</code>.</li>
+  <li><code>join()</code> бросает непроверяемое <code>CompletionException</code>, <code>get()</code> — проверяемое <code>ExecutionException</code> (+ <code>InterruptedException</code>).</li>
+  <li><code>whenComplete</code> не «лечит» ошибку — она идёт дальше. <code>handle</code> — лечит.</li>
+  <li>Если в цепочке нет обработчика и никто не вызвал <code>join/get</code>, исключение <b>исчезнет молча</b>. Каждую «выстрелил и забыл» цепочку заканчивайте <code>whenComplete</code> с логированием.</li>
+</ul>
+<pre><code class="java">CompletableFuture&lt;Rate&gt; rate = fetchRate(ccy)
+        .handle((r, ex) -&gt; {
+            if (ex == null) return r;
+            Throwable cause = ex instanceof CompletionException ce ? ce.getCause() : ex;
+            if (cause instanceof TimeoutException) return cache.lastKnown(ccy);
+            throw new CompletionException(cause);   // остальное пробрасываем дальше
+        });</code></pre>
+
+<h2 id="cancel"><span class="h-num">9.6</span>Отмена и таймауты</h2>
+<p><code>CompletableFuture.cancel(true)</code> <b>не прерывает</b> поток, выполняющий задачу: CF не знает, кто его вычисляет. Он лишь завершает future с <code>CancellationException</code>, зависимые этапы получают ошибку, а задача в пуле продолжает работать. То же с <code>orTimeout</code>: future завершится по таймауту, но HTTP-запрос/SQL продолжат выполняться. Поэтому таймауты нужно ставить <b>и на сам ресурс</b> (таймаут HTTP-клиента, <code>statement timeout</code> в БД), а не только на future.</p>
+
+<h2 id="pitfalls"><span class="h-num">9.7</span>Чек-лист ошибок</h2>
+<div class="table-wrap"><table>
+<tr><th>Ошибка</th><th>Последствие</th><th>Исправление</th></tr>
+<tr><td><code>supplyAsync(io-вызов)</code> без executor</td><td>исчерпание commonPool, тормозит всё приложение</td><td>передать свой пул</td></tr>
+<tr><td><code>.join()</code> внутри колбэка другой CF на том же ограниченном пуле</td><td>deadlock от голодания потоков пула</td><td><code>thenCompose</code> вместо блокировки</td></tr>
+<tr><td><code>thenApply(x -&gt; otherAsync(x))</code></td><td><code>CF&lt;CF&lt;T&gt;&gt;</code></td><td><code>thenCompose</code></td></tr>
+<tr><td>Нет обработчика ошибок в fire-and-forget</td><td>ошибка теряется</td><td><code>whenComplete</code> с логом</td></tr>
+<tr><td>Только <code>orTimeout</code></td><td>ресурсы продолжают работать</td><td>таймаут на уровне клиента/БД</td></tr>
+<tr><td><code>anyOf</code> для «первого успешного»</td><td>первый с ошибкой тоже «победит»</td><td>свой комбинатор: complete на первом успехе, ошибка — только когда упали все</td></tr>
+</table></div>
+
+<h2 id="sim"><span class="h-num">9.8</span>Интерактив: в каком потоке и с каким результатом</h2>
+<div class="widget" id="cfT">
+  <div class="widget-title">Симулятор: где выполнится колбэк</div>
+  <pre><code class="java">CompletableFuture&lt;User&gt; f = /* источник */;
+f.КОЛБЭК(user -&gt; enrich(user));      // в каком потоке выполнится enrich?</code></pre>
+  <div class="controls">
+    <label>источник f<select id="cfSrc" style="max-width:100%"><option value="pool">supplyAsync(load, dbPool) — ещё выполняется</option><option value="done">уже завершён к моменту регистрации колбэка</option><option value="common">supplyAsync(load) без executor — ещё выполняется</option><option value="manual">завершается вручную: f.complete(user) из потока Netty event loop</option></select></label>
+    <label>метод<select id="cfM"><option value="sync">thenApply(fn)</option><option value="async">thenApplyAsync(fn)</option><option value="exec">thenApplyAsync(fn, cpuPool)</option></select></label>
+  </div>
+  <div class="verdict" id="cfTOut"></div>
+</div>
+<div class="widget" id="cfE">
+  <div class="widget-title">Симулятор: ошибка в цепочке</div>
+  <pre><code class="java">supplyAsync(() -&gt; loadUser(id))            // бросает UserNotFound
+    .thenApply(User::email)                  // (1)
+    .ОБРАБОТЧИК                              // (2)
+    .thenAccept(mailer::send);               // (3)</code></pre>
+  <div class="controls"><label>обработчик (2)<select id="cfH" style="max-width:100%">
+    <option value="none">нет обработчика</option>
+    <option value="exc">.exceptionally(ex -&gt; "fallback@shop.ru")</option>
+    <option value="handle">.handle((email, ex) -&gt; ex == null ? email : "fallback@shop.ru")</option>
+    <option value="when">.whenComplete((email, ex) -&gt; log.warn("failed", ex))</option>
+    <option value="excThrow">.exceptionally(ex -&gt; { throw new IllegalStateException(ex); })</option>
+  </select></label></div>
+  <div class="log" id="cfELog"></div>
+  <div class="verdict" id="cfEOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function run() {
+    var s = $("cfSrc").value, m = $("cfM").value, cls = "ok", t;
+    if (m === "exec") t = "В потоке cpuPool — всегда, независимо от состояния f. Единственный вариант, где поток известен заранее. Используйте его, когда колбэк тяжёлый или блокирующий.";
+    else if (m === "async") { cls = "warn"; t = "В ForkJoinPool.commonPool() — общем на всю JVM пуле размером «ядра − 1». Блокирующий enrich() здесь займёт поток, который нужен parallel stream-ам и другим CompletableFuture всего приложения."; }
+    else if (s === "done") { cls = "warn"; t = "В ВЫЗЫВАЮЩЕМ потоке, прямо внутри thenApply: future уже завершён, ждать нечего. Тот же код при другом тайминге выполнится в другом потоке — отсюда «плавающие» баги."; }
+    else if (s === "pool") t = "В потоке dbPool, который завершил загрузку: колбэк выполняется «на плечах» завершающего потока. Пул БД занят вашим enrich() — если тот медленный, запросы к БД встанут в очередь.";
+    else if (s === "common") { cls = "warn"; t = "В потоке ForkJoinPool.commonPool-worker, который выполнял load. Блокирующая загрузка без своего executor — ошибка сама по себе."; }
+    else { cls = "bad"; t = "В потоке Netty event loop, вызвавшем complete(). Если enrich() блокируется (JDBC, HTTP), event loop останавливается и перестаёт обслуживать тысячи соединений. Здесь обязателен thenApplyAsync(fn, executor)."; }
+    $("cfTOut").className = "verdict " + cls; $("cfTOut").textContent = t;
+  }
+  $("cfSrc").addEventListener("change", run); $("cfM").addEventListener("change", run); run();
+
+  function run2() {
+    var h = $("cfH").value, L = ["supplyAsync → ✘ CompletionException(UserNotFound)", "(1) thenApply(User::email) → ПРОПУЩЕН: стадия сразу завершается тем же исключением"], cls = "ok", v;
+    if (h === "none") { L.push("(3) thenAccept(send) → ПРОПУЩЕН", "итоговый future завершён исключением"); cls = "bad"; v = "Если никто не вызовет join()/get() и нет обработчика, исключение пропадёт бесследно — ни лога, ни письма. Каждая цепочка должна заканчиваться обработкой ошибки."; }
+    else if (h === "exc") { L.push("(2) exceptionally → \"fallback@shop.ru\"   (при успехе функция не вызывалась бы)", "(3) thenAccept → send(\"fallback@shop.ru\")"); v = "exceptionally — аналог catch: превращает ошибку в значение, цепочка продолжается нормально."; }
+    else if (h === "handle") { L.push("(2) handle(email = null, ex = CompletionException) → \"fallback@shop.ru\"", "(3) thenAccept → send(\"fallback@shop.ru\")"); v = "handle вызывается всегда — и при успехе, и при ошибке; аналог try/catch с возвратом значения. Исключение приходит обёрнутым в CompletionException: причина — ex.getCause()."; }
+    else if (h === "when") { L.push("(2) whenComplete → лог записан; результат НЕ меняется: исключение идёт дальше", "(3) thenAccept(send) → ПРОПУЩЕН", "итоговый future завершён исключением"); cls = "warn"; v = "whenComplete — аналог finally: побочное действие без изменения результата. Ошибка залогирована, но не обработана."; }
+    else { L.push("(2) exceptionally бросает IllegalStateException", "(3) thenAccept(send) → ПРОПУЩЕН", "итоговый future завершён CompletionException(IllegalStateException)"); cls = "warn"; v = "Так переводят техническое исключение в доменное. Цепочка остаётся в состоянии ошибки."; }
+    $("cfELog").textContent = L.join("\n"); $("cfEOut").className = "verdict " + cls; $("cfEOut").textContent = v;
+  }
+  $("cfH").addEventListener("change", run2); run2();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">9.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем thenApply отличается от thenCompose?</p><ul><li>Ничем</li><li>thenApply принимает функцию T → R; thenCompose — функцию T → CompletableFuture&lt;R&gt; и «разворачивает» вложенный future</li><li>thenCompose выполняется синхронно</li><li>thenApply не обрабатывает ошибки</li></ul><div class="why">Аналог map и flatMap. С thenApply и асинхронной функцией получится CompletableFuture&lt;CompletableFuture&lt;R&gt;&gt;.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает <code>future.cancel(true)</code> у CompletableFuture?</p><ul><li>Прерывает поток, выполняющий задачу</li><li>Ничего</li><li>Завершает future с CancellationException, но выполняющуюся задачу не прерывает</li><li>Останавливает executor</li></ul><div class="why">CompletableFuture не связан с потоком-исполнителем: параметр mayInterruptIfRunning игнорируется. Задача продолжит работу впустую.</div></div>
+<div class="mcq" data-ok="0"><p>Почему для блокирующих операций нельзя использовать supplyAsync без executor?</p><ul><li>Задача попадёт в ForkJoinPool.commonPool — маленький общий пул; блокировка в нём тормозит всё приложение</li><li>Он не поддерживает лямбды</li><li>Результат будет потерян</li><li>Это запрещено компилятором</li></ul><div class="why">Для I/O — собственный ограниченный пул или виртуальные потоки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем thenApply отличается от thenCompose? Когда какой?</summary><div class="a"><p><code>thenApply</code> — синхронное преобразование значения (map). <code>thenCompose</code> — функция возвращает новый CompletionStage, и результат «расплющивается» (flatMap). Если следующий шаг — асинхронный вызов, возвращающий CF, нужен <code>thenCompose</code>.</p></div></details>
+<details class="q"><summary>В каком потоке выполнится thenApply, если future уже завершён к моменту вызова?</summary><div class="a"><p>Сразу в потоке, вызвавшем <code>thenApply</code>. Если не завершён — в потоке, который его завершит. Чтобы явно выбрать поток — <code>thenApplyAsync(fn, executor)</code>.</p></div></details>
+<details class="q"><summary>Остановит ли cf.cancel(true) выполнение задачи в пуле?</summary><div class="a"><p>Нет. CF не связан с потоком-исполнителем, флаг <code>mayInterruptIfRunning</code> игнорируется. Будущее завершится с CancellationException, но задача доработает. Для настоящей отмены — <code>Future</code> из <code>executor.submit</code> (FutureTask прерывает поток) или structured concurrency (тема 10).</p></div></details>
+<details class="q"><summary>Как может возникнуть deadlock с CompletableFuture без единого лока?</summary><div class="a"><p>Пул из N потоков; каждая задача в пуле создаёт подзадачу в том же пуле и блокируется на её <code>join()</code>. Когда все N потоков ждут подзадачи, а подзадачи стоят в очереди того же пула — никто не продвигается (thread starvation deadlock). Лечится неблокирующей композицией (<code>thenCompose</code>), раздельными пулами или виртуальными потоками.</p></div></details>
+<details class="q"><summary>Напишите комбинатор «первый успешный из N».</summary><div class="a"><pre><code class="java">static &lt;T&gt; CompletableFuture&lt;T&gt; firstSuccess(List&lt;CompletableFuture&lt;T&gt;&gt; cfs) {
+    CompletableFuture&lt;T&gt; result = new CompletableFuture&lt;&gt;();
+    AtomicInteger failures = new AtomicInteger();
+    for (CompletableFuture&lt;T&gt; cf : cfs) {
+        cf.whenComplete((v, ex) -&gt; {
+            if (ex == null) result.complete(v);                  // complete идемпотентен: выиграет первый
+            else if (failures.incrementAndGet() == cfs.size())
+                result.completeExceptionally(ex);                // упали все
+        });
+    }
+    return result;
+}</code></pre></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

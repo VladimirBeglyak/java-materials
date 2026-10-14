@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Безопасность и наблюдение</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ЭКСПЛУАТАЦИЯ И МАСШТАБ</div>
+  <h1>Безопасность и наблюдение</h1>
+  <p class="lead">Две обязанности разработчика по отношению к базе: не дать ею злоупотребить (SQL-инъекции, лишние права, утечки) и видеть, что с ней происходит, до того как пользователи заметят. Роли и минимальные привилегии, построчная безопасность для мультиарендных систем, шифрование, аудит — и набор метрик и запросов, который должен быть у каждой команды.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">SQL-инъекции</span><span class="tag">роли</span><span class="tag">RLS</span><span class="tag">TLS</span><span class="tag">метрики</span><span class="tag">pg_stat_*</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="injection"><span class="h-num">20.1</span>SQL-инъекции</h2>
+<div class="widget" id="sqiW">
+  <div class="widget-title">Что попадёт в базу</div>
+  <div class="controls">
+    <label>ввод пользователя в поле «логин»<input type="text" id="sqiIn" value="admin' OR '1'='1"></label>
+    <label>код<select id="sqiM"><option value="concat">конкатенация строк</option><option value="prep">PreparedStatement с параметром</option></select></label>
+  </div>
+  <pre><code class="txt" id="sqiOut"></code></pre>
+  <div class="verdict" id="sqiV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var u = $("sqiIn").value, m = $("sqiM").value;
+    if (m === "concat") {
+      var sql = "SELECT * FROM users WHERE login = '" + u + "' AND password_hash = '…'";
+      $("sqiOut").textContent = '"SELECT * FROM users WHERE login = \'" + login + "\' AND …"\n\n→ ' + sql;
+      var bad = /'/.test(u);
+      $("sqiV").className = "verdict " + (bad ? "bad" : "warn");
+      $("sqiV").textContent = bad ? "Кавычка во вводе закрыла строковый литерал, и остаток стал частью SQL. С вводом admin' -- проверка пароля закомментирована; с '; DROP TABLE users; -- (если драйвер разрешает несколько команд) — разрушение. Через UNION SELECT читаются чужие таблицы." : "С безобидным вводом работает — поэтому уязвимость и доживает до продакшена.";
+    } else {
+      $("sqiOut").textContent = 'ps = conn.prepareStatement("SELECT * FROM users WHERE login = ? AND …");\nps.setString(1, login);\n\n→ Parse: SELECT * FROM users WHERE login = $1 AND …\n→ Bind:  $1 = ' + JSON.stringify(u);
+      $("sqiV").className = "verdict ok";
+      $("sqiV").textContent = "Текст запроса и данные передаются отдельно (протокол Parse/Bind): значение никогда не разбирается как SQL, какие бы кавычки в нём ни были. Найдётся пользователь с таким буквальным логином — или никто.";
+    }
+  }
+  ["sqiIn", "sqiM"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="grid-2">
+<pre class="bad-code" data-title="уязвимо — и в JPA тоже"><code class="java">em.createQuery("from User where login = '" + login + "'");
+jdbc.queryForList("select * from orders order by " + sortField);
+@Query(value = "select * from t where " + filter, nativeQuery = true)</code></pre>
+<pre class="good-code" data-title="безопасно"><code class="java">em.createQuery("from User where login = :l").setParameter("l", login);
+// имена столбцов параметрами не передать → белый список:
+String col = Map.of("date", "created_at", "sum", "total").getOrDefault(sortField, "id");
+// Criteria API / Querydsl / jOOQ — динамические запросы без склейки строк</code></pre>
+</div>
+
+<h2 id="roles"><span class="h-num">20.2</span>Роли и минимальные привилегии</h2>
+<pre data-title="типовая модель ролей"><code class="sql">-- владелец схемы: только для миграций, приложение им НЕ подключается
+CREATE ROLE app_owner LOGIN PASSWORD '…';
+CREATE SCHEMA shop AUTHORIZATION app_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;          -- до PG 15 любой мог создавать объекты в public
+
+-- приложение: только DML, никакого DDL
+CREATE ROLE app_rw LOGIN PASSWORD '…' CONNECTION LIMIT 100;
+GRANT USAGE ON SCHEMA shop TO app_rw;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA shop TO app_rw;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA shop TO app_rw;
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA shop
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_rw;   -- и для будущих таблиц
+
+-- аналитика и поддержка: только чтение, желательно на реплике
+CREATE ROLE readonly LOGIN PASSWORD '…';
+GRANT pg_read_all_data TO readonly;               -- PG 14+
+ALTER ROLE readonly SET default_transaction_read_only = on;</code></pre>
+<ul>
+  <li>Пароли — <code>scram-sha-256</code> (не md5), хранение в секрет-менеджере (Vault, Kubernetes Secrets), ротация; лучше — короткоживущие учётные данные (Vault database engine, IAM-аутентификация облаков).</li>
+  <li><code>pg_hba.conf</code>: доступ только из нужных подсетей, <code>hostssl</code> — только TLS; база не должна быть доступна из интернета.</li>
+  <li>Приложение под суперпользователем — антипаттерн: инъекция превращается в выполнение команд ОС (<code>COPY … PROGRAM</code>).</li>
+</ul>
+
+<h2 id="rls"><span class="h-num">20.3</span>Построчная безопасность для мультиарендных систем</h2>
+<p>Когда данные всех клиентов (tenants) в одних таблицах, забытый <code>WHERE tenant_id = ?</code> в одном запросе = утечка чужих данных. RLS добавляет условие на уровне базы, независимо от кода.</p>
+<pre data-title="Row Level Security"><code class="sql">ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;          -- и для владельца таблицы
+
+CREATE POLICY tenant_isolation ON orders
+  USING (tenant_id = current_setting('app.tenant_id')::bigint)
+  WITH CHECK (tenant_id = current_setting('app.tenant_id')::bigint);
+
+-- приложение в начале каждой транзакции (SET LOCAL — безопасно с пулом и PgBouncer):
+BEGIN;
+SET LOCAL app.tenant_id = '42';
+SELECT * FROM orders;                                 -- видны только строки tenant 42
+COMMIT;</code></pre>
+<div class="callout warn"><span class="c-title">Нюансы RLS</span>
+Обязательно <code>SET LOCAL</code> (иначе значение «прилипнет» к соединению пула и уйдёт следующему запросу другого клиента). Индексы должны начинаться с <code>tenant_id</code>. Суперпользователь и роли с <code>BYPASSRLS</code> политики обходят. Политики с функциями могут ломать планы — проверяйте EXPLAIN.
+</div>
+
+<h2 id="data"><span class="h-num">20.4</span>Защита данных</h2>
+<div class="table-wrap"><table>
+<tr><th>Угроза</th><th>Мера</th></tr>
+<tr><td>Перехват трафика</td><td>TLS между приложением и базой: <code>sslmode=verify-full</code> в JDBC (проверка сертификата и имени хоста)</td></tr>
+<tr><td>Кража дисков или копий</td><td>шифрование томов и копий (pgBackRest repo-cipher, KMS облака)</td></tr>
+<tr><td>Утечка чувствительных полей при доступе к базе</td><td>шифрование на уровне приложения (номера документов, токены), хранение паролей только хэшами (bcrypt/argon2) — никогда в базе в открытом виде</td></tr>
+<tr><td>Персональные данные в тестовых средах</td><td>маскирование при копировании (PostgreSQL Anonymizer), синтетические данные</td></tr>
+<tr><td>Нужно знать, кто читал/менял</td><td>аудит: <code>pgaudit</code> (DDL, роли, доступ к чувствительным таблицам), журнал изменений в приложении</td></tr>
+<tr><td>Данные в логах</td><td>не логировать значения параметров запросов с ПДн; осторожно с <code>log_statement = 'all'</code></td></tr>
+</table></div>
+
+<h2 id="metrics"><span class="h-num">20.5</span>Что мониторить</h2>
+<div class="widget" id="mnW">
+  <div class="widget-title">Панель здоровья: выставьте значения и посмотрите, что тревожно</div>
+  <div class="controls">
+    <label>cache hit, %<input type="number" id="mnH" value="99.5" step="0.1"></label>
+    <label>активных соединений / max<input type="number" id="mnC" value="45" min="0" max="100"></label>
+    <label>самая долгая транзакция, мин<input type="number" id="mnT" value="2" min="0"></label>
+    <label>лаг реплики, с<input type="number" id="mnL" value="0.5" min="0" step="0.1"></label>
+    <label>age(datfrozenxid), млн<input type="number" id="mnX" value="180" min="0"></label>
+    <label>заполнение диска, %<input type="number" id="mnD" value="62" min="0" max="100"></label>
+    <label>deadlocks / ч<input type="number" id="mnDl" value="0" min="0"></label>
+  </div>
+  <div class="rows" id="mnRows"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var M = [
+    ["mnH", "Доля попаданий в кэш", function (v) { return v >= 99 ? 0 : v >= 95 ? 1 : 2; }, "рабочий набор не помещается в память или идут большие сканы — смотреть топ запросов по shared_blks_read"],
+    ["mnC", "Соединения (% от max_connections)", function (v) { return v < 70 ? 0 : v < 90 ? 1 : 2; }, "близко к пределу: утечки, завышенные пулы, нужен PgBouncer"],
+    ["mnT", "Самая долгая транзакция", function (v) { return v < 5 ? 0 : v < 30 ? 1 : 2; }, "держит горизонт VACUUM и блокировки — найти в pg_stat_activity"],
+    ["mnL", "Лаг реплики", function (v) { return v < 5 ? 0 : v < 60 ? 1 : 2; }, "чтение с реплики устарело, RPO растёт; причины — нагрузка записи, сеть, конфликты на реплике"],
+    ["mnX", "Возраст xid", function (v) { return v < 300 ? 0 : v < 1000 ? 1 : 2; }, "autovacuum не успевает замораживать — риск wraparound (тема 14)"],
+    ["mnD", "Заполнение диска", function (v) { return v < 75 ? 0 : v < 90 ? 1 : 2; }, "раздувание, копящийся WAL (упавший архив, забытый слот), рост данных"],
+    ["mnDl", "Deadlock-и", function (v) { return v < 1 ? 0 : v < 10 ? 1 : 2; }, "разный порядок блокировок в коде — смотреть журнал (детали в логе)"]
+  ];
+  function run() {
+    $("mnRows").innerHTML = M.map(function (m) {
+      var v = +$(m[0]).value, s = m[2](v);
+      return '<div class="row' + (s === 0 ? " win" : "") + '"><span>' + ["🟢", "🟡", "🔴"][s] + "</span><span><b>" + m[1] + "</b>" + (s ? "<br><small>" + m[3] + "</small>" : "") + '</span><span style="font-family:var(--font-mono);text-align:right">' + v + "</span></div>";
+    }).join("");
+  }
+  M.forEach(function (m) { $(m[0]).addEventListener("input", run); }); run();
+})();
+</script>
+<pre data-title="запросы, которые стоит держать под рукой"><code class="sql">-- что выполняется сейчас
+SELECT pid, usename, application_name, state, wait_event_type, wait_event,
+       now() - query_start AS running, left(query, 80)
+FROM pg_stat_activity WHERE state &lt;&gt; 'idle' ORDER BY running DESC;
+
+-- доля попаданий в кэш и транзакции по базе
+SELECT datname, round(100.0 * blks_hit / nullif(blks_hit + blks_read, 0), 2) AS hit_pct,
+       xact_commit, xact_rollback, deadlocks, temp_bytes
+FROM pg_stat_database WHERE datname = current_database();
+
+-- таблицы, которые читаются полным просмотром
+SELECT relname, seq_scan, seq_tup_read, idx_scan, n_live_tup
+FROM pg_stat_user_tables ORDER BY seq_tup_read DESC LIMIT 10;
+
+-- неиспользуемые индексы (проверьте и на репликах!)
+SELECT indexrelid::regclass, pg_size_pretty(pg_relation_size(indexrelid)), idx_scan
+FROM pg_stat_user_indexes WHERE idx_scan = 0 ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
+<div class="callout info"><span class="c-title">Стек наблюдения</span>
+<code>postgres_exporter</code> → Prometheus → Grafana (готовые дашборды), алерты на метрики из панели выше; <code>pg_stat_statements</code> для запросов; журнал с <code>log_min_duration_statement</code>, <code>auto_explain</code>, <code>log_lock_waits</code>, <code>log_autovacuum_min_duration</code>; со стороны приложения — метрики HikariCP (<code>hikaricp_connections_pending</code>, <code>…_usage</code>) в Micrometer и трассировка запросов. Готовые решения: pgwatch, PMM, okmeter, облачные Performance Insights.
+</div>
+
+<h2 id="quiz"><span class="h-num">20.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как безопасно реализовать сортировку по полю, выбранному пользователем?</p><ul><li>Передать имя столбца параметром PreparedStatement</li><li>Экранировать кавычки во вводе</li><li>Сопоставить ввод с белым списком допустимых столбцов</li><li>Подставить строку как есть, если она короче 20 символов</li></ul><div class="why">Идентификаторы параметрами не передаются; только белый список (или безопасный построитель запросов).</div></div>
+<div class="mcq" data-ok="0"><p>Почему в RLS-схеме с пулом соединений нужно именно <code>SET LOCAL app.tenant_id</code>?</p><ul><li>Значение действует до конца транзакции и не «утечёт» к следующему пользователю соединения</li><li>SET LOCAL быстрее</li><li>SET не работает с пользовательскими параметрами</li><li>Иначе RLS не включится</li></ul><div class="why">Соединения пула переиспользуются разными запросами и арендаторами.</div></div>
+<div class="mcq" data-ok="3"><p>Под какой ролью должно работать приложение?</p><ul><li>postgres (суперпользователь) — так проще</li><li>Владелец схемы, чтобы выполнять миграции</li><li>Любая, права не важны при наличии TLS</li><li>Отдельная роль только с нужными DML-правами; миграции — под ролью владельца</li></ul><div class="why">Минимальные привилегии ограничивают ущерб от инъекции или утечки пароля.</div></div>
+<div class="mcq" data-ok="1"><p>Какая метрика раньше всех предупредит о будущем раздувании и проблемах VACUUM?</p><ul><li>Число таблиц</li><li>Возраст самой долгой транзакции (и idle in transaction)</li><li>Размер shared_buffers</li><li>Версия PostgreSQL</li></ul><div class="why">Долгие транзакции держат горизонт — первопричина многих проблем.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какие алерты по базе вы бы настроили в первый день?</summary><div class="a"><p>Доступность и роль (primary/replica), заполнение диска и прогноз, лаг репликации, неудачи архивации WAL и возраст последней копии, возраст xid, долгие транзакции и idle in transaction, ожидания блокировок, исчерпание соединений (и pending в HikariCP), deadlock-и, рост задержек ключевых запросов (из pg_stat_statements или APM), ошибки в журнале (FATAL/PANIC, out of memory).</p></div></details>
+<details class="q"><summary>Как изолировать данные клиентов в SaaS на PostgreSQL?</summary><div class="a"><p>Варианты: общая схема с tenant_id + RLS (дёшево, масштабируется на тысячи клиентов, требует дисциплины и индексов с tenant_id); схема на клиента (лучше изоляция, сложнее миграции при тысячах схем); база на клиента (максимальная изоляция, для крупных клиентов и требований регуляторов). Часто комбинируют: мелкие — в общей схеме с RLS, крупные — отдельно. Шардинг (Citus) по tenant_id при росте.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

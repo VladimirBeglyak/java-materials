@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Field updaters, атомарные массивы, ABA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ATOMIC</div>
+  <h1>Field updaters, атомарные массивы, ABA</h1>
+  <p class="lead">Когда атомарных полей миллионы (у каждого узла структуры), объект <code>AtomicReference</code> на каждое поле — роскошь: +16 байт и лишняя ссылка. Для этого есть field updaters (и VarHandle). Атомарные массивы дают volatile-семантику каждому элементу. А в lock-free алгоритмах на ссылках подстерегает проблема ABA — разберём её на стеке Трайбера по шагам и способы защиты: штампы и метки.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">AtomicXxxFieldUpdater</span><span class="tag">AtomicIntegerArray</span><span class="tag">стек Трайбера</span><span class="tag">ABA</span><span class="tag">AtomicStampedReference</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="updaters"><span class="h-num">5.1</span>Field updaters: атомарность без лишних объектов</h2>
+<div class="grid-2">
+<pre class="bad-code" data-title="объект-атомик в каждом узле"><code class="java">final class Node {
+    final Object item;
+    final AtomicReference&lt;Node&gt; next = new AtomicReference&lt;&gt;();
+}
+// на узел: Node 16 Б + AtomicReference 16 Б
+// + лишний переход по ссылке при каждом обращении</code></pre>
+<pre class="good-code" data-title="volatile-поле + один статический updater"><code class="java">final class Node {
+    final Object item;
+    volatile Node next;
+    static final AtomicReferenceFieldUpdater&lt;Node, Node&gt; NEXT =
+        AtomicReferenceFieldUpdater.newUpdater(Node.class, Node.class, "next");
+}
+NEXT.compareAndSet(node, null, newNode);
+// сегодня в JDK чаще используется VarHandle (тема 03)</code></pre>
+</div>
+<ul>
+  <li>Поле должно быть <code>volatile</code> и не <code>static</code>; для примитивов — <code>int</code>/<code>long</code> (AtomicIntegerFieldUpdater, AtomicLongFieldUpdater).</li>
+  <li>Updater создаётся рефлексией и проверяет доступ; операции проверяют тип объекта — чуть медленнее VarHandle. Используйте, если нужна совместимость с Java 8 или привычнее API атомиков.</li>
+  <li>Атомарность гарантируется только относительно других операций через тот же updater/VarHandle: обычная запись в поле в обход — гонка.</li>
+</ul>
+
+<h2 id="arrays"><span class="h-num">5.2</span>Атомарные массивы</h2>
+<p><code>volatile int[] arr</code> делает volatile только ссылку на массив, а не его элементы. <code>AtomicIntegerArray</code>, <code>AtomicLongArray</code>, <code>AtomicReferenceArray</code> дают каждому элементу volatile-чтение/запись и CAS. Внутри — обычный массив и VarHandle на элемент (<code>MethodHandles.arrayElementVarHandle</code>).</p>
+<pre data-title="гистограмма задержек, которую пишут многие потоки"><code class="java">final AtomicLongArray buckets = new AtomicLongArray(64);
+void record(long micros) { buckets.incrementAndGet(63 - Long.numberOfLeadingZeros(Math.max(1, micros))); }
+// осторожно: соседние элементы в одной кэш-линии → false sharing при конкурентной записи соседних ячеек (тема 02)</code></pre>
+
+<h2 id="aba"><span class="h-num">5.3</span>Проблема ABA на стеке Трайбера</h2>
+<pre data-title="неблокирующий стек (Treiber stack)"><code class="java">AtomicReference&lt;Node&gt; top = new AtomicReference&lt;&gt;();
+void push(Node n) { Node t; do { t = top.get(); n.next = t; } while (!top.compareAndSet(t, n)); }
+Node pop() {
+    Node t, next;
+    do { t = top.get(); if (t == null) return null; next = t.next; }
+    while (!top.compareAndSet(t, next));      // CAS сравнивает только ССЫЛКУ
+    return t;
+}</code></pre>
+<div class="widget stepper" id="abaSim">
+  <div class="widget-title">Как стек ломается, если узлы переиспользуются (пул узлов)</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Стек (top →)</h5><div class="items"><span class="chip" id="aS">A → B → C</span></div></div>
+    <div class="lane"><h5>Поток 1 (pop)</h5><div class="items"><span class="chip" id="aT1">t = A, next = B</span></div></div>
+    <div class="lane"><h5>Поток 2</h5><div class="items"><span class="chip off" id="aT2">pop A, pop B, push A</span></div></div>
+  </div>
+  <section class="st-step" data-t="Поток 1 читает" data-hl="aS aT1" data-log="T1: t = top (A), next = A.next (B) — и вытеснен планировщиком перед CAS"><p>Поток 1 начал pop: прочитал вершину A и её следующий B, но перед CAS его вытеснили.</p></section>
+  <section class="st-step" data-t="Поток 2 работает" data-hl="aT2 aS" data-log="T2: pop A, pop B (B возвращён в пул и переиспользован), push A обратно → стек A → C"><p>Поток 2 снимает A, снимает B (узел B уходит в пул и будет переиспользован), затем снова кладёт A. Стек теперь: A → C. Вершина снова A — «та же» ссылка.</p></section>
+  <section class="st-step" data-t="CAS проходит" data-hl="aT1 aS" data-log="T1: CAS(top, A, B) — top == A → УСПЕХ; top = B, но B уже не в стеке!"><p>Поток 1 возобновляется: <code>CAS(top, A, B)</code> — вершина равна A, CAS успешен. Вершиной становится B, который давно снят и, возможно, принадлежит кому-то ещё. Узел C потерян, структура повреждена.</p></section>
+  <section class="st-step" data-t="Почему в Java редкость" data-hl="aS" data-log="с GC узел A не может быть переиспользован, пока на него ссылается T1 → ABA на ссылках возникает только с пулами объектов"><p>В Java с GC проблема ABA на ссылках встречается редко: пока поток 1 держит ссылку на A, этот объект не может быть освобождён и создан заново. ABA возникает при переиспользовании объектов (пулы), при CAS над числами (индексы, счётчики версий с переполнением) и в off-heap структурах.</p></section>
+  <section class="st-step" data-t="Защита" data-hl="aS aT1" data-log="AtomicStampedReference: CAS по паре (ссылка, штамп) — после A→B→A штамп другой → CAS не пройдёт"><p>Решение — менять вместе со ссылкой версию: <code>AtomicStampedReference</code> сравнивает пару (ссылка, int-штамп), каждая операция увеличивает штамп — возврат той же ссылки уже не обманет CAS.</p></section>
+</div>
+<pre data-title="AtomicStampedReference и AtomicMarkableReference"><code class="java">AtomicStampedReference&lt;Node&gt; top = new AtomicStampedReference&lt;&gt;(null, 0);
+int[] stampHolder = new int[1];
+Node t = top.get(stampHolder);
+top.compareAndSet(t, t.next, stampHolder[0], stampHolder[0] + 1);   // успех, только если и ссылка, и штамп прежние
+// внутри — неизменяемая пара Pair(reference, stamp) в volatile-поле: каждое изменение создаёт объект
+
+AtomicMarkableReference&lt;Node&gt; next;     // пара (ссылка, boolean) — «логически удалён» в lock-free списках (Харрис)</code></pre>
+
+<h2 id="quiz"><span class="h-num">5.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Делает ли <code>volatile long[] arr</code> атомарными изменения элементов?</p><ul><li>Да</li><li>Только для long</li><li>Нет: volatile относится к ссылке на массив, нужен AtomicLongArray или VarHandle на элементы</li><li>Только в Java 21</li></ul><div class="why">Элементы массива — обычные поля.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое проблема ABA?</p><ul><li>CAS проходит, потому что значение вернулось к ожидаемому, хотя между чтением и CAS состояние менялось</li><li>Взаимная блокировка двух потоков</li><li>Потерянное обновление volatile</li><li>Голодание потока</li></ul><div class="why">CAS сравнивает значения, а не историю.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем field updater вместо AtomicReference в узлах структуры?</p><ul><li>Он быстрее CAS</li><li>Экономия памяти и косвенности: volatile-поле прямо в узле плюс один общий статический updater</li><li>Он потокобезопаснее</li><li>Он работает со static-полями</li></ul><div class="why">Так устроены многие классы JDK (сейчас чаще VarHandle).</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как работает AtomicStampedReference и чем платим?</summary><div class="a"><p>Хранит volatile-ссылку на неизменяемую пару (reference, stamp); compareAndSet сравнивает обе компоненты и CAS-ом заменяет ссылку на новую пару. Плата — создание объекта Pair на каждое изменение (давление на GC) и ручное управление штампом. Для большинства Java-структур с GC ABA не возникает; штампы нужны при переиспользовании объектов или числовых состояниях.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

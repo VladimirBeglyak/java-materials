@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · WebFlux или MVC на виртуальных потоках</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>WebFlux или MVC на виртуальных потоках</h1>
+  <p class="lead">С Java 21 и Spring Boot 3.2 (<code>spring.threads.virtual.enabled=true</code>) обычный блокирующий MVC-код масштабируется по числу одновременных запросов почти как реактивный: виртуальный поток при блокировке на I/O отпускает поток-носитель. Значит ли это, что WebFlux больше не нужен? Сравниваем модели по существу, смотрим один и тот же сценарий в двух стилях и выбираем осознанно.</p>
+  <div class="meta"><span class="tag">~1 час</span><span class="tag">виртуальные потоки</span><span class="tag">Project Loom</span><span class="tag">pinning</span><span class="tag">structured concurrency</span><span class="tag">RestClient</span><span class="tag">выбор стека</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="how"><span class="h-num">21.1</span>Как виртуальные потоки решают ту же задачу</h2>
+<div class="grid-2">
+  <div class="card"><h4>WebFlux</h4><p>Код явно асинхронный: вместо ожидания вы возвращаете Mono, а продолжение регистрируется как колбэк. Мало потоков, потому что никто не ждёт. Цена — другой стиль программирования, «окрашенные» функции (Mono везде), сложные стектрейсы.</p></div>
+  <div class="card"><h4>Виртуальные потоки</h4><p>Код блокирующий и последовательный, но блокировка дешёвая: JVM снимает стек виртуального потока с потока-носителя (ForkJoinPool, по числу ядер) и возвращает его, когда I/O готов. По сути, JVM делает «реактивное» преобразование за вас.</p></div>
+</div>
+
+<h2 id="code"><span class="h-num">21.2</span>Один сценарий — два стиля</h2>
+<p>Профиль пользователя: параллельно вызвать два сервиса с таймаутом 2 с, некритичный — с запасным значением.</p>
+<pre data-title="WebFlux"><code class="java">Mono&lt;Profile&gt; profile(String id) {
+    Mono&lt;User&gt; user = userClient.get(id).timeout(Duration.ofSeconds(2));
+    Mono&lt;Loyalty&gt; loyalty = loyaltyClient.get(id).timeout(Duration.ofSeconds(2))
+                                          .onErrorReturn(Loyalty.UNKNOWN);
+    return Mono.zip(user, loyalty, Profile::new);
+}</code></pre>
+<pre data-title="MVC + виртуальные потоки (RestClient; structured concurrency — всё ещё preview, API JDK 25+, JEP 505)"><code class="java">Profile profile(String id) throws Exception {
+    try (var scope = StructuredTaskScope.open(                          // в JDK 21–24 был конструктор
+            Joiner.awaitAllSuccessfulOrThrow(),                         // и ShutdownOnFailure/joinUntil
+            cfg -&gt; cfg.withTimeout(Duration.ofSeconds(2)))) {
+        var user    = scope.fork(() -&gt; userClient.get(id));            // RestClient, блокирует — дёшево
+        var loyalty = scope.fork(() -&gt; {
+            try { return loyaltyClient.get(id); } catch (Exception e) { return Loyalty.UNKNOWN; }
+        });
+        scope.join();                                                   // ошибка или таймаут → исключение
+        return new Profile(user.get(), loyalty.get());
+    }
+}
+// без preview-API: CompletableFuture.supplyAsync(..., virtualExecutor) + orTimeout</code></pre>
+
+<h2 id="table"><span class="h-num">21.3</span>Сравнение</h2>
+<div class="table-wrap"><table>
+<tr><th>Критерий</th><th>WebFlux</th><th>MVC + виртуальные потоки</th></tr>
+<tr><td>Масштаб по одновременным запросам</td><td>отличный</td><td>отличный (с оговорками про pinning)</td></tr>
+<tr><td>Стиль кода, отладка, стектрейсы</td><td>сложнее</td><td>привычный, простой</td></tr>
+<tr><td>JDBC/JPA и блокирующие SDK</td><td>только через boundedElastic</td><td>работают как есть</td></tr>
+<tr><td>Стриминг с противодавлением</td><td>встроен (Flux, SSE, NDJSON)</td><td>вручную, без сквозного backpressure</td></tr>
+<tr><td>Композиция: таймауты, повторы, гонки, отмена</td><td>богатая библиотека операторов</td><td>CompletableFuture / structured concurrency</td></tr>
+<tr><td>ThreadLocal, MDC, транзакции</td><td>через Context и пропагацию</td><td>работают как обычно</td></tr>
+<tr><td>Защита ресурсов</td><td>противодавление, concurrency</td><td>нужны семафоры/лимиты: потоков «бесконечно», а пул БД — нет</td></tr>
+<tr><td>Экосистема</td><td>Spring Cloud Gateway, RSocket, R2DBC</td><td>весь Spring MVC, Spring Data JPA</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Подводные камни виртуальных потоков</span>
+<b>Pinning</b>: до JDK 24 блокировка внутри <code>synchronized</code> «прибивала» виртуальный поток к носителю (JEP 491 в JDK 24 это исправил); нативные вызовы прибивают всегда. <b>ThreadLocal-кэши</b> на поток (пулы буферов) теряют смысл при миллионах потоков. <b>Перегрузка зависимостей</b>: 10 000 виртуальных потоков радостно ринутся в пул БД из 20 соединений — нужен явный лимит параллельности.
+</div>
+
+<h2 id="decide"><span class="h-num">21.4</span>Помощник выбора</h2>
+<div class="widget" id="dcW">
+  <div class="widget-title">Отметьте, что верно для вашего сервиса</div>
+  <div class="checks col">
+    <label><input type="checkbox" id="dc1"> Используем JPA/Hibernate, JDBC или блокирующие SDK</label>
+    <label><input type="checkbox" id="dc2"> Нужен стриминг (SSE, WebSocket, NDJSON) с противодавлением</label>
+    <label><input type="checkbox" id="dc3" checked> Доступна Java 21+</label>
+    <label><input type="checkbox" id="dc4"> Шлюз/прокси/агрегатор: тысячи соединений, почти вся работа — ожидание</label>
+    <label><input type="checkbox" id="dc5"> Команда уверенно владеет Reactor</label>
+    <label><input type="checkbox" id="dc6"> Много параллельных вызовов с таймаутами, повторами, отменой</label>
+    <label><input type="checkbox" id="dc7" checked> Важны простота поддержки и порог входа для новых разработчиков</label>
+    <label><input type="checkbox" id="dc8"> Строим на Spring Cloud Gateway или RSocket</label>
+  </div>
+  <div class="rows" id="dcRows"></div>
+  <div class="verdict" id="dcV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  var W = { dc1: [0, 3], dc2: [3, 0], dc3: [0, 2], dc4: [2, 1], dc5: [2, 0], dc6: [2, 0], dc7: [0, 2], dc8: [5, 0] };
+  function run() {
+    var wf = 0, mv = 0, k, why = [];
+    for (k in W) if ($(k).checked) { wf += W[k][0]; mv += W[k][1]; }
+    if (!$("dc3").checked) { mv -= 1; why.push("без Java 21 виртуальных потоков нет — MVC масштабируется только пулом потоков"); }
+    if ($("dc8").checked) why.push("Spring Cloud Gateway (классический) работает только на WebFlux");
+    if ($("dc1").checked && !$("dc8").checked) why.push("блокирующие зависимости обнуляют главный выигрыш WebFlux");
+    if ($("dc2").checked) why.push("сквозное противодавление и Flux-стриминг — сильная сторона WebFlux");
+    var whyS = why.join("; "); whyS = whyS ? whyS.charAt(0).toUpperCase() + whyS.slice(1) : ""; why = whyS ? [whyS] : [];
+    var tot = Math.max(1, Math.abs(wf) + Math.abs(mv)), rows = '<div class="row"><b>WebFlux</b><span class="bar ' + (wf > mv ? "ok" : "") + '"><i style="width:' + (Math.max(0, wf) / tot * 100).toFixed(0) + '%"></i></span><span>' + wf + '</span></div><div class="row"><b>MVC + virtual threads</b><span class="bar ' + (mv >= wf ? "ok" : "") + '"><i style="width:' + (Math.max(0, mv) / tot * 100).toFixed(0) + '%"></i></span><span>' + mv + "</span></div>";
+    $("dcRows").innerHTML = rows;
+    var v = $("dcV");
+    if (wf > mv + 1) { v.className = "verdict ok"; v.textContent = "Рекомендация: WebFlux. " + why.join("; ") + "."; }
+    else if (mv > wf + 1) { v.className = "verdict ok"; v.textContent = "Рекомендация: Spring MVC" + ($("dc3").checked ? " на виртуальных потоках" : "") + ". " + (why.length ? why.join("; ") + "." : "Простой блокирующий код даст ту же масштабируемость без сложности реактивного стиля."); }
+    else { v.className = "verdict warn"; v.textContent = "Пограничный случай. Частый компромисс: MVC на виртуальных потоках для основной логики + WebClient/Reactor там, где нужна композиция вызовов или стриминг. " + why.join("; "); }
+  }
+  for (var k in W) $(k).addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="migrate"><span class="h-num">21.5</span>Миграция в обе стороны</h2>
+<ul>
+  <li><b>MVC → виртуальные потоки</b>: Boot 3.2+, <code>spring.threads.virtual.enabled=true</code> — Tomcat, @Async, планировщики, Kafka-листенеры переходят на виртуальные потоки. Проверить: synchronized вокруг I/O (до JDK 24), размеры пулов соединений, нагрузку на БД.</li>
+  <li><b>WebFlux в MVC частично</b>: контроллер MVC может возвращать Mono/Flux — Spring MVC подпишется и обработает асинхронно (поток Servlet освобождается), а SSE через Flux работает и в MVC.</li>
+  <li><b>MVC → WebFlux</b>: оправдано, только если стек целиком неблокирующий; переписывание сервисного слоя на Mono/Flux — главная стоимость.</li>
+</ul>
+
+<h2 id="quiz"><span class="h-num">21.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что происходит с виртуальным потоком, когда он блокируется на чтении сокета?</p><ul><li>Блокируется поток-носитель</li><li>Выбрасывается исключение</li><li>Он снимается с носителя, носитель выполняет другие виртуальные потоки</li><li>JVM создаёт новый платформенный поток</li></ul><div class="why">Так блокирующий код получает масштабируемость асинхронного.</div></div>
+<div class="mcq" data-ok="0"><p>Какой сценарий остаётся сильной стороной WebFlux даже при наличии виртуальных потоков?</p><ul><li>Стриминг со сквозным противодавлением и богатая композиция асинхронных операций</li><li>CRUD поверх JPA</li><li>Простые REST-эндпоинты</li><li>Пакетная обработка файлов</li></ul><div class="why">Loom решает проблему стоимости потоков, а не потоков данных.</div></div>
+<div class="mcq" data-ok="3"><p>Почему с виртуальными потоками нужно явно ограничивать параллельность обращений к БД?</p><ul><li>Виртуальные потоки медленнее</li><li>JDBC не поддерживает виртуальные потоки</li><li>Из-за pinning</li><li>Число потоков больше не ограничивает нагрузку, а пул соединений остаётся конечным</li></ul><div class="why">Раньше пул Tomcat (200) неявно ограничивал давление на БД.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что ответить на собеседовании на вопрос «WebFlux устарел из-за Loom?»</summary><div class="a"><p>Нет, но его ниша сузилась. Loom снимает главный аргумент «реактивность нужна, чтобы не держать поток на ожидание»: для типичного CRUD-сервиса MVC на виртуальных потоках проще и масштабируется сопоставимо. WebFlux остаётся оправданным для стриминга с противодавлением, шлюзов (Spring Cloud Gateway), сложной асинхронной композиции, полностью неблокирующего стека и там, где он уже есть. Выбор — по характеру нагрузки, зависимостям и компетенциям команды, подкреплённый нагрузочным тестом.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

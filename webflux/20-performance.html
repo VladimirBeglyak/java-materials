@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>20 · Производительность и блокировка event loop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="20">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 20 · ЭКСПЛУАТАЦИЯ</div>
+  <h1>Производительность и блокировка event loop</h1>
+  <p class="lead">Главная угроза реактивного сервиса — не медленный код, а <b>блокирующий</b>. Потоков event loop по умолчанию max(ядра, 4); один <code>Thread.sleep</code>, JDBC-вызов или синхронная запись лога в обработчике останавливает все соединения этого потока. Моделируем последствия, учимся находить блокировки BlockHound-ом и разбираем настройки Reactor Netty, влияющие на пропускную способность.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">event loop</span><span class="tag">BlockHound</span><span class="tag">boundedElastic</span><span class="tag">ioWorkerCount</span><span class="tag">epoll</span><span class="tag">нагрузочное тестирование</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="sim"><span class="h-num">20.1</span>Цена одной блокировки</h2>
+<div class="widget" id="elW">
+  <div class="widget-title">8 потоков event loop, у каждого своя доля соединений</div>
+  <div class="controls">
+    <label>запросов/с на сервис<input type="number" id="elR" value="8000" min="1"></label>
+    <label>CPU на запрос, мс<input type="number" id="elC" value="0.3" min="0.01" step="0.05"></label>
+    <label>доля запросов с блокировкой, %<input type="number" id="elP" value="2" min="0" max="100"></label>
+    <label>длительность блокировки, мс<input type="number" id="elB" value="20" min="0"></label>
+    <label><input type="checkbox" id="elOff"> блокирующий вызов вынесен на boundedElastic</label>
+  </div>
+  <div class="rows" id="elRows"></div>
+  <div class="verdict" id="elV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var R = Math.max(1, +$("elR").value), c = Math.max(0.01, +$("elC").value), p = Math.min(100, Math.max(0, +$("elP").value)) / 100, B = Math.max(0, +$("elB").value), off = $("elOff").checked, N = 8;
+    var perLoop = R / N, svc = c + (off ? 0.05 : p * B), rho = perLoop * svc / 1000;
+    function row(n, val, frac, cls) { return '<div class="row"><b>' + n + '</b><span class="bar ' + (cls || "") + '"><i style="width:' + (Math.min(1, Math.max(0, frac)) * 100).toFixed(1) + '%"></i></span><span>' + val + "</span></div>"; }
+    var html = row("загрузка event loop", Math.round(rho * 100) + "%", rho, rho > 0.8 ? "bad" : rho > 0.6 ? "warn" : "ok");
+    var v = $("elV"), msg, cls;
+    if (rho >= 1) {
+      html += row("очередь задач event loop", "растёт без предела", 1, "bad");
+      cls = "bad"; msg = "Event loop перегружен: " + (off ? "даже CPU-работы слишком много." : "на блокировки уходит " + Math.round(perLoop * p * B / 10) + "% времени каждого потока. Запросы, попавшие на этот поток, ждут в очереди — латентность растёт до таймаутов, хотя CPU почти свободен.");
+    } else {
+      var wait = rho / (2 * (1 - rho)) * svc, hitBlock = off ? 0 : Math.min(1, perLoop * p * B / 1000);
+      html += row("среднее ожидание в очереди", wait.toFixed(2) + " мс", Math.min(1, wait / 50), wait > 5 ? "bad" : "ok");
+      html += row("шанс попасть за блокировку", Math.round(hitBlock * 100) + "%", hitBlock, hitBlock > 0.05 ? "bad" : "ok");
+      if (off) { var thr = Math.ceil(R * p * B / 1000); html += row("занято потоков boundedElastic", thr + " из " + 10 * N, thr / (10 * N), thr > 10 * N ? "bad" : "ok"); }
+      cls = off ? "ok" : hitBlock > 0.05 ? "warn" : "ok";
+      if (!off && hitBlock < 0.001) { $("elRows").innerHTML = html; v.className = "verdict ok"; v.textContent = "Блокировок нет: event loop занят только короткой CPU-работой, очередь почти пуста."; return; }
+      msg = off ? "Блокировка вынесена: event loop занят только CPU-работой, а ожидание " + B + " мс платят лишь те " + Math.round(p * 100) + "% запросов, которые его вызывают. Пул boundedElastic ограничен " + 10 * N + " потоками — при росте нагрузки он станет узким местом." : "Каждый " + Math.round(1 / Math.max(hitBlock, 0.0001)) + "-й запрос, даже не связанный с блокирующим вызовом, ждёт до " + B + " мс, потому что делит поток с заблокированным обработчиком. Хвостовая латентность (p99) страдает у всех.";
+    }
+    $("elRows").innerHTML = html; v.className = "verdict " + cls; v.textContent = msg;
+  }
+  ["elR", "elC", "elP", "elB", "elOff"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="blockers"><span class="h-num">20.2</span>Что блокирует (часто неочевидно)</h2>
+<div class="table-wrap"><table>
+<tr><th>Источник</th><th>Почему блокирует</th><th>Что делать</th></tr>
+<tr><td>JDBC, JPA, RestTemplate, Feign</td><td>синхронный сокет</td><td>R2DBC, WebClient; или boundedElastic</td></tr>
+<tr><td><code>block()</code>, <code>toFuture().get()</code></td><td>ожидание результата</td><td>встроить в цепочку; Reactor бросит исключение в NonBlocking-потоке</td></tr>
+<tr><td>Логирование в файл синхронным appender-ом</td><td>запись на диск, блокировки appender-а</td><td>AsyncAppender / асинхронные логгеры Log4j2</td></tr>
+<tr><td><code>UUID.randomUUID()</code>, <code>SecureRandom</code></td><td>может ждать энтропию</td><td>обычно быстро, но BlockHound ловит — разрешить явно или использовать другой генератор</td></tr>
+<tr><td><code>synchronized</code> вокруг I/O, <code>ReentrantLock</code> под нагрузкой</td><td>ожидание монитора</td><td>неблокирующие структуры, атомики</td></tr>
+<tr><td>Чтение файлов (<code>Files.readAllBytes</code>), шаблонизаторы с диска</td><td>файловый I/O</td><td><code>DataBufferUtils.read</code> (AsynchronousFileChannel), кэш</td></tr>
+<tr><td>DNS-резолв JDK (<code>InetAddress</code>)</td><td>системный вызов</td><td>Reactor Netty использует свой неблокирующий резолвер</td></tr>
+<tr><td>Тяжёлая CPU-работа (крипто, большие JSON, сжатие)</td><td>не блокирует, но занимает loop</td><td><code>publishOn(parallel())</code> для крупных задач</td></tr>
+</table></div>
+
+<h2 id="blockhound"><span class="h-num">20.3</span>BlockHound</h2>
+<pre data-title="Подключение в тестах"><code class="java">// testImplementation("io.projectreactor.tools:blockhound:1.0.x")
+@BeforeAll
+static void installBlockHound() {
+    BlockHound.builder()
+        .allowBlockingCallsInside("java.util.UUID", "randomUUID")       // осознанное исключение
+        .allowBlockingCallsInside("ch.qos.logback.classic.Logger", "callAppenders")
+        .install();
+}
+
+@Test
+void controllerDoesNotBlock() {
+    webTestClient.get().uri("/api/report/1").exchange().expectStatus().isOk();
+}
+// reactor.blockhound.shaded.net.bytebuddy...:
+// BlockingOperationError: Blocking call! java.net.Socket$SocketInputStream#read
+//   at com.shop.LegacyDao.load(LegacyDao.java:42)   ← найдено</code></pre>
+<p>BlockHound — Java-агент, который инструментирует блокирующие методы JDK (<code>Thread.sleep</code>, чтение сокета, <code>Object.wait</code>, <code>LockSupport.park</code> и др.) и бросает ошибку, если вызов произошёл в потоке, помеченном как неблокирующий (NonBlocking: parallel, event loop Netty). На JDK 13+ нужен флаг <code>-XX:+AllowRedefinitionToAddDeleteMethods</code>. Держите его включённым во всех интеграционных тестах.</p>
+
+<h2 id="tuning"><span class="h-num">20.4</span>Настройки и нагрузочное тестирование</h2>
+<div class="grid-2">
+  <div class="card"><h4>Reactor Netty</h4><ul><li><code>reactor.netty.ioWorkerCount</code> — потоков event loop (по умолчанию max(ядра, 4)); увеличивать почти никогда не нужно.</li><li>Нативный транспорт epoll/kqueue (netty-transport-native-*) — меньше накладных расходов, чем NIO.</li><li>HTTP/2: <code>server.http2.enabled=true</code> — мультиплексирование, меньше соединений.</li><li><code>server.compression.enabled</code> — экономит сеть, тратит CPU loop.</li><li>Контейнер: укажите реальные ядра (cgroup), иначе потоков будет больше или меньше нужного.</li></ul></div>
+  <div class="card"><h4>Как мерить</h4><ul><li>Нагрузка открытой моделью (Gatling, k6 с constant-arrival-rate) — закрытая модель (N потоков JMeter) скрывает рост латентности.</li><li>Смотрите p99/p999 и ошибки, а не только среднее и RPS.</li><li>Сравнивайте с MVC на виртуальных потоках на том же сценарии (тема 21).</li><li>Профилирование: async-profiler в режиме wall — покажет, где ждут event loop-потоки.</li><li>Прогрев JIT перед замерами.</li></ul></div>
+</div>
+<div class="callout info"><span class="c-title">Микрооптимизации Reactor</span>
+Цепочка из десятков операторов на каждый элемент стоит аллокаций и вызовов; Reactor сглаживает это «слиянием» (operator fusion: map+filter над синхронным источником выполняются без очередей). Но не дробите логику на операторы ради красоты: один <code>map</code> с методом дешевле пяти. <code>Mono.just</code> + <code>flatMap</code> там, где хватит <code>map</code>, — лишняя подписка на каждый элемент.
+</div>
+
+<h2 id="quiz"><span class="h-num">20.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему блокирующий вызов в одном эндпоинте замедляет другие, не связанные с ним эндпоинты?</p><ul><li>Из-за общего пула БД</li><li>Соединения, обслуживаемые тем же потоком event loop, ждут, пока поток не освободится</li><li>Netty перезапускается</li><li>Не замедляет</li></ul><div class="why">Каждое соединение навсегда привязано к своему event loop.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает BlockHound?</p><ul><li>Ускоряет блокирующие вызовы</li><li>Автоматически переносит их на boundedElastic</li><li>Считает метрики потоков</li><li>Бросает ошибку при блокирующем вызове в неблокирующем потоке</li></ul><div class="why">Инструмент обнаружения, а не исправления.</div></div>
+<div class="mcq" data-ok="0"><p>Почему для нагрузочного теста реактивного сервиса предпочтительна открытая модель нагрузки?</p><ul><li>Закрытая модель (фиксированное число пользователей) сама снижает частоту запросов при росте латентности и скрывает деградацию</li><li>Она быстрее</li><li>Закрытая модель не поддерживает HTTP/2</li><li>Это требование Netty</li></ul><div class="why">Coordinated omission: тест «подстраивается» под медленный сервер.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>WebFlux-сервис показывает высокую латентность при CPU 20%. Как искать причину?</summary><div class="a"><p>1) Дамп потоков: есть ли reactor-http-nio в состояниях, отличных от epoll_wait (socketRead, park, sleep) — это блокировка. 2) Метрика reactor.netty.eventloop.pending.tasks — растущая очередь подтверждает. 3) Пулы: reactor.netty.connection.provider.pending.connections (WebClient ждёт соединений), r2dbc.pool.pending — запросы стоят в очереди к БД. 4) boundedElastic: все потоки заняты, задачи в очереди. 5) Внешние зависимости и их таймауты. Низкий CPU при высокой латентности — почти всегда ожидание, а не вычисления.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

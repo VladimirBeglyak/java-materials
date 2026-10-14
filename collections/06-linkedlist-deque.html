@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · LinkedList и ArrayDeque</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.ring { display: flex; flex-wrap: wrap; gap: 3px; margin: 12px 0; }
+.ring div { width: 46px; text-align: center; font: 12px var(--font-mono); border-radius: 5px; border: 1.5px solid var(--line); background: var(--bg); padding: 4px 0; }
+.ring div b { display: block; font-size: 13px; padding: 4px 0; }
+.ring div.u { background: var(--info-soft); border-color: var(--info); }
+.ring div small { font-size: 10px; color: var(--fg-muted); }
+.ring div.h { box-shadow: inset 0 -3px 0 var(--ok); } .ring div.t { box-shadow: inset 0 3px 0 var(--accent); }
+.nodes { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 10px 0; font: 12px var(--font-mono); }
+.nodes span.n { border: 1.5px solid var(--line); border-radius: 6px; padding: 6px 8px; background: var(--bg-sunk); }
+.nodes span.v { border-color: var(--warn); background: var(--warn-soft); }
+</style>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · СПИСКИ И ОЧЕРЕДИ</div>
+  <h1>LinkedList и ArrayDeque</h1>
+  <p class="lead"><code>LinkedList</code> — двусвязный список, который учебники рекомендуют «для частых вставок», а практика почти никогда. <code>ArrayDeque</code> — кольцевой буфер, лучшая реализация стека и очереди в JDK. Разбираем оба изнутри: обход узлов для <code>get(i)</code>, накладные расходы на узел, работу кольцевого буфера с указателями head/tail (симулятор) и почему <code>Stack</code> устарел.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">узлы Node</span><span class="tag">локальность памяти</span><span class="tag">кольцевой буфер</span><span class="tag">Deque API</span><span class="tag">стек и очередь</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="linked"><span class="h-num">6.1</span>LinkedList: двусвязный список</h2>
+<pre data-title="устройство"><code class="java">public class LinkedList&lt;E&gt; extends AbstractSequentialList&lt;E&gt; implements List&lt;E&gt;, Deque&lt;E&gt; {
+    transient int size; transient Node&lt;E&gt; first, last;
+    private static class Node&lt;E&gt; { E item; Node&lt;E&gt; next, prev; }   // 12 заголовок + 3×4 ссылки = 24 байта на узел
+    Node&lt;E&gt; node(int index) {                                      // get(i), set(i), add(i, e) начинаются с поиска узла
+        if (index &lt; (size &gt;&gt; 1)) { Node&lt;E&gt; x = first; for (int i = 0; i &lt; index; i++) x = x.next; return x; }
+        else                     { Node&lt;E&gt; x = last;  for (int i = size - 1; i &gt; index; i--) x = x.prev; return x; }
+    }
+}</code></pre>
+<div class="widget" id="llW">
+  <div class="widget-title">Сколько узлов обойдёт get(i)?</div>
+  <div class="controls"><label>размер<input type="number" id="llN" value="12" min="1" max="40"></label><label>индекс<input type="number" id="llI" value="4" min="0"></label></div>
+  <div class="nodes" id="llView"></div>
+  <div class="verdict" id="llV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var n = Math.max(1, Math.min(40, +$("llN").value)), i = Math.max(0, Math.min(n - 1, +$("llI").value)), fromHead = i < (n >> 1), steps = fromHead ? i : n - 1 - i, h = "";
+    for (var k = 0; k < n; k++) { var v = fromHead ? k <= i : k >= i; h += '<span class="n' + (v ? " v" : "") + '">' + k + "</span>" + (k < n - 1 ? "⇄" : ""); }
+    $("llView").innerHTML = (fromHead ? "first → " : "") + h + (fromHead ? "" : " ← last");
+    $("llV").className = "verdict " + (steps > 3 ? "warn" : "ok");
+    $("llV").textContent = "get(" + i + "): обход " + (fromHead ? "с головы" : "с хвоста") + ", переходов по ссылкам: " + steps + ". На списке из 1 млн элементов get(500 000) — 500 тыс. переходов по случайным адресам памяти, каждый — потенциальный промах кэша. Цикл for (int i…) list.get(i) по LinkedList — O(n²).";
+  }
+  ["llN", "llI"].forEach(function (i) { $(i).addEventListener("input", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Миф о быстрых вставках</span>
+Вставка в середину LinkedList — O(1) <b>только если узел уже найден</b> (через ListIterator). Поиск позиции — O(n) по разбросанным в памяти узлам. ArrayList сдвигает элементы <code>System.arraycopy</code> по непрерывной памяти, что на современных CPU обычно быстрее даже для сотен тысяч элементов. Плюс 24 байта на узел против 4 байт на ссылку в массиве. Джошуа Блох, автор LinkedList: «Кто-нибудь вообще использует LinkedList? Я написал его и никогда не использую».
+</div>
+
+<h2 id="deque"><span class="h-num">6.2</span>ArrayDeque: кольцевой буфер</h2>
+<p>Массив и два индекса: <code>head</code> — первый элемент, <code>tail</code> — следующая свободная ячейка после последнего. Добавление в начало сдвигает head влево, в конец — tail вправо, индексы «заворачиваются» по модулю длины массива. Сдвигов элементов нет вообще.</p>
+<div class="widget" id="dqW">
+  <div class="widget-title">Симулятор ArrayDeque (начальная ёмкость 8 для наглядности)</div>
+  <div class="controls">
+    <button class="btn primary" type="button" data-a="addLast">addLast / offer</button>
+    <button class="btn primary" type="button" data-a="addFirst">addFirst / push</button>
+    <button class="btn" type="button" data-a="pollFirst">pollFirst / poll / pop</button>
+    <button class="btn" type="button" data-a="pollLast">pollLast</button>
+    <button class="btn" type="button" data-a="reset">↺</button>
+  </div>
+  <div class="ring" id="dqRing"></div>
+  <div class="out" id="dqOut"></div>
+  <div class="log" id="dqLog"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); }, a, head, tail, size, next, log;
+  function reset() { a = new Array(8).fill(null); head = 0; tail = 0; size = 0; next = 1; log = ["new ArrayDeque<>(): массив, head = tail = 0 (в JDK по умолчанию 16 ячеек + 1)"]; draw(); }
+  function grow() {
+    var old = a.length, nc = old + (old < 64 ? old + 2 : old >> 1), b = new Array(nc).fill(null);
+    for (var i = 0; i < size; i++) b[i] = a[(head + i) % old];
+    log.push("  массив полон → рост " + old + " → " + nc + " (малые массивы почти удваиваются, большие — ×1,5); элементы скопированы по порядку, head = 0");
+    a = b; head = 0; tail = size;
+  }
+  function act(op) {
+    if (op === "addLast") { if (size === a.length) grow(); a[tail] = next; log.push("addLast(" + next + "): a[" + tail + "] = " + next + ", tail → " + ((tail + 1) % a.length)); next++; tail = (tail + 1) % a.length; size++; }
+    else if (op === "addFirst") { if (size === a.length) grow(); head = (head - 1 + a.length) % a.length; a[head] = next; log.push("addFirst(" + next + "): head → " + head + " (заворот через край массива, если был 0), a[" + head + "] = " + next); next++; size++; }
+    else if (op === "pollFirst") { if (!size) { log.push("pollFirst(): пусто → null (removeFirst/pop бросили бы NoSuchElementException)"); } else { var v = a[head]; a[head] = null; log.push("pollFirst() → " + v + ", ячейка обнулена, head → " + ((head + 1) % a.length)); head = (head + 1) % a.length; size--; } }
+    else if (op === "pollLast") { if (!size) { log.push("pollLast(): пусто → null"); } else { tail = (tail - 1 + a.length) % a.length; var w = a[tail]; a[tail] = null; log.push("pollLast() → " + w + ", tail → " + tail); size--; } }
+    draw();
+  }
+  function draw() {
+    $("dqRing").innerHTML = a.map(function (v, i) { var used = v !== null; return '<div class="' + (used ? "u" : "") + (i === head && size ? " h" : "") + (i === tail ? " t" : "") + '"><small>' + i + "</small><b>" + (used ? v : "·") + "</b><small>" + (i === head && size ? "head" : "") + (i === tail ? (i === head && size ? "/" : "") + "tail" : "") + "</small></div>"; }).join("");
+    var order = []; for (var i = 0; i < size; i++) order.push(a[(head + i) % a.length]);
+    $("dqOut").textContent = "size = " + size + ", ёмкость = " + a.length + "\nпорядок от первого к последнему: [" + order.join(", ") + "]";
+    $("dqLog").textContent = log.slice(-7).join("\n"); $("dqLog").scrollTop = 1e6;
+  }
+  document.querySelectorAll("#dqW [data-a]").forEach(function (b) { b.addEventListener("click", function () { var o = b.getAttribute("data-a"); if (o === "reset") reset(); else act(o); }); });
+  reset();
+})();
+</script>
+<div class="callout info"><span class="c-title">Что попробовать</span>
+Сделайте addLast ×3, затем addFirst ×2 — head «завернётся» в конец массива, хотя логически элементы идут подряд. Добавляйте, пока массив не заполнится, — увидите рост с «распрямлением» кольца. ArrayDeque <b>не допускает null</b>: null в poll означает «пусто».
+</div>
+
+<h2 id="api"><span class="h-num">6.3</span>Deque как стек и как очередь</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Метод Deque</th><th>Эквивалент</th><th>Без исключений</th></tr>
+<tr><td>Стек: положить</td><td><code>push(e)</code></td><td><code>addFirst</code></td><td><code>offerFirst</code></td></tr>
+<tr><td>Стек: снять</td><td><code>pop()</code></td><td><code>removeFirst</code></td><td><code>pollFirst</code></td></tr>
+<tr><td>Стек: посмотреть</td><td><code>peek()</code></td><td><code>peekFirst</code></td><td>—</td></tr>
+<tr><td>Очередь: в хвост</td><td><code>offer(e)</code> / <code>add</code></td><td><code>addLast</code></td><td><code>offerLast</code></td></tr>
+<tr><td>Очередь: из головы</td><td><code>poll()</code> / <code>remove</code></td><td><code>removeFirst</code></td><td><code>pollFirst</code></td></tr>
+</table></div>
+<pre data-title="стек: ArrayDeque вместо Stack"><code class="java">Deque&lt;Character&gt; stack = new ArrayDeque&lt;&gt;();     // Stack extends Vector: синхронизирован, позволяет insertElementAt(…) в середину
+for (char c : "({[]})".toCharArray()) {
+    if ("([{".indexOf(c) &gt;= 0) stack.push(c);
+    else if (stack.isEmpty() || "([{".indexOf(stack.pop()) != ")]}".indexOf(c)) return false;
+}
+return stack.isEmpty();
+// внимание: итерация Stack (Vector) идёт снизу вверх, ArrayDeque как стек — сверху вниз</code></pre>
+
+<h2 id="compare"><span class="h-num">6.4</span>Сравнение</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>ArrayList</th><th>LinkedList</th><th>ArrayDeque</th></tr>
+<tr><td>get(i)</td><td>O(1)</td><td>O(n)</td><td>нет (не List)</td></tr>
+<tr><td>в начало / из начала</td><td>O(n)</td><td>O(1)</td><td>O(1)</td></tr>
+<tr><td>в конец / из конца</td><td>O(1) амортизированно</td><td>O(1)</td><td>O(1) амортизированно</td></tr>
+<tr><td>память на элемент</td><td>4 Б (+ запас ёмкости)</td><td>24 Б узел</td><td>4 Б (+ запас)</td></tr>
+<tr><td>null</td><td>да</td><td>да</td><td>нет</td></tr>
+<tr><td>Когда</td><td>по умолчанию для списков</td><td>почти никогда; иногда — удаление через ListIterator на очень длинных списках, нужен null в очереди</td><td>стек, очередь, двусторонняя очередь, BFS, скользящее окно</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">6.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что использовать как стек в современном Java?</p><ul><li>Stack</li><li>LinkedList</li><li>ArrayDeque (push/pop/peek)</li><li>Vector</li></ul><div class="why">Stack наследует синхронизированный Vector и раскрывает лишние операции.</div></div>
+<div class="mcq" data-ok="0"><p>Почему цикл <code>for (int i = 0; i &lt; list.size(); i++) list.get(i)</code> по LinkedList медленный?</p><ul><li>Каждый get(i) обходит узлы от ближайшего конца — суммарно O(n²)</li><li>size() вычисляется за O(n)</li><li>LinkedList синхронизирован</li><li>Он не медленный</li></ul><div class="why">Используйте for-each (итератор) для последовательного обхода.</div></div>
+<div class="mcq" data-ok="3"><p>Что означает null, возвращённый ArrayDeque.poll()?</p><ul><li>В очереди лежал null</li><li>Ошибка</li><li>Первый элемент удалён</li><li>Очередь пуста — null-элементы ArrayDeque запрещены</li></ul><div class="why">Поэтому null не допускается: иначе poll был бы неоднозначен.</div></div>
+<div class="mcq" data-ok="1"><p>Сколько элементов сдвигает ArrayDeque.addFirst?</p><ul><li>Все</li><li>Ни одного: сдвигается индекс head по кольцу</li><li>Половину</li><li>Один</li></ul><div class="why">Копирование — только при росте массива.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда LinkedList всё-таки оправдан?</summary><div class="a"><p>Редко: когда нужны частые вставки/удаления в середине очень длинного списка в позиции, уже найденной ListIterator-ом (и элементов так много, что сдвиг массива дорог); когда нужна очередь с null-элементами; когда важна стабильность времени операции без пиков роста массива. В большинстве задач ArrayList или ArrayDeque быстрее и компактнее — проверяйте бенчмарком.</p></div></details>
+<details class="q"><summary>Реализуйте скользящий максимум окна размера k за O(n).</summary><div class="a"><p>ArrayDeque индексов, значения по которым убывают: для каждого i удалить из головы индексы ≤ i − k; удалить из хвоста индексы со значениями ≤ a[i] (они уже никогда не станут максимумом); добавить i в хвост; голова — индекс максимума окна. Каждый индекс добавляется и удаляется один раз — O(n).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

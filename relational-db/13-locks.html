@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Блокировки и deadlock</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · ТРАНЗАКЦИИ И КОНКУРЕНТНОСТЬ</div>
+  <h1>Блокировки и deadlock</h1>
+  <p class="lead">MVCC избавил чтение от блокировок, но запись по-прежнему блокирует запись, а DDL — всех. Разбираем блокировки строк и таблиц, матрицу конфликтов, очередь блокировок (из-за которой безобидный <code>ALTER TABLE</code> кладёт продакшен), взаимные блокировки, очереди задач на <code>SKIP LOCKED</code> и диагностику «кто кого ждёт».</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">FOR UPDATE</span><span class="tag">режимы блокировок</span><span class="tag">lock_timeout</span><span class="tag">deadlock</span><span class="tag">SKIP LOCKED</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="rows"><span class="h-num">13.1</span>Блокировки строк</h2>
+<p>UPDATE, DELETE и <code>SELECT … FOR …</code> блокируют строки. В PostgreSQL блокировка строки хранится <b>в самой строке</b> (поле xmax + флаги), а не в памяти — поэтому можно заблокировать миллионы строк без «эскалации». Ожидающий ждёт завершения транзакции-владельца.</p>
+<div class="table-wrap"><table>
+<tr><th>Режим</th><th>Кто берёт</th><th>Конфликтует с</th></tr>
+<tr><td><code>FOR KEY SHARE</code></td><td>проверка внешнего ключа при вставке дочерней строки</td><td>FOR UPDATE (удаление строки, изменение ключа)</td></tr>
+<tr><td><code>FOR SHARE</code></td><td>«не меняйте, пока я читаю»</td><td>FOR NO KEY UPDATE, FOR UPDATE</td></tr>
+<tr><td><code>FOR NO KEY UPDATE</code></td><td>обычный UPDATE, не меняющий ключевых столбцов</td><td>FOR SHARE, FOR NO KEY UPDATE, FOR UPDATE</td></tr>
+<tr><td><code>FOR UPDATE</code></td><td>DELETE, UPDATE ключа, явный <code>SELECT … FOR UPDATE</code></td><td>со всеми</td></tr>
+</table></div>
+<p>Разделение на «ключевые» и «неключевые» нужно, чтобы вставка заказа (проверка FK → <code>FOR KEY SHARE</code> на клиента) не ждала обновления имени клиента (<code>FOR NO KEY UPDATE</code>).</p>
+<pre data-title="опции ожидания"><code class="sql">SELECT * FROM seats WHERE id = 7 FOR UPDATE;              -- ждать сколько угодно (до lock_timeout)
+SELECT * FROM seats WHERE id = 7 FOR UPDATE NOWAIT;       -- сразу ошибка 55P03, если занято
+SELECT * FROM jobs WHERE status = 'ready'
+ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED;              -- пропустить занятые (очереди задач)</code></pre>
+
+<h2 id="tables"><span class="h-num">13.2</span>Блокировки таблиц и матрица конфликтов</h2>
+<p>Каждая команда берёт блокировку таблицы в одном из восьми режимов. Даже SELECT берёт самый слабый — <code>ACCESS SHARE</code>, чтобы таблицу не удалили во время чтения.</p>
+<div class="widget" id="lkW">
+  <div class="widget-title">Совместимы ли две операции над одной таблицей?</div>
+  <div class="controls">
+    <label>сессия 1 (держит)<select id="lk1"></select></label>
+    <label>сессия 2 (запрашивает)<select id="lk2"></select></label>
+  </div>
+  <div class="verdict" id="lkV"></div>
+  <div class="table-wrap"><table id="lkM"></table></div>
+</div>
+<script>
+(function () {
+  var M = ["ACCESS SHARE", "ROW SHARE", "ROW EXCLUSIVE", "SHARE UPDATE EXCLUSIVE", "SHARE", "SHARE ROW EXCLUSIVE", "EXCLUSIVE", "ACCESS EXCLUSIVE"];
+  var C = [[8], [7, 8], [5, 6, 7, 8], [4, 5, 6, 7, 8], [3, 4, 6, 7, 8], [3, 4, 5, 6, 7, 8], [2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 7, 8]];
+  var OPS = [["SELECT", 1], ["SELECT … FOR UPDATE", 2], ["INSERT / UPDATE / DELETE", 3], ["VACUUM, ANALYZE", 4], ["CREATE INDEX CONCURRENTLY", 4], ["ALTER TABLE … VALIDATE CONSTRAINT", 4], ["CREATE INDEX", 5], ["ALTER TABLE … ADD FOREIGN KEY (на ссылаемой таблице)", 6], ["REFRESH MATERIALIZED VIEW CONCURRENTLY", 7], ["ALTER TABLE ADD COLUMN / ALTER TYPE / DROP COLUMN", 8], ["TRUNCATE, DROP TABLE", 8], ["VACUUM FULL, CLUSTER", 8], ["LOCK TABLE (по умолчанию)", 8]];
+  var $ = function (i) { return document.getElementById(i); };
+  ["lk1", "lk2"].forEach(function (id, j) { $(id).innerHTML = OPS.map(function (o, i) { return '<option value="' + i + '"' + (i === (j ? 0 : 9) ? " selected" : "") + ">" + o[0] + "</option>"; }).join(""); });
+  $("lkM").innerHTML = "<tr><th></th>" + M.map(function (m, i) { return '<th title="' + m + '">' + (i + 1) + "</th>"; }).join("") + "</tr>" + M.map(function (m, i) {
+    return "<tr><td><b>" + (i + 1) + "</b> " + m + "</td>" + M.map(function (x, j) { return '<td id="lkc' + i + "_" + j + '" style="text-align:center">' + (C[i].indexOf(j + 1) >= 0 ? "✘" : "·") + "</td>"; }).join("") + "</tr>";
+  }).join("");
+  function run() {
+    var a = OPS[+$("lk1").value], b = OPS[+$("lk2").value], bad = C[a[1] - 1].indexOf(b[1]) >= 0;
+    document.querySelectorAll("#lkM td.hl").forEach(function (t) { t.classList.remove("hl"); });
+    var cell = $("lkc" + (a[1] - 1) + "_" + (b[1] - 1)); if (cell) cell.classList.add("hl");
+    $("lkV").className = "verdict " + (bad ? "bad" : "ok");
+    $("lkV").textContent = a[0] + " → " + M[a[1] - 1] + ";  " + b[0] + " → " + M[b[1] - 1] + ".  " + (bad ? "Конфликт: вторая операция ждёт, пока первая транзакция завершится." : "Совместимы: выполняются одновременно.") + (b[1] === 8 && !bad ? "" : b[1] === 8 ? " ACCESS EXCLUSIVE несовместим ни с чем, даже с SELECT." : "");
+  }
+  ["lk1", "lk2"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="queue"><span class="h-num">13.3</span>Очередь блокировок: как ALTER TABLE кладёт продакшен</h2>
+<div class="widget stepper" id="qSim">
+  <div class="widget-title">Симулятор: «быстрая» миграция ADD COLUMN</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Держит блокировку</h5><div class="items"><span class="chip ok" id="qR">отчёт: SELECT 3 мин (ACCESS SHARE)</span></div></div>
+    <div class="lane"><h5>Очередь ожидания</h5><div class="items"><span class="chip off" id="qA">ALTER TABLE ADD COLUMN (ACCESS EXCLUSIVE)</span><span class="chip off" id="qS">SELECT из API ×500</span></div></div>
+    <div class="lane"><h5>Приложение</h5><div class="items"><span class="chip" id="qP">пул соединений 20/50</span><span class="chip off" id="qX">пул исчерпан, таймауты</span></div></div>
+  </div>
+  <section class="st-step" data-t="Долгий запрос" data-hl="qR qP" data-log="t=0: аналитический SELECT по orders держит ACCESS SHARE 3 минуты"><p>По таблице <code>orders</code> идёт долгий отчёт. Он держит самую слабую блокировку — никому не мешает.</p></section>
+  <section class="st-step" data-t="Миграция встаёт в очередь" data-hl="qA" data-log="t=10s: ALTER TABLE orders ADD COLUMN note text — нужен ACCESS EXCLUSIVE, конфликт с ACCESS SHARE → ждёт"><p>Деплой запускает <code>ALTER TABLE orders ADD COLUMN note text</code>. Само изменение мгновенное (только каталог), но нужна блокировка ACCESS EXCLUSIVE, которая конфликтует с ACCESS SHARE отчёта. Миграция ждёт.</p></section>
+  <section class="st-step" data-t="Все встают за миграцией" data-hl="qS qA" data-log="t=11s: новые SELECT из API конфликтуют с ОЖИДАЮЩИМ ACCESS EXCLUSIVE → встают в очередь за ним"><p>Ключевой момент: новые запросы проверяют конфликт не только с держателями, но и с <b>ожидающими</b> раньше них (иначе миграция никогда бы не дождалась). Обычные SELECT из API конфликтуют с запрошенным ACCESS EXCLUSIVE и встают в очередь. Таблица недоступна никому.</p></section>
+  <section class="st-step" data-t="Авария" data-hl="qX" data-log="t=30s: все соединения пула ждут → таймауты HTTP, health-check падает, перезапуски подов"><p>Через несколько секунд все соединения пула висят в ожидании, API отвечает таймаутами, оркестратор перезапускает поды. Всё из-за «мгновенной» миграции и отчёта, который ей мешал.</p></section>
+  <section class="st-step" data-t="Защита: lock_timeout" data-hl="qA qP" data-log="SET lock_timeout = '3s'; ALTER TABLE … → ERROR через 3 с, очередь рассасывается; повтор позже"><p>Решение: миграции выполнять с коротким <code>lock_timeout</code> (2–5 с) и повторять при неудаче. Если блокировку не получили за 3 секунды — ошибка, очередь сразу рассасывается, а инструмент миграций повторит попытку. Плюс <code>statement_timeout</code> для отчётов и вынесение аналитики на реплику.</p></section>
+</div>
+<pre data-title="безопасная обёртка для DDL"><code class="sql">SET lock_timeout = '3s';
+SET statement_timeout = '15s';
+ALTER TABLE orders ADD COLUMN note text;
+-- Flyway: эти SET можно вписать в начало скрипта миграции; Liquibase — sql-изменение с теми же командами</code></pre>
+
+<h2 id="deadlock"><span class="h-num">13.4</span>Взаимная блокировка (deadlock)</h2>
+<div class="widget stepper" id="dlSim">
+  <div class="widget-title">Симулятор: два перевода навстречу друг другу</div>
+  <div class="flow st-stage">
+    <div class="node" id="dlA"><b>T1: перевод X → Y</b></div>
+    <div class="node" id="dlX"><b>строка X</b></div>
+    <div class="node" id="dlY"><b>строка Y</b></div>
+    <div class="node" id="dlB"><b>T2: перевод Y → X</b></div>
+  </div>
+  <section class="st-step" data-t="T1 блокирует X" data-hl="dlA dlX" data-log="T1: UPDATE acc SET balance = balance - 10 WHERE id = 'X'  → блокировка X"><p>T1 списывает деньги со счёта X и блокирует строку X.</p></section>
+  <section class="st-step" data-t="T2 блокирует Y" data-hl="dlB dlY" data-log="T2: UPDATE acc SET balance = balance - 5 WHERE id = 'Y'  → блокировка Y"><p>Одновременно T2 списывает со счёта Y и блокирует Y.</p></section>
+  <section class="st-step" data-t="T1 ждёт Y" data-hl="dlA dlY" data-log="T1: UPDATE … WHERE id = 'Y' → ждёт T2"><p>T1 хочет зачислить на Y — строка занята T2. Ждёт.</p></section>
+  <section class="st-step" data-t="T2 ждёт X — цикл" data-hl="dlB dlX dlA dlY" data-log="T2: UPDATE … WHERE id = 'X' → ждёт T1. Цикл ожидания: T1 → T2 → T1"><p>T2 хочет зачислить на X — строка занята T1. Цикл: каждая ждёт другую, сами они его не разорвут.</p></section>
+  <section class="st-step" data-t="Детектор" data-hl="dlB" data-log="через deadlock_timeout (1s): ERROR 40P01 deadlock detected — T2 прервана; T1 продолжает"><p>Если ожидание длится дольше <code>deadlock_timeout</code> (1 с), процесс проверяет граф ожиданий, находит цикл и прерывает одну из транзакций с ошибкой <code>40P01</code>. Другая продолжает. Приложение должно повторить прерванную транзакцию.</p></section>
+  <section class="st-step" data-t="Профилактика" data-hl="dlX dlY" data-log="решение: блокировать строки в одном порядке: SELECT … WHERE id IN ('X','Y') ORDER BY id FOR UPDATE"><p>Главное лекарство — <b>единый порядок</b> захвата: всегда блокировать строки по возрастанию id (например, <code>SELECT … WHERE id IN (:a, :b) ORDER BY id FOR UPDATE</code> в начале транзакции). Тогда цикл невозможен. Плюс короткие транзакции и повтор при 40P01.</p></section>
+</div>
+<div class="callout info"><span class="c-title">Неочевидные источники deadlock</span>
+Массовый UPDATE без ORDER BY в двух параллельных задачах (строки блокируются в разном физическом порядке); внешние ключи без индекса (удаление родителя сканирует дочернюю таблицу); пакетные вставки в таблицу с уникальным индексом в разном порядке ключей; Hibernate, сбрасывающий изменения в порядке, отличном от вашего (включите <code>hibernate.order_updates</code>).
+</div>
+
+<h2 id="queue-pattern"><span class="h-num">13.5</span>Очередь задач на SKIP LOCKED и advisory-блокировки</h2>
+<pre data-title="очередь задач в PostgreSQL без брокера"><code class="sql">-- воркер забирает пачку задач; параллельные воркеры не ждут друг друга
+WITH picked AS (
+  SELECT id FROM jobs
+  WHERE status = 'ready' AND run_at &lt;= now()
+  ORDER BY run_at
+  LIMIT 10
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs j SET status = 'running', locked_at = now(), attempts = attempts + 1
+FROM picked WHERE j.id = picked.id
+RETURNING j.*;
+-- частичный индекс: CREATE INDEX jobs_ready ON jobs (run_at) WHERE status = 'ready';</code></pre>
+<pre data-title="advisory lock: «только один экземпляр выполняет задачу»"><code class="sql">SELECT pg_try_advisory_lock(hashtext('nightly-report'));   -- true: мы владельцы; false: уже кто-то выполняет
+-- … работа …
+SELECT pg_advisory_unlock(hashtext('nightly-report'));
+-- pg_advisory_xact_lock(...) — снимется сам по окончании транзакции (безопаснее с пулом соединений)
+-- в Spring: ShedLock с JdbcTemplateLockProvider решает ту же задачу таблицей блокировок</code></pre>
+
+<h2 id="diagnose"><span class="h-num">13.6</span>Диагностика: кто кого ждёт</h2>
+<pre data-title="заблокированные и блокирующие сессии"><code class="sql">SELECT a.pid, a.wait_event_type, a.state, now() - a.query_start AS waiting,
+       pg_blocking_pids(a.pid) AS blocked_by, left(a.query, 60) AS query
+FROM pg_stat_activity a
+WHERE cardinality(pg_blocking_pids(a.pid)) &gt; 0;
+
+-- корень дерева ожиданий: сессия, которая блокирует, но сама не ждёт
+-- аккуратно завершить: SELECT pg_cancel_backend(pid);  крайняя мера: pg_terminate_backend(pid)
+
+-- в журнал — все ожидания дольше deadlock_timeout:
+ALTER SYSTEM SET log_lock_waits = on;</code></pre>
+
+<h2 id="quiz"><span class="h-num">13.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему <code>ALTER TABLE ADD COLUMN</code> (мгновенная операция) может остановить все запросы к таблице?</p><ul><li>Он переписывает таблицу</li><li>Он блокирует всю базу</li><li>Он ждёт ACCESS EXCLUSIVE за долгим запросом, а новые запросы встают в очередь за ним</li><li>Он отключает индексы</li></ul><div class="why">Защита — lock_timeout и повторы.</div></div>
+<div class="mcq" data-ok="0"><p>Как надёжнее всего предотвратить deadlock при переводах между счетами?</p><ul><li>Блокировать строки всегда в одном порядке (например, по возрастанию id)</li><li>Увеличить deadlock_timeout</li><li>Использовать READ UNCOMMITTED</li><li>Убрать индексы</li></ul><div class="why">Без цикла ожидания взаимной блокировки быть не может.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем в очереди задач <code>FOR UPDATE SKIP LOCKED</code>?</p><ul><li>Чтобы не блокировать строки</li><li>Чтобы параллельные воркеры брали разные задачи, не ожидая друг друга</li><li>Чтобы задачи выполнялись строго по порядку</li><li>Чтобы ускорить индекс</li></ul><div class="why">Каждый воркер пропускает строки, захваченные другими.</div></div>
+<div class="mcq" data-ok="3"><p>Совместимы ли <code>CREATE INDEX</code> (без CONCURRENTLY) и <code>INSERT</code> в ту же таблицу?</p><ul><li>Да</li><li>Да, если индекс уникальный</li><li>Только на репликах</li><li>Нет: SHARE конфликтует с ROW EXCLUSIVE — запись ждёт всё время построения</li></ul><div class="why">Поэтому на живых таблицах — CREATE INDEX CONCURRENTLY.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как найти причину внезапного «зависания» запросов к таблице?</summary><div class="a"><p>Посмотреть <code>pg_stat_activity</code> с <code>wait_event_type = 'Lock'</code> и <code>pg_blocking_pids()</code>, пройти по цепочке до корня — сессии, которая блокирует, но не ждёт. Частые корни: idle in transaction, долгий отчёт перед DDL, долгая миграция. Решение на месте — <code>pg_cancel_backend</code>; системно — lock_timeout для DDL, idle_in_transaction_session_timeout, statement_timeout, log_lock_waits.</p></div></details>
+<details class="q"><summary>Можно ли сделать очередь задач на PostgreSQL вместо брокера сообщений?</summary><div class="a"><p>Да, для умеренной нагрузки (сотни–тысячи задач в секунду): таблица задач, выборка <code>FOR UPDATE SKIP LOCKED</code>, частичный индекс по готовым задачам, повторы через attempts и run_at, LISTEN/NOTIFY для пробуждения. Плюсы — транзакционность с бизнес-данными, нет дополнительной инфраструктуры. Минусы — нагрузка на основную базу, раздувание таблицы (нужен агрессивный autovacuum), нет fan-out и долгого хранения как в Kafka.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

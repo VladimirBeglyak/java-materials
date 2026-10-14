@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Тестирование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .ct-row { display: grid; grid-template-columns: minmax(150px, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+  .ct-row .checks { margin: 0; gap: 4px 14px; }
+  .ct-row b { font-family: var(--font-mono); font-size: 13px; }
+  @media (max-width: 700px) { .ct-row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · БЕЗОПАСНОСТЬ И ТЕСТЫ</div>
+  <h1>Тестирование Spring-приложений</h1>
+  <p class="lead">Spring умеет поднимать в тесте контекст целиком, частично (срез) или не поднимать вовсе. Ключевой механизм — кэш контекстов TestContext Framework: от него зависит, идут ли тесты 2 минуты или 20. Разберём, как устроен кэш, когда он ломается, как работают срезы и как тестировать с настоящей БД в контейнере.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">TestContext</span><span class="tag">кэш контекстов</span><span class="tag">срезы</span><span class="tag">Testcontainers</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pyramid"><span class="h-num">14.1</span>Уровни тестов</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Что поднимается</th><th>Скорость</th><th>Что проверяет</th></tr>
+<tr><td>Юнит</td><td>ничего: <code>new Service(mock(Repo.class))</code></td><td>миллисекунды</td><td>бизнес-логику. Возможно благодаря внедрению через конструктор</td></tr>
+<tr><td>Срез (<code>@WebMvcTest</code>, <code>@DataJpaTest</code>…)</td><td>часть контекста: один слой + его автоконфигурация</td><td>секунды</td><td>маппинг HTTP, сериализацию, валидацию, запросы к БД, безопасность</td></tr>
+<tr><td>Интеграционный (<code>@SpringBootTest</code>)</td><td>весь контекст, часто с реальной БД в Testcontainers</td><td>секунды на контекст + тесты</td><td>связку компонентов, транзакции, конфигурацию</td></tr>
+<tr><td>Контрактный / e2e</td><td>несколько сервисов</td><td>минуты</td><td>совместимость API между сервисами</td></tr>
+</table></div>
+
+<h2 id="testcontext"><span class="h-num">14.2</span>TestContext Framework изнутри</h2>
+<div class="flow col">
+  <div class="node info"><b>JUnit 5 → SpringExtension</b><small>@SpringBootTest и срезы мета-аннотированы @ExtendWith(SpringExtension.class)</small></div><span class="to">↓</span>
+  <div class="node"><b>TestContextManager</b><small>один на тестовый класс; bootstrapper (SpringBootTestContextBootstrapper) собирает конфигурацию: ищет @SpringBootConfiguration вверх по пакетам</small></div><span class="to">↓</span>
+  <div class="node acc"><b>MergedContextConfiguration</b><small>классы конфигурации, профили, свойства, инициализаторы, ContextCustomizer-ы (моки, @ServiceConnection, срезы) — это КЛЮЧ кэша</small></div><span class="to">↓</span>
+  <div class="node ok"><b>ContextCache</b><small>статический, на JVM; LRU, по умолчанию 32 контекста (spring.test.context.cache.maxSize)</small></div><span class="to">↓</span>
+  <div class="node"><b>TestExecutionListener-ы</b><small>DependencyInjection (внедряет @Autowired в тест), Transactional (откат после теста), SqlScripts (@Sql), сброс моков, DirtiesContext, события</small></div>
+</div>
+<p>Контекст поднимается один раз для всех тестовых классов с одинаковым ключом и живёт до конца JVM (или до вытеснения/<code>@DirtiesContext</code>). Gradle и Maven Surefire по умолчанию запускают тесты модуля в одной JVM — кэш работает на весь прогон.</p>
+
+<h2 id="cache"><span class="h-num">14.3</span>Что ломает кэш</h2>
+<p>Любое различие в ключе — новый контекст: свой набор <code>@MockitoBean</code>, другие <code>@ActiveProfiles</code>, <code>properties</code>, <code>@TestPropertySource</code>, <code>@Import</code> тестовой конфигурации, вложенный <code>@TestConfiguration</code>. <code>@DirtiesContext</code> закрывает контекст после класса.</p>
+<div class="widget" id="ct">
+  <div class="widget-title">Симулятор кэша контекстов</div>
+  <p class="hint">Шесть классов с <code>@SpringBootTest</code> выполняются по порядку. Старт контекста ≈ 9 с. Меняйте аннотации — смотрите, сколько контекстов поднимется.</p>
+  <div class="rows" id="ctRows"></div>
+  <div class="log" id="ctLog"></div>
+  <div class="verdict" id="ctOut"></div>
+</div>
+<script>
+(function () {
+  var tests = [
+    { n: "OrderServiceIT", f: {} }, { n: "PaymentServiceIT", f: {} }, { n: "OrderApiIT", f: { mock: 1 } },
+    { n: "RefundApiIT", f: { mock: 1 } }, { n: "ReportIT", f: { prof: 1 } }, { n: "MigrationIT", f: { dirty: 1 } }
+  ];
+  var opts = [["mock", "@MockitoBean PaymentClient"], ["prof", "@ActiveProfiles(\"report\")"], ["prop", "properties=\"feature.x=true\""], ["dirty", "@DirtiesContext"]];
+  var rows = document.getElementById("ctRows");
+  rows.innerHTML = tests.map(function (t, i) {
+    return '<div class="ct-row"><b>' + t.n + '</b><div class="checks">' + opts.map(function (o) {
+      return '<label><input type="checkbox" data-i="' + i + '" data-k="' + o[0] + '"' + (t.f[o[0]] ? " checked" : "") + ">" + SG.esc(o[1]) + "</label>";
+    }).join("") + "</div></div>";
+  }).join("");
+  function run() {
+    rows.querySelectorAll("input").forEach(function (c) { tests[+c.dataset.i].f[c.dataset.k] = c.checked ? 1 : 0; });
+    var cache = {}, starts = 0, L = [], id = 0;
+    tests.forEach(function (t) {
+      var key = ["base", t.f.mock ? "mock:PaymentClient" : "", t.f.prof ? "profile:report" : "", t.f.prop ? "prop:feature.x" : ""].filter(Boolean).join(" + ");
+      if (cache[key]) L.push(t.n + ": контекст #" + cache[key] + " из кэша  [" + key + "]  ~0 с");
+      else { cache[key] = ++id; starts++; L.push(t.n + ": СТАРТ контекста #" + id + "  [" + key + "]  ~9 с"); }
+      if (t.f.dirty) { L.push("   @DirtiesContext → контекст #" + cache[key] + " закрыт и удалён из кэша"); delete cache[key]; }
+    });
+    document.getElementById("ctLog").textContent = L.join("\n");
+    var o = document.getElementById("ctOut");
+    o.className = "verdict " + (starts <= 2 ? "ok" : (starts <= 3 ? "warn" : "bad"));
+    o.innerHTML = "Поднято контекстов: <b>" + starts + "</b>, на старты ушло ≈ <b>" + starts * 9 + " с</b>. " + (starts > 2 ? "Совет: соберите моки в общий базовый класс или одну @TestConfiguration, чтобы у тестов был одинаковый ключ." : "Хорошо: тесты делят контексты.");
+  }
+  rows.addEventListener("change", run); run();
+})();
+</script>
+<div class="callout ok"><span class="c-title">Как держать число контекстов малым</span>
+Общий абстрактный базовый класс <code>AbstractIntegrationTest</code> с одним набором аннотаций, моков и контейнеров; все интеграционные тесты наследуют его. Вместо <code>@DirtiesContext</code> — очищать данные (<code>@Sql</code>, truncate в <code>@AfterEach</code>). В логе (<code>logging.level.org.springframework.test.context.cache=DEBUG</code>) видна статистика попаданий в кэш.
+</div>
+
+<h2 id="slices"><span class="h-num">14.4</span>Срезы</h2>
+<div class="table-wrap"><table>
+<tr><th>Аннотация</th><th>Что в контексте</th><th>Чего нет</th></tr>
+<tr><td><code>@WebMvcTest(OrderController.class)</code></td><td>контроллер, <code>@ControllerAdvice</code>, фильтры, конвертеры, Security, <code>MockMvc</code></td><td><code>@Service</code>, репозитории — их мокают</td></tr>
+<tr><td><code>@DataJpaTest</code></td><td>EntityManager, репозитории, <code>TestEntityManager</code>, Flyway/Liquibase; каждый тест в транзакции с откатом</td><td>сервисы, веб. По умолчанию заменяет DataSource встроенной БД</td></tr>
+<tr><td><code>@JdbcTest</code>, <code>@DataJdbcTest</code></td><td>JdbcTemplate/JdbcClient или Spring Data JDBC</td><td>JPA</td></tr>
+<tr><td><code>@JsonTest</code></td><td>JsonMapper (Jackson 3, Boot 4; в Boot 3 — ObjectMapper Jackson 2) с настройками Boot, <code>JacksonTester</code></td><td>всё остальное</td></tr>
+<tr><td><code>@RestClientTest</code></td><td>RestClient.Builder, <code>MockRestServiceServer</code></td><td>сервер</td></tr>
+<tr><td><code>@WebFluxTest</code>, <code>@DataMongoTest</code>, <code>@DataRedisTest</code>…</td><td>аналогично для своих технологий</td><td></td></tr>
+</table></div>
+<p>Как это сделано: аннотация среза включает <code>@TypeExcludeFilters(WebMvcTypeExcludeFilter.class)</code> — сканирование пропускает всё, кроме веб-компонентов, — и <code>@AutoConfigureWebMvc</code>, который через <code>@ImportAutoConfiguration</code> подключает только перечисленные в файле <code>META-INF/spring/…AutoConfigureWebMvc.imports</code> автоконфигурации.</p>
+<pre data-title="Срез веб-слоя с AssertJ-API (Spring 6.2+: MockMvcTester)"><code class="java">@WebMvcTest(OrderController.class)
+class OrderControllerTest {
+    @Autowired MockMvcTester mvc;
+    @MockitoBean OrderService orders;                   // заменяет бин в контексте среза
+
+    @Test
+    void returns400OnInvalidBody() {
+        assertThat(mvc.post().uri("/api/orders").with(jwt())
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"items\": [], \"address\": \"\"}"))
+            .hasStatus(HttpStatus.BAD_REQUEST)
+            .bodyJson().extractingPath("$.errors[*].field").asArray().contains("items", "address");
+        verifyNoInteractions(orders);
+    }
+}</code></pre>
+<div class="callout info"><span class="c-title">@MockBean → @MockitoBean</span>
+Spring Framework 6.2 добавил собственные <code>@MockitoBean</code>, <code>@MockitoSpyBean</code> и <code>@TestBean</code> (подмена бина фабричным методом). <code>@MockBean</code> из Boot объявлен устаревшим в 3.4 и удалён в 4.0. Механизм тот же: <code>BeanOverrideContextCustomizer</code> входит в ключ кэша.
+</div>
+
+<h2 id="boottest"><span class="h-num">14.5</span>@SpringBootTest и Testcontainers</h2>
+<pre data-title="Базовый класс интеграционных тестов"><code class="java">@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@AutoConfigureRestTestClient                             // Boot 4: клиент для запросов к запущенному серверу
+@Testcontainers
+abstract class AbstractIntegrationTest {
+
+    @Container
+    @ServiceConnection                                   // Boot сам подставит url/user/password в DataSource
+    static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17-alpine");   // Testcontainers 2 (Boot 4): org.testcontainers.postgresql
+
+    @Container
+    @ServiceConnection
+    static KafkaContainer kafka = new KafkaContainer("apache/kafka:3.9.0");
+
+    @Autowired protected RestTestClient http;           // в Boot 3 — TestRestTemplate (внедряется без доп. аннотаций)
+}
+
+class OrderFlowIT extends AbstractIntegrationTest {
+    @Autowired OrderRepository repo;
+
+    @Test
+    void createsOrder() {
+        http.post().uri("/api/orders").body(validRequest()).exchange()
+            .expectStatus().isCreated();
+        assertThat(repo.count()).isEqualTo(1);
+    }
+}</code></pre>
+<div class="grid-2">
+  <div class="card"><h4>webEnvironment</h4><p><code>MOCK</code> (по умолчанию) — mock servlet-окружение, тестируется через <code>MockMvc</code>, всё в одном потоке. <code>RANDOM_PORT</code> — настоящий Tomcat на случайном порту, запросы идут по сети. <code>NONE</code> — без веба.</p></div>
+  <div class="card"><h4>@ServiceConnection</h4><p>Контейнер превращается в бин <code>ConnectionDetails</code> (<code>JdbcConnectionDetails</code>, <code>KafkaConnectionDetails</code>), который автоконфигурация использует вместо свойств. Раньше — <code>@DynamicPropertySource</code> с ручной передачей URL.</p></div>
+</div>
+<p>Тот же контейнер можно использовать при локальной разработке: класс <code>TestShopApplication</code> в test-исходниках с <code>SpringApplication.from(ShopApplication::main).with(ContainersConfig.class).run(args)</code> поднимает приложение с БД в Docker без ручной установки.</p>
+
+<h2 id="tx"><span class="h-num">14.6</span>@Transactional в тестах: удобство и ловушки</h2>
+<p><code>TransactionalTestExecutionListener</code> открывает транзакцию до теста и <b>откатывает</b> её после — база чистая без уборки. Но:</p>
+<ul>
+  <li>С <code>RANDOM_PORT</code> запрос обрабатывает поток Tomcat — у него своя транзакция, она коммитится, и откат теста её не затрагивает.</li>
+  <li>Тест и код в одной транзакции и одном persistence context: ленивые связи грузятся, хотя в проде упадут с <code>LazyInitializationException</code>; ошибки ограничений БД не проявятся, если flush не случился. Вызывайте <code>entityManager.flush()</code> или проверяйте без транзакции.</li>
+  <li><code>@TransactionalEventListener(AFTER_COMMIT)</code> не вызывается — коммита нет.</li>
+</ul>
+<p>Поэтому для сквозных сценариев надёжнее тесты без <code>@Transactional</code> и явная очистка данных.</p>
+
+<h2 id="quiz"><span class="h-num">14.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Два тестовых класса @SpringBootTest отличаются только тем, что во втором есть @MockitoBean EmailSender. Сколько контекстов поднимется?</p><ul><li>Один — моки не влияют на контекст</li><li>Один, но мок будет и в первом классе</li><li>Два — набор подменённых бинов входит в ключ кэша</li><li>Ноль, моки отключают кэш</li></ul><div class="why">ContextCustomizer подмены бинов — часть MergedContextConfiguration. Разный набор моков — разные ключи.</div></div>
+<div class="mcq" data-ok="0"><p>Тест @SpringBootTest(webEnvironment = RANDOM_PORT) помечен @Transactional и через HTTP создаёт заказ. Откатится ли заказ после теста?</p><ul><li>Нет: запрос выполнялся в потоке сервера в собственной транзакции, которая закоммитилась</li><li>Да, всегда</li><li>Да, если БД PostgreSQL</li><li>Тест упадёт</li></ul><div class="why">Транзакции привязаны к потоку. Транзакция теста и транзакция обработки запроса — разные.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает @DataJpaTest с DataSource по умолчанию?</p><ul><li>Использует DataSource из application.yml</li><li>Не создаёт DataSource</li><li>Подключается к Testcontainers автоматически</li><li>Заменяет его встроенной БД (H2 и т.п.), если не указано @AutoConfigureTestDatabase(replace = NONE) или @ServiceConnection</li></ul><div class="why">Для проверки нативных запросов и диалекта нужна та же СУБД, что в проде — используйте контейнер.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как работает кэш контекстов и почему тесты могут быть медленными?</summary><div class="a"><p>ContextCache — статическая LRU-карта MergedContextConfiguration → ApplicationContext на JVM. Одинаковая конфигурация тестовых классов — один контекст. Разные моки, профили, свойства, @Import, @DirtiesContext создают и пересоздают контексты, каждый — секунды старта. Лечится унификацией конфигурации через базовый класс.</p></div></details>
+<details class="q"><summary>Чем @WebMvcTest отличается от @SpringBootTest с MockMvc?</summary><div class="a"><p>@WebMvcTest поднимает только веб-слой (контроллеры, advice, фильтры, конвертеры, Security) — сервисы надо мокать; быстро и изолированно. @SpringBootTest + @AutoConfigureMockMvc поднимает весь контекст — проверяет интеграцию слоёв, медленнее.</p></div></details>
+<details class="q"><summary>Почему H2 вместо настоящей БД в тестах — плохая идея?</summary><div class="a"><p>Другой SQL-диалект, типы, функции, поведение блокировок и уровней изоляции, ограничения. Тест зелёный — прод падает на нативном запросе или миграции. Testcontainers с той же версией СУБД даёт реальное поведение ценой нескольких секунд старта, которые кэш контекста амортизирует.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

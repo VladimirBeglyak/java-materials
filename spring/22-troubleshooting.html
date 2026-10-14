@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · Диагностика типичных ошибок</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+  .dx { display: grid; grid-template-columns: minmax(200px, 300px) minmax(0, 1fr); gap: 16px; margin-top: 12px; }
+  .dx-list { display: grid; gap: 4px; align-content: start; max-height: 520px; overflow-y: auto; }
+  .dx-list button { text-align: left; font: 12.5px/1.35 var(--font-mono); padding: 7px 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; overflow-wrap: anywhere; }
+  .dx-list button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); font-weight: 600; }
+  .dx-body h4 { margin: 14px 0 4px; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-muted); }
+  .dx-body h4:first-child { margin-top: 0; }
+  .dx-body p, .dx-body ul { margin: 0 0 6px; font-size: 15px; }
+  .dx-body ul { padding-left: 20px; }
+  @media (max-width: 760px) { .dx { grid-template-columns: minmax(0, 1fr); } .dx-list { max-height: 190px; } }
+</style>
+</head>
+<body data-page="22">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · ПРАКТИКА</div>
+  <h1>Диагностика: типичные ошибки и как их читать</h1>
+  <p class="lead">Сообщения об ошибках Spring длинные, но устроены одинаково: цепочка «кто кого пытался создать» и первопричина в самом низу. Зная внутренности из предыдущих глав, любую ошибку можно свести к конкретному механизму. Эта глава — справочник: как читать стектрейс, что означают частые исключения, какие логи включить и куда ставить точки останова.</p>
+  <div class="meta"><span class="tag">справочник</span><span class="tag">18 ошибок с разбором</span><span class="tag">логи и breakpoints</span><span class="tag">интерактив</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="read"><span class="h-num">22.1</span>Как читать стектрейс старта</h2>
+<pre data-title="Типичная ошибка: читать снизу вверх"><code class="txt">org.springframework.beans.factory.UnsatisfiedDependencyException:
+  Error creating bean with name 'orderController' defined in file [.../OrderController.class]:
+  Unsatisfied dependency expressed through constructor parameter 0:
+    Error creating bean with name 'orderService' defined in file [.../OrderService.class]:
+    Unsatisfied dependency expressed through constructor parameter 1:
+      No qualifying bean of type 'com.shop.payment.PaymentClient' available:
+      expected at least 1 bean which qualifies as autowire candidate. Dependency annotations: {}
+...
+Caused by: org.springframework.beans.factory.NoSuchBeanDefinitionException:
+  No qualifying bean of type 'com.shop.payment.PaymentClient' available   ← ПЕРВОПРИЧИНА</code></pre>
+<ol class="steps">
+  <li><b>Найдите последний «Caused by»</b> — это первопричина. Всё выше — обёртки, показывающие путь.</li>
+  <li><b>Прочитайте цепочку «Error creating bean with name»</b> сверху вниз: это стек рекурсивных <code>getBean</code>: контроллер → сервис → отсутствующий клиент.</li>
+  <li><b>«through constructor parameter 1»</b> — индекс параметра (с нуля); «through field 'x'» — полевое внедрение.</li>
+  <li>В Spring Boot сначала смотрите блок <code>APPLICATION FAILED TO START</code>: <code>FailureAnalyzer</code> уже перевёл ошибку в «Description / Action».</li>
+</ol>
+
+<h2 id="decoder"><span class="h-num">22.2</span>Декодер ошибок</h2>
+<div class="widget" id="dx">
+  <div class="widget-title">Выберите ошибку — получите причину, способ проверки и исправление</div>
+  <div class="dx"><div class="dx-list" id="dxList"></div><div class="dx-body" id="dxBody"></div></div>
+</div>
+<script>
+(function () {
+  var E = [
+    { t: "NoSuchBeanDefinitionException", s: "No qualifying bean of type 'X' available: expected at least 1 bean", c: ["Класс не помечен стереотипом или лежит вне пакета сканирования (главный класс в другом пакете).", "Бин отключён условием: @Profile, @ConditionalOnProperty, неактивная автоконфигурация.", "В срезовом тесте (@WebMvcTest) сервисы не создаются — нужен @MockitoBean.", "Внедряете по классу реализации, а бин — JDK-прокси интерфейса."], d: ["--debug: отчёт условий, Negative matches.", "/actuator/beans или лог DEBUG org.springframework.beans.factory — есть ли бин вообще.", "Проверьте пакет главного класса относительно пакета компонента."], f: "Добавить стереотип/@Bean, поправить пакет или @ComponentScan, активировать профиль/свойство, в тесте — мок.", ch: "01, 07" },
+    { t: "NoUniqueBeanDefinitionException", s: "expected single matching bean but found 2: a,b", c: ["Несколько бинов одного типа, ни один не @Primary, имя параметра не совпало.", "Добавили вторую реализацию интерфейса или второй DataSource/RestClient."], d: ["В сообщении перечислены имена кандидатов."], f: "@Primary на основном, @Qualifier в точке внедрения, внедрение List/Map, либо @Fallback для запасного.", ch: "01" },
+    { t: "BeanCurrentlyInCreationException", s: "The dependencies of some of the beans in the application context form a cycle", c: ["Циклическая зависимость через конструкторы — неразрешима.", "Цикл через поля в Boot 2.6+ запрещён по умолчанию.", "«injected into other beans in its raw version» — цикл + бин оборачивается @Async или другим BPP без поддержки ранних ссылок."], d: ["Boot рисует цикл стрелками в отчёте — найдите звено, которое логически лишнее."], f: "Вынести общую часть в третий бин; заменить вызов событием; @Lazy/ObjectProvider на одном параметре. spring.main.allow-circular-references=true — только как временная мера.", ch: "03" },
+    { t: "BeanDefinitionOverrideException", s: "The bean 'x' could not be registered. A bean with that name has already been defined", c: ["Два бина с одинаковым именем: @Bean-методы с одним именем в разных конфигурациях, ваш бин совпал по имени с бином автоконфигурации. (Одноимённые @Component-классы в разных пакетах дают другое исключение — ConflictingBeanDefinitionException: «Annotation-specified bean name 'x' … conflicts with existing, non-compatible bean definition».)"], d: ["В сообщении указаны оба источника определения."], f: "Переименовать бин (@Component(\"name\"), имя метода). Не включать allow-bean-definition-overriding в проде: порядок загрузки определит, кто победит.", ch: "01, 02" },
+    { t: "Failed to configure a DataSource", s: "'url' attribute is not specified and no embedded datasource could be configured", c: ["На classpath есть JDBC/JPA-стартер, но нет spring.datasource.url и нет встроенной БД.", "URL задан в профиле, который не активирован.", "Модулю БД не нужна, но стартер приехал транзитивно."], d: ["/actuator/env или лог активных профилей («The following 1 profile is active»)."], f: "Задать url, активировать профиль, либо исключить DataSourceAutoConfiguration / убрать зависимость.", ch: "07, 08" },
+    { t: "Could not resolve placeholder", s: "Could not resolve placeholder 'app.key' in value \"${app.key}\"", c: ["Свойства нет ни в одном источнике, значения по умолчанию нет.", "Опечатка в имени; файл конфигурации не попал в jar или профиль не активен.", "В тесте не подгружен нужный файл."], d: ["/actuator/env/app.key; проверить содержимое BOOT-INF/classes в jar."], f: "Задать свойство, добавить default ${app.key:value}, а лучше перейти на @ConfigurationProperties с валидацией.", ch: "05, 08" },
+    { t: "Failed to bind properties under 'x'", s: "Failed to bind properties under 'shop.payments.timeout' to java.time.Duration", c: ["Значение не конвертируется в тип (\"5 sec\" вместо 5s).", "Ошибка валидации @Validated (тогда BindValidationException со списком полей).", "Нет подходящего конструктора/сеттера у класса свойств."], d: ["Отчёт Boot показывает Property, Value, Origin (файл и строку!) и Reason."], f: "Исправить значение по указанному Origin; добавить Converter с @ConfigurationPropertiesBinding для своего типа.", ch: "08" },
+    { t: "Web server failed to start. Port 8080 was already in use", s: "PortInUseException", c: ["Порт занят другим процессом или прошлым запуском приложения."], d: ["Windows: netstat -ano | findstr :8080; Linux/macOS: lsof -i :8080."], f: "Остановить процесс, сменить server.port, в тестах — RANDOM_PORT / server.port=0.", ch: "06" },
+    { t: "LazyInitializationException", s: "could not initialize proxy [Order#1] - no Session", c: ["Обращение к ленивой связи после закрытия EntityManager: вне транзакции, в контроллере при open-in-view=false, при сериализации сущности в JSON, в @Async."], d: ["Стектрейс покажет место обращения: геттер коллекции или Jackson-сериализатор."], f: "Загрузить нужное в транзакции: join fetch, @EntityGraph, DTO-проекция. Не возвращать сущности из API. Не «лечить» EAGER или OSIV.", ch: "12" },
+    { t: "TransactionRequiredException", s: "No EntityManager with actual transaction available for current thread / Executing an update/delete query", c: ["Изменяющая операция (persist, @Modifying-запрос, derived delete) вызвана без транзакции.", "@Transactional не сработал: self-invocation, private-метод, объект не бин.", "Не тот TransactionManager при нескольких DataSource."], d: ["logging.level.org.springframework.transaction.interceptor=TRACE — видно, открывалась ли транзакция."], f: "Поставить @Transactional на публичный метод сервиса, вызывать через бин.", ch: "11, 12" },
+    { t: "UnexpectedRollbackException", s: "Transaction silently rolled back because it has been marked as rollback-only", c: ["Вложенный @Transactional (REQUIRED) бросил исключение и пометил общую транзакцию rollback-only, а внешний метод поймал исключение и дошёл до коммита."], d: ["DEBUG менеджера транзакций (logging.level.org.springframework.orm.jpa.JpaTransactionManager=DEBUG или DataSourceTransactionManager) покажет «Participating transaction failed - marking existing transaction as rollback-only»."], f: "Не глотать исключение; либо вынести внутреннюю операцию в REQUIRES_NEW/noRollbackFor; либо ловить внутри вложенного метода.", ch: "11" },
+    { t: "HikariPool: Connection is not available", s: "SQLTransientConnectionException: HikariPool-1 - Connection is not available, request timed out after 30000ms", c: ["Все соединения заняты: долгие транзакции, HTTP-вызовы внутри транзакции, REQUIRES_NEW (два соединения на поток), OSIV.", "Утечка: соединение взято вручную и не закрыто.", "Виртуальные потоки сняли ограничение конкурентности — пул стал узким местом."], d: ["Метрики hikaricp.connections.active/pending; leak-detection-threshold; thread dump — кто ждёт getConnection и кто держит."], f: "Сократить транзакции, вынести внешние вызовы, ограничить конкурентность, затем уже увеличивать пул.", ch: "11, 12, 10" },
+    { t: "HttpMessageNotReadableException (400)", s: "JSON parse error: Cannot deserialize value of type …", c: ["Тело не соответствует DTO: тип поля, формат даты, неизвестное значение enum, отсутствует тело.", "Нет конструктора/сеттеров у DTO (для record — проблем нет)."], d: ["Сообщение Jackson указывает поле и позицию (line, column)."], f: "Исправить контракт/формат; для дат — ISO-8601 и типы java.time; обработать в @ControllerAdvice понятным сообщением.", ch: "09" },
+    { t: "415 / 406", s: "HttpMediaTypeNotSupportedException / HttpMediaTypeNotAcceptableException", c: ["415: Content-Type запроса не совпал с consumes или нет конвертера для него (забыли application/json).", "406: нет конвертера, способного записать тип ответа в формате из Accept; у DTO нет геттеров/это не record → Jackson «не умеет» его писать."], d: ["DEBUG org.springframework.web покажет выбранный обработчик и согласование типов."], f: "Указать верные заголовки; добавить геттеры/record; проверить наличие Jackson на classpath.", ch: "09" },
+    { t: "No thread-bound request found", s: "IllegalStateException: No thread-bound request found: Are you referring to request attributes outside of an actual web request", c: ["Обращение к request/session-scoped бину или RequestContextHolder вне потока запроса: @Async, @Scheduled, свой пул, слушатель Kafka."], d: ["Имя потока в логе: не http-nio-…"], f: "Передавать нужные данные параметрами; для @Async — TaskDecorator, копирующий контекст.", ch: "03, 15" },
+    { t: "401 / 403 / ошибка CORS", s: "Неожиданный отказ Spring Security или «blocked by CORS policy» в браузере", c: ["401: нет/просрочен/невалиден токен, неверный issuer или JWKS.", "403: не хватает authority (ROLE_ против SCOPE_), CSRF на POST, порядок правил requestMatchers.", "CORS: не настроен CorsConfigurationSource в Security, preflight получает 401."], d: ["logging.level.org.springframework.security=DEBUG (TRACE покажет каждый фильтр и решение).", "Смотрите заголовок WWW-Authenticate в ответе — там причина для 401."], f: "Исправить по логу; для CORS — http.cors(...) + бин CorsConfigurationSource.", ch: "13" },
+    { t: "NoSuchMethodError / ClassNotFoundException", s: "java.lang.NoSuchMethodError, NoClassDefFoundError при старте или первом вызове", c: ["Конфликт версий: зависимость притащила библиотеку другой версии, чем ожидает Boot.", "Явно задана версия библиотеки, управляемой BOM.", "Смешаны javax.* и jakarta.* (Boot 2 против Boot 3+)."], d: ["./gradlew dependencyInsight --dependency jackson-core, mvn dependency:tree -Dverbose."], f: "Убрать явные версии управляемых BOM библиотек; для осознанного переопределения — свойство версии (<code>jackson-bom.version</code>; в Boot 4 для Jackson 2 — <code>jackson-2-bom.version</code>). Обновить библиотеки до совместимых с вашей веткой Boot.", ch: "06, 07" },
+    { t: "Аннотация «не работает» (без ошибки)", s: "@Transactional / @Async / @Cacheable / @PreAuthorize молча игнорируется", c: ["Вызов через this (self-invocation).", "Метод private, final или static.", "Объект создан через new, а не взят из контекста.", "Не включена инфраструктура (@EnableAsync, @EnableCaching, @EnableMethodSecurity).", "Бин создан слишком рано: «not eligible for getting processed by all BeanPostProcessors».", "Вызов из @PostConstruct — прокси ещё нет."], d: ["AopUtils.isAopProxy(bean) в отладчике; класс бина должен быть …$$SpringCGLIB$$0.", "Для транзакций — TransactionSynchronizationManager.isActualTransactionActive() внутри метода."], f: "Вызывать через внедрённый бин; сделать метод public; включить нужный @Enable…", ch: "04, 11, 15" }
+  ];
+  var list = document.getElementById("dxList"), body = document.getElementById("dxBody");
+  function show(i) {
+    var e = E[i];
+    list.querySelectorAll("button").forEach(function (b, k) { b.setAttribute("aria-pressed", k === i ? "true" : "false"); });
+    function ul(a) { return "<ul>" + a.map(function (x) { return "<li>" + SG.esc(x) + "</li>"; }).join("") + "</ul>"; }
+    body.innerHTML = "<h4>Сообщение</h4><p><code>" + SG.esc(e.s) + "</code></p><h4>Причины</h4>" + ul(e.c) + "<h4>Как проверить</h4>" + ul(e.d) +
+      "<h4>Что делать</h4><p>" + SG.esc(e.f) + "</p><h4>Механизм разобран в темах</h4><p>" + e.ch + "</p>";
+  }
+  E.forEach(function (e, i) {
+    var b = document.createElement("button"); b.type = "button"; b.textContent = e.t;
+    b.addEventListener("click", function () { show(i); }); list.appendChild(b);
+  });
+  show(0);
+})();
+</script>
+
+<h2 id="logs"><span class="h-num">22.3</span>Какие логи включить</h2>
+<div class="table-wrap"><table>
+<tr><th>Вопрос</th><th>Настройка</th></tr>
+<tr><td>Почему (не) создан бин автоконфигурации</td><td><code>--debug</code> или <code>logging.level.org.springframework.boot.autoconfigure=DEBUG</code></td></tr>
+<tr><td>В каком порядке создаются бины</td><td><code>logging.level.org.springframework.beans.factory.support=DEBUG</code></td></tr>
+<tr><td>Где начинается и кончается транзакция</td><td><code>logging.level.org.springframework.transaction.interceptor=TRACE</code>, <code>org.springframework.orm.jpa.JpaTransactionManager=DEBUG</code></td></tr>
+<tr><td>Какой SQL выполняется и с какими параметрами</td><td><code>logging.level.org.hibernate.SQL=DEBUG</code>, <code>org.hibernate.orm.jdbc.bind=TRACE</code>; для JdbcTemplate — <code>org.springframework.jdbc.core=DEBUG</code></td></tr>
+<tr><td>Как выбран обработчик запроса, почему 4xx</td><td><code>logging.level.org.springframework.web=DEBUG</code> (<code>spring.mvc.log-request-details=true</code> для параметров)</td></tr>
+<tr><td>Почему Security отказал</td><td><code>logging.level.org.springframework.security=DEBUG</code> / <code>TRACE</code></td></tr>
+<tr><td>Что с пулом соединений</td><td><code>logging.level.com.zaxxer.hikari=DEBUG</code> — раз в 30 с статистика пула</td></tr>
+<tr><td>Что с Kafka-слушателями</td><td><code>logging.level.org.springframework.kafka=DEBUG</code></td></tr>
+<tr><td>Кэш контекстов в тестах</td><td><code>logging.level.org.springframework.test.context.cache=DEBUG</code></td></tr>
+</table></div>
+<p>На работающем сервисе уровень меняется без рестарта: <code>POST /actuator/loggers/org.springframework.security {"configuredLevel":"DEBUG"}</code>.</p>
+
+<h2 id="breakpoints"><span class="h-num">22.4</span>Куда ставить точки останова</h2>
+<div class="table-wrap"><table>
+<tr><th>Хочу увидеть</th><th>Класс.метод</th><th>Совет</th></tr>
+<tr><td>Создание конкретного бина</td><td><code>AbstractAutowireCapableBeanFactory.doCreateBean</code></td><td>условие: <code>beanName.equals("orderService")</code></td></tr>
+<tr><td>Почему внедрён именно этот бин</td><td><code>DefaultListableBeanFactory.doResolveDependency</code></td><td>смотрите <code>matchingBeans</code></td></tr>
+<tr><td>Решение условия</td><td><code>OnBeanCondition.getMatchOutcome</code>, <code>OnClassCondition.getMatchOutcome</code></td><td></td></tr>
+<tr><td>Создание прокси</td><td><code>AbstractAutoProxyCreator.wrapIfNecessary</code></td><td><code>specificInterceptors</code> — список advisors</td></tr>
+<tr><td>Вызов через прокси</td><td><code>CglibAopProxy.DynamicAdvisedInterceptor.intercept</code>, <code>ReflectiveMethodInvocation.proceed</code></td><td></td></tr>
+<tr><td>Границы транзакции</td><td><code>TransactionAspectSupport.invokeWithinTransaction</code>, <code>AbstractPlatformTransactionManager.getTransaction</code></td><td></td></tr>
+<tr><td>Маршрутизацию запроса</td><td><code>DispatcherServlet.doDispatch</code></td><td><code>mappedHandler</code></td></tr>
+<tr><td>Разбор аргументов контроллера</td><td><code>InvocableHandlerMethod.getMethodArgumentValues</code></td><td></td></tr>
+<tr><td>Цепочку фильтров Security</td><td><code>FilterChainProxy.doFilterInternal</code></td><td><code>filters</code> — фактический список</td></tr>
+<tr><td>Откуда значение свойства</td><td><code>PropertySourcesPropertyResolver.getProperty</code></td><td>условие по ключу</td></tr>
+</table></div>
+<p>В IDE подключите исходники Spring (Download Sources) — отладка по декомпилированному коду без комментариев вдвое тяжелее.</p>
+
+<h2 id="runtime"><span class="h-num">22.5</span>Проблемы под нагрузкой</h2>
+<div class="grid-2">
+  <div class="card"><h4>Сервис «завис»</h4><p>Thread dump (<code>jstack</code>, <code>/actuator/threaddump</code>): в каком методе стоят потоки <code>http-nio-*</code>. Все в <code>HikariPool.getConnection</code> — исчерпан пул; в <code>SocketInputStream.read</code> — ждут downstream без таймаута; BLOCKED на мониторе — блокировка в коде.</p></div>
+  <div class="card"><h4>Медленные ответы</h4><p>Трейс запроса (тема 16) покажет, какой span длинный. Затем: счётчик SQL-запросов на HTTP-запрос (N+1), метрика ожидания соединения <code>hikaricp.connections.acquire</code>, GC-паузы (<code>jvm.gc.pause</code>), очередь пула потоков.</p></div>
+  <div class="card"><h4>Рост памяти</h4><p>Heap dump и анализ в Eclipse MAT / VisualVM. Частые причины в Spring-приложениях: неограниченный кэш (<code>ConcurrentMapCacheManager</code>), неограниченная очередь executor'а, большие выборки сущностей в persistence context, ThreadLocal без очистки.</p></div>
+  <div class="card"><h4>Медленный старт</h4><p><code>/actuator/startup</code> и DEBUG-лог создания бинов — найдите долгие бины (тема 17).</p></div>
+</div>
+
+<h2 id="quiz"><span class="h-num">22.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В стектрейсе пять вложенных UnsatisfiedDependencyException и в конце NoSuchBeanDefinitionException. С чего начать?</p><ul><li>С первого исключения</li><li>С последнего «Caused by» — это первопричина, остальное — путь до неё</li><li>С третьего</li><li>Перезапустить</li></ul><div class="why">Каждый уровень — один рекурсивный getBean. Корень внизу.</div></div>
+<div class="mcq" data-ok="3"><p>Метод с @Cacheable вызывается, но кэш не используется, ошибок нет. Что проверить в первую очередь?</p><ul><li>Версию Java</li><li>Размер пула соединений</li><li>Настройки Tomcat</li><li>Как вызывается метод (не через this ли), public ли он, включён ли @EnableCaching, прокси ли бин</li></ul><div class="why">Молчаливое игнорирование аннотаций почти всегда значит, что вызов не прошёл через прокси.</div></div>
+<div class="mcq" data-ok="0"><p>Все потоки http-nio в thread dump стоят в HikariPool.getConnection. Что это значит?</p><ul><li>Пул соединений исчерпан: кто-то держит соединения слишком долго</li><li>БД недоступна</li><li>Tomcat перегружен</li><li>Deadlock в JVM</li></ul><div class="why">Ищите в том же дампе потоки, которые держат соединение: долгие транзакции, внешние вызовы внутри транзакции, REQUIRES_NEW.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Приложение не стартует с ошибкой создания бина. Ваш алгоритм действий?</summary><div class="a"><p>Прочитать блок APPLICATION FAILED TO START (Description/Action) → найти последний Caused by → пройти цепочку «Error creating bean» → определить механизм (нет бина, неоднозначность, цикл, свойство, условие) → проверить отчёт условий (--debug), активные профили, пакет сканирования, дерево зависимостей.</p></div></details>
+<details class="q"><summary>Как узнать, действительно ли метод выполняется в транзакции?</summary><div class="a"><p>TRACE-лог org.springframework.transaction.interceptor («Getting transaction for…», «Completing transaction for…»), в отладчике TransactionSynchronizationManager.isActualTransactionActive() и getCurrentTransactionName(), стек вызовов должен содержать TransactionInterceptor.invoke между вызывающим и методом.</p></div></details>
+<details class="q"><summary>Как диагностировать «всё тормозит» в продакшене без отладчика?</summary><div class="a"><p>Метрики (латентность по endpoint-ам, пул потоков, пул соединений, GC), распределённый трейс медленного запроса, thread dump (несколько с интервалом), временное повышение уровня логирования через /actuator/loggers, при подозрении на память — heap dump.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

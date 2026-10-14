@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Реактивный Spring Security</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · WEBFLUX</div>
+  <h1>Реактивный Spring Security</h1>
+  <p class="lead">Spring Security для WebFlux — отдельная реализация: вместо цепочки Servlet-фильтров — <code>SecurityWebFilterChain</code> из WebFilter-ов, вместо SecurityContextHolder — Reactor Context, все менеджеры и сервисы возвращают Mono. Разбираем конфигурацию, путь запроса через фильтры безопасности, JWT resource server, методную безопасность и особенности CSRF.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">SecurityWebFilterChain</span><span class="tag">ServerHttpSecurity</span><span class="tag">ReactiveAuthenticationManager</span><span class="tag">JWT</span><span class="tag">@PreAuthorize</span><span class="tag">CSRF</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="config"><span class="h-num">17.1</span>Конфигурация</h2>
+<pre data-title="SecurityConfig.java"><code class="java">@Configuration
+@EnableWebFluxSecurity
+@EnableReactiveMethodSecurity
+class SecurityConfig {
+    @Bean
+    SecurityWebFilterChain api(ServerHttpSecurity http) {
+        return http
+            .securityMatcher(pathMatchers("/api/**", "/admin/**", "/actuator/**"))
+            .authorizeExchange(ex -&gt; ex
+                .pathMatchers("/actuator/health").permitAll()
+                .pathMatchers("/admin/**").hasRole("ADMIN")
+                .pathMatchers(HttpMethod.POST, "/api/orders").hasAuthority("SCOPE_orders:write")
+                .anyExchange().authenticated())
+            .oauth2ResourceServer(rs -&gt; rs.jwt(jwt -&gt; jwt.jwtAuthenticationConverter(rolesConverter())))
+            .csrf(ServerHttpSecurity.CsrfSpec::disable)       // stateless API с Bearer-токенами
+            .securityContextRepository(NoOpServerSecurityContextRepository.getInstance())   // без WebSession
+            .build();
+    }
+}</code></pre>
+<pre data-title="application.yml"><code class="yaml">spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://auth.example.com/realms/shop   # ключи через JWKS, кэшируются
+</code></pre>
+
+<h2 id="chain"><span class="h-num">17.2</span>Путь запроса через фильтры безопасности</h2>
+<div class="widget" id="seW">
+  <div class="widget-title">WebFilterChainProxy (order −100) → фильтры SecurityWebFilterChain</div>
+  <div class="controls">
+    <label>Запрос<select id="seP"><option value="health">GET /actuator/health</option><option value="orders">GET /api/orders</option><option value="post">POST /api/orders</option><option value="admin">GET /admin/users</option></select></label>
+    <label>Authorization<select id="seA"><option value="none">нет заголовка</option><option value="user" selected>Bearer: валидный JWT (user, SCOPE_orders:read)</option><option value="writer">Bearer: валидный JWT (user, SCOPE_orders:write)</option><option value="admin">Bearer: валидный JWT (ROLE_ADMIN)</option><option value="expired">Bearer: истёкший JWT</option></select></label>
+  </div>
+  <div class="log" id="seLog"></div>
+  <div class="verdict" id="seV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var p = $("seP").value, a = $("seA").value, L = ["HttpHeaderWriterWebFilter: X-Content-Type-Options, Cache-Control, X-Frame-Options…", "ReactorContextWebFilter: Context ← Mono<SecurityContext> (лениво)"], status, cls, msg;
+    var principal = null;
+    if (a === "none") L.push("AuthenticationWebFilter (bearer): токена нет → пропускает дальше");
+    else if (a === "expired") { L.push("AuthenticationWebFilter: ServerBearerTokenAuthenticationConverter → JwtReactiveAuthenticationManager", "  ReactiveJwtDecoder: JwtValidationException: Jwt expired at …", "  → ServerAuthenticationEntryPoint"); $("seLog").textContent = L.join("\n"); $("seV").className = "verdict bad"; $("seV").textContent = "401, WWW-Authenticate: Bearer error=\"invalid_token\". Даже для permitAll-пути: невалидный токен отвергается на этапе аутентификации, до проверки прав" + (p === "health" ? " — поэтому /actuator/health с протухшим токеном тоже 401." : "."); return; }
+    else { principal = a; L.push("AuthenticationWebFilter: JWT проверен (подпись по JWKS, exp, iss) → JwtAuthenticationToken", "  authorities: " + (a === "admin" ? "ROLE_ADMIN" : a === "writer" ? "SCOPE_orders:write" : "SCOPE_orders:read"), "  SecurityContext сохранён в Context (repository NoOp — в сессию не пишется)"); }
+    L.push("ExceptionTranslationWebFilter: ловит AccessDeniedException ниже");
+    var need = p === "health" ? "permitAll" : p === "admin" ? "hasRole('ADMIN')" : p === "post" ? "hasAuthority('SCOPE_orders:write')" : "authenticated";
+    L.push("AuthorizationWebFilter: " + need);
+    var ok;
+    if (need === "permitAll") ok = true;
+    else if (!principal) ok = "anon";
+    else if (need === "authenticated") ok = true;
+    else if (need === "hasRole('ADMIN')") ok = principal === "admin";
+    else ok = principal === "writer";
+    if (ok === true) { L.push("  → разрешено", "→ DispatcherHandler → контроллер"); status = "200"; cls = "ok"; msg = "Доступ разрешён. В контроллере пользователь доступен через @AuthenticationPrincipal Jwt jwt или ReactiveSecurityContextHolder.getContext()."; }
+    else if (ok === "anon") { L.push("  → AccessDeniedException (анонимный)", "ExceptionTranslationWebFilter → entryPoint.commence"); status = "401"; cls = "warn"; msg = "401 Unauthorized + WWW-Authenticate: Bearer. Анонимному пользователю отказ превращается в требование аутентификации."; }
+    else { L.push("  → AccessDeniedException", "ExceptionTranslationWebFilter → accessDeniedHandler"); status = "403"; cls = "bad"; msg = "403 Forbidden: пользователь аутентифицирован, но прав (" + need + ") нет."; }
+    L.push("HTTP " + status);
+    $("seLog").textContent = L.join("\n"); $("seV").className = "verdict " + cls; $("seV").textContent = msg;
+  }
+  $("seP").addEventListener("change", run); $("seA").addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="principal"><span class="h-num">17.3</span>Пользователь в коде</h2>
+<pre data-title="Три способа получить аутентификацию"><code class="java">@GetMapping("/me")
+Mono&lt;Profile&gt; me(@AuthenticationPrincipal Jwt jwt) {               // 1. аргумент метода
+    return profiles.find(jwt.getSubject());
+}
+
+Mono&lt;String&gt; currentUser() {                                      // 2. в сервисе
+    return ReactiveSecurityContextHolder.getContext()
+        .map(SecurityContext::getAuthentication)
+        .map(Authentication::getName)
+        .switchIfEmpty(Mono.error(new AccessDeniedException("no auth")));
+}
+
+@PreAuthorize("hasRole('ADMIN') or #ownerId == authentication.name")   // 3. методная безопасность
+Mono&lt;Void&gt; deleteOrder(String ownerId, long id) { ... }               // метод ОБЯЗАН возвращать Publisher</code></pre>
+<div class="callout warn"><span class="c-title">SecurityContext — в Context, а не в потоке</span>
+<code>SecurityContextHolder.getContext()</code> в реактивном коде пуст. Контекст безопасности не дойдёт и до кода, выполняемого вне цепочки (subscribe() в другом месте, @Async, ручной executor). Для вызовов WebClient с токеном пользователя — <code>ServerBearerExchangeFilterFunction</code>, который берёт токен из Context.
+</div>
+
+<h2 id="session"><span class="h-num">17.4</span>Логин, сессии и CSRF</h2>
+<div class="grid-2">
+  <div class="card"><h4>Сессии</h4><ul><li>По умолчанию SecurityContext хранится в WebSession (<code>WebSessionServerSecurityContextRepository</code>) — для form login.</li><li>Сессии в памяти инстанса; для кластера — Spring Session (реактивный Redis).</li><li>Stateless API: <code>NoOpServerSecurityContextRepository</code>.</li><li>Пользователи: <code>MapReactiveUserDetailsService</code> или свой <code>ReactiveUserDetailsService</code>; пароли — <code>PasswordEncoderFactories.createDelegatingPasswordEncoder()</code>.</li></ul></div>
+  <div class="card"><h4>CSRF</h4><ul><li><code>CsrfWebFilter</code> проверяет токен у изменяющих запросов.</li><li>Токен — <code>Mono&lt;CsrfToken&gt;</code> в атрибутах exchange: пока на него никто не подписался, cookie не создаётся. Для SPA с <code>CookieServerCsrfTokenRepository.withHttpOnlyFalse()</code> нужен WebFilter, который подписывается на токен.</li><li>С 6.x по умолчанию — <code>XorServerCsrfTokenRequestAttributeHandler</code> (защита от BREACH).</li><li>Для чистого Bearer-API без cookie CSRF не нужен.</li></ul></div>
+</div>
+<pre data-title="Подписка на CSRF-токен для SPA"><code class="java">@Bean
+WebFilter csrfCookieFilter() {
+    return (ex, chain) -&gt; {
+        Mono&lt;CsrfToken&gt; token = ex.getAttribute(CsrfToken.class.getName());
+        return (token != null ? token.then() : Mono.empty()).then(chain.filter(ex));
+    };
+}</code></pre>
+
+<h2 id="quiz"><span class="h-num">17.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Запрос с истёкшим JWT на permitAll-эндпоинт. Результат?</p><ul><li>200, токен игнорируется</li><li>403</li><li>401: невалидный токен отвергается при аутентификации</li><li>500</li></ul><div class="why">Аутентификация выполняется до авторизации; невалидные учётные данные — ошибка.</div></div>
+<div class="mcq" data-ok="0"><p>Почему @PreAuthorize не работает на методе, возвращающем void, в WebFlux-приложении с @EnableReactiveMethodSecurity?</p><ul><li>Реактивная методная безопасность требует Publisher (Mono/Flux) в качестве результата</li><li>Нужен @Secured</li><li>@PreAuthorize только для контроллеров</li><li>Работает всегда</li></ul><div class="why">Проверка встраивается в цепочку возвращаемого Mono.</div></div>
+<div class="mcq" data-ok="3"><p>Где хранится аутентификация во время обработки запроса?</p><ul><li>SecurityContextHolder (ThreadLocal)</li><li>HttpServletRequest</li><li>Статическая карта по requestId</li><li>Reactor Context (Mono&lt;SecurityContext&gt;)</li></ul><div class="why">ReactorContextWebFilter кладёт её туда.</div></div>
+<div class="mcq" data-ok="1"><p>Аутентифицированный пользователь без нужной роли обращается к /admin. Статус?</p><ul><li>401</li><li>403</li><li>404</li><li>302 на /login</li></ul><div class="why">401 — нет аутентификации, 403 — нет прав.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как сделать два набора правил: JWT для /api и form login для /ui?</summary><div class="a"><p>Объявить два бина SecurityWebFilterChain с разными <code>securityMatcher</code> и <code>@Order</code>: первый — <code>pathMatchers("/api/**")</code> с resource server и без сессии, второй — для остального с formLogin и CSRF. WebFilterChainProxy выбирает первую цепочку, чей matcher совпал.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

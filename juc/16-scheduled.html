@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · ScheduledThreadPoolExecutor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.sch2 { position: relative; height: 92px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-sunk); margin: 10px 0; overflow: hidden; }
+.sch2 i { position: absolute; top: 34px; height: 24px; border-radius: 4px; background: var(--info-soft); border: 1.5px solid var(--info); font: 10px/22px var(--font-mono); text-align: center; overflow: hidden; }
+.sch2 i.late { background: var(--warn-soft); border-color: var(--warn); } .sch2 i.err { background: var(--bad-soft); border-color: var(--bad); }
+.sch2 b { position: absolute; top: 6px; width: 1px; height: 80px; background: var(--accent); opacity: .5; }
+.sch2 b span { position: absolute; top: -2px; left: 3px; font: 9px var(--font-mono); color: var(--accent); white-space: nowrap; }
+</style>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ИСПОЛНИТЕЛИ</div>
+  <h1>ScheduledThreadPoolExecutor</h1>
+  <p class="lead">Планировщик задач в JDK — это ThreadPoolExecutor с особой очередью: двоичной кучей задач, упорядоченной по времени запуска. Разбираем, чем <code>scheduleAtFixedRate</code> отличается от <code>scheduleWithFixedDelay</code>, когда задача длиннее периода (симулятор временной шкалы), почему одно исключение навсегда останавливает периодическую задачу без единой строчки в логе, и почему <code>maximumPoolSize</code> здесь ничего не значит.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">DelayedWorkQueue</span><span class="tag">fixed rate</span><span class="tag">fixed delay</span><span class="tag">overrun</span><span class="tag">исключения</span><span class="tag">Timer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="struct"><span class="h-num">16.1</span>Устройство</h2>
+<ul>
+  <li>Очередь — <code>DelayedWorkQueue</code>: двоичная куча (как PriorityQueue) <code>ScheduledFutureTask</code> по времени запуска; при равенстве — по порядковому номеру отправки (FIFO).</li>
+  <li>Поток берёт задачу из головы кучи, только когда её время наступило: один поток-«лидер» спит ровно до времени головы (<code>awaitNanos</code>), остальные ждут без таймаута (паттерн Leader-Follower).</li>
+  <li>Периодическая задача после выполнения вычисляет следующее время и <b>снова кладёт себя</b> в очередь — одновременно две копии одной задачи не выполняются никогда.</li>
+  <li>Очередь неограниченная, поэтому пул никогда не растёт сверх <code>corePoolSize</code>: <code>maximumPoolSize</code> не используется, <code>allowCoreThreadTimeOut</code> — осторожно.</li>
+</ul>
+
+<h2 id="rate"><span class="h-num">16.2</span>Fixed rate против fixed delay</h2>
+<div class="widget" id="rtW">
+  <div class="widget-title">Временная шкала периодической задачи</div>
+  <div class="controls">
+    <label>метод<select id="rtM"><option value="rate">scheduleAtFixedRate(task, 0, period)</option><option value="delay">scheduleWithFixedDelay(task, 0, delay)</option></select></label>
+    <label>период / задержка, мс<input type="number" id="rtP" value="100" min="10" max="500"></label>
+    <label>длительность задачи, мс<select id="rtD"><option value="40">40 (короче периода)</option><option value="var">иногда 250 (выброс)</option><option value="150">150 (всегда длиннее)</option></select></label>
+    <label>исключение<select id="rtE"><option value="0">нет</option><option value="3">в 3-м запуске</option></select></label>
+  </div>
+  <div class="sch2" id="rtTl"></div>
+  <div class="out" id="rtOut"></div>
+  <div class="verdict" id="rtV"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var m = $("rtM").value, p = Math.max(10, +$("rtP").value), dsel = $("rtD").value, err = +$("rtE").value, END = 1000, t = 0, sched = 0, runs = [], i = 0, dead = false;
+    while (sched < END && runs.length < 40) {
+      i++; var start = Math.max(sched, t), dur = dsel === "var" ? (i === 2 ? 250 : 40) : +dsel;
+      if (start >= END) break;
+      var isErr = err && i === err; runs.push([start, isErr ? 15 : dur, start > sched + 1, sched, isErr]);
+      if (isErr) { dead = true; break; }
+      t = start + dur;
+      sched = m === "rate" ? sched + p : t + p;          // fixed rate: от ЗАПЛАНИРОВАННОГО начала; fixed delay: от конца
+    }
+    var W = 100 / END, h = "";
+    for (var k = 0; k * p < END && m === "rate"; k++) h += '<b style="left:' + k * p * W + '%"><span>' + k * p + "</span></b>";
+    h += runs.map(function (r, j) { return '<i class="' + (r[4] ? "err" : r[2] ? "late" : "") + '" style="left:' + r[0] * W + "%;width:" + Math.max(0.8, r[1] * W - 0.2) + '%">' + (r[4] ? "💥" : "#" + (j + 1)) + "</i>"; }).join("");
+    $("rtTl").innerHTML = h;
+    var late = runs.filter(function (r) { return r[2]; }).length;
+    $("rtOut").textContent = "запусков за " + END + " мс: " + runs.length + ", запущено позже плана: " + late + "\nначала: " + runs.map(function (r) { return Math.round(r[0]); }).join(", ");
+    var v = $("rtV");
+    if (dead) { v.className = "verdict bad"; v.textContent = "Исключение в 3-м запуске: ScheduledFutureTask завершилась исключительно и больше НЕ перепланируется. В логах — ничего (исключение сохранено в ScheduledFuture, который никто не читает). Оборачивайте тело периодической задачи в try/catch(Throwable) с логированием."; }
+    else if (m === "rate") { v.className = "verdict " + (late ? "warn" : "ok"); v.textContent = late ? "Fixed rate: следующее время = запланированное начало + период. Если задача затянулась, пропущенные запуски выполняются сразу друг за другом («догоняет» расписание), но никогда параллельно. При систематическом превышении периода задача идёт без пауз." : "Fixed rate: запуски строго каждые " + p + " мс от начала — для метрик, опросов с постоянной частотой."; }
+    else { v.className = "verdict ok"; v.textContent = "Fixed delay: следующее начало = конец предыдущего + задержка. Пауза между запусками гарантирована, частота плавает. Для «опрашивай, но не чаще» и задач, которые не должны наслаиваться."; }
+  }
+  ["rtM", "rtP", "rtD", "rtE"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+
+<h2 id="api"><span class="h-num">16.3</span>Практика</h2>
+<pre data-title="надёжная периодическая задача"><code class="java">ScheduledThreadPoolExecutor ses = new ScheduledThreadPoolExecutor(2, Thread.ofPlatform().name("sched-", 0).factory());
+ses.setRemoveOnCancelPolicy(true);           // отменённые задачи сразу удаляются из очереди (иначе висят до своего времени)
+
+ScheduledFuture&lt;?&gt; f = ses.scheduleWithFixedDelay(() -&gt; {
+    try { refreshCache(); }
+    catch (Throwable t) { log.error("refresh failed", t); }   // иначе первое исключение молча остановит расписание
+}, 0, 30, TimeUnit.SECONDS);
+
+f.cancel(false);                             // остановить (false — не прерывать текущее выполнение)
+ses.schedule(() -&gt; sendReminder(id), 15, TimeUnit.MINUTES);   // однократно с задержкой</code></pre>
+<div class="table-wrap"><table>
+<tr><th></th><th>java.util.Timer</th><th>ScheduledThreadPoolExecutor</th></tr>
+<tr><td>Потоки</td><td>один</td><td>пул</td></tr>
+<tr><td>Исключение в задаче</td><td>убивает поток таймера — ВСЕ задачи перестают выполняться</td><td>останавливает только эту задачу</td></tr>
+<tr><td>Время</td><td>System.currentTimeMillis — чувствителен к переводу часов</td><td>System.nanoTime — монотонное</td></tr>
+<tr><td>Итог</td><td>наследие</td><td>использовать</td></tr>
+</table></div>
+<p>Для распределённого планирования (задача должна выполниться один раз на кластер) нужен внешний механизм: ShedLock, Quartz с JDBC, планировщик Kubernetes CronJob.</p>
+
+<h2 id="quiz"><span class="h-num">16.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Периодическая задача бросила исключение. Что дальше?</p><ul><li>Она запустится по расписанию снова</li><li>Последующие запуски отменены; исключение сохранено в ScheduledFuture</li><li>Пул остановится</li><li>Исключение напечатается в лог</li></ul><div class="why">Самая частая причина «перестал работать фоновый джоб».</div></div>
+<div class="mcq" data-ok="2"><p>Задача с fixed rate 100 мс выполняется 250 мс. Будут ли параллельные выполнения?</p><ul><li>Да, три параллельно</li><li>Да, два</li><li>Нет: следующее выполнение начнётся сразу после окончания предыдущего</li><li>Задача будет отменена</li></ul><div class="why">Копия задачи перепланируется только после завершения.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем setMaximumPoolSize у ScheduledThreadPoolExecutor?</p><ul><li>Ни зачем: очередь неограниченная, пул не растёт сверх core</li><li>Ограничивает число задач</li><li>Задаёт число периодических задач</li><li>Ограничивает очередь</li></ul><div class="why">Задавайте corePoolSize.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как устроено ожидание в DelayedWorkQueue без активного опроса?</summary><div class="a"><p>Leader-Follower: если голова кучи ещё не готова, первый поток становится лидером и спит awaitNanos(delay головы); остальные ждут на условии без таймаута. Лидер просыпается вовремя, забирает задачу и будит следующего, который станет новым лидером. При добавлении задачи с более ранним временем, чем голова, лидер сбрасывается и все ожидающие пересчитывают ожидание.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

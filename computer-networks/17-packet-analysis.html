@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Практикум: читаем дампы трафика</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ПОД КАПОТОМ И ПРАКТИКА</div>
+  <h1>Практикум: читаем дампы трафика</h1>
+  <p class="lead">Когда логи приложения молчат, а метрики противоречат друг другу, остаётся источник, который не врёт, — сами пакеты. Умение за минуту снять дамп и увидеть в нём «SYN без ответа» или «окно ноль» превращает многочасовое гадание в диагноз. Здесь — минимум tcpdump, конструктор фильтров и восемь дампов из реальных аварий: по каждому нужно поставить диагноз.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">tcpdump</span><span class="tag">Wireshark</span><span class="tag">8 разборов</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="capture"><span class="h-num">17.1</span>Как снять дамп</h2>
+<pre><code class="txt">tcpdump -i any -nn -s 0 -w /tmp/dump.pcap 'host 10.2.3.40 and port 8443'
+#        │      │   │    │                 └ фильтр захвата (BPF): чем уже, тем меньше файл и нагрузка
+#        │      │   │    └ писать в файл для Wireshark (без -w — печатать на экран)
+#        │      │   └ захватывать пакет целиком (по умолчанию может обрезать)
+#        │      └ не превращать адреса и порты в имена: быстрее и однозначнее
+#        └ все интерфейсы; в контейнере — nsenter -t &lt;pid&gt; -n tcpdump …
+
+tcpdump -r /tmp/dump.pcap -nn -tttt 'tcp[tcpflags] &amp; (tcp-syn|tcp-rst) != 0'   # прочитать файл, показать только SYN и RST</code></pre>
+<div class="widget" id="tfW">
+  <div class="widget-title">Конструктор фильтра</div>
+  <div class="controls">
+    <label>что ищем<select id="tfWhat" style="max-width:100%">
+      <option value="conn">не устанавливается соединение с сервисом</option>
+      <option value="rst">кто-то рвёт соединения</option>
+      <option value="dns">медленный или неработающий DNS</option>
+      <option value="slow">медленные ответы, подозрение на потери</option>
+      <option value="http">содержимое HTTP-запросов (без TLS)</option>
+      <option value="tls">ошибки TLS-рукопожатия</option>
+      <option value="icmp">проблемы MTU и недоступность</option>
+    </select></label>
+    <label>хост<input type="text" id="tfHost" value="10.2.3.40"></label>
+    <label>порт<input type="text" id="tfPort" value="8443" style="width:80px"></label>
+  </div>
+  <div class="out" id="tfOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var w = $("tfWhat").value, h = $("tfHost").value.trim() || "HOST", p = $("tfPort").value.trim() || "PORT", cmd, look, ws;
+    var hp = "host " + h + " and port " + p;
+    if (w === "conn") { cmd = "tcpdump -i any -nn '" + hp + " and tcp[tcpflags] & (tcp-syn|tcp-rst) != 0'"; look = "SYN без ответа и повторы через 1, 2, 4 с → фильтрация или хост недоступен.\nSYN → RST → порт закрыт.\nSYN → SYN-ACK → ACK → рукопожатие в порядке, смотрите выше по стеку."; ws = "tcp.flags.syn == 1 || tcp.flags.reset == 1"; }
+    else if (w === "rst") { cmd = "tcpdump -i any -nn '" + hp + " and tcp[tcpflags] & tcp-rst != 0'"; look = "От кого пришёл RST (адрес источника) и после чего: сразу после SYN — закрытый порт; после простоя — балансировщик или файрвол; в ответ на данные — другая сторона уже закрыла сокет.\nСравните TTL пакета RST с TTL обычных пакетов сервера: отличается — RST послало промежуточное устройство."; ws = "tcp.flags.reset == 1"; }
+    else if (w === "dns") { cmd = "tcpdump -i any -nn -s 0 'port 53'"; look = "Запрос без ответа и повтор ровно через 5 с → не отвечает первый DNS-сервер.\nПары запросов A и AAAA: приходит ли ответ на оба.\nNXDomain на имена с добавленными search-доменами → эффект ndots."; ws = "dns && (dns.flags.rcode != 0 || dns.time > 1)"; }
+    else if (w === "slow") { cmd = "tcpdump -i any -nn -s 96 -w /tmp/slow.pcap '" + hp + "'"; look = "В Wireshark: Statistics → TCP Stream Graphs → Time Sequence; Analyze → Expert Information.\nРетрансляции и Dup ACK → потери. Zero Window → не успевает читать получатель. Паузы между запросом и первым байтом ответа → думает сервер, сеть ни при чём."; ws = "tcp.analysis.retransmission || tcp.analysis.zero_window || tcp.analysis.duplicate_ack"; }
+    else if (w === "http") { cmd = "tcpdump -i any -nn -A -s 0 '" + hp + " and tcp[((tcp[12:1] & 0xf0) >> 2):4] = 0x47455420'"; look = "Флаг -A печатает содержимое как текст; выражение отбирает сегменты, начинающиеся с «GET ».\nДля HTTPS содержимое зашифровано: смотрите на балансировщике после терминации TLS или используйте SSLKEYLOGFILE."; ws = "http.request || http.response.code >= 400"; }
+    else if (w === "tls") { cmd = "tcpdump -i any -nn -s 0 -w /tmp/tls.pcap '" + hp + "'"; look = "В Wireshark видны открытые части рукопожатия: ClientHello (SNI, версии, шифры), ServerHello, Alert.\nAlert «handshake_failure» → нет общих шифров/версий; «bad_certificate», «unknown_ca» → проблема доверия; «certificate_required» → сервер ждёт клиентский сертификат."; ws = "tls.handshake || tls.alert_message"; }
+    else { cmd = "tcpdump -i any -nn 'icmp and host " + h + "'"; look = "«unreachable - need to frag (mtu 1400)» → на пути меньший MTU: сообщение должно дойти до отправителя.\n«host unreachable», «port unreachable» (для UDP), «time exceeded» → причина недоступности.\nICMP нет совсем, а большие пакеты пропадают → ICMP фильтруется: чёрная дыра MTU."; ws = "icmp.type == 3 || icmp.type == 11"; }
+    $("tfOut").textContent = cmd + "\n\nФильтр отображения Wireshark:  " + ws + "\n\nНа что смотреть:\n" + look;
+  }
+  ["tfWhat", "tfHost", "tfPort"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<div class="callout warn"><span class="c-title">Где снимать</span>
+Один и тот же обмен выглядит по-разному с двух сторон: если клиент видит ушедший SYN, а на сервере его нет — пакет потерян по пути. Снимайте с обеих сторон и на промежуточных узлах (балансировщик), сравнивайте по времени и номерам последовательности. Помните о NAT: адреса и порты на разных участках разные.</div>
+
+<h2 id="read"><span class="h-num">17.2</span>Как читать строку tcpdump</h2>
+<pre><code class="txt">12:00:01.000123 IP 10.0.0.5.51000 &gt; 10.2.3.40.8443: Flags [P.], seq 1:201, ack 1, win 502, length 200
+│               │  │                │                      │      │           │      │        └ байт данных
+│               │  │                │                      │      │           │      └ окно приёма отправителя (× масштаб)
+│               │  │                │                      │      │           └ «жду от тебя байт №1»
+│               │  │                │                      │      └ относительные номера: байты с 1 по 200
+│               │  │                │                      └ S=SYN  F=FIN  R=RST  P=PSH  .=ACK
+│               │  └ источник:порт  └ назначение:порт
+└ время с микросекундами: разница между строками — главное, на что смотреть</code></pre>
+
+<h2 id="cases"><span class="h-num">17.3</span>Восемь дампов: поставьте диагноз</h2>
+<div class="mcq-score"></div>
+
+<h3>Дамп 1</h3>
+<pre><code class="txt">12:00:01.000 IP 10.0.0.5.51000 &gt; 10.2.3.40.8443: Flags [S], seq 1000, win 64240, options [mss 1460]
+12:00:02.003 IP 10.0.0.5.51000 &gt; 10.2.3.40.8443: Flags [S], seq 1000, win 64240, options [mss 1460]
+12:00:04.011 IP 10.0.0.5.51000 &gt; 10.2.3.40.8443: Flags [S], seq 1000, win 64240, options [mss 1460]
+12:00:08.027 IP 10.0.0.5.51000 &gt; 10.2.3.40.8443: Flags [S], seq 1000, win 64240, options [mss 1460]</code></pre>
+<div class="mcq" data-ok="1"><p>Что происходит?</p><ul><li>Порт закрыт</li><li>SYN уходит, ответа нет: пакеты отбрасываются файрволом/security group или хост недоступен; клиент повторяет с удвоением интервала</li><li>Сервер перегружен и отвечает медленно</li><li>Проблема TLS</li></ul><div class="why">Тишина в ответ на SYN и интервалы 1–2–4 с. Закрытый порт дал бы мгновенный RST. Следующий шаг — дамп на сервере: доходят ли SYN.</div></div>
+
+<h3>Дамп 2</h3>
+<pre><code class="txt">12:00:01.000 IP 10.0.0.5.51002 &gt; 10.2.3.40.8443: Flags [S], seq 2000
+12:00:01.001 IP 10.2.3.40.8443 &gt; 10.0.0.5.51002: Flags [R.], seq 0, ack 2001, win 0</code></pre>
+<div class="mcq" data-ok="2"><p>Диагноз?</p><ul><li>Файрвол отбрасывает пакеты</li><li>Потеря пакета</li><li>Хост доступен, но на порту 8443 никто не слушает — «Connection refused»</li><li>Сервер закрыл соединение по таймауту</li></ul><div class="why">RST в ответ на SYN за 1 мс: ядро сервера получило пакет и не нашло слушающего сокета. Сервис не запущен или слушает другой адрес/порт.</div></div>
+
+<h3>Дамп 3</h3>
+<pre><code class="txt">12:00:01.000 IP A.51003 &gt; B.443: Flags [P.], seq 1:1461, ack 1, length 1460
+12:00:01.000 IP A.51003 &gt; B.443: Flags [P.], seq 1461:2921, ack 1, length 1460
+12:00:01.000 IP A.51003 &gt; B.443: Flags [P.], seq 2921:4381, ack 1, length 1460
+12:00:01.041 IP B.443 &gt; A.51003: Flags [.], ack 1, win 501, options [sack 1461:4381]
+12:00:01.041 IP B.443 &gt; A.51003: Flags [.], ack 1, win 501, options [sack 1461:4381]
+12:00:01.042 IP A.51003 &gt; B.443: Flags [P.], seq 1:1461, ack 1, length 1460
+12:00:01.083 IP B.443 &gt; A.51003: Flags [.], ack 4381, win 490</code></pre>
+<div class="mcq" data-ok="0"><p>Что здесь видно?</p><ul><li>Первый сегмент потерян: получатель сообщает через SACK, что имеет 1461–4381, но ждёт байт 1; отправитель повторяет сегмент</li><li>Получатель не успевает читать</li><li>Соединение сброшено</li><li>Рукопожатие не завершилось</li></ul><div class="why">ack 1 при sack 1461:4381 — «дыра» в начале. После ретрансляции ack сразу прыгает на 4381. Единичные потери нормальны; много — ищите перегруженный канал или плохой линк.</div></div>
+
+<h3>Дамп 4</h3>
+<pre><code class="txt">12:00:01.000 IP A.51004 &gt; B.9000: Flags [P.], seq 1:65536, ack 1, length 65535
+12:00:01.001 IP B.9000 &gt; A.51004: Flags [.], ack 65536, win 0
+12:00:01.250 IP A.51004 &gt; B.9000: Flags [.], seq 65535:65536, ack 1, length 1     (zero window probe)
+12:00:01.251 IP B.9000 &gt; A.51004: Flags [.], ack 65536, win 0
+12:00:01.750 IP A.51004 &gt; B.9000: Flags [.], seq 65535:65536, ack 1, length 1
+12:00:01.751 IP B.9000 &gt; A.51004: Flags [.], ack 65536, win 0</code></pre>
+<div class="mcq" data-ok="3"><p>В чём причина остановки передачи?</p><ul><li>Потери пакетов в сети</li><li>Файрвол</li><li>Перегрузка канала</li><li>Получатель B объявил окно 0: его приложение не читает данные из сокета, буфер приёма заполнен</li></ul><div class="why">Сеть работает идеально — ответы приходят за 1 мс. Проблема в приложении на стороне B: зависло, заблокировано, не успевает. Смотреть нужно его thread dump, а не сеть.</div></div>
+
+<h3>Дамп 5</h3>
+<pre><code class="txt">12:00:01.000 IP A.51005 &gt; LB.443: Flags [P.], seq 501:701, ack 9001, length 200       (предыдущий обмен был в 11:53:40)
+12:00:01.001 IP LB.443 &gt; A.51005: Flags [R], seq 9001, win 0</code></pre>
+<div class="mcq" data-ok="1"><p>Клиент получил «Connection reset by peer» на первом запросе после перерыва. Почему?</p><ul><li>Сервер упал</li><li>Балансировщик закрыл простаивавшее больше его таймаута соединение, а клиент из пула этого не заметил и отправил в него запрос</li><li>Потерян пакет</li><li>Неверный сертификат</li></ul><div class="why">Между обменами прошло 6 минут 20 секунд — больше типичного таймаута простоя (60–350 с). Лечение: время жизни и проверка соединений в пуле короче таймаута балансировщика, повтор идемпотентных запросов.</div></div>
+
+<h3>Дамп 6</h3>
+<pre><code class="txt">12:00:01.000 IP 10.0.0.5.40112 &gt; 10.0.0.2.53: 4411+ A? payments.internal. (35)
+12:00:06.005 IP 10.0.0.5.40112 &gt; 10.0.0.3.53: 4411+ A? payments.internal. (35)
+12:00:06.007 IP 10.0.0.3.53 &gt; 10.0.0.5.40112: 4411 1/0/0 A 10.2.3.40 (51)</code></pre>
+<div class="mcq" data-ok="2"><p>Откуда задержка ровно 5 секунд?</p><ul><li>Медленная сеть</li><li>Долгая обработка на авторитетном сервере</li><li>Первый DNS-сервер из resolv.conf не ответил; через таймаут 5 с резолвер обратился ко второму</li><li>Потеря TCP-сегмента</li></ul><div class="why">Таймаут резолвера по умолчанию — 5 с. Ровные задержки 5/10/15 с на новых соединениях почти всегда DNS. Починить первый сервер, уменьшить <code>options timeout:1 attempts:2</code>, добавить локальный кэш.</div></div>
+
+<h3>Дамп 7</h3>
+<pre><code class="txt">12:00:01.000 IP A.51007 &gt; B.443: Flags [S], seq 100, options [mss 1460]
+12:00:01.020 IP B.443 &gt; A.51007: Flags [S.], seq 900, ack 101, options [mss 1460]
+12:00:01.020 IP A.51007 &gt; B.443: Flags [.], ack 901
+12:00:01.021 IP A.51007 &gt; B.443: Flags [P.], seq 101:618, length 517      (TLS ClientHello)
+12:00:01.041 IP B.443 &gt; A.51007: Flags [.], ack 618
+12:00:01.250 IP B.443 &gt; A.51007: Flags [P.], seq 901:2361, length 1460    — не дошёл до A
+12:00:01.500 IP B.443 &gt; A.51007: Flags [P.], seq 901:2361, length 1460    — не дошёл до A
+12:00:02.000 IP B.443 &gt; A.51007: Flags [P.], seq 901:2361, length 1460    — не дошёл до A
+                 (дамп снят на стороне B; на стороне A этих пакетов нет)</code></pre>
+<div class="mcq" data-ok="0"><p>Маленькие пакеты проходят, полноразмерные от B до A — нет. Причина?</p><ul><li>На пути MTU меньше 1500 (туннель, VPN), а ICMP «fragmentation needed» не доходит до B — чёрная дыра PMTUD</li><li>Сервер B перегружен</li><li>Закрыт порт 443</li><li>Клиент не поддерживает TLS 1.3</li></ul><div class="why">Рукопожатие TCP (40 байт) и ClientHello (517 байт) проходят, а ServerHello с сертификатом (1460 байт) — нет. Симптом: «соединение устанавливается, TLS зависает». Лечение: разрешить ICMP type 3 code 4, MSS clamping, меньший MTU на интерфейсе.</div></div>
+
+<h3>Дамп 8</h3>
+<pre><code class="txt">12:00:01.000 IP A.51008 &gt; B.8080: Flags [P.], seq 1:201, ack 1, length 200        (HTTP-запрос)
+12:00:01.001 IP B.8080 &gt; A.51008: Flags [.], ack 201, win 502
+12:00:09.340 IP B.8080 &gt; A.51008: Flags [P.], seq 1:1201, ack 201, length 1200     (HTTP-ответ)
+12:00:09.340 IP A.51008 &gt; B.8080: Flags [.], ack 1201</code></pre>
+<div class="mcq" data-ok="3"><p>Ответ пришёл через 8,3 секунды. Виновата ли сеть?</p><ul><li>Да, потери пакетов</li><li>Да, малое окно</li><li>Да, проблема MTU</li><li>Нет: запрос подтверждён за 1 мс, ретрансляций нет; 8 секунд сервер B формировал ответ — искать нужно в приложении</li></ul><div class="why">Самый частый и самый полезный результат анализа дампа — доказательство, что сеть ни при чём. Время между ACK запроса и первым байтом ответа — это время работы сервера.</div></div>
+
+<h2 id="wireshark"><span class="h-num">17.4</span>Wireshark: пять приёмов</h2>
+<div class="table-wrap"><table>
+<tr><th>Приём</th><th>Где</th><th>Что даёт</th></tr>
+<tr><td>Follow → TCP Stream</td><td>контекстное меню пакета</td><td>весь диалог одного соединения как текст</td></tr>
+<tr><td>Expert Information</td><td>Analyze</td><td>сводка: ретрансляции, дубли ACK, окно ноль, RST — с переходом к пакетам</td></tr>
+<tr><td>Столбец времени «с предыдущего пакета»</td><td>View → Time Display Format → Seconds Since Previous Displayed Packet</td><td>сразу видно, где пауза</td></tr>
+<tr><td>Conversations</td><td>Statistics</td><td>кто с кем, сколько байт и пакетов; сортировка по длительности</td></tr>
+<tr><td>Расшифровка TLS</td><td>переменная <code>SSLKEYLOGFILE</code> у клиента + Preferences → TLS → (Pre)-Master-Secret log</td><td>содержимое HTTPS для своих клиентов (браузер, curl; для JVM — агент jSSLKeyLog)</td></tr>
+</table></div>
+<div class="callout bad">Дамп содержит всё, что не зашифровано: токены, пароли, персональные данные. Снимайте с узким фильтром и ограничением размера (<code>-s 96</code> для заголовков, <code>-c</code> по числу пакетов), храните недолго, не выкладывайте в общие чаты.</div>
+
+<h2 id="quiz"><span class="h-num">17.5</span>Самопроверка</h2>
+<div class="quiz">
+<details class="q"><summary>Как по дампу отличить проблему сети от проблемы приложения?</summary><div class="a"><p>Сеть: SYN без ответа, ретрансляции, дубли ACK, потери, большие задержки между отправкой и ACK. Приложение: быстрые ACK при долгой паузе до ответа, окно ноль (не читает), RST после простоя или на закрытый сокет, FIN без ответного close. Время «ACK запроса → первый байт ответа» — время сервера.</p></div></details>
+<details class="q"><summary>Что означают SYN без ответа и SYN → RST?</summary><div class="a"><p>Без ответа — пакет не дошёл или отброшен (файрвол, security group, выключенный хост, переполненная очередь SYN). RST — дошёл до хоста, но порт закрыт. Первое даёт таймаут соединения, второе — мгновенный Connection refused.</p></div></details>
+<details class="q"><summary>Почему стоит снимать дамп с двух сторон?</summary><div class="a"><p>Чтобы определить, где теряется пакет: отправлен, но не получен — потеря на пути; получен, но без ответа — проблема на получателе. Плюс NAT и балансировщики меняют адреса, а задержку вносит конкретный участок.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

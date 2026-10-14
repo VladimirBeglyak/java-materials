@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · SSH, почта, время, VPN: протоколы вокруг сервиса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ПОД КАПОТОМ И ПРАКТИКА</div>
+  <h1>SSH, почта, время, VPN: протоколы вокруг сервиса</h1>
+  <p class="lead">HTTP — не единственный протокол в жизни бэкенд-разработчика. Вы каждый день заходите на серверы по SSH и пробрасываете порты, ваш сервис отправляет письма, которые попадают в спам, токены «истекают» из-за разъехавшихся часов, а доступ к базе идёт через VPN. Эта глава — рабочий минимум по каждому из этих протоколов: как устроен, что настраивать и что ломается.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">SSH-туннели</span><span class="tag">SPF · DKIM · DMARC</span><span class="tag">NTP</span><span class="tag">WireGuard</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="ssh"><span class="h-num">18.1</span>SSH</h2>
+<p>SSH даёт зашифрованный канал поверх TCP (порт 22), в котором мультиплексируются <b>каналы</b>: интерактивная оболочка, выполнение команды, передача файлов (SFTP), проброс TCP-портов.</p>
+<ol class="steps">
+  <li><b>Обмен ключами</b> (Диффи — Хеллман на эллиптической кривой) — общий секрет, из которого выводятся ключи шифрования.</li>
+  <li><b>Аутентификация сервера</b>: сервер подписывает обмен своим <b>host key</b>. Клиент сверяет ключ с <code>~/.ssh/known_hosts</code>. Первый раз — «The authenticity of host can't be established»: в этот момент вы принимаете ключ на веру (TOFU). Сообщение «REMOTE HOST IDENTIFICATION HAS CHANGED» — либо сервер переустановили, либо между вами кто-то стоит.</li>
+  <li><b>Аутентификация пользователя</b>: клиент доказывает владение закрытым ключом, подписывая данные сессии; сервер проверяет подпись открытым ключом из <code>~/.ssh/authorized_keys</code>. Закрытый ключ не покидает клиента.</li>
+</ol>
+<pre data-title="~/.ssh/config — один раз настроить, чтобы не писать длинные команды"><code class="txt">Host bastion
+    HostName bastion.shop.ru
+    User deploy
+    IdentityFile ~/.ssh/id_ed25519
+
+Host db-prod
+    HostName 10.2.3.40              # адрес во внутренней сети
+    ProxyJump bastion               # зайти через бастион одной командой: ssh db-prod
+    LocalForward 15432 localhost:5432
+    ServerAliveInterval 30          # keepalive: соединение не умрёт на NAT</code></pre>
+
+<div class="widget" id="shW">
+  <div class="widget-title">Конструктор SSH-туннеля</div>
+  <div class="controls"><label>задача<select id="shCase" style="max-width:100%">
+    <option value="L">подключиться с ноутбука к PostgreSQL во внутренней сети</option>
+    <option value="R">показать коллеге в интернете сервис, запущенный у меня на localhost:8080</option>
+    <option value="D">открывать в браузере внутренние сайты компании</option>
+    <option value="J">зайти на сервер, доступный только с бастиона</option>
+    <option value="A">с сервера клонировать приватный git-репозиторий своим ключом</option>
+  </select></label></div>
+  <div class="out" id="shCmd"></div>
+  <div class="flow" id="shFlow"></div>
+  <div class="verdict ok" id="shOut"></div>
+</div>
+<script>
+(function () {
+  var D = {
+    L: ["ssh -N -L 15432:10.2.3.40:5432 deploy@bastion.shop.ru\npsql -h localhost -p 15432 -U app shop", [["Ноутбук", "psql → localhost:15432"], ["SSH-канал", "зашифровано"], ["bastion", "sshd открывает TCP"], ["10.2.3.40:5432", "PostgreSQL"]], "Локальный проброс (-L): ssh слушает порт на ВАШЕЙ машине и переносит соединения на адрес, видимый с сервера. База видит подключение от бастиона. -N — не запускать оболочку."],
+    R: ["ssh -N -R 9000:localhost:8080 user@vps.example.com\n# коллега открывает http://vps.example.com:9000", [["Коллега", "→ vps:9000"], ["vps", "sshd слушает 9000"], ["SSH-канал", "инициирован ВАМИ изнутри"], ["Ноутбук", "localhost:8080"]], "Удалённый проброс (-R): порт открывается на СЕРВЕРЕ и ведёт к вам. Работает из-за NAT, потому что соединение исходящее. Чтобы порт слушал не только localhost сервера, нужен GatewayPorts yes в sshd_config."],
+    D: ["ssh -N -D 1080 deploy@bastion.shop.ru\n# браузер: SOCKS5-прокси localhost:1080 (и DNS через прокси)", [["Браузер", "SOCKS5 localhost:1080"], ["SSH-канал", "зашифровано"], ["bastion", "открывает соединения куда попросят"], ["любой внутренний сайт", ""]], "Динамический проброс (-D): ssh работает как SOCKS-прокси — адрес назначения выбирает приложение для каждого соединения. «VPN для бедных» без прав администратора."],
+    J: ["ssh -J deploy@bastion.shop.ru app@10.2.3.40\n# или ProxyJump bastion в ~/.ssh/config", [["Ноутбук", "ssh"], ["bastion", "только пересылает TCP"], ["10.2.3.40", "sshd"]], "ProxyJump: второе SSH-соединение устанавливается сквозь первое и шифруется от ноутбука до целевого сервера. Бастион не видит содержимое и не хранит ваш ключ — в отличие от «зайти на бастион и оттуда ssh дальше»."],
+    A: ["ssh -A deploy@build.shop.ru        # ForwardAgent\n# на сервере: git clone git@github.com:shop/private.git", [["Ноутбук", "ssh-agent с ключом"], ["SSH-канал", "запросы на подпись"], ["build", "git → github"]], "Проброс агента: сервер просит ваш локальный ssh-agent подписать запрос; закрытый ключ остаётся на ноутбуке. Риск: пока сессия открыта, root этого сервера может пользоваться вашим агентом. Включайте только для доверенных хостов; лучше ProxyJump или deploy-ключи."]
+  };
+  var s = document.getElementById("shCase");
+  function run() {
+    var d = D[s.value];
+    document.getElementById("shCmd").textContent = d[0];
+    document.getElementById("shFlow").innerHTML = d[1].map(function (n, i) { return (i ? '<span class="to">→</span>' : "") + '<div class="node ' + (/SSH-канал/.test(n[0]) ? "acc" : "") + '"><b>' + n[0] + "</b><small>" + n[1] + "</small></div>"; }).join("");
+    document.getElementById("shOut").textContent = d[2];
+  }
+  s.addEventListener("change", run); run();
+})();
+</script>
+<div class="callout ok"><span class="c-title">Гигиена SSH</span>
+Ключи Ed25519 с парольной фразой и ssh-agent; вход по паролю и вход root отключены (<code>PasswordAuthentication no</code>, <code>PermitRootLogin no</code>); доступ — через бастион или VPN, а не с открытым в интернет портом 22 на каждом сервере; для больших парков — короткоживущие сертификаты SSH вместо раздачи <code>authorized_keys</code>.</div>
+
+<h2 id="mail"><span class="h-num">18.2</span>Почта: почему письмо попало в спам</h2>
+<div class="flow">
+  <div class="node info"><b>Ваш сервис</b><small>SMTP submission :587 + STARTTLS + логин</small></div><span class="to">→</span>
+  <div class="node"><b>Почтовый сервис отправителя</b><small>подписывает DKIM</small></div><span class="to">→ DNS: MX получателя → SMTP :25 →</span>
+  <div class="node acc"><b>Сервер получателя</b><small>проверяет SPF, DKIM, DMARC, репутацию</small></div><span class="to">→</span>
+  <div class="node ok"><b>Ящик</b><small>IMAP/веб</small></div>
+</div>
+<p>SMTP 1982 года не проверяет отправителя: в поле <code>From</code> можно написать что угодно. Три DNS-механизма это исправляют, и без них письма крупным почтовым сервисам не доходят.</p>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Что проверяет</th><th>Запись DNS</th></tr>
+<tr><td>SPF</td><td>разрешено ли этому IP отправлять почту от имени домена из служебного адреса (envelope from)</td><td><code>shop.ru TXT "v=spf1 include:_spf.mailprovider.com -all"</code></td></tr>
+<tr><td>DKIM</td><td>подпись заголовков и тела письма ключом домена: письмо не изменено и отправлено владельцем ключа</td><td><code>s1._domainkey.shop.ru TXT "v=DKIM1; k=rsa; p=MIIB…"</code></td></tr>
+<tr><td>DMARC</td><td>совпадает ли домен в видимом <code>From</code> с доменом, прошедшим SPF или DKIM (alignment), и что делать при провале</td><td><code>_dmarc.shop.ru TXT "v=DMARC1; p=reject; rua=mailto:dmarc@shop.ru"</code></td></tr>
+</table></div>
+<div class="widget" id="emW">
+  <div class="widget-title">Симулятор проверки письма получателем</div>
+  <p class="hint">Письмо с видимым адресом <code>From: orders@shop.ru</code>.</p>
+  <div class="controls">
+    <label>SPF<select id="emSpf"><option value="pass">pass, домен shop.ru</option><option value="other">pass, но для домена mailprovider.com</option><option value="fail">fail — IP не в списке</option></select></label>
+    <label>DKIM<select id="emDkim"><option value="pass">подпись верна, d=shop.ru</option><option value="other">подпись верна, d=mailprovider.com</option><option value="fail">подписи нет или она неверна</option></select></label>
+    <label>политика DMARC<select id="emPol"><option value="reject">p=reject</option><option value="quarantine">p=quarantine</option><option value="none">p=none</option><option value="absent">записи нет</option></select></label>
+  </div>
+  <div class="verdict" id="emOut"></div>
+</div>
+<script>
+(function () {
+  var $ = function (i) { return document.getElementById(i); };
+  function run() {
+    var spf = $("emSpf").value, dkim = $("emDkim").value, pol = $("emPol").value, aligned = spf === "pass" || dkim === "pass", o = $("emOut"), cls, msg;
+    var why = "SPF " + (spf === "pass" ? "прошёл и совпал с доменом From" : (spf === "other" ? "прошёл, но для чужого домена — выравнивания нет" : "не прошёл")) + "; DKIM " + (dkim === "pass" ? "прошёл и совпал с доменом From" : (dkim === "other" ? "прошёл, но подписан чужим доменом — выравнивания нет" : "не прошёл")) + ". ";
+    if (aligned) { cls = "ok"; msg = why + "DMARC: PASS — достаточно одного выровненного механизма. Письмо принимается; дальше решают репутация домена и IP и содержимое." + (pol === "absent" ? " Но без записи DMARC крупные сервисы всё равно понижают доверие к массовым рассылкам." : ""); }
+    else if (pol === "reject") { cls = "bad"; msg = why + "DMARC: FAIL → p=reject: письмо отклонено на этапе SMTP (550). Отправитель получит отбойник. Типичная причина: подключили сервис рассылок и не настроили для него DKIM своим доменом."; }
+    else if (pol === "quarantine") { cls = "warn"; msg = why + "DMARC: FAIL → p=quarantine: письмо попадает в спам."; }
+    else if (pol === "none") { cls = "warn"; msg = why + "DMARC: FAIL → p=none: политика «только наблюдать». Письмо, вероятно, дойдёт (в спам или входящие — решит фильтр), а владелец домена получит отчёт. Этот режим — для этапа внедрения: собрать отчёты, найти все легитимные источники, затем ужесточить."; }
+    else { cls = "bad"; msg = why + "Записи DMARC нет: кто угодно может отправлять письма от имени shop.ru, а получатель не знает, как с ними поступать. Домен беззащитен перед фишингом, и крупные почтовые сервисы требуют DMARC от массовых отправителей."; }
+    o.className = "verdict " + cls; o.textContent = msg;
+  }
+  ["emSpf", "emDkim", "emPol"].forEach(function (i) { $(i).addEventListener("change", run); }); run();
+})();
+</script>
+<p>Практика для сервиса: отправляйте через почтового провайдера (API или SMTP на 587), а не напрямую со своих IP; настройте DKIM своим доменом; отделите транзакционные письма от рассылок поддоменами; обрабатывайте отбойники и жалобы — отправка на несуществующие адреса быстро убивает репутацию.</p>
+
+<h2 id="time"><span class="h-num">18.3</span>Время: NTP и почему оно важно</h2>
+<p>Кварцевые часы сервера уходят на секунды в сутки. NTP (UDP 123) периодически сверяется с серверами времени и вычисляет смещение с поправкой на сетевую задержку: клиент фиксирует четыре метки времени (отправка запроса, приём и отправка на сервере, приём ответа) и получает <code>offset = ((t2 − t1) + (t3 − t4)) / 2</code>.</p>
+<div class="table-wrap"><table>
+<tr><th>Что ломается при неверных часах</th><th>Симптом</th></tr>
+<tr><td>TLS</td><td><code>certificate is not yet valid</code> / <code>has expired</code> на исправном сертификате</td></tr>
+<tr><td>JWT и подписи запросов (AWS SigV4)</td><td>«token used before issued», «request time too skewed» — отсюда допуск (leeway) в проверке <code>exp</code>/<code>nbf</code></td></tr>
+<tr><td>TOTP-коды двухфакторной аутентификации</td><td>код «неверный» при расхождении больше 30 секунд</td></tr>
+<tr><td>Kerberos</td><td>отказ при расхождении больше 5 минут</td></tr>
+<tr><td>Логи и трейсы</td><td>события разных серверов в «невозможном» порядке</td></tr>
+<tr><td>Распределённые системы</td><td>«последняя запись побеждает» выбирает не ту запись; лизы и локи с TTL истекают не вовремя</td></tr>
+</table></div>
+<div class="grid-2">
+  <div class="card"><h4>Часы могут идти назад</h4><p>При коррекции NTP системное время может скачком уйти назад. Поэтому длительности измеряют монотонными часами (<code>System.nanoTime()</code>), а порядок событий в распределённой системе — логическими часами или версиями, а не метками времени.</p></div>
+  <div class="card"><h4>Проверка</h4><p><code>timedatectl</code> — «System clock synchronized: yes»; <code>chronyc tracking</code> — текущее смещение. В контейнере часы общие с хостом: настраивать NTP нужно на узле. Мониторинг смещения — обязательная метрика инфраструктуры.</p></div>
+</div>
+
+<h2 id="vpn"><span class="h-num">18.4</span>VPN</h2>
+<p>VPN создаёт виртуальный сетевой интерфейс (<code>tun0</code>, <code>wg0</code>). Пакет, отправленный в него, шифруется, заворачивается во внешний пакет (обычно UDP) и уходит на VPN-сервер, где разворачивается и попадает во внутреннюю сеть. Какие адреса идут в туннель, определяет таблица маршрутов (тема 03).</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>WireGuard</th><th>OpenVPN</th><th>IPsec (IKEv2)</th></tr>
+<tr><td>Транспорт</td><td>UDP</td><td>UDP или TCP</td><td>ESP / UDP 4500</td></tr>
+<tr><td>Модель</td><td>пары открытых ключей, у каждого пира список разрешённых адресов (AllowedIPs)</td><td>TLS с сертификатами, много настроек</td><td>сложное согласование, поддержка в ОС и сетевом оборудовании</td></tr>
+<tr><td>Код и скорость</td><td>~4 тыс. строк в ядре, быстрый</td><td>пользовательское пространство, медленнее</td><td>в ядре</td></tr>
+<tr><td>Особенность</td><td>нет состояния «подключён»: пир молчит, пока нет трафика; роуминг между сетями</td><td>работает через TCP 443 там, где UDP закрыт</td><td>стандарт для связи офисов и облаков (site-to-site)</td></tr>
+</table></div>
+<pre data-title="WireGuard: вся конфигурация клиента"><code class="txt">[Interface]
+PrivateKey = &lt;закрытый ключ клиента&gt;
+Address = 10.8.0.2/32
+DNS = 10.8.0.1
+
+[Peer]
+PublicKey = &lt;открытый ключ сервера&gt;
+Endpoint = vpn.shop.ru:51820
+AllowedIPs = 10.0.0.0/8            # split tunnel: в VPN идёт только корпоративная сеть;  0.0.0.0/0 — весь трафик
+PersistentKeepalive = 25           # держать запись NAT живой</code></pre>
+<div class="callout warn"><span class="c-title">Типичные проблемы VPN</span>
+<b>MTU</b>: заголовки туннеля отнимают 60–80 байт — большие пакеты не пролезают (тема 02); MTU интерфейса WireGuard обычно 1420. <b>Пересечение подсетей</b>: домашняя сеть 192.168.1.0/24 и такая же в офисе — пакеты уходят не туда. <b>DNS</b>: внутренние имена не разрешаются, если запросы идут не на корпоративный резолвер. <b>Split tunnel</b>: весь трафик в VPN — медленно, только корпоративные сети — нужно точно перечислить маршруты.
+</div>
+
+<h2 id="more"><span class="h-num">18.5</span>Что ещё встречается</h2>
+<div class="table-wrap"><table>
+<tr><th>Протокол</th><th>Назначение</th><th>Что знать бэкенд-разработчику</th></tr>
+<tr><td>HTTP CONNECT / SOCKS5</td><td>прокси для произвольного TCP</td><td>корпоративный прокси для исходящего трафика: переменные <code>HTTPS_PROXY</code>, <code>NO_PROXY</code>; JVM их не читает — нужны <code>-Dhttps.proxyHost</code> или настройка клиента</td></tr>
+<tr><td>PROXY protocol</td><td>передать исходный IP клиента через L4-балансировщик</td><td>строка-заголовок перед данными; обе стороны должны его ожидать, иначе «мусор» в начале соединения</td></tr>
+<tr><td>AMQP, MQTT, протокол Kafka</td><td>обмен сообщениями поверх TCP</td><td>долгие соединения: keepalive/heartbeat, таймауты простоя балансировщиков, перебалансировка при обрыве</td></tr>
+<tr><td>Протоколы БД (PostgreSQL wire, MySQL)</td><td>запросы и ответы поверх TCP, свой TLS</td><td>соединение с состоянием: пул, <code>sslmode=verify-full</code>, pgbouncer и подготовленные запросы</td></tr>
+<tr><td>STUN / TURN / ICE (WebRTC)</td><td>прямое соединение между клиентами за NAT</td><td>STUN узнаёт внешний адрес, TURN ретранслирует, когда напрямую нельзя</td></tr>
+<tr><td>LDAP, Kerberos</td><td>каталог и аутентификация в корпоративных сетях</td><td>зависимость от DNS и точного времени</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">18.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p><code>ssh -L 15432:10.2.3.40:5432 bastion</code> — где открывается порт 15432 и откуда идёт соединение к базе?</p><ul><li>Порт на бастионе, соединение с ноутбука</li><li>Порт на вашей машине; соединение к 10.2.3.40:5432 устанавливает бастион</li><li>Порт на сервере БД</li><li>Порт нигде не открывается</li></ul><div class="why">Локальный проброс: слушает клиент, целевой адрес разрешается и открывается на стороне сервера SSH.</div></div>
+<div class="mcq" data-ok="2"><p>Письма сервиса через провайдера рассылок отклоняются с «DMARC policy reject», хотя SPF проходит. Почему?</p><ul><li>Неверный MX</li><li>Закрыт порт 25</li><li>SPF проходит для домена провайдера, а не для домена в From; DKIM своим доменом не настроен — выравнивания нет</li><li>Письмо слишком большое</li></ul><div class="why">DMARC требует, чтобы SPF или DKIM прошёл именно для домена из видимого From.</div></div>
+<div class="mcq" data-ok="0"><p>JWT, только что выданный сервером авторизации, отклоняется сервисом как «ещё не действителен».</p><ul><li>Часы сервиса отстают от часов сервера авторизации; нужен NTP и допуск на расхождение</li><li>Неверная подпись</li><li>Токен слишком длинный</li><li>Ошибка DNS</li></ul><div class="why">Проверки iat/nbf/exp зависят от локального времени проверяющего.</div></div>
+<div class="mcq" data-ok="3"><p>Что означает AllowedIPs = 10.0.0.0/8 в конфигурации пира WireGuard на клиенте?</p><ul><li>Клиенту разрешено подключаться только из этой сети</li><li>Это адрес VPN-сервера</li><li>Это список заблокированных адресов</li><li>В туннель к этому пиру направляются пакеты для адресов 10.0.0.0/8 (и только от этих адресов принимаются) — остальной трафик идёт мимо VPN</li></ul><div class="why">AllowedIPs одновременно таблица маршрутов на отправку и фильтр на приём.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как SSH аутентифицирует сервер и пользователя?</summary><div class="a"><p>Сервер подписывает обмен ключами своим host key; клиент сверяет открытый ключ с known_hosts (при первом подключении принимает на веру). Пользователь подписывает данные сессии закрытым ключом; сервер проверяет подпись ключом из authorized_keys. Закрытые ключи сторон не передаются.</p></div></details>
+<details class="q"><summary>Что такое SPF, DKIM и DMARC?</summary><div class="a"><p>SPF — список IP, которым домен разрешает отправлять почту. DKIM — криптографическая подпись письма ключом домена. DMARC — политика домена: требует, чтобы SPF или DKIM прошёл для домена из From, и говорит получателю, что делать при провале (none, quarantine, reject), плюс отчёты.</p></div></details>
+<details class="q"><summary>Почему в распределённой системе нельзя упорядочивать события по времени серверов?</summary><div class="a"><p>Часы расходятся на миллисекунды–секунды, корректируются скачками и могут идти назад. Событие с «более поздней» меткой могло произойти раньше. Используют логические часы, версии, номера в журнале или сервис с единым порядком.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

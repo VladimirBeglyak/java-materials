@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Lock-free структуры: CLQ и SkipList</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.ms { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 10px 0; font: 12.5px var(--font-mono); }
+.ms span { padding: 7px 10px; border: 1.5px solid var(--line); border-radius: 6px; background: var(--bg-sunk); position: relative; }
+.ms span.h { border-color: var(--ok); } .ms span.t { box-shadow: inset 0 -3px 0 var(--accent); } .ms span.new { background: var(--accent-soft); border-color: var(--accent); }
+.sl { font: 12px var(--font-mono); margin: 10px 0; overflow-x: auto; }
+.sl .row { display: flex; gap: 3px; margin-bottom: 3px; align-items: center; }
+.sl .row b { width: 54px; flex: none; color: var(--fg-muted); font-weight: 400; }
+.sl .row span { width: 36px; flex: none; text-align: center; padding: 5px 0; border-radius: 4px; }
+.sl .row span.n { border: 1.5px solid var(--line); background: var(--bg-sunk); } .sl .row span.p { background: var(--accent-soft); border-color: var(--accent); } .sl .row span.f { background: var(--ok-soft); border-color: var(--ok); }
+</style>
+</head>
+<body data-page="21">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · ОЧЕРЕДИ И СТРУКТУРЫ</div>
+  <h1>Lock-free структуры: CLQ и SkipList</h1>
+  <p class="lead">Неблокирующие структуры обходятся без блокировок вообще: каждое изменение — один или несколько CAS, а потоки, заставшие операцию другого незавершённой, <b>помогают</b> её закончить. Разберём по шагам очередь Майкла–Скотта (основа <code>ConcurrentLinkedQueue</code>) с её «отстающим» хвостом и список с пропусками (<code>ConcurrentSkipListMap</code>) — упорядоченную конкурентную карту без деревьев и поворотов.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">lock-free</span><span class="tag">очередь Майкла–Скотта</span><span class="tag">помощь</span><span class="tag">skip list</span><span class="tag">вероятностная балансировка</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="progress"><span class="h-num">21.1</span>Гарантии прогресса</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Гарантия</th><th>Пример</th></tr>
+<tr><td>Блокирующий</td><td>остановка потока-владельца (вытеснение, page fault, сбой) может остановить всех</td><td>ReentrantLock, synchronized</td></tr>
+<tr><td>Lock-free</td><td>в любой момент <b>хотя бы один</b> поток продвигается; отдельный поток может повторять CAS бесконечно (теоретически)</td><td>ConcurrentLinkedQueue, AtomicInteger.updateAndGet, стек Трайбера</td></tr>
+<tr><td>Wait-free</td><td><b>каждый</b> поток завершает операцию за ограниченное число шагов</td><td>getAndIncrement на x86 (lock xadd), чтение volatile</td></tr>
+</table></div>
+
+<h2 id="ms"><span class="h-num">21.2</span>Очередь Майкла–Скотта</h2>
+<pre data-title="суть offer (ConcurrentLinkedQueue, упрощённо)"><code class="java">public boolean offer(E e) {
+    Node&lt;E&gt; newNode = new Node&lt;&gt;(e);
+    for (Node&lt;E&gt; t = tail, p = t;;) {
+        Node&lt;E&gt; q = p.next;
+        if (q == null) {                                   // p — последний узел
+            if (NEXT.compareAndSet(p, null, newNode)) {    // CAS №1: прицепить узел — ТОЧКА ЛИНЕАРИЗАЦИИ
+                if (p != t) TAIL.weakCompareAndSet(this, t, newNode);   // CAS №2: подвинуть tail (может не удаться — не страшно)
+                return true;
+            }
+        } else p = (p != t &amp;&amp; t != (t = tail)) ? t : q;    // tail отстаёт → идём вперёд (помогаем)
+    }
+}</code></pre>
+<div class="widget stepper" id="msSim">
+  <div class="widget-title">Два потока одновременно делают offer</div>
+  <div class="lanes st-stage">
+    <div class="lane"><h5>Очередь</h5><div class="items"><span class="chip" id="m0">head → [A] → [B]·tail</span><span class="chip off" id="m1">… [B] → [C]</span><span class="chip off" id="m2">… [C] → [D]</span></div></div>
+    <div class="lane"><h5>Поток 1: offer(C)</h5><div class="items"><span class="chip" id="m3">t = tail = B</span></div></div>
+    <div class="lane"><h5>Поток 2: offer(D)</h5><div class="items"><span class="chip off" id="m4">t = tail = B</span></div></div>
+  </div>
+  <section class="st-step" data-t="Оба читают tail" data-hl="m0 m3 m4" data-log="T1 и T2: t = tail (B), B.next == null"><p>Оба потока видят, что B — последний узел.</p></section>
+  <section class="st-step" data-t="T1 выигрывает CAS №1" data-hl="m1 m3" data-log="T1: CAS(B.next, null, C) ✔ — C в очереди; tail ещё указывает на B"><p>T1 успешно прицепил C к B. С этого момента C логически в очереди — даже если tail пока не сдвинут.</p></section>
+  <section class="st-step" data-t="T2 проигрывает" data-hl="m4" data-log="T2: CAS(B.next, null, D) ✘ — B.next уже C; T2 видит, что tail отстаёт, и идёт к C"><p>CAS T2 провалился: B.next уже не null. T2 не ждёт T1 — он просто переходит по ссылке к C (tail «отстаёт» на один узел).</p></section>
+  <section class="st-step" data-t="T2 добавляет D" data-hl="m2 m4" data-log="T2: CAS(C.next, null, D) ✔; CAS(tail, B, D) — помогает передвинуть хвост"><p>T2 прицепляет D к C и двигает tail (через узел). Если бы T1 «умер» после CAS №1, другие потоки всё равно продвигали бы tail — никто не ждёт никого.</p></section>
+  <section class="st-step" data-t="Итог" data-hl="m0 m1 m2" data-log="очередь A → B → C → D; tail может отставать до 2 узлов — оптимизация JDK: двигать tail через раз"><p>Порядок сохранён, блокировок не было. В JDK tail и head намеренно сдвигаются не на каждой операции (реже CAS по горячим полям), а удалённые узлы «самоссылаются» для быстрой помощи GC. Цена — <code>size()</code> обходит всю очередь (O(n)), итераторы слабо согласованы.</p></section>
+</div>
+
+<h2 id="skiplist"><span class="h-num">21.3</span>Список с пропусками</h2>
+<p>Упорядоченный связный список, над которым надстроены «экспресс-полосы»: каждый узел с вероятностью 1/2 получает уровень 1, с 1/4 — уровень 2 и т. д. Поиск спускается сверху: по верхнему уровню — большими прыжками, затем ниже. В среднем O(log n), без поворотов: вставка меняет только соседние ссылки — поэтому его легко сделать неблокирующим на CAS (в отличие от красно-чёрного дерева).</p>
+<div class="widget" id="slW">
+  <div class="widget-title">ConcurrentSkipListMap: поиск ключа</div>
+  <div class="controls"><label>ключ<input type="number" id="slK" value="47"></label><button class="btn" type="button" id="slNew">Перестроить уровни</button></div>
+  <div class="sl" id="slView"></div>
+  <div class="out" id="slOut"></div>
+</div>
+<script>
+(function () {
+  var KEYS = [3, 8, 12, 19, 23, 30, 36, 41, 47, 52, 58, 64, 71, 77, 85, 92], $ = function (i) { return document.getElementById(i); }, lv;
+  function build() { lv = KEYS.map(function () { var l = 1; while (Math.random() < 0.5 && l < 4) l++; return l; }); run(); }
+  function run() {
+    var k = +$("slK").value, path = {}, steps = 0, i = -1, log = [];
+    for (var level = 4; level >= 1; level--) {
+      while (true) { var j = i + 1; while (j < KEYS.length && lv[j] < level) j++; if (j < KEYS.length && KEYS[j] <= k) { i = j; steps++; path[level + ":" + i] = 1; } else break; }
+      steps++; log.push("уровень " + level + ": остановились на " + (i < 0 ? "голове" : KEYS[i]));
+    }
+    var found = i >= 0 && KEYS[i] === k, h = "";
+    for (var L = 4; L >= 1; L--) { h += '<div class="row"><b>ур. ' + L + "</b>"; KEYS.forEach(function (key, idx) { h += lv[idx] >= L ? '<span class="n' + (path[L + ":" + idx] ? (found && idx === i ? " f" : " p") : "") + '">' + key + "</span>" : "<span></span>"; }); h += "</div>"; }
+    $("slView").innerHTML = h;
+    $("slOut").textContent = log.join("\n") + "\n" + (found ? "найден " + k : "не найден; floorKey = " + (i >= 0 ? KEYS[i] : "null")) + " за " + steps + " шагов (линейный поиск в списке — до " + KEYS.length + ")";
+  }
+  $("slK").addEventListener("input", run); $("slNew").addEventListener("click", build); build();
+})();
+</script>
+<div class="table-wrap"><table>
+<tr><th></th><th>TreeMap + блокировка</th><th>ConcurrentSkipListMap</th></tr>
+<tr><td>Конкурентность</td><td>одна блокировка на всю карту</td><td>неблокирующие CAS, читатели не ждут</td></tr>
+<tr><td>Сложность</td><td>O(log n) гарантированно</td><td>O(log n) в среднем</td></tr>
+<tr><td>Память</td><td>~40 Б узел</td><td>узел + индексные узлы (в среднем ещё ~1 на элемент)</td></tr>
+<tr><td>size()</td><td>O(1)</td><td>быстрый счётчик на LongAdder (в современных JDK), но при конкурентных изменениях — лишь оценка; у ConcurrentLinkedQueue size() — обход O(n)</td></tr>
+<tr><td>Навигационный API</td><td>NavigableMap</td><td>ConcurrentNavigableMap — тот же, со слабо согласованными представлениями</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">21.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что значит «lock-free»?</p><ul><li>Каждый поток завершает операцию за ограниченное число шагов</li><li>Система в целом всегда продвигается: хотя бы один поток завершает операцию, даже если другие остановлены</li><li>Нет синхронизации вообще</li><li>Используется только volatile</li></ul><div class="why">Каждый поток — это уже wait-free.</div></div>
+<div class="mcq" data-ok="3"><p>Почему в очереди Майкла–Скотта tail может отставать от реального последнего узла?</p><ul><li>Это ошибка</li><li>Из-за GC</li><li>Так задумано для FIFO</li><li>Добавление узла и сдвиг tail — два разных CAS; любой поток, заметивший отставание, помогает сдвинуть tail</li></ul><div class="why">Точка линеаризации — CAS next.</div></div>
+<div class="mcq" data-ok="0"><p>Почему ConcurrentSkipListMap, а не конкурентное красно-чёрное дерево?</p><ul><li>Вставка в список с пропусками меняет только соседние ссылки и хорошо ложится на CAS; балансировка дерева поворотами затрагивает много узлов сразу</li><li>Skip list всегда быстрее дерева</li><li>Деревья не поддерживают порядок</li><li>Так исторически сложилось</li></ul><div class="why">Вероятностная балансировка — локальная.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему lock-free структуры не всегда быстрее блокировок?</summary><div class="a"><p>При сильной конкуренции CAS проваливаются и повторяются, кэш-линии горячих полей (head, tail) «пинг-понгом» гоняются между ядрами, а помощь чужим операциям добавляет работы. Блокировка при высокой конкуренции может быть эффективнее: потоки засыпают, а не крутятся. Выигрыш lock-free — в отсутствии взаимных блокировок, инверсии приоритетов и в устойчивости к вытеснению потоков, а также в низкой задержке при умеренной конкуренции.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>
