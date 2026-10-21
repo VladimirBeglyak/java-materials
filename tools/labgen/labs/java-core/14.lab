@@ -1,0 +1,120 @@
+@chapter 14 | quiz
+@intro
+<p>Три эксперимента с памятью на уровне Java-разработчика: где живут переменные и объекты, как выглядит работа сборщика в логе и как найти утечку на работающем процессе. Глубже — в пособии <a href="../jvm/index.html">JVM изнутри</a> (темы 9–15). Модуль IDEA — <code>ch14</code>.</p>
+@end
+
+@lab 14.1 | Стек и куча: две разные ошибки | 15 мин
+@goal
+<p>Переполнить стек рекурсией и кучу объектами и сравнить, от чего зависит каждая ошибка.</p>
+@end
+@file StackHeap.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class StackHeap {
+    static int depth = 0;
+    static void recurse() { depth++; recurse(); }
+
+    public static void main(String[] args) {
+        try { recurse(); }
+        catch (StackOverflowError e) { System.out.println("StackOverflowError на глубине " + depth); }
+
+        List<int[]> hog = new ArrayList<>();
+        try {
+            while (true) hog.add(new int[1_000_000]);
+        } catch (OutOfMemoryError e) {
+            int mb = hog.size() * 4;
+            hog = null;                                    // освобождаем, чтобы было на что печатать
+            System.out.println("OutOfMemoryError после ~" + mb + " МБ: " + e.getMessage());
+        }
+    }
+}
+@end
+@ide VM options: <code>-Xmx128m -Xss512k</code>
+@run
+javac StackHeap.java
+java -Xmx128m -Xss512k StackHeap
+@end
+@predict Что изменится при <code>-Xmx256m -Xss2m</code>?
+@answer
+<p>Глубина рекурсии вырастет в 4–5 раз (стек потока в 4 раза больше), объём до OOM — примерно вдвое. Локальные переменные и кадры вызовов живут в стеке своего потока (<code>-Xss</code>), объекты — в общей куче (<code>-Xmx</code>). Ловить <code>OutOfMemoryError</code> в реальном коде почти всегда бессмысленно — здесь это только для демонстрации.</p>
+@end
+@run
+java -Xmx256m -Xss2m StackHeap
+@end
+
+@lab 14.2 | Сборщик за работой: читаем лог | 15 мин
+@goal
+<p>Включить лог GC и увидеть, что короткоживущий мусор убирается быстро и дёшево.</p>
+@end
+@file Churn.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Churn {
+    public static void main(String[] args) {
+        List<String> keep = new ArrayList<>();
+        for (int i = 0; i < 3_000_000; i++) {
+            String tmp = "запрос-" + i;                    // мусор сразу после итерации
+            if (i % 1000 == 0) keep.add(tmp);              // 0,1% живёт долго
+        }
+        System.out.println("сохранено: " + keep.size());
+    }
+}
+@end
+@ide VM options: <code>-Xmx256m -Xlog:gc</code>
+@run
+javac Churn.java
+java -Xmx256m -Xlog:gc Churn
+@end
+@predict Сколько длится одна пауза и сколько памяти остаётся после каждой сборки?
+@answer
+<p>Паузы — доли миллисекунды или единицы мс, «после» (число справа от стрелки) — единицы МБ. Молодая сборка копирует только живые объекты, а их почти нет: стоимость сборки пропорциональна живым данным, а не мусору. Поэтому в Java дёшево создавать много короткоживущих объектов.</p>
+@end
+
+@lab 14.3 | Утечка памяти в «кэше» и её поиск | 20 мин
+@goal
+<p>Найти утечку на работающем процессе гистограммой классов.</p>
+@end
+@file Leak.java
+import java.util.HashMap;
+import java.util.Map;
+
+public class Leak {
+    record Session(String user, byte[] data) { }
+    static final Map<String, Session> SESSIONS = new HashMap<>();   // никто не удаляет
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        for (int i = 0; ; i++) {
+            SESSIONS.put("s" + i, new Session("user" + i, new byte[512]));
+            if (i % 100 == 0) Thread.sleep(10);
+        }
+    }
+}
+@end
+@exec
+javac Leak.java
+(java -Xmx512m Leak > leak.out 2>&1 &)
+sleep 4
+@end
+@step Запустите <code>Leak</code> и в терминале снимите гистограмму живых объектов дважды с паузой:
+@run head=9
+jcmd <pid> GC.class_histogram ||| P=$(jcmd | grep " Leak" | cut -d' ' -f1); jcmd $P GC.class_histogram | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+sleep 4
+@end
+@run head=9
+jcmd <pid> GC.class_histogram ||| P=$(jcmd | grep " Leak" | cut -d' ' -f1); jcmd $P GC.class_histogram | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+P=$(jcmd | grep " Leak" | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@predict По каким строкам видно, что утекают именно сессии?
+@answer
+<p>Между снимками растёт число <code>Leak$Session</code>, <code>[B</code> (byte[] данных и строк), <code>java.lang.String</code> и <code>java.util.HashMap$Node</code> — примерно на одинаковую величину. Совпадение счётчиков Session и HashMap$Node подсказывает: объекты держит карта. Дальше — дамп кучи (<code>jcmd &lt;pid&gt; GC.heap_dump file.hprof</code>) и путь к GC root: <code>Leak.SESSIONS</code>.</p>
+@end
+@try
+Почини утечку, ограничив размер «кэша» через LinkedHashMap с <code>removeEldestEntry</code> (лаба 9.3), и повтори гистограммы. ::: Числа Session стабилизируются на пределе кэша — так выглядит здоровый ограниченный кэш.
+@end

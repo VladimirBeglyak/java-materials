@@ -30,7 +30,7 @@
   <div class="kicker">ТЕМА 02 · ПЛАТФОРМА И БАЙТКОД</div>
   <h1>Формат class-файла</h1>
   <p class="lead">Class-файл — единственное, что JVM знает о вашем коде. Ни исходников, ни импортов, ни имён локальных переменных (без отладочной информации) там нет: только пул констант, описания полей и методов, байткод и атрибуты. Разберём настоящий class-файл в 401 байт побайтово: щёлкайте по структурам и байтам — увидите, как JVM читает каждый из них.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">magic и версия</span><span class="tag">constant pool</span><span class="tag">дескрипторы</span><span class="tag">атрибуты</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">magic и версия</span><span class="tag">constant pool</span><span class="tag">дескрипторы</span><span class="tag">атрибуты</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -218,7 +218,260 @@ javap -v Hello.class             # всё: пул констант, флаги, 
 javap -c -p java.lang.String     # классы JDK тоже можно смотреть
 # программно: java.lang.classfile (Class-File API, финальный в Java 24), ASM, Byte Buddy</code></pre>
 
-<h2 id="quiz"><span class="h-num">2.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">2.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Class-файл — обычный двоичный файл, и его можно прочитать самому. В этих лабораторных вы напишете крошечный парсер заголовка, найдёте в пуле констант то, что «спрятал» javac, научитесь читать дескрипторы и увидите, какие атрибуты зависят от флагов компиляции. Модуль IDEA — <code>ch02</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-2.1">
+<div class="lab-head"><span class="lab-num">Лаба 2.1</span><b>Читаем заголовок class-файла своим кодом</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что class-файл начинается с <code>CAFEBABE</code>, номер версии определяет минимальную JVM, а <code>javac --release</code> меняет эту версию.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Класс-«подопытный»:</div>
+<pre data-title="Point.java"><code class="java">public class Point {
+    static final int ORIGIN = 0;
+    private final int x, y;
+
+    public Point(int x, int y) { this.x = x; this.y = y; }
+
+    public int dist2() { return x * x + y * y; }
+
+    @Override
+    public String toString() { return "Point(" + x + ", " + y + ")"; }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Мини-парсер: читает первые поля структуры <code>ClassFile</code> из спецификации JVMS §4.1:</div>
+<pre data-title="ClassHeader.java"><code class="java">import java.io.DataInputStream;
+import java.io.FileInputStream;
+
+public class ClassHeader {
+    public static void main(String[] args) throws Exception {
+        try (var in = new DataInputStream(new FileInputStream(args[0]))) {
+            int magic = in.readInt();
+            int minor = in.readUnsignedShort();
+            int major = in.readUnsignedShort();
+            int cpCount = in.readUnsignedShort();
+            System.out.printf("magic         = %X%n", magic);
+            System.out.printf("version       = %d.%d  (Java %d)%n", major, minor, major - 44);
+            System.out.printf("constant_pool = %d записей (индексы 1..%d)%n", cpCount, cpCount - 1);
+        }
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>Program arguments: <code>out/production/ch02/Point.class</code> (относительно корня проекта). Или из терминала — команды ниже.</p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Point.java ClassHeader.java
+java ClassHeader Point.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">magic         = CAFEBABE
+version       = 69.0  (Java 25)
+constant_pool = 47 записей (индексы 1..46)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Скомпилируем <code>Point</code> для Java 8: <code>javac --release 8 Point.java</code>. Что изменится в заголовке?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac --release 8 Point.java
+java ClassHeader Point.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">warning: [options] source value 8 is obsolete and will be removed in a future release
+warning: [options] target value 8 is obsolete and will be removed in a future release
+warning: [options] To suppress warnings about obsolete options, use -Xlint:-options.
+3 warnings
+magic         = CAFEBABE
+version       = 52.0  (Java 8)
+constant_pool = 46 записей (индексы 1..45)</code></pre></details>
+<div class="lab-ans" hidden><p><code>version = 52.0 (Java 8)</code>: major version = номер Java + 44. Пул констант тоже станет другим: для Java 8 javac собирает строку в <code>toString</code> через <code>StringBuilder</code>, а не через <code>invokedynamic</code>, — в пуле появятся ссылки на методы <code>StringBuilder</code> вместо <code>StringConcatFactory</code>. Предупреждения «source value 8 is obsolete» — JDK напоминает, что поддержку компиляции под Java 8 скоро уберут.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сверьтесь со стандартным инструментом (сейчас <code>Point.class</code> собран под Java 8):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -v Point.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Classfile /Point.class
+  Last modified Oct 21, 2026; size 659 bytes
+  SHA-256 checksum 44be82625ed21f8028980340febe30ff1a0aeb2320ae64a7e3648436cf7ddd78
+  Compiled from "Point.java"
+public class Point
+  minor version: 0
+  major version: 52
+  flags: (0x0021) ACC_PUBLIC, ACC_SUPER
+…</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Скомпилируйте <code>Point</code> под Java 25 (просто <code>javac Point.java</code>) и попробуйте загрузить его на JDK 21 (если он у вас есть). Что произойдёт?</div>
+<details class="lab-out"><summary>Вывод</summary><pre><code class="txt">Error: LinkageError occurred while loading main class Point
+	java.lang.UnsupportedClassVersionError: Point has been compiled by a more recent version of the Java Runtime (class file version 69.0), this version of the Java Runtime only recognizes class file versions up to 65.0</code></pre></details>
+<div class="lab-ans" hidden><p><code>UnsupportedClassVersionError</code>: «class file version 69.0, this version of the Java Runtime only recognizes class file versions up to 65.0». Старая JVM не знает новых версий формата и отказывается даже начинать разбор. Обратная ситуация (старый class на новой JVM) работает всегда.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему <code>--release 8</code> лучше, чем старое <code>-source 8 -target 8</code>?</summary><div><code>--release</code> ещё и проверяет API: компилятор подставляет сигнатуры стандартной библиотеки Java 8 и не даст вызвать, например, <code>List.of</code>, которого там нет. С <code>-target</code> код скомпилируется и упадёт <code>NoSuchMethodError</code> уже на Java 8.</div></details></li>
+<li><details><summary>Допишите в парсер чтение <code>access_flags</code>, <code>this_class</code> и <code>super_class</code>. Почему просто так не получится?</summary><div>Они идут после пула констант, а записи пула имеют разную длину (тег определяет формат). Придётся разобрать пул целиком: 1 — Utf8 (u2 длина + байты), 7 — Class (u2), 10 — Methodref (u2+u2), 3/4 — Integer/Float (u4), 5/6 — Long/Double (u8 и занимают ДВА индекса) и т. д.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-2.2">
+<div class="lab-head"><span class="lab-num">Лаба 2.2</span><b>Пул констант: что туда кладёт javac</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в пуле констант строки, числа и символические ссылки и понять, когда константа попадает в пул, а когда «вшивается» прямо в инструкцию.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Класс с разными видами констант:</div>
+<pre data-title="Consts.java"><code class="java">public class Consts {
+    static final int SMALL = 100;
+    static final int BIG = 100_000;
+    static final String HELLO = "hello";
+
+    static int calc(int a) {
+        return a * 7 + 40_000 + 1_000_000;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(HELLO + calc(SMALL) + BIG);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Consts.java
+javap -v -p Consts.class | findstr "Integer String Methodref Fieldref InvokeDynamic ConstantValue"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">   #1 = Methodref          #2.#3          // java/lang/Object."&lt;init&gt;":()V
+   #7 = Integer            40000
+   #8 = Integer            1000000
+   #9 = Fieldref           #10.#11        // java/lang/System.out:Ljava/io/PrintStream;
+  #17 = Methodref          #15.#18        // Consts.calc:(I)I
+  #21 = InvokeDynamic      #0:#22         // #0:makeConcatWithConstants:(I)Ljava/lang/String;
+  #25 = Methodref          #26.#27        // java/io/PrintStream.println:(Ljava/lang/String;)V
+  #33 = Utf8               ConstantValue
+  #34 = Integer            100
+  #36 = Integer            100000
+  #39 = String             #40            // hello
+  #48 = String             #49            // hello\u0001100000
+  #51 = Methodref          #52.#53        // java/lang/invoke/StringConcatFactory.makeConcatWithConstants:(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;
+    ConstantValue: int 100
+    ConstantValue: int 100000
+    ConstantValue: String hello</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько записей <code>Integer</code> окажется в пуле и почему именно таких? Посмотрите заодно на байткод <code>calc</code>: <code>javap -c Consts</code>.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -c Consts.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  static int calc(int);
+         1: bipush        7
+         3: imul
+         4: ldc           #7                  // int 40000
+         6: iadd
+         7: ldc           #8                  // int 1000000
+         9: iadd
+        10: ireturn
+         3: bipush        100
+         5: invokestatic  #17                 // Method calc:(I)I</code></pre></details>
+<div class="lab-ans" hidden><p>Числа 7 и 100 помещаются в инструкцию (<code>bipush</code> — байт, <code>sipush</code> — до 32767), поэтому в пул не попадают как операнды кода. 40 000 и 1 000 000 не влезают в <code>short</code> — для них <code>ldc</code> и записи <code>Integer</code> в пуле. Отдельно в пуле есть <code>Integer 100</code> и <code>Integer 100000</code> — это значения атрибутов <code>ConstantValue</code> у полей SMALL и BIG. А в <code>main</code> выражение <code>HELLO + calc(SMALL) + BIG</code> использует уже подставленные константы: <code>bipush 100</code> и строку «…100000» в рецепте конкатенации.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите, как javac «свернул» константы в <code>main</code>: число <code>BIG</code> стало частью строки-рецепта для <code>invokedynamic</code>:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -c -v Consts.class | findstr /C:"invokedynamic" /C:"\u0001"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  #48 = String             #49            // hello\u0001100000
+  #49 = Utf8               hello\u0001100000
+         8: invokedynamic #21,  0             // InvokeDynamic #0:makeConcatWithConstants:(I)Ljava/lang/String;
+      #48 hello\u0001100000</code></pre></details>
+<p class="lab-note">Символ <code>\u0001</code> в рецепте — место для динамического аргумента (результат <code>calc</code>), остальное — константный текст: <code>"hello" + ? + "100000"</code>.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>final</code> у <code>BIG</code> и снова посмотрите на <code>main</code>.</summary><div>Теперь это обычное статическое поле: появится <code>getstatic Consts.BIG</code>, а в рецепте конкатенации — второй <code>\u0001</code>. Константа времени компиляции — только <code>static final</code> примитив или String, инициализированный константным выражением.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-2.3">
+<div class="lab-head"><span class="lab-num">Лаба 2.3</span><b>Дескрипторы и Signature: что остаётся от generics</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Научиться читать дескрипторы методов и увидеть, где хранится информация о параметрах типов, которую «стирает» компилятор.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Descr.java</code>:</div>
+<pre data-title="Descr.java"><code class="java">import java.util.List;
+import java.util.Map;
+
+public class Descr {
+    void a() {}
+    int b(long x, double y) { return 0; }
+    String[] c(Map&lt;String, List&lt;Integer&gt;&gt; m, int[][] grid) { return null; }
+    &lt;T extends Comparable&lt;T&gt;&gt; T max(List&lt;? extends T&gt; xs) { return null; }
+    static boolean d(char c, byte b, short s, float f, Object o) { return true; }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запишите дескриптор каждого метода, прежде чем запускать <code>javap -s</code>. Особенно <code>c</code> и <code>max</code>.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Descr.java
+javap -s -p Descr.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Compiled from "Descr.java"
+public class Descr {
+  public Descr();
+    descriptor: ()V
+
+  void a();
+    descriptor: ()V
+
+  int b(long, double);
+    descriptor: (JD)I
+
+  java.lang.String[] c(java.util.Map&lt;java.lang.String, java.util.List&lt;java.lang.Integer&gt;&gt;, int[][]);
+    descriptor: (Ljava/util/Map;[[I)[Ljava/lang/String;
+
+  &lt;T extends java.lang.Comparable&lt;T&gt;&gt; T max(java.util.List&lt;? extends T&gt;);
+    descriptor: (Ljava/util/List;)Ljava/lang/Comparable;
+
+  static boolean d(char, byte, short, float, java.lang.Object);
+    descriptor: (CBSFLjava/lang/Object;)Z
+}</code></pre></details>
+<div class="lab-ans" hidden><p><code>a: ()V</code>, <code>b: (JD)I</code>, <code>c: (Ljava/util/Map;[[I)[Ljava/lang/String;</code>, <code>max: (Ljava/util/List;)Ljava/lang/Comparable;</code> — тип <code>T</code> стёрт до своей границы <code>Comparable</code>, <code>d: (CBSFLjava/lang/Object;)Z</code>. Буквы: J — long, Z — boolean, L…; — класс, [ — массив.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Где же generics? В атрибуте <code>Signature</code> — его читает компилятор и рефлексия, но не JVM при выполнении:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -v -p Descr.class | findstr Signature</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">    Signature: #17                          // (Ljava/util/Map&lt;Ljava/lang/String;Ljava/util/List&lt;Ljava/lang/Integer;&gt;;&gt;;[[I)[Ljava/lang/String;
+    Signature: #20                          // &lt;T::Ljava/lang/Comparable&lt;TT;&gt;;&gt;(Ljava/util/List&lt;+TT;&gt;;)TT;</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Напишите <code>Descr.class.getDeclaredMethod("c", Map.class, int[][].class).getGenericParameterTypes()</code> в jshell или в main. Что выведется?</summary><div><code>[java.util.Map&lt;java.lang.String, java.util.List&lt;java.lang.Integer&gt;&gt;, class [[I]</code> — рефлексия берёт полные типы из атрибута Signature. Поэтому Jackson и Spring умеют узнать тип элементов у поля <code>List&lt;Order&gt;</code>, но не у локальной переменной: у локальных переменных Signature хранится только в отладочной LocalVariableTypeTable.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-2.4">
+<div class="lab-head"><span class="lab-num">Лаба 2.4</span><b>Атрибуты отладки: откуда берутся номера строк</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что номера строк в стектрейсе и имена параметров — это необязательные атрибуты, зависящие от флагов <code>javac</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Boom.java</code>:</div>
+<pre data-title="Boom.java"><code class="java">public class Boom {
+    static int divide(int numerator, int denominator) {
+        return numerator / denominator;
+    }
+
+    public static void main(String[] args) throws Exception {
+        var m = Boom.class.getDeclaredMethod("divide", int.class, int.class);
+        for (var p : m.getParameters()) System.out.println("параметр: " + p.getName());
+        divide(1, 0);
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Обычная компиляция:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Boom.java
+java Boom</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">параметр: arg0
+параметр: arg1
+Exception in thread "main" java.lang.ArithmeticException: / by zero
+	at Boom.divide(Boom.java:3)
+	at Boom.main(Boom.java:9)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Скомпилируем с <code>javac -g:none</code> (без отладочной информации). Что изменится в стектрейсе?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -g:none Boom.java
+java Boom</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">параметр: arg0
+параметр: arg1
+Exception in thread "main" java.lang.ArithmeticException: / by zero
+	at Boom.divide(Unknown Source)
+	at Boom.main(Unknown Source)</code></pre></details>
+<div class="lab-ans" hidden><p>Вместо <code>Boom.java:3</code> будет <code>Unknown Source</code>: исчез атрибут <code>LineNumberTable</code> (и <code>SourceFile</code>). JVM знает только смещение инструкции в байткоде, а сопоставить его со строкой исходника нечем.</p></div>
+</li>
+<li class="lab-step predict"><div class="lab-text">А как получить настоящие имена параметров <code>numerator</code>, <code>denominator</code> вместо <code>arg0</code>, <code>arg1</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -parameters Boom.java
+java Boom
+javap -v Boom.class | findstr /C:"MethodParameters" /C:"LineNumberTable"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">параметр: numerator
+параметр: denominator
+Exception in thread "main" java.lang.ArithmeticException: / by zero
+	at Boom.divide(Boom.java:3)
+	at Boom.main(Boom.java:9)
+      LineNumberTable:
+      LineNumberTable:
+    MethodParameters:
+      LineNumberTable:
+    MethodParameters:</code></pre></details>
+<div class="lab-ans" hidden><p>Флаг <code>javac -parameters</code> добавляет атрибут <code>MethodParameters</code>. Его используют Spring (<code>@PathVariable</code> без имени), Jackson-модуль parameter-names. Отладочная <code>LocalVariableTable</code> (<code>-g</code>) рефлексией не читается. В IDEA флаг включается в Settings → Build → Compiler → Java Compiler → Additional parameters.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Скомпилируйте с <code>-g</code> и найдите в <code>javap -v -p</code> таблицу <code>LocalVariableTable</code> метода <code>divide</code>. Что в колонках Start и Length?</summary><div>Диапазон байткода, где переменная «жива», и слот локальных переменных. Отладчик IDEA показывает имена переменных именно отсюда; без <code>-g</code> он увидит только <code>slot_0</code>, <code>slot_1</code>.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">2.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Ошибка <code>UnsupportedClassVersionError … class file version 69.0 … only recognizes up to 65.0</code>. Что случилось?</p><ul><li>Повреждён class-файл</li><li>Класс скомпилирован для Java 25, а запускается на Java 21</li><li>Не найден класс</li><li>Нехватка памяти</li></ul><div class="why">major − 44 = версия Java. Компилируйте с --release по минимальной целевой версии.</div></div>
 <div class="mcq" data-ok="3"><p>Где хранится строка «Hi» из <code>println("Hi")</code>?</p><ul><li>Прямо в байткоде инструкции</li><li>В куче при компиляции</li><li>В атрибуте SourceFile</li><li>В пуле констант: String → Utf8; инструкция ldc ссылается на индекс</li></ul><div class="why">При выполнении ldc JVM возвращает интернированный объект String.</div></div>

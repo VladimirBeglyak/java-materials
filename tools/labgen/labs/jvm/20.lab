@@ -1,0 +1,95 @@
+@chapter 20 | quiz
+@intro
+<p>Измерим время старта небольшого приложения и ускорим его тремя способами, встроенными в JDK 25: стандартным CDS, архивом своих классов (AppCDS) и AOT-кэшем проекта Leyden. AOT-кэш работает только с classpath из jar-файлов, поэтому приложение сначала соберём в jar. Модуль IDEA — <code>ch20</code>.</p>
+@end
+
+@lab 20.1 | Приложение, которому есть что грузить | 15 мин
+@goal
+<p>Собрать jar, который на старте загружает около тысячи классов (HTTP-клиент, XML, регулярные выражения, стримы), и измерить время до конца <code>main</code>.</p>
+@end
+@file app-src/StartApp.java
+import java.io.StringReader;
+import java.lang.management.ManagementFactory;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.xml.sax.InputSource;
+
+public class StartApp {
+    public static void main(String[] args) throws Exception {
+        var client = HttpClient.newHttpClient();
+        var req = HttpRequest.newBuilder(URI.create("http://localhost/health")).build();
+        var doc = DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new InputSource(new StringReader("<cfg><port>8080</port></cfg>")));
+        String port = doc.getElementsByTagName("port").item(0).getTextContent();
+        var words = Pattern.compile("\\s+").splitAsStream("быстрый старт JVM на JDK 25").collect(Collectors.toList());
+        int sum = IntStream.rangeClosed(1, 100).filter(i -> i % 3 == 0).sum();
+
+        long uptime = ManagementFactory.getRuntimeMXBean().getUptime();
+        int classes = ManagementFactory.getClassLoadingMXBean().getLoadedClassCount();
+        System.out.printf("готов: port=%s, слов=%d, sum=%d, метод=%s | %d мс, классов %d%n",
+                port, words.size(), sum, req.method(), uptime, classes);
+    }
+}
+@end
+@run
+javac -d app-out app-src/StartApp.java
+jar --create --file app.jar --main-class StartApp -C app-out .
+java -jar app.jar
+java -jar app.jar
+java -jar app.jar
+@end
+@note Запустите несколько раз: первый запуск после компиляции обычно медленнее — файлы ещё не в кэше ОС. Сравнивайте установившиеся значения.
+@try
+Запустите с <code>-Xshare:off</code>. ::: Время вырастет в 1,5–2 раза: стандартный CDS-архив JDK (<code>lib/server/classes.jsa</code>) включён по умолчанию и уже ускоряет загрузку классов java.base. Вы как раз отключили его.
+@end
+
+@lab 20.2 | AppCDS: архив своих классов | 15 мин
+@goal
+<p>Записать динамический архив классов при первом запуске и использовать его при следующих.</p>
+@end
+@ide VM options первого запуска: <code>-XX:ArchiveClassesAtExit=app.jsa</code>; следующих: <code>-XX:SharedArchiveFile=app.jsa</code>
+@run
+java -XX:ArchiveClassesAtExit=app.jsa -jar app.jar
+java -XX:SharedArchiveFile=app.jsa -jar app.jar
+java -XX:SharedArchiveFile=app.jsa -jar app.jar
+@end
+@note Предупреждения <code>[cds] Skipping … JFR event class</code> при создании архива — норма: служебные классы JFR в архив не попадают.
+@predict Откуда теперь загружаются классы HTTP-клиента и <code>StartApp</code>? Проверьте через <code>-Xlog:class+load</code>.
+@answer
+<p>Из архива: <code>source: shared objects file (top)</code> — «top» означает динамический архив поверх базового CDS JDK. Классы не читаются из jar и не разбираются заново, а отображаются в память почти готовыми. Время до <code>main</code> падает ещё на 20–40%.</p>
+@end
+@run grep="StartApp|HttpClientImpl " head=4
+java -XX:SharedArchiveFile=app.jsa -Xlog:class+load -jar app.jar ||| java -XX:SharedArchiveFile=app.jsa -Xlog:class+load -jar app.jar | grep -E "StartApp |HttpClientImpl "
+@end
+@try
+Перекомпилируйте StartApp (поменяйте текст) и пересоберите jar, не обновляя архив. ::: JVM заметит, что jar изменился (проверяется время модификации и размер), напишет предупреждение и проигнорирует архив — приложение работает, просто без ускорения. Архив пересоздают при каждой сборке.
+@end
+
+@lab 20.3 | AOT-кэш Leyden (JDK 25) | 20 мин
+@goal
+<p>Создать AOT-кэш одной командой (JEP 514) и сравнить с AppCDS: кэш хранит классы уже загруженными и связанными, а также профили методов (JEP 515).</p>
+@end
+@ide VM options обучающего запуска: <code>-XX:AOTCacheOutput=app.aot</code>; рабочих: <code>-XX:AOTCache=app.aot</code>
+@run
+java -XX:AOTCacheOutput=app.aot -jar app.jar
+java -XX:AOTCache=app.aot -jar app.jar
+java -XX:AOTCache=app.aot -jar app.jar
+@end
+@note Обучающий запуск выполняет приложение, а затем сам запускает дочернюю JVM, которая собирает кэш (строки «Launching child process…», «AOTCache creation is complete»). «Picked up JAVA_TOOL_OPTIONS» — параметры, которые JVM передала дочернему процессу.
+@predict Почему AOT-кэш быстрее AppCDS, хотя и тот и другой — «архив классов»?
+@answer
+<p>AppCDS сохраняет разобранные классы, но их всё равно нужно загрузить, связать и инициализировать при каждом старте. AOT-кэш сохраняет состояние после обучающего запуска: классы уже загружены и слинкованы, разрешены вызовы <code>invokedynamic</code> (лямбды, конкатенация), есть профили для JIT. Цена — обучающий прогон и требование одинаковых JDK, флагов и classpath.</p>
+@end
+@step Сравните размеры артефактов:
+@run
+ls -l app.jsa app.aot ||| stat -c "%s байт  %n" app.jsa app.aot
+@end
+@note В PowerShell: <code>Get-ChildItem app.jsa, app.aot</code> (колонка Length).
+@try
+Запустите с кэшем, но другим GC: <code>-XX:AOTCache=app.aot -XX:+UseSerialGC</code>. ::: Кэш может быть отклонён (в журнале <code>-Xlog:aot</code> будет причина): часть содержимого зависит от конфигурации JVM. Флаги рабочего запуска должны совпадать с обучающим.
+@end

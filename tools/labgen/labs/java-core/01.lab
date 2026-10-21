@@ -1,0 +1,123 @@
+@chapter 01 | quiz
+@intro
+<p>Путь «исходник → байткод → JVM» стоит один раз пройти руками без IDE, а потом увидеть, что IDEA делает ровно то же. Создайте в проекте <code>java-core-lab</code> модуль <code>ch01</code>; для команд откройте терминал IDEA (Alt+F12) и перейдите в <code>ch01/src</code>.</p>
+@end
+
+@lab 1.1 | Три способа запустить программу | 15 мин
+@goal
+<p>Скомпилировать и запустить класс вручную, запустить исходник без компиляции и попробовать «компактный» исходный файл Java 25.</p>
+@end
+@file Hello.java
+public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Привет, " + (args.length > 0 ? args[0] : "мир") + "!");
+        System.out.println("Java " + Runtime.version() + ", класс загружен из: "
+                + Hello.class.getProtectionDomain().getCodeSource().getLocation());
+    }
+}
+@end
+@step Классический путь — компилятор, затем JVM:
+@run
+javac Hello.java
+java Hello Java
+@end
+@step Однофайловый режим (Java 11+): лаунчер компилирует исходник в память и сразу запускает:
+@run
+java Hello.java Java
+@end
+@predict Где появится файл <code>Hello.class</code> во втором случае и откуда «загружен» класс?
+@answer
+<p>Нигде: класс скомпилирован в память, на диске ничего не создаётся. А «загружен из» покажет сам исходник — <code>file:/…/Hello.java</code>: лаунчер подставляет его как источник кода. Режим удобен для скриптов и экспериментов, но для приложений из многих файлов нужен javac или система сборки (с Java 22 лаунчер умеет и несколько файлов в одном каталоге).</p>
+@end
+@step Java 25 разрешает «компактные» исходные файлы (JEP 512): без объявления класса, с методом <code>main</code> без <code>static</code> и аргументов, и с классом <code>IO</code> для консоли:
+@file Compact.java
+void main() {
+    String name = IO.readln("Как вас зовут? ");
+    IO.println("Здравствуйте, " + name + "! Сегодня " + java.time.LocalDate.now().getDayOfWeek());
+}
+@end
+@run
+java Compact.java ||| echo "Neo" | java Compact.java
+@end
+@try
+Скомпилируйте <code>Compact.java</code> javac-ом и посмотрите <code>javap Compact</code>. Что получилось? ::: Обычный класс <code>final class Compact</code> с экземплярным методом <code>main()</code> и конструктором по умолчанию: компактный файл — синтаксический сахар, JVM про него ничего не знает. Лаунчер сам создаёт экземпляр и вызывает main.
+Запустите <code>java Hello</code> из другого каталога. ::: <code>Error: Could not find or load main class Hello</code>: JVM ищет классы в classpath, по умолчанию — текущий каталог. Помогает <code>java -cp путь/к/каталогу Hello</code>.
+@end
+
+@lab 1.2 | Внутри class-файла | 10 мин
+@goal
+<p>Убедиться, что в class-файле байткод, и прочитать его версию.</p>
+@end
+@run grep="major|minor|public static void main|^\s+\d+: (getstatic|invoke)"
+javap -v -c Hello.class
+@end
+@note <code>major version: 69</code> — Java 25 (номер версии = версия Java + 44). Инструкции <code>getstatic</code>, <code>invokevirtual</code> — команды стековой машины из раздела 1.3 этой главы. Подробно байткод разбирается в пособии «JVM изнутри».
+@try
+Скомпилируйте с <code>javac --release 17 Hello.java</code> и посмотрите major version. Запустится ли этот класс на Java 25? А класс от Java 25 — на Java 17? ::: 61; старый class на новой JVM запускается всегда, новый на старой — нет: <code>UnsupportedClassVersionError</code>.
+@end
+
+@lab 1.3 | Собираем исполняемый jar руками | 15 мин
+@goal
+<p>Понять, что jar — это zip с манифестом, и собрать его без Maven/Gradle.</p>
+@end
+@file app/com/example/App.java
+package com.example;
+
+import com.example.util.Greeter;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println(Greeter.greet("jar"));
+    }
+}
+@end
+@file app/com/example/util/Greeter.java
+package com.example.util;
+
+public class Greeter {
+    public static String greet(String who) { return "Запущено из " + who + "!"; }
+}
+@end
+@step Компилируем в каталог <code>out</code> (пакеты станут подкаталогами) и упаковываем:
+@run
+javac -d out app/com/example/App.java app/com/example/util/Greeter.java
+jar --create --file app.jar --main-class com.example.App -C out .
+jar --list --file app.jar
+java -jar app.jar
+@end
+@predict Что лежит в <code>META-INF/MANIFEST.MF</code> и как JVM узнала, какой класс запускать?
+@answer
+<p>В манифесте строка <code>Main-Class: com.example.App</code> (её добавил флаг <code>--main-class</code>) плюс служебные <code>Manifest-Version</code> и <code>Created-By</code>. <code>java -jar</code> читает манифест и ищет классы только внутри jar — флаг <code>-cp</code> при этом игнорируется. Зависимости указывают строкой <code>Class-Path</code> в манифесте или собирают «толстый» jar.</p>
+@end
+@run
+jar --extract --file app.jar META-INF/MANIFEST.MF ||| jar --extract --file app.jar META-INF/MANIFEST.MF && cat META-INF/MANIFEST.MF
+type META-INF\MANIFEST.MF ||| true
+@end
+@note В bash вместо <code>type</code> — <code>cat META-INF/MANIFEST.MF</code>. Можно и просто открыть <code>app.jar</code> любым архиватором.
+@try
+Запустите <code>java -cp app.jar com.example.App</code>. ::: Работает так же: jar можно использовать как обычный элемент classpath и указать главный класс явно.
+@end
+
+@lab 1.4 | jshell: песочница для экспериментов | 10 мин
+@goal
+<p>Освоить REPL — дальше в курсе он пригодится для быстрых проверок.</p>
+@end
+@file session.jsh
+int x = 7
+x * 6
+var list = new java.util.ArrayList<>(java.util.List.of(3, 1, 2))
+java.util.Collections.sort(list)
+list
+"java".repeat(3)
+0.1 + 0.2
+/vars
+/exit
+@end
+@step Наберите строки по одной в <code>jshell</code> (точка с запятой не обязательна, результат выражения печатается сам):
+@run
+jshell ||| jshell --feedback normal -R-Dstdout.encoding=UTF-8 < session.jsh 2>&1 | sed 's/jshell> //g' | grep -vE "^$|Welcome|introduction|Goodbye"
+@end
+@note Полезные команды: <code>/vars</code>, <code>/methods</code>, <code>/imports</code>, <code>/edit</code>, Tab — автодополнение, <code>/open файл.jsh</code> — выполнить скрипт. В IDEA есть свой Tools → JShell Console.
+@try
+Объявите метод <code>int sq(int a) { return a * a; }</code>, затем вызовите <code>sq(12)</code>, затем переобъявите его как <code>long sq(int a)</code>. ::: jshell разрешает переопределять объявления на лету и пишет «replaced method sq(int)» — удобно для экспериментов, невозможно в обычном коде.
+@end

@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 21 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
   <h1>Сборка: classpath, JAR, Maven и Gradle</h1>
   <p class="lead">IDE скрывает сборку за зелёной кнопкой — до первого <code>NoSuchMethodError</code> на проде или «у меня локально работает». Разберём, что на самом деле делают <code>javac</code> и <code>java</code>, как устроен JAR, как Maven и Gradle находят зависимости и почему при конфликте версий они выбирают разные варианты.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">classpath</span><span class="tag">жизненный цикл Maven</span><span class="tag">конфликты версий</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">classpath</span><span class="tag">жизненный цикл Maven</span><span class="tag">конфликты версий</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -165,7 +165,201 @@ tasks.test { useJUnitPlatform() }</code></pre>
   <div class="card"><h4>CI — источник истины</h4><p>Артефакт для продакшена собирается только в CI из чистого клона, один раз, и продвигается по окружениям без пересборки.</p></div>
 </div>
 
-<h2 id="quiz"><span class="h-num">21.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">21.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Сначала собираем приложение из двух «модулей» руками — <code>javac</code>, <code>jar</code>, classpath, — чтобы понять, что делают инструменты сборки. Затем тот же проект на Maven и Gradle. В IntelliJ IDEA Maven и Gradle встроены: проект открывается по <code>pom.xml</code> или <code>build.gradle.kts</code> (File → Open), а задачи запускаются из боковых окон Maven/Gradle. Для командной строки нужны установленные <code>mvn</code> и <code>gradle</code> (или wrapper-скрипты <code>mvnw</code>/<code>gradlew</code> из проекта).</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-21.1">
+<div class="lab-head"><span class="lab-num">Лаба 21.1</span><b>Сборка руками: библиотека, приложение, classpath</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Собрать библиотеку в jar, скомпилировать против неё приложение и поймать ошибки «забыли jar» на этапе компиляции и запуска.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>textlib/src/com/acme/text/Slug.java</code>:</div>
+<pre data-title="textlib/src/com/acme/text/Slug.java"><code class="java">package com.acme.text;
+
+import java.text.Normalizer;
+import java.util.Locale;
+
+public final class Slug {
+    private Slug() { }
+
+    public static String of(String title) {
+        String s = Normalizer.normalize(title, Normalizer.Form.NFD).replaceAll("\\p{M}", "");
+        return s.toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}]+", "-").replaceAll("(^-|-$)", "");
+    }
+}</code></pre>
+<pre data-title="app/src/com/acme/app/Main.java"><code class="java">package com.acme.app;
+
+import com.acme.text.Slug;
+
+public class Main {
+    public static void main(String[] args) {
+        for (String t : new String[] { "Привет, Мир!", "Café &amp; Crème", "  Java 25 — LTS  " })
+            System.out.println("\"" + t + "\" -&gt; " + Slug.of(t));
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Соберите библиотеку и приложение. Разделитель путей в <code>-cp</code>: <code>;</code> в Windows, <code>:</code> в Linux/macOS:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d textlib/out textlib/src/com/acme/text/Slug.java
+jar --create --file textlib.jar -C textlib/out .
+javac -cp textlib.jar -d app/out app/src/com/acme/app/Main.java
+java -cp "app/out;textlib.jar" com.acme.app.Main</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"Привет, Мир!" -&gt; привет-мир
+"Café &amp; Crème" -&gt; cafe-creme
+"  Java 25 — LTS  " -&gt; java-25-lts</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что будет, если забыть <code>textlib.jar</code> при компиляции? А при запуске?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d app/out2 app/src/com/acme/app/Main.java
+java -cp app/out com.acme.app.Main</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">app\src\com\acme\app\Main.java:3: error: package com.acme.text does not exist
+import com.acme.text.Slug;
+                    ^
+app\src\com\acme\app\Main.java:8: error: cannot find symbol
+            System.out.println("\"" + t + "\" -&gt; " + Slug.of(t));
+                                                     ^
+  symbol:   variable Slug
+  location: class Main
+2 errors
+Exception in thread "main" java.lang.NoClassDefFoundError: com/acme/text/Slug
+	at com.acme.app.Main.main(Main.java:8)
+Caused by: java.lang.ClassNotFoundException: com.acme.text.Slug
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:580)
+	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:490)
+	... 1 more</code></pre></details>
+<div class="lab-ans" hidden><p>При компиляции: <code>error: package com.acme.text does not exist</code> — javac не знает о классе. При запуске: <code>NoClassDefFoundError: com/acme/text/Slug</code> — class-файл Main ссылается на Slug, а в рантайме его нет. Ровно эти две ошибки инструменты сборки и избавляют вас от необходимости ловить вручную: они формируют classpath для компиляции и для запуска из одного описания зависимостей.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте «толстый» исполняемый jar вручную: распакуйте классы библиотеки и приложения в один каталог и упакуйте с <code>--main-class</code>.</summary><div><code>jar --create --file app-all.jar --main-class com.acme.app.Main -C app/out . -C textlib/out .</code> — теперь <code>java -jar app-all.jar</code> работает без -cp. Так устроены shade/shadow-плагины (и, с отличиями, Spring Boot jar).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-21.2">
+<div class="lab-head"><span class="lab-num">Лаба 21.2</span><b>Тот же проект на Maven</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Описать проект в <code>pom.xml</code>, собрать его, запустить тесты и посмотреть дерево зависимостей.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>mvn-demo/pom.xml</code>:</div>
+<pre data-title="mvn-demo/pom.xml"><code class="txt">&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+&lt;project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd"&gt;
+    &lt;modelVersion&gt;4.0.0&lt;/modelVersion&gt;
+    &lt;groupId&gt;com.acme&lt;/groupId&gt;
+    &lt;artifactId&gt;mvn-demo&lt;/artifactId&gt;
+    &lt;version&gt;1.0-SNAPSHOT&lt;/version&gt;
+
+    &lt;properties&gt;
+        &lt;maven.compiler.release&gt;25&lt;/maven.compiler.release&gt;
+        &lt;project.build.sourceEncoding&gt;UTF-8&lt;/project.build.sourceEncoding&gt;
+    &lt;/properties&gt;
+
+    &lt;dependencies&gt;
+        &lt;dependency&gt;
+            &lt;groupId&gt;com.fasterxml.jackson.core&lt;/groupId&gt;
+            &lt;artifactId&gt;jackson-databind&lt;/artifactId&gt;
+            &lt;version&gt;2.20.0&lt;/version&gt;
+        &lt;/dependency&gt;
+    &lt;/dependencies&gt;
+&lt;/project&gt;</code></pre>
+<pre data-title="mvn-demo/src/main/java/com/acme/Json.java"><code class="java">package com.acme;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.Map;
+
+public class Json {
+    public static void main(String[] args) throws Exception {
+        var mapper = new ObjectMapper();
+        String json = mapper.writeValueAsString(Map.of("lang", "Java", "version", 25));
+        System.out.println(json);
+        System.out.println(mapper.readTree(json).get("version").asInt() + 1);
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Соберите проект (первый запуск скачает плагины и зависимости в <code>~/.m2/repository</code>):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">mvn -f mvn-demo/pom.xml package</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[INFO] Building mvn-demo 1.0-SNAPSHOT
+[INFO] --- resources:3.4.0:resources (default-resources) @ mvn-demo ---
+[INFO] --- compiler:3.15.0:compile (default-compile) @ mvn-demo ---
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ mvn-demo ---
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ mvn-demo ---
+[INFO] --- surefire:3.5.4:test (default-test) @ mvn-demo ---
+[INFO] --- jar:3.5.0:jar (default-jar) @ mvn-demo ---
+[INFO] Building jar: mvn-demo\target\mvn-demo-1.0-SNAPSHOT.jar
+[INFO] BUILD SUCCESS</code></pre></details>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите, что ещё приехало вместе с jackson-databind:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">mvn -f mvn-demo/pom.xml dependency:tree</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[INFO] -------------------------&lt; com.acme:mvn-demo &gt;--------------------------
+[INFO] com.acme:mvn-demo:jar:1.0-SNAPSHOT
+[INFO] \- com.fasterxml.jackson.core:jackson-databind:jar:2.20.0:compile
+[INFO]    +- com.fasterxml.jackson.core:jackson-annotations:jar:2.20:compile
+[INFO]    \- com.fasterxml.jackson.core:jackson-core:jar:2.20.0:compile
+[INFO] BUILD SUCCESS</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Вы объявили одну зависимость. Почему в дереве три артефакта и почему <code>java -cp mvn-demo/target/mvn-demo-1.0-SNAPSHOT.jar com.acme.Json</code> не запустится?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -cp mvn-demo/target/mvn-demo-1.0-SNAPSHOT.jar com.acme.Json</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Exception in thread "main" java.lang.NoClassDefFoundError: com/fasterxml/jackson/databind/ObjectMapper
+	at com.acme.Json.main(Json.java:8)
+Caused by: java.lang.ClassNotFoundException: com.fasterxml.jackson.databind.ObjectMapper
+	at java.base/jdk.internal.loader.BuiltinClassLoader.loadClass(BuiltinClassLoader.java:580)
+	at java.base/java.lang.ClassLoader.loadClass(ClassLoader.java:490)
+	... 1 more</code></pre></details>
+<div class="lab-ans" hidden><p>jackson-databind сам зависит от jackson-annotations и jackson-core — это <b>транзитивные</b> зависимости, Maven подтягивает их автоматически. А обычный <code>package</code> кладёт в jar только ваши классы: при запуске с одним этим jar будет <code>NoClassDefFoundError: com/fasterxml/jackson/databind/ObjectMapper</code>. В IDEA запуск работает, потому что она сама собирает classpath из pom. Для командной строки — <code>mvn exec:java</code>, плагин копирования зависимостей или «толстый» jar.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте в pom явную зависимость <code>jackson-core</code> версии <code>2.15.0</code> и снова посмотрите <code>dependency:tree</code>. Какая версия победит?</summary><div>2.15.0 — «ближайшая» в дереве (прямая зависимость побеждает транзитивную). Maven не выбирает самую новую версию — и databind 2.20 окажется в рантайме с несовместимым core 2.15: возможен <code>NoSuchMethodError</code>. Такие конфликты решают через <code>dependencyManagement</code>/BOM (<code>jackson-bom</code>).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-21.3">
+<div class="lab-head"><span class="lab-num">Лаба 21.3</span><b>Тот же проект на Gradle</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Описать тот же проект в Gradle Kotlin DSL и запустить приложение задачей <code>run</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>gradle-demo/settings.gradle.kts</code>:</div>
+<pre data-title="gradle-demo/settings.gradle.kts"><code class="txt">rootProject.name = "gradle-demo"</code></pre>
+<pre data-title="gradle-demo/build.gradle.kts"><code class="txt">plugins {
+    application
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.20.0")
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+
+application {
+    mainClass = "com.acme.Json"
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Положите тот же <code>Json.java</code> в <code>gradle-demo/src/main/java/com/acme/</code> и запустите:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">gradle -p gradle-demo run</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">&gt; Task :compileJava
+&gt; Task :processResources NO-SOURCE
+&gt; Task :classes
+&gt; Task :run
+{"lang":"Java","version":25}
+26
+BUILD SUCCESSFUL in 7s</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">gradle -p gradle-demo dependencies --configuration runtimeClasspath</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">runtimeClasspath - Runtime classpath of source set 'main'.
+\--- com.fasterxml.jackson.core:jackson-databind:2.20.0
+     +--- com.fasterxml.jackson.core:jackson-annotations:2.20
+     +--- com.fasterxml.jackson.core:jackson-core:2.20.0
+     |    \--- com.fasterxml.jackson:jackson-bom:2.20.0
+     |         +--- com.fasterxml.jackson.core:jackson-annotations:2.20 (c)
+     |         +--- com.fasterxml.jackson.core:jackson-core:2.20.0 (c)
+     |         \--- com.fasterxml.jackson.core:jackson-databind:2.20.0 (c)
+     \--- com.fasterxml.jackson:jackson-bom:2.20.0 (*)</code></pre></details>
+<p class="lab-note"><code>implementation</code> в Gradle — зависимость нужна для компиляции и выполнения, но не «протекает» к потребителям вашей библиотеки (в отличие от <code>api</code>). В Maven ближайший аналог — scope <code>compile</code>. Задача <code>run</code> сама собирает classpath из всех зависимостей — поэтому здесь запуск работает сразу.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">21.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Что выполнит <code>mvn package</code>?</p><ul><li>Только упаковку jar</li><li>Все фазы до package включительно: ресурсы, компиляцию, тесты, упаковку</li><li>Упаковку и установку в ~/.m2</li><li>Сначала clean, потом упаковку</li></ul><div class="why">Фазы жизненного цикла выполняются последовательно от первой до указанной. clean — отдельный цикл.</div></div>
 <div class="mcq" data-ok="2"><p>Библиотека X приходит транзитивно: версия 1.0 на глубине 2 и версия 3.0 на глубине 3. Что выберут Maven и Gradle?</p><ul><li>Оба — 3.0</li><li>Оба — 1.0</li><li>Maven — 1.0 (ближайшая), Gradle — 3.0 (наибольшая)</li><li>Обе версии окажутся на classpath</li></ul><div class="why">Разные стратегии разрешения — причина того, что проект ведёт себя по-разному после миграции между инструментами.</div></div>

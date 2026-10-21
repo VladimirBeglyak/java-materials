@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 05 · ОСНОВА ЯЗЫКА</div>
   <h1>equals, hashCode, иммутабельность</h1>
   <p class="lead">Каждый класс наследует от <code>Object</code> несколько методов с контрактами, на которые опирается вся стандартная библиотека. Нарушение контракта не вызывает ошибку компиляции — объект просто «теряется» в <code>HashMap</code> или дублируется в <code>Set</code>. Самая спрашиваемая тема Java Core.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">контракт</span><span class="tag">Comparable</span><span class="tag">immutable</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">контракт</span><span class="tag">Comparable</span><span class="tag">immutable</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -208,7 +208,201 @@ List&lt;String&gt; snapshot = List.copyOf(source);      // неизменяем�
 })();
 </script>
 
-<h2 id="quiz"><span class="h-num">5.9</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">5.9</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Нарушенный контракт <code>equals</code>/<code>hashCode</code> не даёт ошибок компиляции — коллекции просто начинают «терять» элементы. Сломаем контракт тремя способами и починим. Модуль IDEA — <code>ch05</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-5.1">
+<div class="lab-head"><span class="lab-num">Лаба 5.1</span><b>Без hashCode и с изменяемым ключом</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть дубликаты в <code>HashSet</code> и «потерянный» элемент после изменения поля.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Broken.java</code>:</div>
+<pre data-title="Broken.java"><code class="java">import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+public class Broken {
+    static class NoHash {
+        final String id;
+        NoHash(String id) { this.id = id; }
+        @Override public boolean equals(Object o) { return o instanceof NoHash n &amp;&amp; n.id.equals(id); }
+        // hashCode забыли
+    }
+
+    static class Mutable {
+        String id;
+        Mutable(String id) { this.id = id; }
+        @Override public boolean equals(Object o) { return o instanceof Mutable m &amp;&amp; m.id.equals(id); }
+        @Override public int hashCode() { return Objects.hash(id); }
+        @Override public String toString() { return id; }
+    }
+
+    public static void main(String[] args) {
+        Set&lt;NoHash&gt; a = new HashSet&lt;&gt;();
+        a.add(new NoHash("x"));
+        a.add(new NoHash("x"));
+        System.out.println("1. размер без hashCode: " + a.size());
+        System.out.println("2. contains: " + a.contains(new NoHash("x")));
+
+        Set&lt;Mutable&gt; b = new HashSet&lt;&gt;();
+        Mutable key = new Mutable("old");
+        b.add(key);
+        key.id = "new";
+        System.out.println("3. contains(key): " + b.contains(key));
+        System.out.println("4. содержимое: " + b + ", размер " + b.size());
+        System.out.println("5. remove(key): " + b.remove(key));
+        b.add(key);
+        System.out.println("6. после повторного add: " + b);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Шесть ответов.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Broken.java
+java Broken</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1. размер без hashCode: 2
+2. contains: false
+3. contains(key): false
+4. содержимое: [new], размер 1
+5. remove(key): false
+6. после повторного add: [new, new]</code></pre></details>
+<div class="lab-ans" hidden><p>1 — <b>2</b>: без hashCode каждый объект получает свой identity-хэш, объекты попадают в разные корзины, equals даже не вызывается. 2 — <b>false</b>. 3 — <b>false</b>: после изменения <code>id</code> ключ ищется в корзине по новому хэшу, а лежит в старой. 4 — <code>[new], размер 1</code>: элемент есть, но недостижим. 5 — <b>false</b>. 6 — <code>[new, new]</code>: «дубликат» одного и того же объекта. Ключи хэш-коллекций должны быть неизменяемыми.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>HashSet</code> на <code>TreeSet</code> с компаратором по id (<code>Comparator.comparing(m -&gt; m.id)</code>) и повторите эксперимент с изменением id.</summary><div>Та же беда в другом виде: дерево упорядочено по старому значению, поиск идёт по новому и может свернуть не туда. Изменение ключа ломает любую упорядоченную или хэш-структуру.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-5.2">
+<div class="lab-head"><span class="lab-num">Лаба 5.2</span><b>equals и наследование: нарушаем симметрию</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что <code>instanceof</code> в equals при наследовании с новыми полями ломает симметрию, а <code>getClass()</code> или record — нет.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Symmetry.java</code>:</div>
+<pre data-title="Symmetry.java"><code class="java">import java.util.List;
+
+public class Symmetry {
+    static class Point {
+        final int x, y;
+        Point(int x, int y) { this.x = x; this.y = y; }
+        @Override public boolean equals(Object o) {
+            return o instanceof Point p &amp;&amp; p.x == x &amp;&amp; p.y == y;
+        }
+        @Override public int hashCode() { return 31 * x + y; }
+    }
+
+    static class ColorPoint extends Point {
+        final String color;
+        ColorPoint(int x, int y, String color) { super(x, y); this.color = color; }
+        @Override public boolean equals(Object o) {
+            return o instanceof ColorPoint c &amp;&amp; super.equals(c) &amp;&amp; c.color.equals(color);
+        }
+    }
+
+    public static void main(String[] args) {
+        Point p = new Point(1, 2);
+        ColorPoint cp = new ColorPoint(1, 2, "red");
+        System.out.println("p.equals(cp)  = " + p.equals(cp));
+        System.out.println("cp.equals(p)  = " + cp.equals(p));
+        System.out.println("List.of(p).contains(cp) = " + List.of(p).contains(cp));
+        System.out.println("List.of(cp).contains(p) = " + List.of(cp).contains(p));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатают четыре строки и какие свойства контракта нарушены?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Symmetry.java
+java Symmetry</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">p.equals(cp)  = true
+cp.equals(p)  = false
+List.of(p).contains(cp) = false
+List.of(cp).contains(p) = true</code></pre></details>
+<div class="lab-ans" hidden><p><code>true, false, false, true</code>. Нарушена симметрия: <code>p.equals(cp)</code> ≠ <code>cp.equals(p)</code>. А <code>contains(o)</code> вызывает <code>o.equals(элемент)</code>, поэтому результат зависит от того, кого ищут и кто лежит в списке, — ровно наоборот интуиции. Исправления: в equals сравнивать <code>getClass() == o.getClass()</code>, предпочесть композицию (ColorPoint содержит Point) или сделать оба типа record'ами — record final и сравнивает все компоненты.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-5.3">
+<div class="lab-head"><span class="lab-num">Лаба 5.3</span><b>compareTo, не согласованный с equals</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, как одни и те же данные дают разный размер в <code>HashSet</code> и <code>TreeSet</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Consistency.java</code>:</div>
+<pre data-title="Consistency.java"><code class="java">import java.math.BigDecimal;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.TreeSet;
+
+public class Consistency {
+    record Person(String name, int age) { }
+
+    public static void main(String[] args) {
+        var nums = List.of(new BigDecimal("1.0"), new BigDecimal("1.00"), new BigDecimal("1"));
+        System.out.println("HashSet: " + new HashSet&lt;&gt;(nums));
+        System.out.println("TreeSet: " + new TreeSet&lt;&gt;(nums));
+
+        var people = List.of(new Person("Анна", 30), new Person("Борис", 30), new Person("Анна", 25));
+        var byAge = new TreeSet&lt;&gt;(Comparator.comparingInt(Person::age));
+        byAge.addAll(people);
+        System.out.println("TreeSet по возрасту: " + byAge);
+        var full = new TreeSet&lt;&gt;(Comparator.comparingInt(Person::age).thenComparing(Person::name));
+        full.addAll(people);
+        System.out.println("по возрасту, затем имени: " + full);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько элементов будет в каждом множестве?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Consistency.java
+java Consistency</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">HashSet: [1.0, 1.00, 1]
+TreeSet: [1.0]
+TreeSet по возрасту: [Person[name=Анна, age=25], Person[name=Анна, age=30]]
+по возрасту, затем имени: [Person[name=Анна, age=25], Person[name=Анна, age=30], Person[name=Борис, age=30]]</code></pre></details>
+<div class="lab-ans" hidden><p>HashSet BigDecimal — 3 (equals учитывает масштаб), TreeSet — 1 (compareTo сравнивает значения). TreeSet людей по возрасту — 2: Борис «равен» Анне по компаратору и молча не добавлен! Сортированные коллекции используют только compareTo/компаратор, не equals. Компаратор должен различать всё, что различает equals, — отсюда <code>thenComparing</code>.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-5.4">
+<div class="lab-head"><span class="lab-num">Лаба 5.4</span><b>Неизменяемый класс: где течёт изменяемость</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти утечку изменяемого состояния через конструктор и геттер — даже у record.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Immutable.java</code>:</div>
+<pre data-title="Immutable.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Immutable {
+    record Team(String name, List&lt;String&gt; members) { }
+
+    record SafeTeam(String name, List&lt;String&gt; members) {
+        SafeTeam { members = List.copyOf(members); }      // компактный конструктор: защитная копия
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; source = new ArrayList&lt;&gt;(List.of("Анна"));
+        Team t = new Team("A", source);
+        SafeTeam s = new SafeTeam("A", source);
+
+        source.add("Взломщик");
+        System.out.println("Team:     " + t.members());
+        System.out.println("SafeTeam: " + s.members());
+        try {
+            s.members().add("ещё");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("изменить SafeTeam нельзя: " + e);
+        }
+        System.out.println("equals: " + new SafeTeam("A", List.of("Анна")).equals(s) + ", toString: " + s);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Изменится ли состав команд после <code>source.add(...)</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Immutable.java
+java Immutable</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Team:     [Анна, Взломщик]
+SafeTeam: [Анна]
+изменить SafeTeam нельзя: java.lang.UnsupportedOperationException
+equals: true, toString: SafeTeam[name=A, members=[Анна]]</code></pre></details>
+<div class="lab-ans" hidden><p><code>Team</code> — да: record хранит ту же ссылку на список, «неизменяемость» record поверхностная. <code>SafeTeam</code> — нет: <code>List.copyOf</code> сделал неизменяемую копию, и через геттер её тоже не изменить (<code>UnsupportedOperationException</code>). equals/hashCode/toString record генерирует по всем компонентам.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">5.10</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>У двух объектов одинаковый hashCode. Что можно утверждать?</p><ul><li>Они равны по equals</li><li>Ничего: это может быть коллизия; равенство решает только equals</li><li>Это один и тот же объект</li><li>Контракт нарушен</li></ul><div class="why">Контракт односторонний: равные по equals ⇒ равные хэши. Обратное не требуется и при 2³² значений int невозможно гарантировать.</div></div>
 <div class="mcq" data-ok="2"><p>Чем <code>Comparable</code> отличается от <code>Comparator</code>?</p><ul><li>Ничем, это синонимы</li><li>Comparable быстрее</li><li>Comparable — «естественный порядок», реализуется самим классом (compareTo); Comparator — внешняя стратегия сравнения, их может быть много</li><li>Comparator работает только со строками</li></ul><div class="why"><code>list.sort(null)</code> использует compareTo; <code>Comparator.comparing(User::age).thenComparing(User::name)</code> задаёт порядок снаружи, не меняя класс.</div></div>

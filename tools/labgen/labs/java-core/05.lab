@@ -1,0 +1,183 @@
+@chapter 05 | quiz
+@intro
+<p>Нарушенный контракт <code>equals</code>/<code>hashCode</code> не даёт ошибок компиляции — коллекции просто начинают «терять» элементы. Сломаем контракт тремя способами и починим. Модуль IDEA — <code>ch05</code>.</p>
+@end
+
+@lab 5.1 | Без hashCode и с изменяемым ключом | 20 мин
+@goal
+<p>Увидеть дубликаты в <code>HashSet</code> и «потерянный» элемент после изменения поля.</p>
+@end
+@file Broken.java
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+
+public class Broken {
+    static class NoHash {
+        final String id;
+        NoHash(String id) { this.id = id; }
+        @Override public boolean equals(Object o) { return o instanceof NoHash n && n.id.equals(id); }
+        // hashCode забыли
+    }
+
+    static class Mutable {
+        String id;
+        Mutable(String id) { this.id = id; }
+        @Override public boolean equals(Object o) { return o instanceof Mutable m && m.id.equals(id); }
+        @Override public int hashCode() { return Objects.hash(id); }
+        @Override public String toString() { return id; }
+    }
+
+    public static void main(String[] args) {
+        Set<NoHash> a = new HashSet<>();
+        a.add(new NoHash("x"));
+        a.add(new NoHash("x"));
+        System.out.println("1. размер без hashCode: " + a.size());
+        System.out.println("2. contains: " + a.contains(new NoHash("x")));
+
+        Set<Mutable> b = new HashSet<>();
+        Mutable key = new Mutable("old");
+        b.add(key);
+        key.id = "new";
+        System.out.println("3. contains(key): " + b.contains(key));
+        System.out.println("4. содержимое: " + b + ", размер " + b.size());
+        System.out.println("5. remove(key): " + b.remove(key));
+        b.add(key);
+        System.out.println("6. после повторного add: " + b);
+    }
+}
+@end
+@predict Шесть ответов.
+@answer
+<p>1 — <b>2</b>: без hashCode каждый объект получает свой identity-хэш, объекты попадают в разные корзины, equals даже не вызывается. 2 — <b>false</b>. 3 — <b>false</b>: после изменения <code>id</code> ключ ищется в корзине по новому хэшу, а лежит в старой. 4 — <code>[new], размер 1</code>: элемент есть, но недостижим. 5 — <b>false</b>. 6 — <code>[new, new]</code>: «дубликат» одного и того же объекта. Ключи хэш-коллекций должны быть неизменяемыми.</p>
+@end
+@run
+javac Broken.java
+java Broken
+@end
+@try
+Замените <code>HashSet</code> на <code>TreeSet</code> с компаратором по id (<code>Comparator.comparing(m -&gt; m.id)</code>) и повторите эксперимент с изменением id. ::: Та же беда в другом виде: дерево упорядочено по старому значению, поиск идёт по новому и может свернуть не туда. Изменение ключа ломает любую упорядоченную или хэш-структуру.
+@end
+
+@lab 5.2 | equals и наследование: нарушаем симметрию | 15 мин
+@goal
+<p>Убедиться, что <code>instanceof</code> в equals при наследовании с новыми полями ломает симметрию, а <code>getClass()</code> или record — нет.</p>
+@end
+@file Symmetry.java
+import java.util.List;
+
+public class Symmetry {
+    static class Point {
+        final int x, y;
+        Point(int x, int y) { this.x = x; this.y = y; }
+        @Override public boolean equals(Object o) {
+            return o instanceof Point p && p.x == x && p.y == y;
+        }
+        @Override public int hashCode() { return 31 * x + y; }
+    }
+
+    static class ColorPoint extends Point {
+        final String color;
+        ColorPoint(int x, int y, String color) { super(x, y); this.color = color; }
+        @Override public boolean equals(Object o) {
+            return o instanceof ColorPoint c && super.equals(c) && c.color.equals(color);
+        }
+    }
+
+    public static void main(String[] args) {
+        Point p = new Point(1, 2);
+        ColorPoint cp = new ColorPoint(1, 2, "red");
+        System.out.println("p.equals(cp)  = " + p.equals(cp));
+        System.out.println("cp.equals(p)  = " + cp.equals(p));
+        System.out.println("List.of(p).contains(cp) = " + List.of(p).contains(cp));
+        System.out.println("List.of(cp).contains(p) = " + List.of(cp).contains(p));
+    }
+}
+@end
+@predict Что напечатают четыре строки и какие свойства контракта нарушены?
+@answer
+<p><code>true, false, false, true</code>. Нарушена симметрия: <code>p.equals(cp)</code> ≠ <code>cp.equals(p)</code>. А <code>contains(o)</code> вызывает <code>o.equals(элемент)</code>, поэтому результат зависит от того, кого ищут и кто лежит в списке, — ровно наоборот интуиции. Исправления: в equals сравнивать <code>getClass() == o.getClass()</code>, предпочесть композицию (ColorPoint содержит Point) или сделать оба типа record'ами — record final и сравнивает все компоненты.</p>
+@end
+@run
+javac Symmetry.java
+java Symmetry
+@end
+
+@lab 5.3 | compareTo, не согласованный с equals | 15 мин
+@goal
+<p>Увидеть, как одни и те же данные дают разный размер в <code>HashSet</code> и <code>TreeSet</code>.</p>
+@end
+@file Consistency.java
+import java.math.BigDecimal;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.TreeSet;
+
+public class Consistency {
+    record Person(String name, int age) { }
+
+    public static void main(String[] args) {
+        var nums = List.of(new BigDecimal("1.0"), new BigDecimal("1.00"), new BigDecimal("1"));
+        System.out.println("HashSet: " + new HashSet<>(nums));
+        System.out.println("TreeSet: " + new TreeSet<>(nums));
+
+        var people = List.of(new Person("Анна", 30), new Person("Борис", 30), new Person("Анна", 25));
+        var byAge = new TreeSet<>(Comparator.comparingInt(Person::age));
+        byAge.addAll(people);
+        System.out.println("TreeSet по возрасту: " + byAge);
+        var full = new TreeSet<>(Comparator.comparingInt(Person::age).thenComparing(Person::name));
+        full.addAll(people);
+        System.out.println("по возрасту, затем имени: " + full);
+    }
+}
+@end
+@predict Сколько элементов будет в каждом множестве?
+@answer
+<p>HashSet BigDecimal — 3 (equals учитывает масштаб), TreeSet — 1 (compareTo сравнивает значения). TreeSet людей по возрасту — 2: Борис «равен» Анне по компаратору и молча не добавлен! Сортированные коллекции используют только compareTo/компаратор, не equals. Компаратор должен различать всё, что различает equals, — отсюда <code>thenComparing</code>.</p>
+@end
+@run
+javac Consistency.java
+java Consistency
+@end
+
+@lab 5.4 | Неизменяемый класс: где течёт изменяемость | 15 мин
+@goal
+<p>Найти утечку изменяемого состояния через конструктор и геттер — даже у record.</p>
+@end
+@file Immutable.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Immutable {
+    record Team(String name, List<String> members) { }
+
+    record SafeTeam(String name, List<String> members) {
+        SafeTeam { members = List.copyOf(members); }      // компактный конструктор: защитная копия
+    }
+
+    public static void main(String[] args) {
+        List<String> source = new ArrayList<>(List.of("Анна"));
+        Team t = new Team("A", source);
+        SafeTeam s = new SafeTeam("A", source);
+
+        source.add("Взломщик");
+        System.out.println("Team:     " + t.members());
+        System.out.println("SafeTeam: " + s.members());
+        try {
+            s.members().add("ещё");
+        } catch (UnsupportedOperationException e) {
+            System.out.println("изменить SafeTeam нельзя: " + e);
+        }
+        System.out.println("equals: " + new SafeTeam("A", List.of("Анна")).equals(s) + ", toString: " + s);
+    }
+}
+@end
+@predict Изменится ли состав команд после <code>source.add(...)</code>?
+@answer
+<p><code>Team</code> — да: record хранит ту же ссылку на список, «неизменяемость» record поверхностная. <code>SafeTeam</code> — нет: <code>List.copyOf</code> сделал неизменяемую копию, и через геттер её тоже не изменить (<code>UnsupportedOperationException</code>). equals/hashCode/toString record генерирует по всем компонентам.</p>
+@end
+@run
+javac Immutable.java
+java Immutable
+@end

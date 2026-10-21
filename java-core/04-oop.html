@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 04 · ОСНОВА ЯЗЫКА</div>
   <h1>ООП: классы, наследование, интерфейсы</h1>
   <p class="lead">Объектная модель Java проста по правилам и коварна в деталях: какой из перегруженных методов будет вызван, в каком порядке инициализируются поля родителя и потомка, почему поле «не переопределяется». Глава разбирает механику, на которой держатся эти правила.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">полиморфизм</span><span class="tag">инициализация</span><span class="tag">интерфейсы</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">полиморфизм</span><span class="tag">инициализация</span><span class="tag">интерфейсы</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -226,7 +226,215 @@ class Child extends Parent {
   <section class="st-step" data-t="Конструктор Child" data-hl="ioIC" data-log="9 конструктор Child"><h4>Тело конструктора Child</h4><p>Объект готов. Итоговый порядок: статика родителя → статика потомка → (поля и блоки родителя → конструктор родителя) → (поля и блоки потомка → конструктор потомка).</p></section>
 </div>
 
-<h2 id="quiz"><span class="h-num">4.10</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">4.10</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Порядок инициализации, выбор перегрузки, скрытая ссылка внутреннего класса на внешний и устройство enum — всё это видно по выводу программы и по <code>javap</code>. Модуль IDEA — <code>ch04</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-4.1">
+<div class="lab-head"><span class="lab-num">Лаба 4.1</span><b>Порядок инициализации родителя и наследника</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Записать точный порядок выполнения статических блоков, инициализаторов полей и конструкторов — и попасть в ловушку вызова переопределённого метода из конструктора.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>InitOrder.java</code>:</div>
+<pre data-title="InitOrder.java"><code class="java">public class InitOrder {
+    static String log(String s) { System.out.println(s); return s; }
+
+    static class Parent {
+        static String ps = log("1? Parent: static поле");
+        static { log("?  Parent: static блок"); }
+        String pf = log("?  Parent: поле экземпляра");
+        { log("?  Parent: блок экземпляра"); }
+        Parent() {
+            log("?  Parent: конструктор");
+            describe();
+        }
+        void describe() { log("   Parent.describe"); }
+    }
+
+    static class Child extends Parent {
+        static String cs = log("?  Child: static поле");
+        static { log("?  Child: static блок"); }
+        String name = log("?  Child: поле экземпляра");
+        Child() {
+            log("?  Child: конструктор");
+        }
+        @Override void describe() { log("   Child.describe, name = " + name); }
+    }
+
+    public static void main(String[] args) {
+        log("--- первый new Child() ---");
+        new Child();
+        log("--- второй new Child() ---");
+        new Child();
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Расставьте номера вместо «?» для первого вызова. Что напечатает <code>Child.describe</code>? Что изменится при втором <code>new Child()</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac InitOrder.java
+java InitOrder</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">--- первый new Child() ---
+1? Parent: static поле
+?  Parent: static блок
+?  Child: static поле
+?  Child: static блок
+?  Parent: поле экземпляра
+?  Parent: блок экземпляра
+?  Parent: конструктор
+   Child.describe, name = null
+?  Child: поле экземпляра
+?  Child: конструктор
+--- второй new Child() ---
+?  Parent: поле экземпляра
+?  Parent: блок экземпляра
+?  Parent: конструктор
+   Child.describe, name = null
+?  Child: поле экземпляра
+?  Child: конструктор</code></pre></details>
+<div class="lab-ans" hidden><p>Статика: Parent static поле → Parent static блок → Child static поле → Child static блок (один раз на всю жизнь класса, при первом обращении). Затем на каждый объект: поля и блоки Parent → конструктор Parent → поля Child → конструктор Child. <code>describe()</code> из конструктора Parent вызывает версию Child, когда поле <code>name</code> ещё не инициализировано: <b>name = null</b>. Во втором вызове статических строк нет.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте <code>name</code> полем <code>final String name = "constant";</code>. Что напечатает describe теперь?</summary><div>«constant»: final-поле с константным инициализатором javac подставляет прямо в использования как константу — значение видно даже до инициализации поля. С <code>final String name = log("…")</code> снова будет null. Вывод: не вызывайте переопределяемые методы из конструктора.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-4.2">
+<div class="lab-head"><span class="lab-num">Лаба 4.2</span><b>Перегрузка выбирается при компиляции, переопределение — при выполнении</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Разделить в голове статический и динамический выбор метода.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Dispatch.java</code>:</div>
+<pre data-title="Dispatch.java"><code class="java">public class Dispatch {
+    static class Animal {
+        String name = "животное";
+        String sound() { return "…"; }
+        static String kind() { return "Animal.kind"; }
+    }
+    static class Cat extends Animal {
+        String name = "кот";
+        @Override String sound() { return "мяу"; }
+        static String kind() { return "Cat.kind"; }
+    }
+
+    static String describe(Animal a) { return "describe(Animal)"; }
+    static String describe(Cat c) { return "describe(Cat)"; }
+    static String describe(Object o) { return "describe(Object)"; }
+
+    public static void main(String[] args) {
+        Animal a = new Cat();
+        System.out.println("1. " + a.sound());
+        System.out.println("2. " + describe(a));
+        System.out.println("3. " + a.name);
+        System.out.println("4. " + a.kind());
+        System.out.println("5. " + describe((Cat) a));
+        System.out.println("6. " + describe(null));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Шесть строк — шесть ответов.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Dispatch.java
+java Dispatch</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1. мяу
+2. describe(Animal)
+3. животное
+4. Animal.kind
+5. describe(Cat)
+6. describe(Cat)</code></pre></details>
+<div class="lab-ans" hidden><p>1 — <b>мяу</b>: переопределение, выбор по реальному классу объекта при выполнении. 2 — <b>describe(Animal)</b>: перегрузка выбирается компилятором по <i>статическому</i> типу переменной. 3 — <b>животное</b>: поля не полиморфны, Cat.name лишь скрывает поле родителя. 4 — <b>Animal.kind</b>: статические методы не переопределяются, а скрываются, вызов привязан к типу переменной (IDEA подсветит предупреждение). 5 — describe(Cat). 6 — <b>describe(Cat)</b>: null подходит ко всем, компилятор выбирает самый специфичный тип.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте перегрузку <code>describe(String s)</code>. Что станет с вызовом <code>describe(null)</code>?</summary><div>Ошибка компиляции «reference to describe is ambiguous»: String и Cat не связаны наследованием, и самого специфичного нет.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-4.3">
+<div class="lab-head"><span class="lab-num">Лаба 4.3</span><b>Что прячет внутренний класс</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть скрытое поле <code>this$0</code>, из-за которого внутренние классы удерживают внешний объект.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Outer.java</code>:</div>
+<pre data-title="Outer.java"><code class="java">import java.util.function.Supplier;
+
+public class Outer {
+    private final byte[] bigData = new byte[10_000_000];
+    private int counter = 42;
+
+    class Inner { int read() { return counter; } }
+    static class Nested { int read() { return 7; } }
+
+    Supplier&lt;Integer&gt; lambda() { return () -&gt; 1; }
+    Supplier&lt;Integer&gt; lambdaUsingField() { return () -&gt; counter; }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Outer.java
+javap -p Outer$Inner.class Outer$Nested.class
+javap -p Outer.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">class Outer$Inner {
+  final Outer this$0;
+  Outer$Inner(Outer);
+class Outer$Nested {
+  Outer$Nested();
+public class Outer {
+  private final byte[] bigData;
+  public Outer();
+  java.util.function.Supplier&lt;java.lang.Integer&gt; lambda();
+  java.util.function.Supplier&lt;java.lang.Integer&gt; lambdaUsingField();
+  private java.lang.Integer lambda$lambdaUsingField$0();
+  private static java.lang.Integer lambda$lambda$0();</code></pre></details>
+<p class="lab-note">В PowerShell имя с <code>$</code> возьмите в одинарные кавычки: <code>javap -p 'Outer$Inner.class'</code>.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие из четырёх вещей (Inner, Nested, lambda, lambdaUsingField) удерживают объект Outer с его 10 МБ?</div>
+<div class="lab-ans" hidden><p><code>Inner</code> — да: у него поле <code>final Outer this$0</code> и конструктор <code>Inner(Outer)</code>, даже если внешний объект не используется. <code>Nested</code> — нет. <code>lambda()</code> — нет: тело <code>lambda$lambda$0</code> статическое. <code>lambdaUsingField()</code> — да: тело стало экземплярным методом, и лямбда захватывает <code>this</code>. Отсюда правило: вложенные классы по умолчанию делайте <code>static</code>.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-4.4">
+<div class="lab-head"><span class="lab-num">Лаба 4.4</span><b>Enum изнутри</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Понять, во что компилируется перечисление с поведением, и поработать с <code>EnumMap</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Op.java</code>:</div>
+<pre data-title="Op.java"><code class="java">import java.util.EnumMap;
+
+public enum Op {
+    PLUS("+") { int apply(int a, int b) { return a + b; } },
+    TIMES("×") { int apply(int a, int b) { return a * b; } };
+
+    final String sign;
+    Op(String sign) { this.sign = sign; }
+    abstract int apply(int a, int b);
+
+    public static void main(String[] args) {
+        EnumMap&lt;Op, Integer&gt; results = new EnumMap&lt;&gt;(Op.class);
+        for (Op op : values()) results.put(op, op.apply(6, 7));
+        System.out.println(results);
+        System.out.println(Op.valueOf("TIMES").ordinal() + " " + TIMES.getClass() + " " + TIMES.getDeclaringClass());
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Op.java
+java Op
+javap -p Op.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">{PLUS=13, TIMES=42}
+1 class Op$2 class Op
+Compiled from "Op.java"
+public abstract class Op extends java.lang.Enum&lt;Op&gt; {
+  public static final Op PLUS;
+  public static final Op TIMES;
+  final java.lang.String sign;
+  private static final Op[] $VALUES;
+  public static Op[] values();
+  public static Op valueOf(java.lang.String);
+  private Op(java.lang.String);
+  abstract int apply(int, int);
+  public static void main(java.lang.String[]);
+  private static Op[] $values();
+  static {};
+}</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему <code>TIMES.getClass()</code> не равен <code>Op.class</code>?</div>
+<div class="lab-ans" hidden><p>Константа с телом компилируется в анонимный подкласс <code>Op$2</code> (посмотрите список файлов: <code>Op$1.class</code>, <code>Op$2.class</code>). Поэтому для сравнения типа перечисления используют <code>getDeclaringClass()</code>. В javap видны и сгенерированные компилятором <code>values()</code>, <code>valueOf(String)</code> и поле <code>$VALUES</code>; конструктор перечисления всегда private.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Вызовите <code>Op.valueOf("plus")</code>.</summary><div><code>IllegalArgumentException: No enum constant Op.plus</code> — valueOf чувствителен к регистру. Для разбора внешних данных пишут свой метод поиска.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">4.11</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Класс A объявляет <code>static void hi()</code>, класс B extends A объявляет свой <code>static void hi()</code>. Что вызовет <code>A ref = new B(); ref.hi();</code>?</p><ul><li>B.hi() — полиморфизм</li><li>Ошибку компиляции</li><li>A.hi() — статические методы не переопределяются, а скрываются; выбор по типу ссылки</li><li>Оба метода</li></ul><div class="why">Динамическая диспетчеризация работает только для методов экземпляра. Статический вызов привязывается на этапе компиляции к типу переменной.</div></div>
 <div class="mcq" data-ok="1"><p>Какой метод будет вызван: <code>void print(Object o)</code> или <code>void print(String s)</code> при <code>Object x = "text"; print(x);</code>?</p><ul><li>print(String) — фактический тип String</li><li>print(Object) — перегрузка выбирается при компиляции по объявленному типу аргумента</li><li>Оба по очереди</li><li>Неоднозначность, ошибка компиляции</li></ul><div class="why">Перегрузка (overload) — статическое связывание по типам выражений; переопределение (override) — динамическое по типу объекта.</div></div>

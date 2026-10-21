@@ -1,0 +1,87 @@
+@chapter 16 | quiz
+@intro
+<p>JIT-компилятор работает прямо у вас на глазах: <code>-XX:+PrintCompilation</code> печатает каждую компиляцию, а простые замеры показывают прогрев. Модуль IDEA — <code>ch16</code>.</p>
+@end
+
+@lab 16.1 | Читаем PrintCompilation: уровни, OSR, деоптимизация | 25 мин
+@goal
+<p>Найти в журнале компиляции свой метод на уровнях 3 и 4, OSR-компиляцию цикла и «made not entrant».</p>
+@end
+@file Hot.java
+public class Hot {
+    static int work(int x) { return (x * 31) ^ (x >>> 3); }
+
+    public static void main(String[] args) {
+        long sum = 0;
+        for (int i = 0; i < 50_000_000; i++) sum += work(i);    // один долгий цикл в main
+        System.out.println("sum = " + sum);
+    }
+}
+@end
+@ide VM options: <code>-XX:+PrintCompilation</code>. Вывод большой — ищите в консоли по слову <code>Hot::</code>
+@run grep="Hot::|sum ="
+javac Hot.java
+java -XX:+PrintCompilation Hot | findstr "Hot:: sum" ||| java -XX:+PrintCompilation Hot | grep -E "Hot::|sum ="
+@end
+@predict Расшифруйте колонки строк с <code>Hot::work</code> и <code>Hot::main</code>. Что означают <code>%</code>, <code>@ 4</code>, цифры 3 и 4?
+@answer
+<p>Колонки: время от старта (мс), номер компиляции, флаги, <b>уровень</b> (3 — C1 с профилированием, 4 — C2), метод, размер байткода. <code>work</code> сначала компилируется на уровне 3, затем на 4 — после этого уровень-3-версия получает «made not entrant». <code>main</code> вызывается один раз, но в нём горячий цикл — поэтому <code>%</code>: OSR-компиляция, <code>@ 4</code> — смещение в байткоде, где JVM подменяет интерпретируемый кадр скомпилированным посреди цикла.</p>
+@end
+@try
+Запустите с <code>-XX:-TieredCompilation</code>. Какие уровни останутся? ::: Только C2 (в выводе уровень не печатается или остаётся одна компиляция метода). Метод дольше интерпретируется, прежде чем станет горячим для C2 (порог ~10 000 вызовов) — старт медленнее, пиковая скорость та же.
+Сколько всего методов JDK скомпилировалось за этот короткий запуск? ::: Сотни: <code>String::hashCode</code>, <code>String::equals</code>, методы загрузчиков и т. д. Посчитайте строки вывода без фильтра — даже Hello World компилирует десятки методов.
+@end
+
+@lab 16.2 | Кривая прогрева | 15 мин
+@goal
+<p>Измерить, как ускоряется один и тот же код по мере компиляции, и сравнить режимы.</p>
+@end
+@file Warmup.java
+import java.util.HashMap;
+import java.util.Map;
+
+public class Warmup {
+    static int task() {
+        Map<String, Integer> m = new HashMap<>();
+        for (int i = 0; i < 2000; i++) m.merge("k" + (i % 100), 1, Integer::sum);
+        return m.size();
+    }
+
+    public static void main(String[] args) {
+        for (int batch = 1; batch <= 10; batch++) {
+            long t = System.nanoTime();
+            for (int i = 0; i < 200; i++) task();
+            System.out.printf("пакет %2d: %6.2f мс%n", batch, (System.nanoTime() - t) / 1e6);
+        }
+    }
+}
+@end
+@run
+javac Warmup.java
+java Warmup
+@end
+@predict Как будет выглядеть та же таблица с <code>-Xint</code> и с <code>-XX:TieredStopAtLevel=1</code>?
+@answer
+<p><code>-Xint</code> — плоская и медленная: прогрева нет, все пакеты как первый или хуже. <code>TieredStopAtLevel=1</code> (только C1) — быстро выходит на плато, но плато выше, чем у полного режима: C1 компилирует быстро, но слабо оптимизирует. Полный tiered-режим даёт и быстрый старт, и лучшую пиковую скорость — ценой прогрева, который вы видите в первых пакетах.</p>
+@end
+@run
+java -Xint Warmup
+java -XX:TieredStopAtLevel=1 Warmup
+@end
+@try
+Почему микробенчмарки «на коленке» вроде этого врут, и что использовать вместо них? ::: Прогрев, OSR, удаление мёртвого кода, свёртка констант и GC искажают замеры. Для честных измерений — JMH (<code>org.openjdk.jmh</code>): он делает прогревочные итерации, форки JVM и защищает результат через Blackhole.
+@end
+
+@lab 16.3 | Code cache: где живёт скомпилированный код | 10 мин
+@goal
+<p>Посмотреть, сколько места занимает машинный код и как он поделён на сегменты.</p>
+@end
+@exec
+(java Warmup > /dev/null 2>&1; true)
+@end
+@ide VM options: <code>-XX:+PrintCodeCache</code> (печатает статистику при завершении JVM)
+@run
+java -XX:+PrintCodeCache Warmup ||| java -XX:+PrintCodeCache Warmup | grep -vE "^пакет"
+@end
+@note Три сегмента: <code>non-nmethods</code> (интерпретатор, заглушки), <code>profiled nmethods</code> (код C1 с профилированием), <code>non-profiled nmethods</code> (C2). Если code cache заполнится, JIT отключится с предупреждением «CodeCache is full. Compiler has been disabled» — и приложение резко замедлится. Размер задаётся <code>-XX:ReservedCodeCacheSize</code> (по умолчанию 240 МБ).
+@end

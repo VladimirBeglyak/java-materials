@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 08 · ЗАГРУЗКА КЛАССОВ</div>
   <h1>Модули (JPMS) и слои</h1>
   <p class="lead">С Java 9 сама JDK разбита на ~70 модулей, а доступ определяется не только модификаторами <code>public/private</code>, но и тем, экспортирует ли модуль пакет. Даже если вы не пишете <code>module-info.java</code>, система модулей влияет на вас: <code>InaccessibleObjectException</code> при рефлексии, флаги <code>--add-opens</code>, <code>jlink</code> для маленьких образов. Разбираем, как JVM решает «можно ли обратиться», что такое безымянный и автоматические модули и как слои позволяют грузить две версии одной библиотеки.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">module-info</span><span class="tag">exports/opens</span><span class="tag">читаемость</span><span class="tag">unnamed module</span><span class="tag">--add-opens</span><span class="tag">jlink</span><span class="tag">ModuleLayer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">module-info</span><span class="tag">exports/opens</span><span class="tag">читаемость</span><span class="tag">unnamed module</span><span class="tag">--add-opens</span><span class="tag">jlink</span><span class="tag">ModuleLayer</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -98,7 +98,155 @@ Configuration cf = parent.configuration().resolve(finder, ModuleFinder.of(), Set
 ModuleLayer layer = parent.defineModulesWithOneLoader(cf, ClassLoader.getSystemClassLoader());
 ServiceLoader.load(layer, Plugin.class).forEach(Plugin::start);</code></pre>
 
-<h2 id="quiz"><span class="h-num">8.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">8.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Соберите два настоящих модуля, нарушьте их границы, узнайте, какие модули JDK нужны вашему коду, и соберите из них собственный маленький runtime. Здесь удобнее всего терминал: в IDEA модулям JPMS соответствуют отдельные модули проекта с файлом <code>module-info.java</code>, а команды ниже повторяют то, что IDEA делает при сборке.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-8.1">
+<div class="lab-head"><span class="lab-num">Лаба 8.1</span><b>Два модуля: exports, requires и что бывает без них</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Собрать модули <code>com.greet</code> и <code>com.app</code> и проверить три уровня доступа: экспортированный пакет, неэкспортированный пакет и рефлексия.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>mods/com.greet/module-info.java</code>:</div>
+<pre data-title="mods/com.greet/module-info.java"><code class="java">module com.greet {
+    exports com.greet.api;
+}</code></pre>
+<pre data-title="mods/com.greet/com/greet/api/Greeter.java"><code class="java">package com.greet.api;
+
+import com.greet.impl.Secret;
+
+public class Greeter {
+    public static String hello(String who) { return "Привет, " + who + Secret.suffix(); }
+}</code></pre>
+<pre data-title="mods/com.greet/com/greet/impl/Secret.java"><code class="java">package com.greet.impl;
+
+public class Secret {
+    public static String suffix() { return "!"; }
+    private String token = "s3cr3t";
+}</code></pre>
+<pre data-title="mods/com.app/module-info.java"><code class="java">module com.app {
+    requires com.greet;
+}</code></pre>
+<pre data-title="mods/com.app/com/app/Main.java"><code class="java">package com.app;
+
+import com.greet.api.Greeter;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        System.out.println(Greeter.hello("модули"));
+        System.out.println("мой модуль: " + Main.class.getModule());
+        Class&lt;?&gt; secret = Class.forName("com.greet.impl.Secret");
+        var f = secret.getDeclaredField("token");
+        f.setAccessible(true);
+        System.out.println("token = " + f.get(secret.getDeclaredConstructor().newInstance()));
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Компиляция всех модулей сразу и запуск по имени модуля:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out --module-source-path mods --module com.greet,com.app
+java --module-path out -m com.app/com.app.Main</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Привет, модули!
+мой модуль: module com.app
+Exception in thread "main" java.lang.reflect.InaccessibleObjectException: Unable to make field private java.lang.String com.greet.impl.Secret.token accessible: module com.greet does not "opens com.greet.impl" to module com.app
+	at java.base/java.lang.reflect.AccessibleObject.throwInaccessibleObjectException(AccessibleObject.java:353)
+	at java.base/java.lang.reflect.AccessibleObject.checkCanSetAccessible(AccessibleObject.java:329)
+	at java.base/java.lang.reflect.AccessibleObject.checkCanSetAccessible(AccessibleObject.java:277)
+	at java.base/java.lang.reflect.Field.checkCanSetAccessible(Field.java:179)
+	at java.base/java.lang.reflect.Field.setAccessible(Field.java:173)
+	at com.app/com.app.Main.main(Main.java:11)</code></pre></details>
+<p class="lab-note"><code>--module-source-path mods</code> говорит javac, что каждый подкаталог <code>mods</code> — исходники модуля с тем же именем; <code>--module</code> перечисляет, какие модули собрать.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Компиляция прошла, приветствие напечаталось. Что случится на <code>setAccessible(true)</code>?</div>
+<div class="lab-ans" hidden><p><code>InaccessibleObjectException: Unable to make field private java.lang.String com.greet.impl.Secret.token accessible: module com.greet does not "opens com.greet.impl" to module com.app</code>. <code>Class.forName</code> и <code>getDeclaredField</code> работают, а глубокая рефлексия в неоткрытый пакет запрещена. Исправление — в модуле-владельце: <code>opens com.greet.impl to com.app;</code> или запуск с <code>--add-opens com.greet/com.greet.impl=com.app</code>.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Проверьте исправление флагом командной строки, не трогая код:</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>--add-opens com.greet/com.greet.impl=com.app</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java --module-path out --add-opens com.greet/com.greet.impl=com.app -m com.app/com.app.Main</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Привет, модули!
+мой модуль: module com.app
+token = s3cr3t</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Импортируйте в <code>Main</code> класс <code>com.greet.impl.Secret</code> и вызовите <code>Secret.suffix()</code> напрямую.</summary><div>Ошибка компиляции: «package com.greet.impl is not visible … (package com.greet.impl is declared in module com.greet, which does not export it)». Модули проверяют доступ и при компиляции, и в рантайме.</div></details></li>
+<li><details><summary>Уберите <code>requires com.greet</code> из <code>com.app</code>.</summary><div>«package com.greet.api is not visible»: без requires модуль не читает другой модуль, даже если тот экспортирует пакет.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-8.2">
+<div class="lab-head"><span class="lab-num">Лаба 8.2</span><b>Сильная инкапсуляция JDK</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Попробовать залезть в приватное поле <code>String</code> и понять, откуда в реальных проектах берутся <code>--add-opens java.base/…</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>DeepReflection.java</code>:</div>
+<pre data-title="DeepReflection.java"><code class="java">public class DeepReflection {
+    public static void main(String[] args) throws Exception {
+        var f = String.class.getDeclaredField("value");
+        System.out.println("поле найдено: " + f);
+        f.setAccessible(true);
+        byte[] v = (byte[]) f.get("hello");
+        System.out.println("внутри строки " + v.length + " байт, coder = Latin-1");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">java DeepReflection.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">поле найдено: private final byte[] java.lang.String.value
+Exception in thread "main" java.lang.reflect.InaccessibleObjectException: Unable to make field private final byte[] java.lang.String.value accessible: module java.base does not "opens java.lang" to unnamed module @4e41089d
+	at java.base/java.lang.reflect.AccessibleObject.throwInaccessibleObjectException(AccessibleObject.java:353)
+	at java.base/java.lang.reflect.AccessibleObject.checkCanSetAccessible(AccessibleObject.java:329)
+	at java.base/java.lang.reflect.AccessibleObject.checkCanSetAccessible(AccessibleObject.java:277)
+	at java.base/java.lang.reflect.Field.checkCanSetAccessible(Field.java:179)
+	at java.base/java.lang.reflect.Field.setAccessible(Field.java:173)
+	at DeepReflection.main(DeepReflection.java:5)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Каким флагом это «разрешить» и почему в продакшене так лучше не делать?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>--add-opens java.base/java.lang=ALL-UNNAMED</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java --add-opens java.base/java.lang=ALL-UNNAMED DeepReflection.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">поле найдено: private final byte[] java.lang.String.value
+внутри строки 5 байт, coder = Latin-1</code></pre></details>
+<div class="lab-ans" hidden><p><code>--add-opens java.base/java.lang=ALL-UNNAMED</code> (код из classpath живёт в безымянном модуле). С Java 17 (JEP 403) это единственный способ — раньше хватало предупреждения. Флаг открывает весь пакет всем библиотекам из classpath; правильнее обновить библиотеку, которая требует такого доступа.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="jvm-8.3">
+<div class="lab-head"><span class="lab-num">Лаба 8.3</span><b>jdeps и jlink: свой runtime на 45 МБ</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Узнать, какие модули JDK реально нужны приложению, и собрать из них урезанный runtime.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Tiny.java</code>:</div>
+<pre data-title="Tiny.java"><code class="java">import java.net.http.HttpClient;
+import java.util.logging.Logger;
+
+public class Tiny {
+    public static void main(String[] args) {
+        Logger.getLogger("tiny").info("клиент: " + HttpClient.newHttpClient().version());
+        System.out.println("модули в runtime: " + ModuleLayer.boot().modules().size());
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d tiny-out Tiny.java
+jdeps --print-module-deps tiny-out
+java -cp tiny-out Tiny</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">java.base,java.logging,java.net.http
+Oct 21, 2026 9:15:21 PM Tiny main
+INFO: клиент: HTTP_2
+модули в runtime: 62</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">jdeps показал три модуля. Сколько модулей окажется в рантайме, собранном только из них, и во сколько раз он меньше полного JDK?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jlink --add-modules java.net.http,java.logging --strip-debug --no-header-files --no-man-pages --output tiny-jre
+tiny-jre/bin/java -cp tiny-out Tiny
+tiny-jre/bin/java --list-modules</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Oct 21, 2026 9:15:24 PM Tiny main
+INFO: клиент: HTTP_2
+модули в runtime: 3
+java.base@25.0.2
+java.logging@25.0.2
+java.net.http@25.0.2
+размер tiny-jre: 46 МБ, полный JDK: 371 МБ</code></pre></details>
+<p class="lab-note">Размер каталога в Windows: свойства папки в проводнике или <code>(Get-ChildItem tiny-jre -Recurse | Measure-Object Length -Sum).Sum / 1MB</code> в PowerShell. Для сравнения в последней строке вывода — размер полного JDK.</p>
+<div class="lab-ans" hidden><p>Ровно три: jlink добавляет транзитивные зависимости, но <code>java.net.http</code> и <code>java.logging</code> зависят только от <code>java.base</code>. Размер — около 45 МБ против ~370 МБ у полного JDK (в 8 раз меньше). На этом построены минимальные Docker-образы: <code>jlink</code> в стадии сборки, копирование результата в образ без JDK.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Выполните <code>java --describe-module java.sql</code>. Что значит <code>requires transitive java.logging</code>?</summary><div>Кто требует java.sql, автоматически читает и java.logging: типы из java.logging есть в публичном API java.sql (например, <code>Driver.getParentLogger()</code> возвращает <code>Logger</code>).</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">8.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Jackson не может заполнить private-поле класса из вашего модуля. Что нужно в module-info?</p><ul><li>exports пакета</li><li>requires com.fasterxml.jackson.databind</li><li>opens пакета для jackson.databind (или для всех)</li><li>uses ObjectMapper</li></ul><div class="why">Глубокая рефлексия требует opens; exports даёт только доступ к public.</div></div>
 <div class="mcq" data-ok="0"><p>Почему на Java 17 библиотека получила InaccessibleObjectException при доступе к private-полю java.lang.String?</p><ul><li>JDK строго инкапсулирует внутренности (JEP 403); нужен --add-opens java.base/java.lang=ALL-UNNAMED или обновление библиотеки</li><li>String стал final</li><li>Нужен requires java.base</li><li>Ошибка classpath</li></ul><div class="why">В Java 9–16 действовал --illegal-access=permit с предупреждением.</div></div>

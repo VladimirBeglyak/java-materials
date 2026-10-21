@@ -23,7 +23,7 @@
   <div class="kicker">ТЕМА 10 · ПАМЯТЬ</div>
   <h1>Объект в памяти: заголовок и раскладка</h1>
   <p class="lead">Сколько байт занимает <code>new Integer(5)</code>? А <code>ArrayList</code> из миллиона Integer? Ответ определяется заголовком объекта, сжатыми указателями, выравниванием и тем, как JVM раскладывает поля. Разберём mark word и klass pointer, compressed oops и «обрыв на 32 ГБ», компактные заголовки Java 25, соберём раскладку своего класса в калькуляторе, повторяющем вывод JOL.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">mark word</span><span class="tag">klass pointer</span><span class="tag">compressed oops</span><span class="tag">выравнивание</span><span class="tag">compact headers</span><span class="tag">JOL</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">mark word</span><span class="tag">klass pointer</span><span class="tag">compressed oops</span><span class="tag">выравнивание</span><span class="tag">compact headers</span><span class="tag">JOL</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -163,7 +163,176 @@ System.out.println(ClassLayout.parseClass(Order.class).toPrintable());
 System.out.println(GraphLayout.parseInstance(map).toFootprint());   // вся достижимая структура
 // или CLI: java -jar jol-cli.jar internals -cp app.jar com.shop.Order</code></pre>
 
-<h2 id="quiz"><span class="h-num">10.5</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">10.5</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Раскладку объектов в памяти показывает утилита <b>JOL</b> (Java Object Layout) из проекта OpenJDK. Скачайте её в каталог <code>lib</code> модуля <code>ch10</code> и добавьте как зависимость (Project Structure → Modules → Dependencies → + → JARs). Флаг <code>--sun-misc-unsafe-memory-access=allow</code> только убирает предупреждения JDK 24+ о том, что JOL использует <code>sun.misc.Unsafe</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-10.1">
+<div class="lab-head"><span class="lab-num">Лаба 10.1</span><b>Заголовок объекта своими глазами</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть mark word и указатель на класс у пустого объекта и у массива и сравнить с компактными заголовками Java 25.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Скачайте JOL:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">curl -L -o lib/jol-cli.jar https://repo1.maven.org/maven2/org/openjdk/jol/jol-cli/0.17/jol-cli-0.17-full.jar</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">java --sun-misc-unsafe-memory-access=allow -jar lib/jol-cli.jar internals java.lang.Object</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt"># Compressed references (oops): 3-bit shift
+# Compressed class pointers: 3-bit shift
+# Array base offsets:    16,   16,   16,   16,   16,   16,   16,   16,   16
+OFF  SZ   TYPE DESCRIPTION               VALUE
+  0   8        (object header: mark)     0x0000000000000001 (non-biasable; age: 0)
+  8   4        (object header: class)    0x00183228
+ 12   4        (object alignment gap)    
+Instance size: 16 bytes
+Space losses: 0 bytes internal + 4 bytes external = 4 bytes total</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Объект без полей занимает 16 байт, из которых 4 — «дырка» выравнивания. А сколько займёт <code>new int[3]</code>?</div>
+<pre data-title="Layout.java"><code class="java">import org.openjdk.jol.info.ClassLayout;
+
+public class Layout {
+    public static void main(String[] args) {
+        System.out.println(ClassLayout.parseInstance(new int[3]).toPrintable());
+        Object o = new Object();
+        System.out.println("до hashCode:   " + ClassLayout.parseInstance(o).toPrintable().lines().filter(l -&gt; l.contains("mark")).findFirst().orElse(""));
+        System.out.printf("hashCode = %x%n", o.hashCode());
+        System.out.println("после hashCode:" + ClassLayout.parseInstance(o).toPrintable().lines().filter(l -&gt; l.contains("mark")).findFirst().orElse(""));
+        synchronized (o) {
+            System.out.println("под synchronized:" + ClassLayout.parseInstance(o).toPrintable().lines().filter(l -&gt; l.contains("mark")).findFirst().orElse(""));
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -cp lib/jol-cli.jar Layout.java
+java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Layout</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">OFF  SZ   TYPE DESCRIPTION               VALUE
+  0   8        (object header: mark)     0x0000000000000001 (non-biasable; age: 0)
+  8   4        (object header: class)    0x00184aa0
+ 12   4        (array length)            3
+ 16  12    int [I.&lt;elements&gt;             N/A
+ 28   4        (object alignment gap)    
+Instance size: 32 bytes
+до hashCode:     0   8        (object header: mark)     0x0000000000000001 (non-biasable; age: 0)
+hashCode = 52a86356
+после hashCode:  0   8        (object header: mark)     0x00000295431ab001 (hash: 0x95431ab0; age: 0)
+под synchronized:  0   8        (object header: mark)     0x00000295431ab000 (thin lock: 0x00000295431ab000)</code></pre></details>
+<p class="lab-note">Обратите внимание: identity hashCode записывается прямо в mark word при первом вызове (биты 0x…01 → появилось ваше значение), а под synchronized mark word содержит указатель на запись блокировки в стеке (thin lock). Подробнее — в теме 18.</p>
+<div class="lab-ans" hidden><p>32 байта: 8 (mark) + 4 (класс) + 4 (длина массива) = 16 байт заголовка, затем 3 × 4 = 12 байт данных, итого 28 → выравнивание до кратного 8 даёт 32.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите тот же <code>internals java.lang.Object</code> с <code>-XX:+UseCompactObjectHeaders</code> (продуктовый флаг с Java 25, JEP 519).</summary><div>Строки «object header: class» больше нет: указатель на класс поместился внутрь 8-байтного mark word (JOL пометит его «Lilliput»). Объект без полей — по-прежнему 16 байт. Заголовок короче на 4 байта, но объект уменьшается, только если эти 4 байта «перешагивают» границу выравнивания в 8 байт (лаба 10.2 покажет обратный случай). В среднем по куче экономия ощутимая — типичные объекты маленькие.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-10.2">
+<div class="lab-head"><span class="lab-num">Лаба 10.2</span><b>Порядок полей и «дырки» выравнивания</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что JVM переставляет поля по размеру и что поля родителя идут раньше полей наследника.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Fields.java</code>:</div>
+<pre data-title="Fields.java"><code class="java">import org.openjdk.jol.info.ClassLayout;
+
+public class Fields {
+    static class Base { boolean flag; }
+    static class Order extends Base {
+        byte status;
+        long id;
+        int qty;
+        Object ref;
+        char code;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(ClassLayout.parseClass(Order.class).toPrintable());
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Поля объявлены в порядке <code>status, id, qty, ref, code</code>. В каком порядке они лежат в памяти и каков размер объекта?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -cp lib/jol-cli.jar Fields.java
+java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Fields</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">OFF  SZ               TYPE DESCRIPTION               VALUE
+  0   8                    (object header: mark)     N/A
+  8   4                    (object header: class)    N/A
+ 12   1            boolean Base.flag                 N/A
+ 13   1               byte Order.status              N/A
+ 14   2               char Order.code                N/A
+ 16   8               long Order.id                  N/A
+ 24   4                int Order.qty                 N/A
+ 28   4   java.lang.Object Order.ref                 N/A
+Instance size: 32 bytes
+Space losses: 0 bytes internal + 0 bytes external = 0 bytes total</code></pre></details>
+<div class="lab-ans" hidden><p>JVM сначала кладёт поля родителя (<code>flag</code>), затем поля класса, сгруппированные по убыванию размера: long → int → ссылки → char → byte, заполняя «дырки» мелкими полями. Порядок объявления не важен. Итог — 32 байта, причём без единого потерянного байта: <code>byte</code> и <code>char</code> заняли щель 13–15 перед <code>long</code>, которому нужно выравнивание на 8.</p></div>
+</li>
+<li class="lab-step predict"><div class="lab-text">Теперь с компактными заголовками: заголовок на 4 байта короче. Станет ли объект меньше 32 байт?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+UseCompactObjectHeaders --sun-misc-unsafe-memory-access=allow</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:+UseCompactObjectHeaders --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Fields</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">OFF  SZ               TYPE DESCRIPTION               VALUE
+  0   8                    (object header: mark)     N/A
+  8   1            boolean Base.flag                 N/A
+  9   1               byte Order.status              N/A
+ 10   2               char Order.code                N/A
+ 12   4                int Order.qty                 N/A
+ 16   8               long Order.id                  N/A
+ 24   4   java.lang.Object Order.ref                 N/A
+ 28   4                    (object alignment gap)    
+Instance size: 32 bytes
+Space losses: 0 bytes internal + 4 bytes external = 4 bytes total</code></pre></details>
+<div class="lab-ans" hidden><p>Нет: 8 + 20 байт полей = 28, выравнивание до 8 даёт те же 32 байта, только теперь с 4 байтами «дырки» в конце. Компактный заголовок выигрывает у объектов, где старый размер был «чуть больше» кратного 8, — например, у класса с одним полем <code>long</code>: 24 → 16 байт.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Отключите сжатые ссылки <code>-XX:-UseCompressedOops</code>. Что изменится?</summary><div>Поле <code>ref</code> станет 8 байт, объект вырастет. Указатель на класс при этом останется 4-байтным: за него отвечает отдельный флаг <code>UseCompressedClassPointers</code>. Это то, что происходит при -Xmx ≥ 32 ГБ.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-10.3">
+<div class="lab-head"><span class="lab-num">Лаба 10.3</span><b>Сколько памяти на самом деле занимает коллекция</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посчитать полный «след» (footprint) структуры данных — со всеми внутренними объектами — и сравнить <code>ArrayList&lt;Integer&gt;</code>, <code>int[]</code> и <code>HashMap</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Footprint.java</code>:</div>
+<pre data-title="Footprint.java"><code class="java">import org.openjdk.jol.info.GraphLayout;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class Footprint {
+    public static void main(String[] args) {
+        int n = 1000;
+        int[] arr = new int[n];
+        List&lt;Integer&gt; list = new ArrayList&lt;&gt;();
+        Map&lt;Integer, Integer&gt; map = new HashMap&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) { arr[i] = i + 1000; list.add(i + 1000); map.put(i + 1000, i + 1000); }
+
+        System.out.println("int[1000]:            " + GraphLayout.parseInstance((Object) arr).totalSize() + " байт");
+        System.out.println("ArrayList&lt;Integer&gt;:   " + GraphLayout.parseInstance(list).totalSize() + " байт");
+        System.out.println("HashMap&lt;Int,Int&gt;:     " + GraphLayout.parseInstance(map).totalSize() + " байт");
+        System.out.println();
+        System.out.println(GraphLayout.parseInstance(map).toFootprint());
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз <code>ArrayList&lt;Integer&gt;</code> тяжелее <code>int[]</code> на тысяче чисел больше 127? А HashMap?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -cp lib/jol-cli.jar Footprint.java
+java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Footprint</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt"># WARNING: Unable to get Instrumentation. Dynamic Attach failed. You may add this JAR as -javaagent manually, or supply -Djdk.attach.allowAttachSelf
+# WARNING: Unable to attach Serviceability Agent. You can try again with escalated privileges. Two options: a) use -Djol.tryWithSudo=true to try with sudo; b) echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+int[1000]:            4016 байт
+ArrayList&lt;Integer&gt;:   20976 байт
+HashMap&lt;Int,Int&gt;:     72256 байт
+
+java.util.HashMap@3e2e18f2d footprint:
+     COUNT       AVG       SUM   DESCRIPTION
+         1      8208      8208   [Ljava.util.HashMap$Node;
+      2000        16     32000   java.lang.Integer
+         1        48        48   java.util.HashMap
+      1000        32     32000   java.util.HashMap$Node
+      3002               72256   (total)</code></pre></details>
+<p class="lab-note">Предупреждения JOL «Unable to get Instrumentation» и «Unable to attach Serviceability Agent» безвредны: для подсчёта размеров они не нужны.</p>
+<div class="lab-ans" hidden><p>ArrayList примерно в 5 раз (4 КБ массива против ~21 КБ): 1000 объектов Integer по 16 байт + массив ссылок с запасом ёмкости. HashMap — примерно в 18 раз (~72 КБ): на каждую пару — узел <code>HashMap$Node</code> (32 байта) и два Integer, плюс таблица. Для больших наборов примитивов это повод взять массив или специализированные коллекции (fastutil, Eclipse Collections).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>i + 1000</code> на <code>i % 100</code> в ArrayList. Почему след резко уменьшится?</summary><div>Значения −128..127 берутся из кэша <code>Integer.valueOf</code> — все 1000 ссылок указывают на 100 общих объектов, а JOL считает каждый объект графа один раз.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">10.6</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Сколько байт занимает объект <code>Integer</code> на 64-битной JVM со сжатыми указателями (без компактных заголовков)?</p><ul><li>4</li><li>16 (12 заголовок + 4 значение)</li><li>8</li><li>24</li></ul><div class="why">С компактными заголовками 8 + 4 = 12 → тоже 16 после выравнивания: выигрыш получают объекты, у которых освободившиеся 4 байта уменьшают размер после выравнивания.</div></div>
 <div class="mcq" data-ok="3"><p>Почему куча 34 ГБ может вместить меньше данных, чем 30 ГБ?</p><ul><li>GC медленнее</li><li>Ошибка JVM</li><li>Больше заголовков</li><li>Выше ~32 ГБ отключаются сжатые указатели, и каждая ссылка занимает 8 байт вместо 4</li></ul><div class="why">Обрыв на 32 ГБ.</div></div>

@@ -1,0 +1,170 @@
+@chapter 02 | quiz
+@intro
+<p>Типы в Java ведут себя строго по правилам, но правила эти неочевидны: переполнение молчит, <code>0.1 + 0.2</code> не равно <code>0.3</code>, а <code>==</code> у обёрток зависит от числа. Всё это проверяем руками. Модуль IDEA — <code>ch02</code>.</p>
+@end
+
+@lab 2.1 | Переполнение и приведения | 15 мин
+@goal
+<p>Предсказать результат каждой строки, затем сверить.</p>
+@end
+@file Numbers.java
+public class Numbers {
+    public static void main(String[] args) {
+        int max = Integer.MAX_VALUE;
+        System.out.println("1. max + 1        = " + (max + 1));
+        System.out.println("2. (byte) 200     = " + (byte) 200);
+        System.out.println("3. (int) 3.99     = " + (int) 3.99);
+        System.out.println("4. (int) -3.99    = " + (int) -3.99);
+        System.out.println("5. 7 / 2          = " + 7 / 2);
+        System.out.println("6. -7 / 2, -7 % 2 = " + (-7 / 2) + ", " + (-7 % 2));
+        System.out.println("7. 'a' + 1        = " + ('a' + 1));
+        System.out.println("8. (char)('a' + 1)= " + (char) ('a' + 1));
+        long big = 1_000_000 * 1_000_000;
+        System.out.println("9. 1e6 * 1e6 (int)= " + big);
+        System.out.println("10. (int) 1e20    = " + (int) 1e20);
+        try {
+            Math.addExact(max, 1);
+        } catch (ArithmeticException e) {
+            System.out.println("11. addExact      → " + e.getMessage());
+        }
+    }
+}
+@end
+@predict Запишите все 11 результатов. Особое внимание — строки 2, 6, 9 и 10.
+@answer
+<p>1: −2147483648 (переполнение «заворачивается»). 2: −56 (берутся младшие 8 бит: 200 − 256). 3 и 4: 3 и −3 — отбрасывание к нулю, не округление. 5: 3. 6: −3 и −1 — деление округляет к нулю, остаток берёт знак делимого (для «математического» остатка — <code>Math.floorMod</code>). 7: 98, 8: b. 9: −727379968 — умножение выполнено в int <b>до</b> присваивания в long; нужно <code>1_000_000L * 1_000_000</code>. 10: 2147483647 — приведение double к int насыщается. 11: «integer overflow».</p>
+@end
+@run
+javac Numbers.java
+java Numbers
+@end
+@try
+Исправьте строку 9, чтобы получилось 1 000 000 000 000. ::: Достаточно одной буквы: <code>1_000_000L * 1_000_000</code> — теперь операция выполняется в long.
+@end
+
+@lab 2.2 | Деньги и плавающая точка | 15 мин
+@goal
+<p>Увидеть, почему double не годится для денег, и как правильно пользоваться <code>BigDecimal</code>.</p>
+@end
+@file Money.java
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+
+public class Money {
+    public static void main(String[] args) {
+        System.out.println("0.1 + 0.2           = " + (0.1 + 0.2));
+        System.out.println("0.1 + 0.2 == 0.3    : " + (0.1 + 0.2 == 0.3));
+        double sum = 0;
+        for (int i = 0; i < 10; i++) sum += 0.1;
+        System.out.println("10 × 0.1            = " + sum);
+        System.out.println("new BigDecimal(0.1) = " + new BigDecimal(0.1));
+        System.out.println("BigDecimal(\"0.1\")   = " + new BigDecimal("0.1"));
+        System.out.println("valueOf(0.1)        = " + BigDecimal.valueOf(0.1));
+
+        BigDecimal price = new BigDecimal("19.99"), qty = new BigDecimal("3");
+        System.out.println("19.99 × 3           = " + price.multiply(qty));
+        System.out.println("100 / 3 (2 знака)   = " + new BigDecimal("100").divide(qty, 2, RoundingMode.HALF_EVEN));
+        System.out.println("1.0 equals 1.00     : " + new BigDecimal("1.0").equals(new BigDecimal("1.00")));
+        System.out.println("1.0 compareTo 1.00  : " + new BigDecimal("1.0").compareTo(new BigDecimal("1.00")));
+        System.out.println("NaN == NaN          : " + (Double.NaN == Double.NaN));
+        System.out.println("0.0 == -0.0         : " + (0.0 == -0.0) + ", equals: " + Double.valueOf(0.0).equals(-0.0));
+    }
+}
+@end
+@predict Что напечатают <code>new BigDecimal(0.1)</code> и сравнения <code>1.0</code> и <code>1.00</code>?
+@answer
+<p><code>new BigDecimal(0.1)</code> покажет точное двоичное значение double: <code>0.1000000000000000055511151231257827…</code> — конструктор из double переносит ошибку. Правильно — из строки или <code>BigDecimal.valueOf</code>. <code>equals</code> у BigDecimal учитывает масштаб (1.0 ≠ 1.00), а <code>compareTo</code> — только значение (0). Отсюда ловушка: в <code>HashSet</code> это два элемента, в <code>TreeSet</code> — один.</p>
+@end
+@run
+javac Money.java
+java Money
+@end
+@try
+Вызовите <code>new BigDecimal("100").divide(new BigDecimal("3"))</code> без масштаба. ::: <code>ArithmeticException: Non-terminating decimal expansion</code> — у 100/3 нет конечной десятичной записи, и BigDecimal отказывается угадывать округление.
+@end
+
+@lab 2.3 | Передача параметров: всегда по значению | 15 мин
+@goal
+<p>Доказать, что Java передаёт копию значения — для ссылок это копия ссылки.</p>
+@end
+@file PassByValue.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class PassByValue {
+    static void swap(int a, int b) { int t = a; a = b; b = t; }
+    static void reassign(List<String> list) { list = new ArrayList<>(); list.add("новый"); }
+    static void mutate(List<String> list) { list.add("добавлено"); }
+    static void swapRefs(StringBuilder x, StringBuilder y) { StringBuilder t = x; x = y; y = t; x.append("!"); }
+
+    public static void main(String[] args) {
+        int a = 1, b = 2;
+        swap(a, b);
+        System.out.println("a=" + a + ", b=" + b);
+
+        List<String> list = new ArrayList<>(List.of("старый"));
+        reassign(list);
+        System.out.println("после reassign: " + list);
+        mutate(list);
+        System.out.println("после mutate:   " + list);
+
+        StringBuilder x = new StringBuilder("X"), y = new StringBuilder("Y");
+        swapRefs(x, y);
+        System.out.println("x=" + x + ", y=" + y);
+    }
+}
+@end
+@predict Что напечатают четыре строки? Особенно последняя.
+@answer
+<p><code>a=1, b=2</code>; после reassign — <code>[старый]</code>; после mutate — <code>[старый, добавлено]</code>; <code>x=X, y=Y!</code>. В <code>swapRefs</code> поменялись местами копии ссылок внутри метода, поэтому <code>x.append</code> внутри метода дописал «!» объекту, на который указывает внешний <code>y</code>. Метод может менять <i>объект</i> по ссылке, но не может переназначить переменную вызывающего.</p>
+@end
+@run
+javac PassByValue.java
+java PassByValue
+@end
+@try
+Как всё-таки «вернуть два значения» из метода? ::: Вернуть объект: record <code>record Pair(int a, int b)</code> — идиоматичный способ. Массив из одного элемента или изменяемый «холдер» работают, но читаются хуже.
+@end
+
+@lab 2.4 | Обёртки: кэш, == и NPE на распаковке | 15 мин
+@goal
+<p>Поймать три классические ловушки автоупаковки.</p>
+@end
+@file Boxing.java
+import java.util.HashMap;
+import java.util.Map;
+
+public class Boxing {
+    public static void main(String[] args) {
+        Integer a = 127, b = 127, c = 128, d = 128;
+        System.out.println("127 == 127: " + (a == b));
+        System.out.println("128 == 128: " + (c == d));
+        System.out.println("128 equals: " + c.equals(d));
+
+        Long l = 10L;
+        System.out.println("Long(10).equals(10): " + l.equals(10));
+
+        Map<String, Integer> stock = new HashMap<>();
+        boolean known = false;
+        try {
+            int n = known ? stock.get("apple") : 0;
+            System.out.println("n = " + n);
+            Integer m = true ? stock.get("apple") : 0;   // ловушка
+            System.out.println("m = " + m);
+        } catch (NullPointerException e) {
+            System.out.println("NPE: " + e.getMessage());
+        }
+    }
+}
+@end
+@predict Почему <code>Long.equals(10)</code> — false, и на какой строке случится NPE?
+@answer
+<p><code>10</code> упаковывается в <code>Integer</code>, а <code>Long.equals</code> возвращает false для объекта другого класса. NPE — на строке с <code>m</code>: у тернарного оператора типы <code>Integer</code> и <code>int</code>, поэтому тип всего выражения — <code>int</code>, и <code>null</code> из карты распаковывается. Сообщение helpful NPE (Java 14+) прямо говорит: <i>Cannot invoke "java.lang.Integer.intValue()" because the return value of "java.util.Map.get(Object)" is null</i>.</p>
+@end
+@run
+javac Boxing.java
+java Boxing
+@end
+@try
+Запустите с <code>-XX:AutoBoxCacheMax=1000</code>. Что станет с <code>128 == 128</code>? ::: true: верхнюю границу кэша Integer можно поднять флагом JVM. Именно поэтому полагаться на <code>==</code> у обёрток нельзя — результат зависит от настроек.
+@end

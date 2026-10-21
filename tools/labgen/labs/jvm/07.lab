@@ -1,0 +1,218 @@
+@chapter 07 | quiz
+@intro
+<p>Пишем собственный загрузчик, делаем на нём горячую перезагрузку, проверяем выгрузку классов и пишем Java-агента. Модуль IDEA — <code>ch07</code>; «перезагружаемый» код живёт в отдельном каталоге <code>reload-src</code> и компилируется из терминала.</p>
+@end
+
+@lab 7.1 | Загрузчик из каталога: findClass + defineClass | 20 мин
+@goal
+<p>Написать загрузчик, который сам читает байты class-файла и определяет класс, и увидеть, что все ссылки этого класса тоже идут через него.</p>
+@end
+@file reload-src/Greeter.java
+public class Greeter implements java.util.function.Supplier<String> {
+    public String get() { return "Привет, версия 1 (" + new Helper().tag() + ")"; }
+}
+
+class Helper { String tag() { return "helper v1"; } }
+@end
+@file DirLoader.java
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class DirLoader extends ClassLoader {
+    private final Path dir;
+
+    DirLoader(Path dir) {
+        super("dir-loader", DirLoader.class.getClassLoader());
+        this.dir = dir;
+    }
+
+    @Override
+    protected Class<?> findClass(String name) throws ClassNotFoundException {
+        Path file = dir.resolve(name.replace('.', '/') + ".class");
+        try {
+            byte[] bytes = Files.readAllBytes(file);
+            System.out.println("  [dir-loader] определяю " + name + " (" + bytes.length + " байт)");
+            return defineClass(name, bytes, 0, bytes.length);
+        } catch (IOException e) {
+            throw new ClassNotFoundException(name, e);
+        }
+    }
+}
+@end
+@file UseLoader.java
+import java.nio.file.Path;
+import java.util.function.Supplier;
+
+public class UseLoader {
+    @SuppressWarnings("unchecked")
+    public static void main(String[] args) throws Exception {
+        var loader = new DirLoader(Path.of("reload-out"));
+        Class<?> c = loader.loadClass("Greeter");
+        var g = (Supplier<String>) c.getDeclaredConstructor().newInstance();
+        System.out.println(g.get());
+        System.out.println("Greeter загружен: " + c.getClassLoader().getName());
+        System.out.println("Supplier загружен: " + Supplier.class.getClassLoader());
+    }
+}
+@end
+@run
+javac -d reload-out reload-src/Greeter.java
+javac DirLoader.java UseLoader.java
+java UseLoader
+@end
+@predict Почему <code>Helper</code> тоже прошёл через dir-loader, хотя мы его явно не загружали, а <code>Supplier</code> и <code>String</code> — нет?
+@answer
+<p>Символические ссылки класса разрешаются его определяющим загрузчиком. Greeter определил dir-loader, поэтому <code>Helper</code> запрашивается у него: делегирование вверх (app → platform → bootstrap) Helper не находит, и вызывается наш <code>findClass</code>. <code>Supplier</code> и <code>String</code> находит bootstrap-родитель. Поэтому приводить к <code>Supplier</code> можно — это один и тот же класс для обеих сторон.</p>
+@end
+@try
+Что будет, если положить <code>Greeter.class</code> ещё и в classpath приложения (скомпилировать <code>reload-src/Greeter.java</code> в текущий каталог)? ::: dir-loader его больше не определит: родитель (app) найдёт Greeter первым, findClass не вызовется. Это главная ловушка самописных загрузчиков — классы «утекают» к родителю. Плагинные системы и Tomcat поэтому используют child-first: сначала ищут у себя.
+@end
+
+@lab 7.2 | Горячая перезагрузка без перезапуска JVM | 25 мин
+@goal
+<p>Менять код класса, пока программа работает, и видеть новую версию — тот же механизм, что у Spring DevTools.</p>
+@end
+@file HotReload.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.util.function.Supplier;
+
+public class HotReload {
+    @SuppressWarnings("unchecked")
+    public static void main(String[] args) throws Exception {
+        Path cls = Path.of("reload-out", "Greeter.class");
+        FileTime seen = null;
+        Supplier<String> current = null;
+        for (int tick = 0; tick < 30; tick++) {
+            FileTime now = Files.getLastModifiedTime(cls);
+            if (!now.equals(seen)) {
+                var loader = new DirLoader(Path.of("reload-out"));    // новый загрузчик на каждую версию
+                current = (Supplier<String>) loader.loadClass("Greeter").getDeclaredConstructor().newInstance();
+                seen = now;
+                System.out.println("== перезагружено новым загрузчиком @" + Integer.toHexString(loader.hashCode()));
+            }
+            System.out.println(tick + ": " + current.get());
+            Thread.sleep(1000);
+        }
+    }
+}
+@end
+@step Запустите <code>HotReload</code> в IDEA (▶) и не останавливайте. Пока он работает, исправьте в <code>reload-src/Greeter.java</code> «версия 1» на «версия 2», «helper v1» на «helper v2» и в терминале перекомпилируйте:
+@exec
+javac HotReload.java
+(java HotReload > hot.out 2>&1 &)
+sleep 3
+sed -i 's/версия 1/версия 2/; s/helper v1/helper v2/' reload-src/Greeter.java
+@end
+@run noout
+javac -d reload-out reload-src/Greeter.java
+@end
+@step Посмотрите в консоль программы:
+@exec
+sleep 4
+P=$(jcmd | grep HotReload | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@run
+#!cat hot.out
+@end
+@predict Старые объекты Greeter v1 (если бы мы их где-то сохранили) поменяют поведение после перезагрузки?
+@answer
+<p>Нет. Объект привязан к своему классу, а класс — к своему загрузчику. Перезагрузка = новый загрузчик + новые объекты. Поэтому DevTools перезапускает Spring-контекст целиком: все бины пересоздаются в «перезапускаемом» загрузчике, а библиотеки остаются в базовом. Подменить код у живых объектов умеет только JVMTI-переопределение (<code>Instrumentation.redefineClasses</code>) — и только тела методов.</p>
+@end
+@try
+Добавьте в Greeter новое поле или метод и перекомпилируйте. Сработает ли перезагрузка? ::: Да — это новый класс в новом загрузчике, ограничений на структуру нет. А вот «Hot Swap» отладчика IDEA (Build → Recompile при отладке) такое не умеет: redefineClasses разрешает менять только тела методов.
+@end
+
+@lab 7.3 | Выгрузка классов и утечка загрузчика | 20 мин
+@goal
+<p>Увидеть, что класс выгружается только вместе с загрузчиком, и устроить «утечку», которая это предотвращает.</p>
+@end
+@file Unload.java
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Unload {
+    static final List<Object> LEAK = new ArrayList<>();
+
+    public static void main(String[] args) throws Exception {
+        boolean leak = args.length > 0;
+        for (int i = 0; i < 3; i++) {
+            var loader = new DirLoader(Path.of("reload-out"));
+            Object g = loader.loadClass("Greeter").getDeclaredConstructor().newInstance();
+            if (leak) LEAK.add(g);          // ссылка на объект -> класс -> загрузчик
+        }
+        System.out.println("вызываем System.gc()");
+        System.gc();
+        Thread.sleep(200);
+        System.out.println("готово");
+    }
+}
+@end
+@ide VM options: <code>-Xlog:class+unload</code>
+@run grep="unload|Greeter|Helper|gc|готово"
+javac Unload.java
+java -Xlog:class+unload Unload
+@end
+@predict Запустите с аргументом <code>leak</code> (Program arguments). Будут ли строки <code>unloading class Greeter</code>?
+@answer
+<p>Нет: каждый объект в статическом списке держит свой класс, класс — свой загрузчик, загрузчик — все определённые им классы. Ничто из этой цепочки не может быть собрано. Ровно так «текут» Tomcat и Spring DevTools после десятка перезагрузок: ThreadLocal, драйвер JDBC в <code>DriverManager</code> или поток, созданный приложением, держат старый загрузчик, и metaspace растёт до <code>OutOfMemoryError: Metaspace</code>.</p>
+@end
+@run grep="unload|Greeter|Helper|готово"
+java -Xlog:class+unload Unload leak
+@end
+@try
+Вместо объекта сохраните в LEAK только <code>loader</code>. Выгрузятся ли классы? ::: Нет — загрузчик хранит ссылки на все свои классы. Сохраните только <code>g.toString()</code> (строку) — тогда выгрузятся: строка — класс из java.base и не ссылается на загрузчик.
+@end
+
+@lab 7.4 | Java-агент: подглядываем за каждой загрузкой | 25 мин
+@goal
+<p>Написать агента с <code>premain</code>, подключить его через <code>-javaagent</code> и перехватить каждую загрузку классов с помощью <code>ClassFileTransformer</code>.</p>
+@end
+@file agent-src/LoadAgent.java
+import java.lang.instrument.ClassFileTransformer;
+import java.lang.instrument.Instrumentation;
+import java.security.ProtectionDomain;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class LoadAgent {
+    public static void premain(String args, Instrumentation inst) {
+        System.out.println("[agent] premain, аргументы: " + args + ", уже загружено классов: " + inst.getAllLoadedClasses().length);
+        AtomicInteger count = new AtomicInteger();
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override
+            public byte[] transform(ClassLoader loader, String name, Class<?> redefined,
+                                    ProtectionDomain pd, byte[] bytes) {
+                count.incrementAndGet();
+                if (loader != null && loader.getName() != null && loader.getName().equals("app"))
+                    System.out.println("[agent] загружается " + name + " (" + bytes.length + " байт)");
+                return null;                       // null = не менять байткод
+            }
+        });
+        Runtime.getRuntime().addShutdownHook(new Thread(() ->
+            System.out.println("[agent] всего классов прошло через transform: " + count.get())));
+    }
+}
+@end
+@file agent-src/MANIFEST.MF
+Premain-Class: LoadAgent
+@end
+@step Соберите агента в jar (в манифесте обязательна пустая строка в конце — генератор файла выше её добавит; в IDEA просто нажмите Enter после последней строки):
+@run
+javac -d agent-out agent-src/LoadAgent.java
+jar cfm agent.jar agent-src/MANIFEST.MF -C agent-out .
+@end
+@step Любое приложение — например, <code>UseLoader</code> из лабы 7.1 — запустите с агентом:
+@ide VM options: <code>-javaagent:agent.jar=hello</code> (путь к jar — относительно рабочего каталога конфигурации запуска)
+@run
+java -javaagent:agent.jar=hello UseLoader
+@end
+@predict Почему в списке нет <code>Greeter</code> и <code>Helper</code>?
+@answer
+<p>Мы печатаем только классы загрузчика с именем <code>app</code>, а их определил <code>dir-loader</code>. Через <code>transform</code> они прошли — это видно по общему счётчику. Агент видит ВСЕ классы, кроме уже загруженных до premain (их можно обработать через <code>retransformClasses</code>). Так работают JaCoCo, OpenTelemetry Java agent, профилировщики, Byte Buddy.</p>
+@end
+@try
+Верните из <code>transform</code> пустой массив <code>new byte[0]</code> для класса <code>UseLoader</code>. Что произойдёт? ::: <code>ClassFormatError</code> (Truncated class file) — JVM честно попытается разобрать ваши «новые» байты. Агенты модифицируют байткод библиотеками (ClassFile API, ASM, Byte Buddy), а не руками.
+@end

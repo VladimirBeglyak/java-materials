@@ -1,0 +1,116 @@
+@chapter 18 | quiz
+@intro
+<p>Unicode, нормализация, регулярные выражения для разбора логов и катастрофический перебор — с замером времени. Модуль IDEA — <code>ch18</code>. Если в консоли IDEA эмодзи отображаются квадратиками — это шрифт консоли, а не ошибка программы.</p>
+@end
+
+@lab 18.1 | char — не символ | 15 мин
+@goal
+<p>Посчитать «длину» строки с эмодзи и диакритикой тремя способами и сравнить две одинаково выглядящие строки.</p>
+@end
+@file Unicode.java
+import java.text.Normalizer;
+
+public class Unicode {
+    public static void main(String[] args) {
+        String s = "Java☕👍🏽";
+        System.out.println("length()        = " + s.length());
+        System.out.println("codePointCount  = " + s.codePointCount(0, s.length()));
+        System.out.println("кодовые точки:   " + s.codePoints().mapToObj(cp -> String.format("U+%04X", cp)).toList());
+        System.out.println("substring(0,6)  = " + s.substring(0, 6).codePoints().mapToObj(cp -> String.format("U+%04X", cp)).toList() + " ← половина суррогатной пары");
+
+        String composed = "é";                 // U+00E9
+        String decomposed = "é";         // e + комбинируемое ударение
+        System.out.println("выглядят одинаково, equals = " + composed.equals(decomposed)
+                + ", длины " + composed.length() + " и " + decomposed.length());
+        System.out.println("после NFC equals = " + Normalizer.normalize(decomposed, Normalizer.Form.NFC).equals(composed));
+    }
+}
+@end
+@predict Какие числа дадут <code>length()</code> и <code>codePointCount</code> для «Java☕👍🏽»?
+@answer
+<p><code>length()</code> = 9: «Java» — 4, ☕ (U+2615, внутри BMP) — 1, 👍 (U+1F44D) — 2 char-а (суррогатная пара), модификатор тона 🏽 (U+1F3FD) — ещё 2. <code>codePointCount</code> = 7. А пользователь видит 6 «символов»: 👍🏽 — одна графема из двух кодовых точек (для графем — <code>BreakIterator</code> или <code>\X</code> в regex). <code>substring</code> по индексам char может разрезать пару и оставить «сироту» U+D83D.</p>
+@end
+@run
+javac Unicode.java
+java Unicode
+@end
+
+@lab 18.2 | Разбор лога регулярным выражением | 20 мин
+@goal
+<p>Вытащить поля из строк лога именованными группами и посчитать статистику.</p>
+@end
+@file LogParse.java
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+public class LogParse {
+    private static final Pattern LINE = Pattern.compile(
+        "^(?<time>\\d{2}:\\d{2}:\\d{2}) \\[(?<level>[A-Z]+)\\s*] (?<logger>[\\w.]+) - (?<msg>.*?)(?: took (?<ms>\\d+)ms)?$");
+
+    public static void main(String[] args) {
+        List<String> log = List.of(
+            "10:15:01 [INFO ] app.web.Controller - GET /orders took 35ms",
+            "10:15:02 [WARN ] app.db.Pool - pool almost exhausted",
+            "10:15:03 [INFO ] app.web.Controller - GET /orders/42 took 120ms",
+            "это не строка лога",
+            "10:15:05 [ERROR] app.pay.Gateway - timeout calling bank took 3000ms");
+
+        List<Map<String, String>> parsed = new ArrayList<>();
+        for (String l : log) {
+            Matcher m = LINE.matcher(l);
+            if (!m.matches()) { System.out.println("не разобрано: " + l); continue; }
+            parsed.add(Map.of("level", m.group("level"), "logger", m.group("logger"),
+                    "ms", Objects.requireNonNullElse(m.group("ms"), "-")));
+        }
+        parsed.forEach(System.out::println);
+        System.out.println("по уровням: " + parsed.stream().collect(Collectors.groupingBy(p -> p.get("level"), TreeMap::new, Collectors.counting())));
+        System.out.println("замена с backreference: " + "2026-10-21".replaceAll("(\\d{4})-(\\d{2})-(\\d{2})", "$3.$2.$1"));
+    }
+}
+@end
+@run
+javac LogParse.java
+java LogParse
+@end
+@predict Зачем в группе <code>msg</code> ленивый квантификатор <code>.*?</code>?
+@answer
+<p>Жадный <code>.*</code> захватил бы и « took 35ms» — необязательная группа <code>(?: took …)?</code> «согласилась» бы ничего не совпадать, и <code>ms</code> всегда был бы null. Ленивый <code>.*?</code> берёт минимум, оставляя хвост необязательной группе. Pattern компилируйте один раз в <code>static final</code> — компиляция дороже сопоставления.</p>
+@end
+
+@lab 18.3 | ReDoS: регулярка, которая вешает сервис | 15 мин
+@goal
+<p>Измерить экспоненциальный рост времени на «злом» шаблоне — и выяснить, от чего современная Java уже защищает, а от чего нет.</p>
+@end
+@file Redos.java
+import java.util.regex.Pattern;
+
+public class Redos {
+    static long ms(Pattern p, String in) {
+        long t = System.nanoTime();
+        p.matcher(in).matches();
+        return (System.nanoTime() - t) / 1_000_000;
+    }
+
+    public static void main(String[] args) {
+        Pattern classic = Pattern.compile("^(a+)+$");          // хрестоматийный ReDoS
+        Pattern counted = Pattern.compile("^(a+){2,40}$");     // то же, но со счётным квантификатором
+        Pattern csv = Pattern.compile("^(.*?,){11}P");          // «найти 12-е поле CSV»
+        Pattern safe = Pattern.compile("^a{2,}$");
+        for (int n = 16; n <= 26; n += 2) {
+            String in = "a".repeat(n) + "!";                     // почти совпадает
+            System.out.printf("n=%2d: (a+)+ %4d мс | (a+){2,40} %5d мс | (.*?,){11}P %5d мс | a{2,} %d мс%n",
+                    n, ms(classic, in), ms(counted, in), ms(csv, "a,".repeat(n) + "!"), ms(safe, in));
+        }
+    }
+}
+@end
+@predict Какой из шаблонов «взорвётся», а какой — нет, хотя по учебникам должен?
+@answer
+<p>Хрестоматийный <code>(a+)+</code> на современной Java отрабатывает мгновенно: с JDK 9 движок запоминает уже проверенные позиции для жадных циклов <code>*</code> и <code>+</code> над группой. А вот <code>(a+){2,40}</code> и <code>(.*?,){11}P</code> растут примерно вдвое на каждые +2 символа: для счётных и ленивых повторов эта защита не работает, и движок перебирает экспоненциально много разбиений строки. 30–40 символов — уже секунды на один запрос. Лечение: убрать вложенные квантификаторы (<code>a{2,}</code>), использовать possessive-квантификаторы (<code>(a+)++</code>) или атомарные группы <code>(?&gt;…)</code>, ограничивать длину входа, а для CSV — парсер вместо регулярки.</p>
+@end
+@run
+javac Redos.java
+java Redos
+@end

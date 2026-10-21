@@ -1,0 +1,177 @@
+@chapter 01 | quiz
+@intro
+<p>Здесь вы сами увидите то, о чём шла речь выше: сколько работы JVM делает до первой строки <code>main</code>, какие настройки она выбирает «сама» на вашей машине и как прочитать флаги живого процесса. Создайте в IDEA модуль <code>ch01</code> и кладите классы в папку <code>src</code> (пакет по умолчанию).</p>
+@end
+
+@lab 1.1 | Что JVM успевает сделать до main | 15 мин
+@goal
+<p>Измерить, сколько классов загружается и сколько миллисекунд проходит до вызова <code>main</code>, и как на это влияет архив CDS.</p>
+@end
+@step Создайте класс <code>Hello</code>. Он печатает, сколько прошло от старта процесса и сколько классов уже загружено:
+@file Hello.java
+import java.lang.management.ManagementFactory;
+
+public class Hello {
+    public static void main(String[] args) {
+        var rt = ManagementFactory.getRuntimeMXBean();
+        long sinceStart = System.currentTimeMillis() - rt.getStartTime();
+        int classes = ManagementFactory.getClassLoadingMXBean().getLoadedClassCount();
+        System.out.println("JVM:            " + rt.getVmName() + " " + rt.getVmVersion());
+        System.out.println("до main прошло: ~" + sinceStart + " мс");
+        System.out.println("классов загружено: " + classes);
+        System.out.println("pid: " + ProcessHandle.current().pid());
+    }
+}
+@end
+@ide Запустите зелёным ▶ рядом с <code>main</code>. Затем откройте встроенный терминал (Alt+F12) — дальше часть команд удобнее запускать из него.
+@step Запустите тот же класс из терминала без отдельной компиляции — лаунчер сам скомпилирует один файл в память (JEP 330):
+@run
+java Hello.java
+@end
+@note Цифра «классов загружено» включает и классы самого компилятора javac, который лаунчер запустил ради однофайлового режима. Чтобы увидеть «чистую» JVM, скомпилируйте заранее.
+@step Скомпилируйте и запустите как обычно:
+@run
+javac Hello.java
+java Hello
+@end
+@predict Выключим CDS — архив заранее разобранных классов JDK (<code>-Xshare:off</code>). Что произойдёт с числом классов и со временем до <code>main</code>?
+@answer
+<p>Число классов почти не изменится — JVM загружает те же классы. Время вырастет заметно (обычно в 1,5–3 раза): без архива каждый класс java.base приходится читать из модуля <code>lib/modules</code>, разбирать и проверять заново. CDS ускоряет именно эту работу.</p>
+@end
+@run
+java -Xshare:off Hello
+@end
+@step Посмотрите, какие именно классы и откуда загружаются. Вывод длинный — в IDEA добавьте флаг в <b>VM options</b> и воспользуйтесь поиском по консоли (Ctrl+F):
+@ide Run → Edit Configurations… → Modify options → <b>Add VM options</b> → <code>-Xlog:class+load</code>
+@run head=12
+java -Xlog:class+load Hello
+@end
+@note <code>source: shared objects file</code> — класс взят из архива CDS, <code>source: jrt:/java.base</code> — прочитан из модуля, <code>source: file:/…</code> — ваш класс из каталога.
+@try
+Найдите в логе строку с <code>Hello</code>: какие классы загружены непосредственно до и после него? ::: Прямо перед Hello — классы, нужные загрузчику (<code>java.security.Permissions</code> и др.), сразу после — те, которыми лаунчер ищет метод <code>main</code> (<code>MethodFinder</code>), и только потом <code>ManagementFactory</code> и весь JMX. Классы загружаются лениво — по первому обращению.
+Удалите из кода работу с ManagementFactory, оставьте только println. Сколько классов теперь? ::: Около 440 вместо ~780: JMX тянет за собой сотни классов. Подсчитать можно и без кода: <code>java -Xlog:class+load Hello | find /c "source:"</code> (Windows) или <code>| grep -c source:</code>.
+@end
+
+@lab 1.2 | Эргономика: что JVM выбрала на вашей машине | 15 мин
+@goal
+<p>Узнать размер кучи, сборщик и число процессоров, которые JVM определила автоматически, и заставить её выбрать иначе.</p>
+@end
+@step Создайте класс <code>Ergo</code>:
+@file Ergo.java
+import java.lang.management.ManagementFactory;
+
+public class Ergo {
+    public static void main(String[] args) {
+        Runtime rt = Runtime.getRuntime();
+        System.out.println("CPU для JVM:   " + rt.availableProcessors());
+        System.out.println("max heap (MB): " + rt.maxMemory() / 1024 / 1024);
+        System.out.println("init heap(MB): " + rt.totalMemory() / 1024 / 1024);
+        for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            System.out.println("сборщик:       " + gc.getName());
+        }
+    }
+}
+@end
+@run
+javac Ergo.java
+java Ergo
+@end
+@note На машине, где снят вывод, 18 логических процессоров и 32 ГБ памяти: max heap = ¼ физической памяти, выбран G1. У вас числа будут свои — сверьте их с диспетчером задач.
+@predict Запустим с <code>-XX:ActiveProcessorCount=1 -Xmx256m</code> (как в маленьком контейнере). Какой сборщик выберет JVM?
+@answer
+<p><b>Serial</b> (в выводе — <code>Copy</code> и <code>MarkSweepCompact</code>). Если процессоров меньше двух или памяти меньше 1792 МБ, машина считается не «серверной», и эргономика выбирает однопоточный SerialGC вместо G1. Это частая неожиданность в контейнерах с <code>cpu: 1</code>.</p>
+@end
+@ide VM options: <code>-XX:ActiveProcessorCount=1 -Xmx256m</code>
+@run
+java -XX:ActiveProcessorCount=1 -Xmx256m Ergo
+@end
+@step Сверьте с тем, что JVM говорит о себе сама. Флаг <code>-XX:+PrintFlagsFinal</code> печатает все ~700 флагов с итоговыми значениями; <code>{ergonomic}</code> отмечает выбранные автоматически:
+@run grep="MaxHeapSize|InitialHeapSize|UseG1GC|UseSerialGC|ParallelGCThreads|ConcGCThreads|ActiveProcessorCount"
+java -XX:+PrintFlagsFinal -version | findstr /R "MaxHeapSize UseG1GC UseSerialGC ParallelGCThreads" ||| java -XX:+PrintFlagsFinal -version | grep -E "MaxHeapSize|InitialHeapSize|UseG1GC |UseSerialGC|ParallelGCThreads|ConcGCThreads|ActiveProcessorCount"
+@end
+@note В PowerShell/cmd фильтр — <code>findstr</code>, в bash/macOS — <code>grep -E "MaxHeapSize|UseG1GC"</code>.
+@try
+Запустите с <code>-XX:MaxRAMPercentage=50</code> — как изменился max heap? ::: Куча стала равна половине физической памяти: MaxRAMPercentage задаёт долю памяти машины (или лимита контейнера) под кучу, по умолчанию 25%.
+Почему <code>max heap</code> из Runtime чуть меньше, чем <code>-Xmx</code>? Попробуйте <code>-Xmx256m -XX:+UseSerialGC</code>. ::: <code>maxMemory()</code> не учитывает одно из пространств выживших (survivor): в любой момент одно из них пустое и недоступно для объектов.
+@end
+
+@lab 1.3 | Флаги живого процесса: jcmd | 15 мин
+@goal
+<p>Подключиться к работающей JVM и прочитать её командную строку, флаги и системные свойства — без перезапуска.</p>
+@end
+@step Создайте программу, которая просто ждёт:
+@file Sleeper.java
+public class Sleeper {
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid() + ", жду 10 минут…");
+        Thread.sleep(600_000);
+    }
+}
+@end
+@ide Запустите с VM options <code>-Xmx300m -XX:+UseParallelGC</code>. Процесс будет висеть — это и нужно.
+@step Во втором окне терминала найдите процесс и спросите его о флагах. Вместо <code>&lt;pid&gt;</code> подставьте число из вывода:
+@exec
+javac Sleeper.java
+(java -Xmx300m -XX:+UseParallelGC Sleeper > sleeper.out 2>&1 &)
+sleep 2
+@end
+@run grep="Sleeper|Command line|-XX:|jvm_args|java_command"
+jcmd ||| jcmd | grep Sleeper | sed 's/^[0-9]*/12345/'
+jcmd <pid> VM.command_line ||| P=$(jcmd | grep Sleeper | cut -d' ' -f1); jcmd $P VM.command_line | sed 's/^[0-9]*:/12345:/'
+jcmd <pid> VM.flags ||| jcmd $P VM.flags | tr ' ' '\n' | grep -E "^-XX:(MaxHeapSize|UseParallelGC|ParallelGCThreads|MaxNewSize)"
+@end
+@predict Какое значение <code>MaxHeapSize</code> покажет VM.flags и почему оно записано в байтах?
+@answer
+<p><code>-XX:MaxHeapSize=314572800</code> = 300 × 1024 × 1024. <code>-Xmx</code> — лишь короткий синоним флага <code>MaxHeapSize</code>; внутри все размеры хранятся в байтах. VM.flags показывает только флаги, отличные от значения по умолчанию или выставленные эргономикой.</p>
+@end
+@step Посмотрите полный список команд, которые понимает процесс, и остановите его:
+@run head=20
+jcmd <pid> help ||| P=$(jcmd | grep Sleeper | cut -d' ' -f1); jcmd $P help | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+P=$(jcmd | grep Sleeper | cut -d' ' -f1); kill $P 2>/dev/null; taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@note Остановите процесс кнопкой ■ в IDEA или Ctrl+C. Эту же процедуру вы будете делать в продакшене — <code>jcmd</code> входит в любой JDK.
+@try
+Выполните <code>jcmd &lt;pid&gt; VM.system_properties</code> и найдите <code>java.class.path</code> — куда IDEA положила скомпилированный класс? ::: В <code>…/out/production/ch01</code> (или <code>target/classes</code> в Maven-проекте) — IDEA компилирует в свой каталог и передаёт его через <code>-classpath</code>.
+Измените флаг на лету: <code>jcmd &lt;pid&gt; VM.set_flag PrintConcurrentLocks true</code>. А получится ли так поменять MaxHeapSize? ::: Нет — «only 'writeable' flags can be set». Менять на лету можно только manageable-флаги (список: <code>java -XX:+PrintFlagsFinal -version</code> с пометкой <code>{manageable}</code>).
+@end
+
+@lab 1.4 | Кто ещё живёт в «однопоточной» программе | 10 мин
+@goal
+<p>Увидеть служебные потоки JVM: GC, JIT-компиляторы, обработчик ссылок, диспетчер сигналов.</p>
+@end
+@step Создайте класс, который печатает все Java-потоки процесса:
+@file Threads.java
+public class Threads {
+    public static void main(String[] args) {
+        Thread.getAllStackTraces().keySet().stream()
+              .sorted((a, b) -> a.getName().compareTo(b.getName()))
+              .forEach(t -> System.out.printf("%-22s daemon=%-5s prio=%d group=%s%n",
+                      t.getName(), t.isDaemon(), t.getPriority(),
+                      t.getThreadGroup() == null ? "-" : t.getThreadGroup().getName()));
+    }
+}
+@end
+@run
+javac Threads.java
+java Threads
+@end
+@predict Это Java-потоки. Будут ли среди них потоки сборщика мусора и JIT-компилятора?
+@answer
+<p>Нет. Потоки GC (<code>GC Thread#0</code>, <code>G1 Main Marker</code>…), JIT (<code>C2 CompilerThread0</code>, <code>C1 CompilerThread0</code>) и <code>VM Thread</code> — нативные потоки JVM, у них нет объекта <code>java.lang.Thread</code>. Их видно только в дампе потоков (<code>jcmd &lt;pid&gt; Thread.print</code>) или в ОС.</p>
+@end
+@step Снимите полный дамп потоков работающего <code>Sleeper</code> из лабы 1.3 и найдите там нативные потоки:
+@exec
+(java Sleeper > s2.out 2>&1 &)
+sleep 2
+@end
+@run grep=^\x22 head=30
+jcmd <pid> Thread.print ||| P=$(jcmd | grep Sleeper | cut -d' ' -f1); jcmd $P Thread.print | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+P=$(jcmd | grep Sleeper | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@try
+Сколько потоков <code>GC Thread#N</code> у вас и как это связано с числом процессоров? Запустите Sleeper с <code>-XX:ParallelGCThreads=2</code> и проверьте. ::: При ≤ 8 ядрах ParallelGCThreads = числу ядер, дальше ≈ 8 + 5/8 от остатка. G1 создаёт рабочие потоки лениво, поэтому в начале их может быть меньше.
+@end

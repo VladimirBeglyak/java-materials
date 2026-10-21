@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 15 · СБОРКА МУСОРА</div>
   <h1>Слабые ссылки, Cleaner, финализация</h1>
   <p class="lead">Иногда нужно ссылаться на объект, не продлевая ему жизнь: кэш, который не должен удерживать данные, метаданные «рядом» с чужими объектами, освобождение нативных ресурсов после смерти Java-объекта. Для этого в JVM есть мягкие, слабые и фантомные ссылки, очереди ссылок и <code>Cleaner</code>. Разбираем, когда каждая очищается, ловушки <code>WeakHashMap</code> и мягких кэшей, и почему <code>finalize()</code> уходит из Java.</p>
-  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Soft/Weak/Phantom</span><span class="tag">ReferenceQueue</span><span class="tag">WeakHashMap</span><span class="tag">Cleaner</span><span class="tag">finalize</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">Soft/Weak/Phantom</span><span class="tag">ReferenceQueue</span><span class="tag">WeakHashMap</span><span class="tag">Cleaner</span><span class="tag">finalize</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -105,7 +105,157 @@ private void expungeStaleEntries() {                          // вызывае�
   <li>Освобождение ресурсов должно быть явным (<code>close()</code>, try-with-resources); GC — лишь страховка от забывчивости.</li>
 </ul>
 
-<h2 id="quiz"><span class="h-num">15.5</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">15.5</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Проверим поведение всех видов ссылок при сборке и нехватке памяти, попадём в ловушку WeakHashMap и сделаем ресурс с <code>Cleaner</code>. Модуль IDEA — <code>ch15</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-15.1">
+<div class="lab-head"><span class="lab-num">Лаба 15.1</span><b>Strong, Soft, Weak, Phantom под давлением памяти</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, в какой момент очищается каждый вид ссылки.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>RefKinds.java</code>:</div>
+<pre data-title="RefKinds.java"><code class="java">import java.lang.ref.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class RefKinds {
+    public static void main(String[] args) throws Exception {
+        var queue = new ReferenceQueue&lt;Object&gt;();
+        var soft = new SoftReference&lt;&gt;(new byte[10 &lt;&lt; 20]);
+        var weak = new WeakReference&lt;&gt;(new byte[10 &lt;&lt; 20]);
+        var phantom = new PhantomReference&lt;&gt;(new byte[10 &lt;&lt; 20], queue);
+        report("после создания", soft, weak, phantom, queue);
+
+        System.gc();
+        report("после System.gc()", soft, weak, phantom, queue);
+
+        List&lt;byte[]&gt; pressure = new ArrayList&lt;&gt;();
+        try {
+            while (true) pressure.add(new byte[1 &lt;&lt; 20]);
+        } catch (OutOfMemoryError e) {
+            pressure = null;
+            report("после нехватки памяти", soft, weak, phantom, queue);
+        }
+    }
+
+    static void report(String when, SoftReference&lt;?&gt; s, WeakReference&lt;?&gt; w, PhantomReference&lt;?&gt; p, ReferenceQueue&lt;?&gt; q) throws Exception {
+        Thread.sleep(100);
+        System.out.printf("%-24s soft=%-5s weak=%-5s phantom в очереди=%s%n", when,
+                s.get() != null, w.get() != null, q.poll() != null);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запишите для каждой строки, какие ссылки ещё «живы».</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx64m</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac RefKinds.java
+java -Xmx64m RefKinds</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">после создания           soft=true  weak=true  phantom в очереди=false
+после System.gc()        soft=true  weak=false phantom в очереди=true
+после нехватки памяти    soft=false weak=false phantom в очереди=false</code></pre></details>
+<div class="lab-ans" hidden><p>После создания — soft и weak живы (у phantom <code>get()</code> всегда null, поэтому смотрим очередь). После <code>System.gc()</code> weak очищена, phantom попала в очередь, soft — жива: при достаточном запасе памяти мягкие ссылки не трогают. Перед <code>OutOfMemoryError</code> JVM обязана очистить все мягкие ссылки — soft=false.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему кэш на SoftReference — плохая идея на сервере?</summary><div>Мягкие ссылки чистятся по эвристике (примерно «секунда жизни на каждый свободный МБ кучи», <code>-XX:SoftRefLRUPolicyMSPerMB</code>) и массово — перед OOM. Кэш раздувает старое поколение, а при нагрузке внезапно пустеет целиком. Ограниченный кэш (Caffeine) с явным размером предсказуемее.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-15.2">
+<div class="lab-head"><span class="lab-num">Лаба 15.2</span><b>Ловушка WeakHashMap</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сделать «самоочищающийся» кэш на WeakHashMap, убедиться, что он не очищается, и починить.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>WeakTrap.java</code>:</div>
+<pre data-title="WeakTrap.java"><code class="java">import java.util.Map;
+import java.util.WeakHashMap;
+
+public class WeakTrap {
+    static class Key { final String id; Key(String id) { this.id = id; } }
+    static class Value {
+        final Key owner; final byte[] data = new byte[1024];
+        Value(Key owner) { this.owner = owner; }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Map&lt;Key, Value&gt; broken = new WeakHashMap&lt;&gt;();
+        Map&lt;Key, byte[]&gt; fixed = new WeakHashMap&lt;&gt;();
+        for (int i = 0; i &lt; 10_000; i++) {
+            Key k1 = new Key("k" + i), k2 = new Key("k" + i);
+            broken.put(k1, new Value(k1));       // значение ссылается на ключ
+            fixed.put(k2, new byte[1024]);       // значение ключ не держит
+        }
+        System.gc();
+        Thread.sleep(200);
+        System.out.println("broken.size() = " + broken.size());
+        System.out.println("fixed.size()  = " + fixed.size());
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Ключи нигде больше не хранятся. Что покажут размеры?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac WeakTrap.java
+java WeakTrap</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">broken.size() = 10000
+fixed.size()  = 0</code></pre></details>
+<div class="lab-ans" hidden><p><code>broken.size() = 10000</code>, <code>fixed.size() = 0</code>. В WeakHashMap значения хранятся сильными ссылками из самой карты; значение ссылается на ключ — значит, ключ сильно достижим через карту и никогда не будет собран. Это утечка, замаскированная под кэш.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему <code>new WeakHashMap&lt;String, …&gt;</code> с ключами-литералами <code>"k1"</code> тоже никогда не очищается?</summary><div>Строковые литералы интернированы и сильно достижимы из пула строк (и из констант класса). Слабые ключи имеют смысл только для объектов, жизненный цикл которых контролирует кто-то другой.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-15.3">
+<div class="lab-head"><span class="lab-num">Лаба 15.3</span><b>Cleaner: страховка для нативного ресурса</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Написать ресурс, который освобождается явно через <code>close()</code>, а если забыли — сборщиком через <code>Cleaner</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>NativeBuffer.java</code>:</div>
+<pre data-title="NativeBuffer.java"><code class="java">import java.lang.ref.Cleaner;
+
+public class NativeBuffer implements AutoCloseable {
+    private static final Cleaner CLEANER = Cleaner.create();
+
+    // Состояние для очистки — отдельный класс, НЕ ссылающийся на NativeBuffer
+    private record State(int id) implements Runnable {
+        public void run() { System.out.println("  освобождаю нативную память #" + id + " в потоке " + Thread.currentThread().getName()); }
+    }
+
+    private final Cleaner.Cleanable cleanable;
+
+    NativeBuffer(int id) {
+        System.out.println("  выделяю #" + id);
+        cleanable = CLEANER.register(this, new State(id));
+    }
+
+    @Override public void close() { cleanable.clean(); }   // повторный clean() ничего не делает
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("1) try-with-resources:");
+        try (var b = new NativeBuffer(1)) { }
+
+        System.out.println("2) забыли close():");
+        new NativeBuffer(2);
+        System.gc();
+        Thread.sleep(300);
+        System.out.println("конец main");
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">В каком потоке выполнится очистка в каждом случае?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac NativeBuffer.java
+java NativeBuffer</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1) try-with-resources:
+  выделяю #1
+  освобождаю нативную память #1 в потоке main
+2) забыли close():
+  выделяю #2
+  освобождаю нативную память #2 в потоке Cleaner-0
+конец main</code></pre></details>
+<div class="lab-ans" hidden><p>№1 — в <code>main</code>, синхронно, при выходе из try. №2 — в служебном потоке нашего Cleaner (<code>Cleaner-0</code>; у системного Cleaner JDK поток называется <code>Common-Cleaner</code>), после того как GC обнаружил объект фантомно-достижимым. Момент второго не гарантирован — поэтому Cleaner только страховка, а не основной путь.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте <code>State</code> нестатическим внутренним классом (или лямбдой, использующей поле NativeBuffer). Что сломается?</summary><div>State будет держать ссылку на NativeBuffer, а Cleaner держит State сильно — объект никогда не станет фантомно-достижимым, очистка в случае №2 не выполнится. Это самая частая ошибка с Cleaner.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">15.6</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Что вернёт <code>phantomRef.get()</code>?</p><ul><li>Объект, пока он жив</li><li>Объект после очистки</li><li>Всегда null</li><li>Исключение</li></ul><div class="why">Фантомная ссылка нужна только как уведомление о смерти объекта.</div></div>
 <div class="mcq" data-ok="0"><p>Почему запись в WeakHashMap может никогда не удалиться?</p><ul><li>Значение сильно ссылается на ключ, и ключ остаётся сильно достижимым через саму карту</li><li>WeakHashMap не работает в Java 17</li><li>GC не обрабатывает слабые ссылки</li><li>Ключ — Integer</li></ul><div class="why">Классическая утечка.</div></div>

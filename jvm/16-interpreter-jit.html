@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 16 · ИСПОЛНЕНИЕ</div>
   <h1>Интерпретатор и JIT: tiered compilation</h1>
   <p class="lead">HotSpot начинает с интерпретации, считает вызовы и итерации циклов и компилирует горячие методы дважды: быстро и без особых оптимизаций (C1), а затем, собрав профиль, — агрессивно (C2). Отсюда «прогрев»: первые запросы после старта в разы медленнее. Разбираем пять уровней компиляции, пороги, OSR, очередь компиляции, вывод <code>-XX:+PrintCompilation</code> и что делать с прогревом.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">уровни 0–4</span><span class="tag">C1 и C2</span><span class="tag">профилирование</span><span class="tag">OSR</span><span class="tag">PrintCompilation</span><span class="tag">прогрев</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">уровни 0–4</span><span class="tag">C1 и C2</span><span class="tag">профилирование</span><span class="tag">OSR</span><span class="tag">PrintCompilation</span><span class="tag">прогрев</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -132,7 +132,134 @@ jcmd &lt;pid&gt; Compiler.codecache                           # заполнен
 Компилятор Graal (на Java) может заменить C2 (<code>-XX:+UseGraalJIT</code> в GraalVM / Oracle GraalVM). Сильнее в частичном escape analysis и оптимизациях потоков данных (стримы, лямбды); проект интеграции Graal в OpenJDK развивается в рамках проекта Galahad.
 </div>
 
-<h2 id="quiz"><span class="h-num">16.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">16.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>JIT-компилятор работает прямо у вас на глазах: <code>-XX:+PrintCompilation</code> печатает каждую компиляцию, а простые замеры показывают прогрев. Модуль IDEA — <code>ch16</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-16.1">
+<div class="lab-head"><span class="lab-num">Лаба 16.1</span><b>Читаем PrintCompilation: уровни, OSR, деоптимизация</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в журнале компиляции свой метод на уровнях 3 и 4, OSR-компиляцию цикла и «made not entrant».</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Hot.java</code>:</div>
+<pre data-title="Hot.java"><code class="java">public class Hot {
+    static int work(int x) { return (x * 31) ^ (x &gt;&gt;&gt; 3); }
+
+    public static void main(String[] args) {
+        long sum = 0;
+        for (int i = 0; i &lt; 50_000_000; i++) sum += work(i);    // один долгий цикл в main
+        System.out.println("sum = " + sum);
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+PrintCompilation</code>. Вывод большой — ищите в консоли по слову <code>Hot::</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Hot.java
+java -XX:+PrintCompilation Hot | findstr "Hot:: sum"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">27   14       3       Hot::work (9 bytes)
+28   15       4       Hot::work (9 bytes)
+28   14       3       Hot::work (9 bytes)   made not entrant: not used
+29   16 %     3       Hot::main @ 4 (37 bytes)
+29   17       3       Hot::main (37 bytes)
+29   18 %     4       Hot::main @ 4 (37 bytes)
+31   16 %     3       Hot::main @ 4 (37 bytes)   made not entrant: OSR invalidation of lower level
+48   18 %     4       Hot::main @ 4 (37 bytes)   made not entrant: uncommon trap
+sum = 38750267755772992</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Расшифруйте колонки строк с <code>Hot::work</code> и <code>Hot::main</code>. Что означают <code>%</code>, <code>@ 4</code>, цифры 3 и 4?</div>
+<div class="lab-ans" hidden><p>Колонки: время от старта (мс), номер компиляции, флаги, <b>уровень</b> (3 — C1 с профилированием, 4 — C2), метод, размер байткода. <code>work</code> сначала компилируется на уровне 3, затем на 4 — после этого уровень-3-версия получает «made not entrant». <code>main</code> вызывается один раз, но в нём горячий цикл — поэтому <code>%</code>: OSR-компиляция, <code>@ 4</code> — смещение в байткоде, где JVM подменяет интерпретируемый кадр скомпилированным посреди цикла.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-XX:-TieredCompilation</code>. Какие уровни останутся?</summary><div>Только C2 (в выводе уровень не печатается или остаётся одна компиляция метода). Метод дольше интерпретируется, прежде чем станет горячим для C2 (порог ~10 000 вызовов) — старт медленнее, пиковая скорость та же.</div></details></li>
+<li><details><summary>Сколько всего методов JDK скомпилировалось за этот короткий запуск?</summary><div>Сотни: <code>String::hashCode</code>, <code>String::equals</code>, методы загрузчиков и т. д. Посчитайте строки вывода без фильтра — даже Hello World компилирует десятки методов.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-16.2">
+<div class="lab-head"><span class="lab-num">Лаба 16.2</span><b>Кривая прогрева</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, как ускоряется один и тот же код по мере компиляции, и сравнить режимы.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Warmup.java</code>:</div>
+<pre data-title="Warmup.java"><code class="java">import java.util.HashMap;
+import java.util.Map;
+
+public class Warmup {
+    static int task() {
+        Map&lt;String, Integer&gt; m = new HashMap&lt;&gt;();
+        for (int i = 0; i &lt; 2000; i++) m.merge("k" + (i % 100), 1, Integer::sum);
+        return m.size();
+    }
+
+    public static void main(String[] args) {
+        for (int batch = 1; batch &lt;= 10; batch++) {
+            long t = System.nanoTime();
+            for (int i = 0; i &lt; 200; i++) task();
+            System.out.printf("пакет %2d: %6.2f мс%n", batch, (System.nanoTime() - t) / 1e6);
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Warmup.java
+java Warmup</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">пакет  1:  46.13 мс
+пакет  2:  16.95 мс
+пакет  3:  12.45 мс
+пакет  4:   8.85 мс
+пакет  5:   6.82 мс
+пакет  6:   9.33 мс
+пакет  7:   9.07 мс
+пакет  8:  11.09 мс
+пакет  9:  11.99 мс
+пакет 10:  11.95 мс</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Как будет выглядеть та же таблица с <code>-Xint</code> и с <code>-XX:TieredStopAtLevel=1</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xint Warmup
+java -XX:TieredStopAtLevel=1 Warmup</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">пакет  1: 576.85 мс
+пакет  2: 557.64 мс
+пакет  3: 557.31 мс
+пакет  4: 561.51 мс
+пакет  5: 557.26 мс
+пакет  6: 554.65 мс
+пакет  7: 563.18 мс
+пакет  8: 559.66 мс
+пакет  9: 556.47 мс
+пакет 10: 572.70 мс
+пакет  1:  36.49 мс
+пакет  2:  23.74 мс
+пакет  3:  23.24 мс
+пакет  4:  18.68 мс
+пакет  5:  20.10 мс
+пакет  6:  24.89 мс
+пакет  7:  24.42 мс
+пакет  8:  24.59 мс
+пакет  9:  26.66 мс
+пакет 10:  23.67 мс</code></pre></details>
+<div class="lab-ans" hidden><p><code>-Xint</code> — плоская и медленная: прогрева нет, все пакеты как первый или хуже. <code>TieredStopAtLevel=1</code> (только C1) — быстро выходит на плато, но плато выше, чем у полного режима: C1 компилирует быстро, но слабо оптимизирует. Полный tiered-режим даёт и быстрый старт, и лучшую пиковую скорость — ценой прогрева, который вы видите в первых пакетах.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему микробенчмарки «на коленке» вроде этого врут, и что использовать вместо них?</summary><div>Прогрев, OSR, удаление мёртвого кода, свёртка констант и GC искажают замеры. Для честных измерений — JMH (<code>org.openjdk.jmh</code>): он делает прогревочные итерации, форки JVM и защищает результат через Blackhole.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-16.3">
+<div class="lab-head"><span class="lab-num">Лаба 16.3</span><b>Code cache: где живёт скомпилированный код</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть, сколько места занимает машинный код и как он поделён на сегменты.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+PrintCodeCache</code> (печатает статистику при завершении JVM)</p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:+PrintCodeCache Warmup</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">CodeHeap 'non-profiled nmethods': size=119232Kb used=80Kb max_used=80Kb free=119151Kb
+ bounds [0x000001c825de0000, 0x000001c826050000, 0x000001c82d250000]
+CodeHeap 'profiled nmethods': size=119104Kb used=148Kb max_used=148Kb free=118955Kb
+ bounds [0x000001c81e250000, 0x000001c81e4c0000, 0x000001c8256a0000]
+CodeHeap 'non-nmethods': size=7424Kb used=2946Kb max_used=2963Kb free=4477Kb
+ bounds [0x000001c8256a0000, 0x000001c825990000, 0x000001c825de0000]
+CodeCache: size=245760Kb, used=3174Kb, max_used=3191Kb, free=242583Kb
+ total_blobs=575, nmethods=193, adapters=283, full_count=0
+Compilation: enabled, stopped_count=0, restarted_count=0</code></pre></details>
+<p class="lab-note">Три сегмента: <code>non-nmethods</code> (интерпретатор, заглушки), <code>profiled nmethods</code> (код C1 с профилированием), <code>non-profiled nmethods</code> (C2). Если code cache заполнится, JIT отключится с предупреждением «CodeCache is full. Compiler has been disabled» — и приложение резко замедлится. Размер задаётся <code>-XX:ReservedCodeCacheSize</code> (по умолчанию 240 МБ).</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">16.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Почему метод сначала компилируется C1 с профилированием, а не сразу C2?</p><ul><li>C2 не умеет компилировать холодный код</li><li>C1 быстрее C2 на любом коде</li><li>C2 нужен профиль (типы, ветки) для спекулятивных оптимизаций, а C1-код с профилем быстро даёт и скорость, и данные</li><li>Так требует спецификация</li></ul><div class="why">Уровень 3 — компромисс скорости и сбора профиля.</div></div>
 <div class="mcq" data-ok="0"><p>Что такое OSR?</p><ul><li>Замена кадра интерпретатора на кадр скомпилированного кода посреди долгого цикла</li><li>Оптимизация строк</li><li>Сборка мусора в старом поколении</li><li>Удаление скомпилированного кода</li></ul><div class="why">Метка % в PrintCompilation.</div></div>

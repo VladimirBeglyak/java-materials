@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 14 · ПЛАТФОРМА ИЗНУТРИ</div>
   <h1>Память JVM и сборка мусора</h1>
   <p class="lead">Автоматическое управление памятью не означает, что о ней можно не думать: утечки в Java существуют, паузы сборщика влияют на время ответа, а контейнер убивает процесс без единой строки в логе. Глава о том, где живут объекты, как JVM решает, что они больше не нужны, и что делать, когда память закончилась.</p>
-  <div class="meta"><span class="tag">~4 часа</span><span class="tag">heap</span><span class="tag">G1 / ZGC</span><span class="tag">утечки</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">heap</span><span class="tag">G1 / ZGC</span><span class="tag">утечки</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -216,7 +216,136 @@ jstat -gcutil &lt;pid&gt; 1000                  # заполнение поко�
 </script>
 <p><b>Попробуйте:</b> (1) создавайте объекты и сразу теряйте ссылки — почти ничего не доходит до Old: это «слабая гипотеза о поколениях» в действии. (2) Создайте много объектов, не теряя ссылок: Survivor переполняется, и объекты уходят в Old раньше срока (преждевременное повышение) — причина роста Old и частых Full GC. Число на объекте — возраст (сколько сборок он пережил).</p>
 
-<h2 id="quiz"><span class="h-num">14.9</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">14.9</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Три эксперимента с памятью на уровне Java-разработчика: где живут переменные и объекты, как выглядит работа сборщика в логе и как найти утечку на работающем процессе. Глубже — в пособии <a href="../jvm/index.html">JVM изнутри</a> (темы 9–15). Модуль IDEA — <code>ch14</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-14.1">
+<div class="lab-head"><span class="lab-num">Лаба 14.1</span><b>Стек и куча: две разные ошибки</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Переполнить стек рекурсией и кучу объектами и сравнить, от чего зависит каждая ошибка.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>StackHeap.java</code>:</div>
+<pre data-title="StackHeap.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class StackHeap {
+    static int depth = 0;
+    static void recurse() { depth++; recurse(); }
+
+    public static void main(String[] args) {
+        try { recurse(); }
+        catch (StackOverflowError e) { System.out.println("StackOverflowError на глубине " + depth); }
+
+        List&lt;int[]&gt; hog = new ArrayList&lt;&gt;();
+        try {
+            while (true) hog.add(new int[1_000_000]);
+        } catch (OutOfMemoryError e) {
+            int mb = hog.size() * 4;
+            hog = null;                                    // освобождаем, чтобы было на что печатать
+            System.out.println("OutOfMemoryError после ~" + mb + " МБ: " + e.getMessage());
+        }
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx128m -Xss512k</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac StackHeap.java
+java -Xmx128m -Xss512k StackHeap</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">StackOverflowError на глубине 9716
+OutOfMemoryError после ~124 МБ: Java heap space</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что изменится при <code>-Xmx256m -Xss2m</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xmx256m -Xss2m StackHeap</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">StackOverflowError на глубине 86717
+OutOfMemoryError после ~252 МБ: Java heap space</code></pre></details>
+<div class="lab-ans" hidden><p>Глубина рекурсии вырастет в 4–5 раз (стек потока в 4 раза больше), объём до OOM — примерно вдвое. Локальные переменные и кадры вызовов живут в стеке своего потока (<code>-Xss</code>), объекты — в общей куче (<code>-Xmx</code>). Ловить <code>OutOfMemoryError</code> в реальном коде почти всегда бессмысленно — здесь это только для демонстрации.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-14.2">
+<div class="lab-head"><span class="lab-num">Лаба 14.2</span><b>Сборщик за работой: читаем лог</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Включить лог GC и увидеть, что короткоживущий мусор убирается быстро и дёшево.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Churn.java</code>:</div>
+<pre data-title="Churn.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Churn {
+    public static void main(String[] args) {
+        List&lt;String&gt; keep = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 3_000_000; i++) {
+            String tmp = "запрос-" + i;                    // мусор сразу после итерации
+            if (i % 1000 == 0) keep.add(tmp);              // 0,1% живёт долго
+        }
+        System.out.println("сохранено: " + keep.size());
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx256m -Xlog:gc</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Churn.java
+java -Xmx256m -Xlog:gc Churn</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.006s][info][gc] Using G1
+[0.058s][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 48M-&gt;1M(256M) 0.889ms
+[0.091s][info][gc] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 116M-&gt;1M(256M) 0.856ms
+сохранено: 3000</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько длится одна пауза и сколько памяти остаётся после каждой сборки?</div>
+<div class="lab-ans" hidden><p>Паузы — доли миллисекунды или единицы мс, «после» (число справа от стрелки) — единицы МБ. Молодая сборка копирует только живые объекты, а их почти нет: стоимость сборки пропорциональна живым данным, а не мусору. Поэтому в Java дёшево создавать много короткоживущих объектов.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-14.3">
+<div class="lab-head"><span class="lab-num">Лаба 14.3</span><b>Утечка памяти в «кэше» и её поиск</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти утечку на работающем процессе гистограммой классов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Leak.java</code>:</div>
+<pre data-title="Leak.java"><code class="java">import java.util.HashMap;
+import java.util.Map;
+
+public class Leak {
+    record Session(String user, byte[] data) { }
+    static final Map&lt;String, Session&gt; SESSIONS = new HashMap&lt;&gt;();   // никто не удаляет
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        for (int i = 0; ; i++) {
+            SESSIONS.put("s" + i, new Session("user" + i, new byte[512]));
+            if (i % 100 == 0) Thread.sleep(10);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите <code>Leak</code> и в терминале снимите гистограмму живых объектов дважды с паузой:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; GC.class_histogram</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:        133002       24493720  [B (java.base@25.0.2)
+   2:         91523        2196552  java.lang.String (java.base@25.0.2)
+   3:         42425        1357600  java.util.HashMap$Node (java.base@25.0.2)
+   4:         41401         993624  Leak$Session
+   5:           257         285968  [Ljava.util.HashMap$Node; (java.base@25.0.2)
+   6:          1736         229584  java.lang.Class (java.base@25.0.2)
+…</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; GC.class_histogram</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:        266802       50540120  [B (java.base@25.0.2)
+   2:        180723        4337352  java.lang.String (java.base@25.0.2)
+   3:         87025        2784800  java.util.HashMap$Node (java.base@25.0.2)
+   4:         86001        2064024  Leak$Session
+   5:          1275         707352  [Ljdk.internal.vm.FillerElement; (java.base@25.0.2)
+   6:           257         548112  [Ljava.util.HashMap$Node; (java.base@25.0.2)
+…</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">По каким строкам видно, что утекают именно сессии?</div>
+<div class="lab-ans" hidden><p>Между снимками растёт число <code>Leak$Session</code>, <code>[B</code> (byte[] данных и строк), <code>java.lang.String</code> и <code>java.util.HashMap$Node</code> — примерно на одинаковую величину. Совпадение счётчиков Session и HashMap$Node подсказывает: объекты держит карта. Дальше — дамп кучи (<code>jcmd &lt;pid&gt; GC.heap_dump file.hprof</code>) и путь к GC root: <code>Leak.SESSIONS</code>.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почини утечку, ограничив размер «кэша» через LinkedHashMap с <code>removeEldestEntry</code> (лаба 9.3), и повтори гистограммы.</summary><div>Числа Session стабилизируются на пределе кэша — так выглядит здоровый ограниченный кэш.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">14.10</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Как сборщик мусора определяет, что объект можно удалить?</p><ul><li>По счётчику ссылок на объект</li><li>По времени жизни объекта</li><li>По недостижимости от GC roots: локальных переменных в стеках потоков, статических полей, JNI-ссылок</li><li>По вызову System.gc()</li></ul><div class="why">Подсчёт ссылок не справляется с циклами. Java обходит граф от корней; всё, до чего не дошли, — мусор, даже если объекты ссылаются друг на друга.</div></div>
 <div class="mcq" data-ok="1"><p>Что вызывает OutOfMemoryError: Java heap space, если мусор собирается исправно?</p><ul><li>Слишком много потоков</li><li>Утечка: объекты остаются достижимыми (статическая коллекция, кэш без лимита, ThreadLocal в пуле потоков, слушатели без отписки)</li><li>Слишком большой стек</li><li>Нехватка места на диске</li></ul><div class="why">GC не может удалить то, на что есть ссылка. Диагностика: heap dump (<code>-XX:+HeapDumpOnOutOfMemoryError</code>) и анализ dominator tree в MAT.</div></div>

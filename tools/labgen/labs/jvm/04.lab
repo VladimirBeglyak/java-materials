@@ -1,0 +1,188 @@
+@chapter 04 | quiz
+@intro
+<p>Пять инструкций вызова, лямбды через <code>invokedynamic</code>, MethodHandle и ошибки связывания — всё это можно потрогать на маленьких классах. Модуль IDEA — <code>ch04</code>.</p>
+@end
+
+@lab 4.1 | Все пять invoke* в одном классе | 15 мин
+@goal
+<p>Написать код, который порождает каждую инструкцию вызова, и проверить предсказание по <code>javap</code>.</p>
+@end
+@file Calls.java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Supplier;
+
+public class Calls {
+    private void secret() {}
+
+    public static void main(String[] args) {
+        List<String> list = new ArrayList<>();      // A
+        list.add("x");                               // B
+        ArrayList<String> al = new ArrayList<>();
+        al.add("y");                                 // C
+        String s = String.valueOf(42);               // D
+        Supplier<String> sup = () -> "lambda";       // E
+        new Calls().secret();                        // F
+        System.out.println(sup.get() + s + list + al);
+    }
+}
+@end
+@predict Для строк A–F назовите инструкцию вызова. Подсказка: важен статический тип переменной, а не объекта.
+@answer
+<p>A — <code>invokespecial</code> (конструктор <code>&lt;init&gt;</code>); B — <code>invokeinterface</code> (тип переменной — интерфейс List); C — <code>invokevirtual</code> (тип — класс ArrayList); D — <code>invokestatic</code>; E — <code>invokedynamic</code> (создание лямбды); F — <code>invokevirtual</code>: с Java 11 (nestmates, JEP 181) приватные методы вызываются через invokevirtual, раньше было invokespecial.</p>
+@end
+@run grep="invoke"
+javac Calls.java
+javap -c -p Calls.class
+@end
+@try
+Почему у <code>sup.get()</code> инструкция <code>invokeinterface</code>, хотя за ней лямбда? ::: invokedynamic выполняется один раз — чтобы получить объект, реализующий Supplier. Дальше это обычный объект, и его метод вызывается через интерфейс.
+Скомпилируйте с <code>--release 8</code> и посмотрите на вызов <code>secret()</code>. ::: <code>invokespecial</code> — так было до nestmates. Поэтому старые инструменты байткода иногда ломаются на новых class-файлах.
+@end
+
+@lab 4.2 | Где живёт лямбда: тело, скрытый класс, синглтон | 20 мин
+@goal
+<p>Найти метод, в который javac вынес тело лямбды, и посмотреть на класс, который JVM сгенерировала при первом выполнении <code>invokedynamic</code>.</p>
+@end
+@file Lambdas.java
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+public class Lambdas {
+    static Supplier<String> make() { return () -> "без захвата"; }
+    static IntSupplier capture(int x) { return () -> x * 2; }
+
+    public static void main(String[] args) {
+        Supplier<String> a = make(), b = make();
+        IntSupplier c = capture(1), d = capture(2);
+        System.out.println("класс a:     " + a.getClass().getName());
+        System.out.println("hidden?      " + a.getClass().isHidden());
+        System.out.println("a == b:      " + (a == b));
+        System.out.println("c == d:      " + (c == d));
+        System.out.println("класс c:     " + c.getClass().getName());
+        System.out.println("интерфейсы:  " + java.util.Arrays.toString(c.getClass().getInterfaces()));
+    }
+}
+@end
+@predict Будут ли <code>a == b</code> и <code>c == d</code> равны <code>true</code>?
+@answer
+<p><code>a == b</code> — <b>true</b>: лямбда без захвата превращается в синглтон, call site после связывания всегда возвращает один и тот же объект. <code>c == d</code> — <b>false</b>: захваченное значение хранится в поле объекта, поэтому на каждый вызов создаётся новый экземпляр (того же скрытого класса).</p>
+@end
+@run
+javac Lambdas.java
+java Lambdas
+@end
+@step Тело лямбды — обычный приватный статический метод внутри вашего класса:
+@run grep="lambda\$|invokedynamic|BootstrapMethods|LambdaMetafactory.metafactory"
+javap -p Lambdas.class
+javap -c -v -p Lambdas.class | findstr /C:"invokedynamic" /C:"metafactory" ||| javap -c -v -p Lambdas.class | grep -E "invokedynamic|metafactory:" | sort -u
+@end
+@step Попросите JVM сохранить сгенерированные классы на диск и дизассемблируйте один из них:
+@ide VM options: <code>-Djdk.invoke.LambdaMetafactory.dumpProxyClassFiles=true</code>; файлы появятся в рабочем каталоге запуска, в папке <code>DUMP_LAMBDA_PROXY_CLASS_FILES</code>
+@run fail
+java -Djdk.invoke.LambdaMetafactory.dumpProxyClassFiles=true Lambdas ||| java -Djdk.invoke.LambdaMetafactory.dumpProxyClassFiles=true Lambdas > /dev/null; true
+dir /s /b DUMP_LAMBDA_PROXY_CLASS_FILES ||| find DUMP_LAMBDA_PROXY_CLASS_FILES -name "*.class" | sort
+@end
+@run grep="class|final int|private|public int|getfield|invokestatic|ireturn"
+javap -c -p DUMP_LAMBDA_PROXY_CLASS_FILES/Lambdas$$Lambda.0x….class ||| javap -c -p $(find DUMP_LAMBDA_PROXY_CLASS_FILES -name "*.class" | sort | tail -1)
+@end
+@note Имя файла у вас будет своим — возьмите его из списка выше. Видно всё устройство: поле <code>arg$1</code> с захваченным <code>x</code>, конструктор и метод <code>getAsInt</code>, который просто вызывает <code>lambda$capture$0</code> вашего класса.
+@try
+Замените лямбду в <code>make()</code> на анонимный класс <code>new Supplier&lt;&gt;() { … }</code>. Что изменится в каталоге после <code>javac</code> и в выводе <code>a == b</code>? ::: Появится файл <code>Lambdas$1.class</code> (анонимный класс компилируется заранее), а <code>a == b</code> станет false — каждый вызов делает <code>new</code>.
+@end
+
+@lab 4.3 | Ломаем связывание: NoSuchMethodError своими руками | 15 мин
+@goal
+<p>Воспроизвести самую частую ошибку при конфликте версий библиотек и понять, почему компиляция её не ловит.</p>
+@end
+@step «Библиотека» и «приложение»:
+@file Lib.java
+public class Lib {
+    public static int version() { return 1; }
+}
+@end
+@file App.java
+public class App {
+    public static void main(String[] args) {
+        System.out.println("версия библиотеки: " + Lib.version());
+    }
+}
+@end
+@run
+javac Lib.java App.java
+java App
+@end
+@predict Поменяйте в <code>Lib</code> тип результата: <code>public static long version() { return 2; }</code> и перекомпилируйте ТОЛЬКО <code>Lib.java</code>. Что будет при запуске App?
+@answer
+<p><code>NoSuchMethodError: 'int Lib.version()'</code>. В байткоде App записан полный дескриптор <code>Lib.version:()I</code>; метода с дескриптором <code>()J</code> JVM не считает тем же самым. Исходник App при этом скомпилировался бы без ошибок — поэтому такие ошибки проявляются только в рантайме, когда в classpath оказалась другая версия jar.</p>
+@end
+@exec
+sed -i 's/public static int version() { return 1; }/public static long version() { return 2; }/' Lib.java
+@end
+@run fail
+javac Lib.java
+java App
+@end
+@step Посмотрите, что именно «запомнил» App о библиотеке:
+@run grep="Lib"
+javap -c App.class
+@end
+@try
+Сделайте <code>version()</code> не статическим (и перекомпилируйте только Lib). Какая ошибка будет теперь? ::: <code>IncompatibleClassChangeError: Expected static method 'int Lib.version()'</code> — инструкция <code>invokestatic</code> зашита в App, а метод стал экземплярным.
+Удалите <code>Lib.class</code> совсем. ::: <code>NoClassDefFoundError: Lib</code> — класс был при компиляции, но не найден при выполнении (тема 05).
+@end
+
+@lab 4.4 | MethodHandle против рефлексии | 20 мин
+@goal
+<p>Вызвать метод через <code>Method.invoke</code> и через <code>MethodHandle</code>, увидеть строгую типизацию <code>invokeExact</code> и сравнить скорость.</p>
+@end
+@file Handles.java
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.lang.reflect.Method;
+
+public class Handles {
+    static final MethodHandle MH;
+    static {
+        try {
+            MH = MethodHandles.lookup().findVirtual(String.class, "length", MethodType.methodType(int.class));
+        } catch (ReflectiveOperationException e) { throw new ExceptionInInitializerError(e); }
+    }
+
+    public static void main(String[] args) throws Throwable {
+        Method m = String.class.getMethod("length");
+        String s = "hello";
+        System.out.println("reflection:  " + m.invoke(s));
+        System.out.println("invokeExact: " + (int) MH.invokeExact(s));
+        try {
+            Object r = MH.invokeExact(s);           // тип результата не совпал
+        } catch (Throwable t) {
+            System.out.println("ошибка:      " + t);
+        }
+        for (int round = 0; round < 3; round++) {
+            long t1 = System.nanoTime(); long a = 0;
+            for (int i = 0; i < 20_000_000; i++) a += (int) m.invoke(s);
+            long t2 = System.nanoTime(); long b = 0;
+            for (int i = 0; i < 20_000_000; i++) b += (int) MH.invokeExact(s);
+            long t3 = System.nanoTime(); long c = 0;
+            for (int i = 0; i < 20_000_000; i++) c += s.length();
+            long t4 = System.nanoTime();
+            System.out.printf("раунд %d: reflection %d мс, static final MH %d мс, прямой вызов %d мс%n",
+                    round, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000, (t4 - t3) / 1_000_000);
+        }
+    }
+}
+@end
+@predict Почему <code>Object r = MH.invokeExact(s)</code> упадёт, хотя метод тот же?
+@answer
+<p><code>WrongMethodTypeException</code>: javac формирует сигнатуру вызова по месту использования — здесь <code>(String)Object</code>, а у хэндла <code>(String)int</code>. <code>invokeExact</code> требует точного совпадения, без упаковки и приведений (для мягкой версии есть <code>invoke</code>).</p>
+@end
+@run
+javac Handles.java
+java Handles
+@end
+@note <code>static final</code> MethodHandle JIT считает константой и встраивает вызов — скорость как у прямого вызова. Рефлексия с Java 18 (JEP 416) тоже работает через MethodHandle, но с проверками доступа и упаковкой аргументов в массив.
+@try
+Уберите <code>final</code> у поля <code>MH</code>. Что произойдёт со временем? ::: Вызов через нефинальное поле JIT не может свернуть в прямой — время заметно вырастет (часто приблизится к рефлексии). Именно поэтому хэндлы в библиотеках хранят в <code>static final</code>.
+@end

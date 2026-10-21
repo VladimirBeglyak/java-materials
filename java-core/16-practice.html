@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 16 · ПЛАТФОРМА ИЗНУТРИ</div>
   <h1>Практика и собеседование</h1>
   <p class="lead">Проверка всего курса. Семнадцать задач «что выведет код» — каждая на конкретную механику из предыдущих глав; список ошибок, которые ищут на код-ревью; и вопросы трёх уровней со ссылками на разделы, где искать ответ.</p>
-  <div class="meta"><span class="tag">~4 часа</span><span class="tag">17 задач</span><span class="tag">чек-лист ревью</span><span class="tag">вопросы</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~4 часа</span><span class="tag">17 задач</span><span class="tag">чек-лист ревью</span><span class="tag">вопросы</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -234,7 +234,127 @@ System.out.println(stream.count());</code></pre>
 <div class="mcq" data-ok="1"><p>Объект больше не нужен программе, но лежит в static Map. Удалит ли его GC?</p><ul><li>Да, при следующей сборке</li><li>Нет: он достижим от GC root (статическое поле) — это утечка</li><li>Да, после Full GC</li><li>Только с -XX:+UseG1GC</li></ul><div class="why">Тема 14: GC удаляет недостижимые, а не «ненужные» объекты.</div></div>
 <div class="mcq" data-ok="2"><p><code>Integer x = null; int y = x;</code></p><ul><li>y = 0</li><li>Ошибка компиляции</li><li>NullPointerException при распаковке</li><li>y = -1</li></ul><div class="why">Тема 02: автораспаковка — это скрытый вызов x.intValue().</div></div>
 
-<h2 id="questions"><span class="h-num">16.5</span>Вопросы по уровням</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">16.5</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Итоговый мини-проект на материале глав 1–15: утилита, которая читает текстовый файл и строит частотный словарь слов. По дороге понадобятся <code>Files</code>, строки и Unicode, records, коллекции, стримы и коллекторы, исключения и немного производительности. Модуль IDEA — <code>ch16</code>. Сначала попробуйте написать каждый шаг сами, затем сверьтесь с кодом.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-16.1">
+<div class="lab-head"><span class="lab-num">Лаба 16.1</span><b>Мини-проект: частотный словарь</b><span class="lab-time">60 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Написать программу <code>WordFreq &lt;файл&gt; [N]</code>, которая печатает N самых частых слов, общее число слов и уникальных слов, и корректно обрабатывает ошибки.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Подготовьте входной файл:</div>
+<pre data-title="text.txt"><code class="txt">Java — это язык. Java — это платформа! Платформа Java включает JVM,
+а JVM исполняет байткод. Байткод создаёт компилятор javac;
+компилятор javac входит в JDK. JDK, JVM, JRE: три буквы — три смысла.</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Шаг 1. Модель результата и чтение файла. Подумайте: как разбить текст на слова, учитывая кириллицу, тире и пунктуацию, и как привести слова к одному регистру?</div>
+<pre data-title="WordFreq.java"><code class="java">import java.io.IOException;
+import java.nio.charset.MalformedInputException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+public class WordFreq {
+    record Stats(long totalWords, int uniqueWords, List&lt;Map.Entry&lt;String, Long&gt;&gt; top) { }
+
+    private static final Pattern NOT_LETTER = Pattern.compile("[^\\p{L}\\p{N}]+");   // всё, кроме букв и цифр Unicode
+
+    static Stats analyze(String text, int n) {
+        Map&lt;String, Long&gt; freq = NOT_LETTER.splitAsStream(text)
+                .filter(w -&gt; !w.isEmpty())
+                .map(w -&gt; w.toLowerCase(Locale.ROOT))
+                .collect(Collectors.groupingBy(w -&gt; w, Collectors.counting()));
+
+        List&lt;Map.Entry&lt;String, Long&gt;&gt; top = freq.entrySet().stream()
+                .sorted(Map.Entry.&lt;String, Long&gt;comparingByValue().reversed()
+                        .thenComparing(Map.Entry.comparingByKey()))
+                .limit(n)
+                .toList();
+
+        long total = freq.values().stream().mapToLong(Long::longValue).sum();
+        return new Stats(total, freq.size(), top);
+    }
+
+    public static void main(String[] args) {
+        if (args.length == 0) {
+            System.err.println("использование: WordFreq &lt;файл&gt; [N]");
+            System.exit(2);
+        }
+        int n = args.length &gt; 1 ? Integer.parseInt(args[1]) : 5;
+        try {
+            String text = Files.readString(Path.of(args[0]));
+            Stats s = analyze(text, n);
+            System.out.printf("слов: %d, уникальных: %d%n", s.totalWords(), s.uniqueWords());
+            s.top().forEach(e -&gt; System.out.printf("%-12s %d%n", e.getKey(), e.getValue()));
+        } catch (NoSuchFileException e) {
+            System.err.println("файл не найден: " + e.getFile());
+            System.exit(1);
+        } catch (MalformedInputException e) {
+            System.err.println("файл не в UTF-8");
+            System.exit(1);
+        } catch (IOException e) {
+            System.err.println("ошибка чтения: " + e);
+            System.exit(1);
+        }
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>Program arguments: <code>text.txt 5</code> (файл — в рабочем каталоге конфигурации запуска)</p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac WordFreq.java
+java WordFreq text.txt 5</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">слов: 30, уникальных: 19
+java         3
+jvm          3
+javac        2
+jdk          2
+байткод      2</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему для сортировки нужен <code>thenComparing(comparingByKey())</code>, если вывод и так выглядит правильно?</div>
+<div class="lab-ans" hidden><p>У нескольких слов одинаковая частота: «java» и «jvm» — по 3, ещё несколько — по 2. Без второго ключа их порядок зависит от порядка обхода HashMap — он не гарантирован и может меняться между версиями JDK и запусками с другими данными. Детерминированный вывод — обязательное свойство утилиты (и условие стабильных тестов).</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Шаг 2. Ошибки: проверьте поведение на несуществующем файле и файле в другой кодировке.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java WordFreq nope.txt
+java WordFreq cp1251.txt</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">файл не найден: nope.txt
+файл не в UTF-8</code></pre></details>
+<p class="lab-note">Файл <code>cp1251.txt</code> — слово «Привет» в кодировке windows-1251 (создайте его, сохранив текст в этой кодировке, например, в Notepad++ или IDEA: File → File Properties → File Encoding). <code>Files.readString</code> по умолчанию требует корректный UTF-8 и бросает <code>MalformedInputException</code>, а не молча портит текст.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Шаг 3. Производительность: сгенерируйте файл побольше и замерьте.</div>
+<pre data-title="Gen.java"><code class="java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Random;
+
+public class Gen {
+    public static void main(String[] args) throws Exception {
+        String[] words = { "java", "jvm", "поток", "память", "класс", "объект", "строка", "карта", "стрим", "тест" };
+        Random r = new Random(1);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i &lt; 2_000_000; i++) sb.append(words[r.nextInt(words.length)]).append(i % 12 == 0 ? ".\n" : " ");
+        Files.writeString(Path.of("big.txt"), sb);
+        System.out.println("big.txt: " + Files.size(Path.of("big.txt")) / 1024 / 1024 + " МБ");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Gen.java
+java Gen
+java WordFreq big.txt 3</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">big.txt: 19 МБ
+слов: 2000000, уникальных: 10
+карта        200772
+тест         200190
+java         200187
+время: 442 мс</code></pre></details>
+<p class="lab-note">Время в Windows замерьте в PowerShell: <code>Measure-Command { java WordFreq big.txt 3 }</code>.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Ускорьте подсчёт: замените <code>groupingBy(…, counting())</code> на цикл с <code>HashMap.merge(w, 1L, Long::sum)</code>, затем попробуйте <code>.parallel()</code> на стриме слов. Что даёт больший выигрыш и почему?</summary><div>Ручной цикл обычно быстрее за счёт отсутствия промежуточных объектов коллектора; parallel может ускорить разбиение и подсчёт на многоядерной машине (groupingByConcurrent), но чтение файла остаётся последовательным. Меряйте оба варианта несколько раз.</div></details></li>
+<li><details><summary>Вынесите <code>analyze</code> в отдельный класс и напишите для него тесты JUnit 5 (глава 23): пустой текст, регистр, пунктуация, равные частоты.</summary><div>Хорошая проверка дизайна: чистую функцию «текст → Stats» тестировать легко, а <code>main</code> с <code>System.exit</code> — трудно. Отсюда правило: логика отдельно, ввод-вывод отдельно.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="questions"><span class="h-num">16.6</span>Вопросы по уровням</h2>
 <div class="grid-3">
   <div class="card"><h4>Junior</h4><ul>
     <li><a href="01-platform.html#jdk-jre-jvm">JDK, JRE и JVM — в чём разница?</a></li>
@@ -274,7 +394,7 @@ System.out.println(stream.count());</code></pre>
   </ul></div>
 </div>
 
-<h2 id="next"><span class="h-num">16.6</span>Что дальше</h2>
+<h2 id="next"><span class="h-num">16.7</span>Что дальше</h2>
 <div class="table-wrap"><table>
 <tr><th>Направление</th><th>Куда идти</th></tr>
 <tr><td>Многопоточность: потоки, модель памяти, блокировки, пулы, виртуальные потоки</td><td><a href="../java-concurrency/index.html">пособие «Java Concurrency»</a></td></tr>

@@ -1,0 +1,151 @@
+@chapter 03 | quiz
+@intro
+<p>Пул строк, цена конкатенации в цикле, кодировки и ловушки API — проверяем каждое утверждение главы кодом. Модуль IDEA — <code>ch03</code>.</p>
+@end
+
+@lab 3.1 | Пул строк и == | 15 мин
+@goal
+<p>Предсказать, какие строки — один и тот же объект.</p>
+@end
+@file Pool.java
+public class Pool {
+    static final String CONST = "ja";
+
+    public static void main(String[] args) {
+        String s1 = "java";
+        String s2 = "ja" + "va";              // константное выражение
+        String s3 = CONST + "va";             // константа + литерал
+        String part = "ja";
+        String s4 = part + "va";              // вычисляется в рантайме
+        String s5 = new String("java");
+        String s6 = s4.intern();
+
+        System.out.println("s1 == s2: " + (s1 == s2));
+        System.out.println("s1 == s3: " + (s1 == s3));
+        System.out.println("s1 == s4: " + (s1 == s4));
+        System.out.println("s1 == s5: " + (s1 == s5));
+        System.out.println("s1 == s6: " + (s1 == s6));
+        System.out.println("s1.equals(s4): " + s1.equals(s4));
+    }
+}
+@end
+@predict true или false для каждого сравнения?
+@answer
+<p>s2 и s3 — <b>true</b>: javac вычисляет константные выражения (литералы и <code>static final</code> строки) при компиляции и кладёт результат в пул. s4 — <b>false</b>: <code>part</code> не константа, строка собирается в рантайме — новый объект. s5 — <b>false</b>: <code>new</code> всегда создаёт объект. s6 — <b>true</b>: <code>intern()</code> возвращает экземпляр из пула. <code>equals</code> — true везде.</p>
+@end
+@run
+javac Pool.java
+java Pool
+@end
+@step Убедитесь, что javac «склеил» строки сам:
+@run grep="ldc|invokedynamic|java$"
+javap -c Pool.class
+@end
+@try
+Сделайте <code>part</code> финальной: <code>final String part = "ja";</code>. ::: s1 == s4 станет true: финальная локальная переменная с константным инициализатором — тоже константа времени компиляции.
+@end
+
+@lab 3.2 | += в цикле против StringBuilder | 15 мин
+@goal
+<p>Измерить квадратичную стоимость конкатенации в цикле.</p>
+@end
+@file Concat.java
+public class Concat {
+    public static void main(String[] args) {
+        for (int n : new int[] { 5_000, 20_000, 40_000, 80_000 }) {      // первый прогон — разогрев JIT
+            long t = System.nanoTime();
+            String s = "";
+            for (int i = 0; i < n; i++) s += "x";
+            long plus = System.nanoTime() - t;
+
+            t = System.nanoTime();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < n; i++) sb.append("x");
+            String r = sb.toString();
+            long builder = System.nanoTime() - t;
+
+            System.out.printf("n=%,6d: += %6.1f мс, StringBuilder %5.2f мс (длины %d/%d)%n",
+                    n, plus / 1e6, builder / 1e6, s.length(), r.length());
+        }
+    }
+}
+@end
+@predict Во сколько раз вырастет время <code>+=</code> при удвоении n? А у StringBuilder?
+@answer
+<p>У <code>+=</code> — в 3–4 раза (замеры «шумят», но рост явно быстрее линейного): каждая итерация копирует всю строку, суммарно ~n²/2 символов. У StringBuilder — примерно в 2 раза (линейно): массив растёт удвоением, копирований O(n). Компилятор не превращает цикл с <code>+=</code> в один StringBuilder — оптимизируется только одно выражение.</p>
+@end
+@run
+javac Concat.java
+java Concat
+@end
+
+@lab 3.3 | Строки и байты: кодировки | 15 мин
+@goal
+<p>Увидеть, что длина строки, число байт и число «символов на экране» — разные числа, и получить «кракозябры» своими руками.</p>
+@end
+@file Bytes.java
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+
+public class Bytes {
+    public static void main(String[] args) {
+        String s = "Привет";
+        System.out.println("length()       = " + s.length());
+        System.out.println("UTF-8 байт     = " + s.getBytes(StandardCharsets.UTF_8).length);
+        System.out.println("UTF-16 байт    = " + s.getBytes(StandardCharsets.UTF_16).length);
+        System.out.println("windows-1251   = " + s.getBytes(Charset.forName("windows-1251")).length);
+
+        byte[] utf8 = s.getBytes(StandardCharsets.UTF_8);
+        System.out.println("UTF-8 как 1251 = " + new String(utf8, Charset.forName("windows-1251")));
+        System.out.println("UTF-8 как Latin-1 = " + new String(utf8, StandardCharsets.ISO_8859_1));
+
+        System.out.println("default charset = " + Charset.defaultCharset());
+        System.out.println("stdout.encoding = " + System.getProperty("stdout.encoding"));
+    }
+}
+@end
+@predict Сколько байт займёт «Привет» в UTF-8, UTF-16 и windows-1251?
+@answer
+<p>UTF-8 — 12 (кириллица по 2 байта), UTF-16 — 14 (по 2 байта + 2 байта BOM, который добавляет кодировщик <code>UTF_16</code>), windows-1251 — 6. Декодирование чужой кодировкой даёт «РџСЂРёРІРµС‚» — классические кракозябры. С Java 18 кодировка по умолчанию — UTF-8 везде (JEP 400), а для консоли действует отдельная <code>stdout.encoding</code>.</p>
+@end
+@run
+javac Bytes.java
+java Bytes
+@end
+@note В консоли IDEA и в терминале Windows значение <code>stdout.encoding</code> может отличаться (например, <code>Cp866</code> или <code>UTF-8</code>) — это кодировка вывода в консоль, а не строк в памяти.
+@end
+
+@lab 3.4 | Ловушки API String | 15 мин
+@goal
+<p>Найти поведение, которое ломает разбор данных в реальных проектах.</p>
+@end
+@file Traps.java
+import java.util.Arrays;
+import java.util.Locale;
+
+public class Traps {
+    public static void main(String[] args) {
+        System.out.println(Arrays.toString("a,b,,".split(",")));
+        System.out.println(Arrays.toString("a,b,,".split(",", -1)));
+        System.out.println(Arrays.toString("a|b|c".split("|")));
+        System.out.println(Arrays.toString("a.b.c".split("\\.")));
+        System.out.println("[" + "  hi  ".trim() + "] vs [" + "  hi  ".strip() + "]");
+        System.out.println("TITLE".toLowerCase(Locale.of("tr")) + " vs " + "TITLE".toLowerCase(Locale.ROOT));
+        System.out.println(String.format(Locale.GERMANY, "%.2f", 1234.5) + " vs " + String.format(Locale.US, "%.2f", 1234.5));
+        String json = """
+            {"name": "Java",
+             "version": 25}
+            """;
+        System.out.println(json);
+    }
+}
+@end
+@predict Сколько элементов вернёт каждый <code>split</code>? Что случится с «TITLE» в турецкой локали?
+@answer
+<p><code>"a,b,,".split(",")</code> → <code>[a, b]</code>: пустые строки в конце отбрасываются; с лимитом −1 → <code>[a, b, , ]</code>. <code>split("|")</code> → <code>[a, |, b, |, c]</code>: аргумент — регулярное выражение, а <code>|</code> — «или пусто». <code>trim()</code> не удаляет Unicode-пробел U+2003, <code>strip()</code> — удаляет. В турецкой локали I → <b>ı</b> (без точки): «tıtle». Для технических строк — всегда <code>Locale.ROOT</code>.</p>
+@end
+@run
+javac Traps.java
+java Traps
+@end
+@end

@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 12 · ФУНКЦИОНАЛЬНЫЙ СТИЛЬ</div>
   <h1>Современная Java: records, sealed, pattern matching</h1>
   <p class="lead">После Java 8 язык изменился сильнее, чем за предыдущие пятнадцать лет. Записи, запечатанные иерархии и сопоставление с образцом вместе дают новый способ моделировать данные — компактный и проверяемый компилятором. Глава о том, что появилось между 9-й и 25-й версиями и как этим пользоваться.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">record</span><span class="tag">sealed</span><span class="tag">switch</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">record</span><span class="tag">sealed</span><span class="tag">switch</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -222,7 +222,156 @@ static double area(Shape s) {
 })();
 </script>
 
-<h2 id="quiz"><span class="h-num">12.9</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">12.9</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Records, sealed-иерархии и сопоставление с образцом складываются в один стиль — «алгебраические типы данных». Построим маленький калькулятор выражений и посмотрим, как компилятор проверяет полноту <code>switch</code>. Модуль IDEA — <code>ch12</code>, language level 25.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-12.1">
+<div class="lab-head"><span class="lab-num">Лаба 12.1</span><b>Record: что генерирует компилятор</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть сгенерированные методы record и написать компактный конструктор с проверкой.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Money.java</code>:</div>
+<pre data-title="Money.java"><code class="java">import java.math.BigDecimal;
+
+public record Money(BigDecimal amount, String currency) {
+    public Money {
+        if (amount.signum() &lt; 0) throw new IllegalArgumentException("отрицательная сумма: " + amount);
+        currency = currency.toUpperCase();
+    }
+
+    public Money plus(Money other) {
+        if (!currency.equals(other.currency)) throw new IllegalArgumentException("разные валюты");
+        return new Money(amount.add(other.amount), currency);
+    }
+
+    public static void main(String[] args) {
+        Money a = new Money(new BigDecimal("10.50"), "rub"), b = new Money(new BigDecimal("4.50"), "RUB");
+        System.out.println(a.plus(b) + ", equals: " + a.equals(new Money(new BigDecimal("10.50"), "RUB")));
+        try { new Money(new BigDecimal("-1"), "rub"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Money.java
+java Money
+javap -p Money.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Money[amount=15.00, currency=RUB], equals: true
+отрицательная сумма: -1
+Compiled from "Money.java"
+public final class Money extends java.lang.Record {
+  private final java.math.BigDecimal amount;
+  private final java.lang.String currency;
+  public Money(java.math.BigDecimal, java.lang.String);
+  public Money plus(Money);
+  public static void main(java.lang.String[]);
+  public final java.lang.String toString();
+  public final int hashCode();
+  public final boolean equals(java.lang.Object);
+  public java.math.BigDecimal amount();
+  public java.lang.String currency();
+}</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие методы есть в javap, хотя вы их не писали?</div>
+<div class="lab-ans" hidden><p>Аксессоры <code>amount()</code> и <code>currency()</code> (без «get»), канонический конструктор, <code>equals</code>, <code>hashCode</code>, <code>toString</code> — последние три помечены <code>final</code> и реализованы через <code>invokedynamic</code> с bootstrap <code>ObjectMethods</code>. Поля — <code>private final</code>. Компактный конструктор выполняется до присваивания полей, поэтому <code>currency = …toUpperCase()</code> меняет параметр, который затем запишется в поле.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-12.2">
+<div class="lab-head"><span class="lab-num">Лаба 12.2</span><b>Sealed-иерархия и исчерпывающий switch</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Описать выражения как sealed-интерфейс с record-ами и вычислять их switch-ем с паттернами — без default.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Expr.java</code>:</div>
+<pre data-title="Expr.java"><code class="java">public sealed interface Expr permits Expr.Num, Expr.Add, Expr.Mul, Expr.Neg {
+    record Num(double value) implements Expr { }
+    record Add(Expr left, Expr right) implements Expr { }
+    record Mul(Expr left, Expr right) implements Expr { }
+    record Neg(Expr inner) implements Expr { }
+
+    static double eval(Expr e) {
+        return switch (e) {
+            case Num n -&gt; n.value();
+            case Add(Expr l, Expr r) -&gt; eval(l) + eval(r);
+            case Mul(Num(var a), Num(var b)) when a == 0 || b == 0 -&gt; 0;     // вложенный паттерн + guard
+            case Mul(Expr l, Expr r) -&gt; eval(l) * eval(r);
+            case Neg(Expr inner) -&gt; -eval(inner);
+        };
+    }
+
+    static String show(Expr e) {
+        return switch (e) {
+            case Num(var v) -&gt; String.valueOf(v);
+            case Add(var l, var r) -&gt; "(" + show(l) + " + " + show(r) + ")";
+            case Mul(var l, var r) -&gt; show(l) + " * " + show(r);
+            case Neg(var i) -&gt; "-" + show(i);
+        };
+    }
+
+    static void main() {
+        Expr e = new Add(new Num(2), new Mul(new Num(3), new Neg(new Num(4))));
+        IO.println(show(e) + " = " + eval(e));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Expr.java
+java Expr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">(2.0 + 3.0 * -4.0) = -10.0</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Добавьте в <code>permits</code> и в интерфейс новый вариант <code>record Div(Expr l, Expr r) implements Expr {}</code> и перекомпилируйте. Что скажет javac?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Expr.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Expr.java:9: error: the switch expression does not cover all possible input values
+        return switch (e) {
+               ^
+Expr.java:19: error: the switch expression does not cover all possible input values
+        return switch (e) {
+               ^
+2 errors</code></pre></details>
+<div class="lab-ans" hidden><p>Две ошибки: «the switch expression does not cover all possible input values» — в <code>eval</code> и в <code>show</code>. Это главная ценность sealed + switch без default: компилятор находит каждое место, которое нужно обновить при добавлении варианта. С <code>default -&gt;</code> вы потеряли бы эту проверку.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Поменяйте местами две ветки <code>case Mul</code>.</summary><div>Ошибка «this case label is dominated by a preceding case label»: общий паттерн <code>Mul(Expr l, Expr r)</code> перекрывает частный, и тот стал бы недостижим. Порядок case в паттерн-switch важен.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-12.3">
+<div class="lab-head"><span class="lab-num">Лаба 12.3</span><b>Паттерны в instanceof и switch по null</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить новые формы паттерн-сопоставления, включая <code>case null</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Patterns.java</code>:</div>
+<pre data-title="Patterns.java"><code class="java">public class Patterns {
+    static String describe(Object o) {
+        return switch (o) {
+            case null -&gt; "это null";
+            case Integer i when i &gt; 100 -&gt; "большое число " + i;
+            case Integer i -&gt; "число " + i;
+            case String s when s.isBlank() -&gt; "пустая строка";
+            case String s -&gt; "строка длины " + s.length();
+            case int[] arr -&gt; "массив int из " + arr.length;
+            default -&gt; "что-то ещё: " + o.getClass().getSimpleName();
+        };
+    }
+
+    public static void main(String[] args) {
+        Object[] samples = { 7, 500, "", "hello", new int[3], 2.5, null };
+        for (Object o : samples) System.out.println(describe(o));
+        Object x = "text";
+        if (x instanceof String s &amp;&amp; s.length() &gt; 2) System.out.println("instanceof с паттерном: " + s.toUpperCase());
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Patterns.java
+java Patterns</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">число 7
+большое число 500
+пустая строка
+строка длины 5
+массив int из 3
+что-то ещё: Double
+это null
+instanceof с паттерном: TEXT</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>case null</code>. Что произойдёт на последнем элементе?</summary><div><code>NullPointerException</code>: switch по-прежнему бросает NPE на null, если явно не обработать <code>case null</code> — для обратной совместимости.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">12.10</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Что record генерирует автоматически?</p><ul><li>Только геттеры</li><li>Геттеры и сеттеры</li><li>Канонический конструктор, методы доступа по именам компонентов, equals, hashCode, toString</li><li>Только toString</li></ul><div class="why">Поля private final, сеттеров нет. Методы доступа называются как компоненты: <code>point.x()</code>, не <code>getX()</code>.</div></div>
 <div class="mcq" data-ok="0"><p>Где нельзя использовать <code>var</code>?</p><ul><li>В полях класса, параметрах методов и без инициализатора</li><li>В цикле for-each</li><li>Для локальной переменной с инициализатором</li><li>В try-with-resources</li></ul><div class="why">var — вывод типа только для локальных переменных с инициализатором (и параметров лямбд). Тип остаётся статическим.</div></div>

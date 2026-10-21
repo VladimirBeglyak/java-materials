@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 06 · ЗАГРУЗКА КЛАССОВ</div>
   <h1>Линковка и инициализация классов</h1>
   <p class="lead">Загруженный класс ещё нельзя использовать: его байткод надо проверить, под статические поля — выделить память, символические ссылки — разрешить, а статические инициализаторы — выполнить ровно один раз, даже если к классу одновременно обратились сто потоков. Здесь — верификатор, ленивое разрешение, точные правила «когда выполнится static-блок» (с тренажёром) и как инициализация классов приводит к взаимоблокировке.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">верификация</span><span class="tag">preparation</span><span class="tag">resolution</span><span class="tag">&lt;clinit&gt;</span><span class="tag">holder idiom</span><span class="tag">deadlock инициализации</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">верификация</span><span class="tag">preparation</span><span class="tag">resolution</span><span class="tag">&lt;clinit&gt;</span><span class="tag">holder idiom</span><span class="tag">deadlock инициализации</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -127,7 +127,238 @@ class Child extends Parent {
   <section class="st-step" data-t="Как избежать" data-hl="cA cB" data-log="решение: никаких циклов в static-инициализаторах; ленивые holder-ы; инициализация в одном месте при старте"><p>Не создавайте циклических зависимостей в статической инициализации; не запускайте потоки и не ждите их из <code>static</code>-блоков; переносите тяжёлую инициализацию из статики в явный жизненный цикл (бины Spring). Классический реальный случай — подкласс, на который ссылается статическое поле родителя (<code>static final Parent DEFAULT = new Child()</code>).</p></section>
 </div>
 
-<h2 id="quiz"><span class="h-num">6.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">6.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Правила «когда класс инициализируется» лучше один раз проверить на трассировке, чем заучивать. А верификатор можно увидеть в деле, сгенерировав заведомо неправильный байткод стандартным ClassFile API (Java 24+). Модуль IDEA — <code>ch06</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-6.1">
+<div class="lab-head"><span class="lab-num">Лаба 6.1</span><b>Инициализирует или нет: семь обращений к классу</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить на трассировке, какие действия запускают <code>&lt;clinit&gt;</code>, а какие — нет.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>InitRules.java</code>:</div>
+<pre data-title="InitRules.java"><code class="java">public class InitRules {
+    static class Parent {
+        static { System.out.println("    [init Parent]"); }
+        static int parentField = 1;
+    }
+
+    static class Child extends Parent {
+        static { System.out.println("    [init Child]"); }
+        static final int CONST = 42;                 // константа времени компиляции
+        static final Integer BOXED = 42;             // не константа
+        static void hello() {}
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("1. Child.class");                Class&lt;?&gt; c = Child.class;
+        System.out.println("2. new Child[10]");              Child[] arr = new Child[10];
+        System.out.println("3. Child.CONST = " + Child.CONST);
+        System.out.println("4. Child.parentField");          int p = Child.parentField;
+        System.out.println("5. loadClass без инициализации");
+        ClassLoader.getSystemClassLoader().loadClass("InitRules$Child");
+        System.out.println("6. Child.BOXED");                Integer b = Child.BOXED;
+        System.out.println("7. Child.hello()");              Child.hello();
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запишите, после каких пунктов появятся <code>[init Parent]</code> и <code>[init Child]</code>.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac InitRules.java
+java InitRules</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1. Child.class
+2. new Child[10]
+3. Child.CONST = 42
+4. Child.parentField
+    [init Parent]
+5. loadClass без инициализации
+6. Child.BOXED
+    [init Child]
+7. Child.hello()</code></pre></details>
+<div class="lab-ans" hidden><p>1–3 ничего не инициализируют (литерал класса, массив, подставленная константа). 4 — только <code>[init Parent]</code>: поле объявлено в Parent, обращение через Child инициализирует лишь класс-владелец. 5 — ничего: <code>loadClass</code> загружает без инициализации. 6 — <code>[init Child]</code> (Parent уже готов). 7 — ничего: Child уже инициализирован.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Включите журнал инициализации JVM и найдите в нём свои классы:</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xlog:class+init=info</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xlog:class+init=info InitRules | findstr InitRules</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.037s][info][class,init] Start class verification for: InitRules
+[0.037s][info][class,init] End class verification for: InitRules
+[0.037s][info][class,init] 323 Initializing 'InitRules'(no method) (0x000000000d040000) by thread "main"
+[0.038s][info][class,init] Start class verification for: InitRules$Parent
+[0.038s][info][class,init] End class verification for: InitRules$Parent
+[0.038s][info][class,init] 328 Initializing 'InitRules$Parent' (0x000000000d040210) by thread "main"
+[0.038s][info][class,init] Start class verification for: InitRules$Child
+[0.038s][info][class,init] End class verification for: InitRules$Child
+[0.038s][info][class,init] 329 Initializing 'InitRules$Child' (0x000000000d040420) by thread "main"</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените в пункте 5 вызов на <code>Class.forName("InitRules$Child")</code>.</summary><div>Child инициализируется в пункте 5: <code>forName(name)</code> по умолчанию инициализирует класс. Есть перегрузка <code>forName(name, false, loader)</code> без инициализации.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-6.2">
+<div class="lab-head"><span class="lab-num">Лаба 6.2</span><b>Верификатор ловит неправильный байткод</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сгенерировать класс, метод которого обещает вернуть строку, а возвращает int, и увидеть <code>VerifyError</code> при загрузке.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>BadGen.java</code>:</div>
+<pre data-title="BadGen.java"><code class="java">import java.lang.classfile.ClassFile;
+import java.lang.constant.ClassDesc;
+import java.lang.constant.MethodTypeDesc;
+import java.lang.invoke.MethodHandles;
+
+import static java.lang.constant.ConstantDescs.CD_String;
+import static java.lang.classfile.ClassFile.ACC_PUBLIC;
+import static java.lang.classfile.ClassFile.ACC_STATIC;
+
+public class BadGen {
+    public static void main(String[] args) throws Exception {
+        boolean broken = args.length &gt; 0 &amp;&amp; args[0].equals("broken");
+        byte[] bytes = ClassFile.of().build(ClassDesc.of("Gen"), cls -&gt;
+            cls.withMethodBody("value", MethodTypeDesc.of(CD_String), ACC_PUBLIC | ACC_STATIC, code -&gt; {
+                if (broken) code.iconst_1().areturn();    // int там, где ожидается ссылка
+                else        code.ldc("ok").areturn();
+            }));
+        System.out.println("сгенерировано " + bytes.length + " байт");
+        Class&lt;?&gt; c = MethodHandles.lookup().defineClass(bytes);   // Gen — в том же (безымянном) пакете, что и BadGen
+        System.out.println("класс определён: " + c);
+        System.out.println("value() = " + c.getMethod("value").invoke(null));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac BadGen.java
+java BadGen</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">сгенерировано 130 байт
+класс определён: class Gen
+value() = ok</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">А что будет с параметром <code>broken</code>: упадёт ли программа на генерации, на определении класса или на вызове метода?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java BadGen broken</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">сгенерировано 121 байт
+Exception in thread "main" java.lang.VerifyError: Bad type on operand stack
+Exception Details:
+  Location:
+    Gen.value()Ljava/lang/String; @1: areturn
+  Reason:
+    Type integer (current frame, stack[0]) is not assignable to reference type
+  Current Frame:
+    bci: @1
+    flags: { }
+    locals: { }
+    stack: { integer }
+  Bytecode:
+    0000000: 04b0                                   
+
+	at java.base/java.lang.ClassLoader.defineClass0(Native Method)
+	at java.base/java.lang.System$1.defineClass(System.java:2050)
+	at java.base/java.lang.invoke.MethodHandles$Lookup$ClassDefiner.defineClass(MethodHandles.java:2354)
+	at java.base/java.lang.invoke.MethodHandles$Lookup$ClassDefiner.defineClass(MethodHandles.java:2329)
+	at java.base/java.lang.invoke.MethodHandles$Lookup.defineClass(MethodHandles.java:1753)
+	at BadGen.main(BadGen.java:19)</code></pre></details>
+<div class="lab-ans" hidden><p>Генерация пройдёт — ClassFile API не проверяет типы на стеке. Падение — на <code>defineClass</code>: <code>VerifyError: Bad type on operand stack … Type integer (current frame, stack[0]) is not assignable to reference type</code>. <code>Lookup.defineClass</code> сразу линкует класс, а линковка начинается с верификации. (При обычной загрузке через ClassLoader верификация ленивая — перед первой инициализацией класса.) В сообщении — смещение инструкции (<code>@1: areturn</code>), состояние кадра и сам байткод <code>04 b0</code> = <code>iconst_1, areturn</code>.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите сломанную версию с <code>-XX:-BytecodeVerificationRemote</code>. Почему так делать нельзя никогда?</summary><div>Флаг отключает проверку классов не из bootstrap-загрузчика (с Java 13 устарел и печатает предупреждение). Неверный байткод тогда выполнится как есть: int трактуется как ссылка, и JVM может упасть с крахом всего процесса (hs_err) вместо исключения.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-6.3">
+<div class="lab-head"><span class="lab-num">Лаба 6.3</span><b>Взаимоблокировка при инициализации классов</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Воспроизвести зависание двух потоков на <code>&lt;clinit&gt;</code> и найти его в дампе потоков.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>InitDeadlock.java</code>:</div>
+<pre data-title="InitDeadlock.java"><code class="java">public class InitDeadlock {
+    static class A {
+        static final Object X;
+        static { sleep(); X = B.Y; }
+    }
+
+    static class B {
+        static final Object Y;
+        static { sleep(); Y = A.X; }
+    }
+
+    static void sleep() { try { Thread.sleep(300); } catch (InterruptedException ignored) {} }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        Thread t1 = new Thread(() -&gt; System.out.println("A.X = " + A.X), "init-A");
+        Thread t2 = new Thread(() -&gt; System.out.println("B.Y = " + B.Y), "init-B");
+        t1.start(); t2.start();
+        t1.join(3000); t2.join(3000);
+        System.out.println("через 3 секунды: init-A " + t1.getState() + ", init-B " + t2.getState());
+        System.exit(0);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Чем закончится программа: напечатаются значения, будет исключение или потоки зависнут?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac InitDeadlock.java
+java InitDeadlock</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">pid 13348
+через 3 секунды: init-A RUNNABLE, init-B RUNNABLE</code></pre></details>
+<div class="lab-ans" hidden><p>Зависнут навсегда (поэтому в main стоит <code>System.exit</code>). init-A держит блокировку инициализации A и ждёт инициализации B; init-B держит B и ждёт A. В отличие от deadlock на <code>synchronized</code>, JVM такую взаимоблокировку <b>не</b> находит: в дампе потоков не будет «Found one Java-level deadlock». Состояние потоков — RUNNABLE, что сбивает с толку.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Пока программа висит (до <code>System.exit</code> 3 секунды — увеличьте <code>join</code> до 60000, чтобы успеть), снимите дамп потоков:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"init-A" #35 [4612] prio=5 os_prio=0 cpu=0.00ms elapsed=3.45s tid=0x000002d19c9dbb40 nid=4612 in Object.wait()  [0x000000ea5b8fe000]
+   java.lang.Thread.State: RUNNABLE
+	at InitDeadlock$A.&lt;clinit&gt;(InitDeadlock.java:4)
+	- waiting on the Class initialization monitor for InitDeadlock$B
+	at InitDeadlock.lambda$main$0(InitDeadlock.java:16)
+--
+"init-B" #36 [23148] prio=5 os_prio=0 cpu=0.00ms elapsed=3.45s tid=0x000002d19c9dd310 nid=23148 in Object.wait()  [0x000000ea5b9fe000]
+   java.lang.Thread.State: RUNNABLE
+	at InitDeadlock$B.&lt;clinit&gt;(InitDeadlock.java:9)
+	- waiting on the Class initialization monitor for InitDeadlock$A
+	at InitDeadlock.lambda$main$1(InitDeadlock.java:17)</code></pre></details>
+<p class="lab-note">Ключевая фраза в дампе — <code>waiting on the Class initialization monitor</code>. Именно её ищут, когда сервис «висит на старте» без нагрузки на CPU.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>sleep()</code> из статических блоков. Повиснет ли программа всегда?</summary><div>Не всегда — это гонка: если один поток успеет инициализировать оба класса до старта второго, всё пройдёт. Такие баги проявляются раз в сто запусков, обычно под нагрузкой при старте.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-6.4">
+<div class="lab-head"><span class="lab-num">Лаба 6.4</span><b>Ленивый синглтон через holder</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что вложенный класс инициализируется только при первом обращении и ровно один раз — даже из многих потоков.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Lazy.java</code>:</div>
+<pre data-title="Lazy.java"><code class="java">import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+
+public class Lazy {
+    static { System.out.println("[init Lazy]"); }
+
+    private Lazy() { System.out.println("[конструктор Lazy] в потоке " + Thread.currentThread().getName()); }
+
+    private static class Holder {
+        static { System.out.println("[init Holder]"); }
+        static final Lazy INSTANCE = new Lazy();
+    }
+
+    static Lazy get() { return Holder.INSTANCE; }
+
+    static void other() { System.out.println("other() — Holder не нужен"); }
+
+    public static void main(String[] args) throws Exception {
+        other();
+        var seen = ConcurrentHashMap.&lt;Lazy&gt;newKeySet();
+        try (var pool = Executors.newFixedThreadPool(16)) {
+            for (int i = 0; i &lt; 1000; i++) pool.submit(() -&gt; seen.add(get()));
+        }
+        System.out.println("разных экземпляров: " + seen.size());
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Lazy.java
+java Lazy</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[init Lazy]
+other() — Holder не нужен
+[init Holder]
+[конструктор Lazy] в потоке pool-1-thread-5
+разных экземпляров: 1</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте поле <code>INSTANCE</code> прямо в <code>Lazy</code> (без Holder). Когда теперь выполнится конструктор?</summary><div>Сразу при инициализации Lazy — до вызова <code>other()</code>, то есть «жадно». Holder откладывает создание до первого <code>get()</code>, а потокобезопасность обеспечивает блокировка инициализации класса — без <code>volatile</code> и <code>synchronized</code>.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">6.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Чему равно <code>static int counter = 42</code> после этапа preparation?</p><ul><li>42</li><li>0 — значение по умолчанию; 42 присвоит &lt;clinit&gt;</li><li>null</li><li>не определено</li></ul><div class="why">Preparation выделяет память и обнуляет, инициализация присваивает.</div></div>
 <div class="mcq" data-ok="3"><p>Почему ленивый синглтон через вложенный класс-holder потокобезопасен?</p><ul><li>Из-за volatile</li><li>Компилятор вставляет synchronized</li><li>Holder — final</li><li>JVM гарантирует однократную инициализацию класса Holder под блокировкой при первом обращении</li></ul><div class="why">Инициализация классов — встроенный механизм ленивой и безопасной инициализации.</div></div>

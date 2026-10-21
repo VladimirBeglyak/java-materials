@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 22 · ЭКСПЛУАТАЦИЯ</div>
   <h1>JVM в контейнерах</h1>
   <p class="lead">Большинство Java-сервисов работает в Docker и Kubernetes, и почти все «странные» проблемы там — несоответствие того, что видит JVM, и ограничений контейнера: OOM killer без ошибки в логе, троттлинг CPU с паузами GC в сотни миллисекунд, Serial GC в поде с 1 CPU, SIGTERM, который не доходит до Java. Разбираем, как JVM читает cgroups, как подобрать флаги под лимиты (с генератором), образ и корректное завершение.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">cgroups v2</span><span class="tag">лимиты памяти</span><span class="tag">квоты CPU</span><span class="tag">троттлинг</span><span class="tag">Dockerfile</span><span class="tag">graceful shutdown</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">cgroups v2</span><span class="tag">лимиты памяти</span><span class="tag">квоты CPU</span><span class="tag">троттлинг</span><span class="tag">Dockerfile</span><span class="tag">graceful shutdown</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -116,7 +116,129 @@ ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]</code>
   <section class="st-step" data-t="Принудительно" data-hl="sd5" data-log="terminationGracePeriodSeconds (30 с) истёк → SIGKILL: без hooks, без завершения запросов"><p>Если за <code>terminationGracePeriodSeconds</code> (по умолчанию 30 с) процесс не завершился — SIGKILL. Сумма preStop + время graceful shutdown должна быть меньше grace period.</p></section>
 </div>
 
-<h2 id="quiz"><span class="h-num">22.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">22.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Всё, что JVM «видит» в контейнере, проверяется одной командой <code>docker run</code>. Нужен Docker Desktop (или Docker на Linux) и образ <code>eclipse-temurin:25-jdk</code> (~200 МБ, скачается при первом запуске). Команды одинаковы для PowerShell и bash; в cmd вместо <code>${PWD}</code> пишите <code>%cd%</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-22.1">
+<div class="lab-head"><span class="lab-num">Лаба 22.1</span><b>Что JVM видит при разных лимитах</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить память и процессоры, которые JVM определяет без лимитов и с лимитами cgroups.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm eclipse-temurin:25-jdk java -XshowSettings:system -version
+docker run --rm eclipse-temurin:25-jdk java -Xlog:gc:stdout -XshowSettings:vm -version</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">    Provider: cgroupv2
+    Effective CPU Count: 18
+    Memory Limit: Unlimited
+[0.003s][info][gc] Using G1
+    Max. Heap Size (Estimated): 3.84G
+    Using VM: OpenJDK 64-Bit Server VM</code></pre></details>
+<p class="lab-note"><code>-XshowSettings:system</code> показывает, что JVM прочитала из cgroups, <code>-XshowSettings:vm</code> — итоговый размер кучи, а первая строка лога GC (<code>-Xlog:gc:stdout</code>) называет выбранный сборщик. Без лимитов контейнер видит всю память виртуальной машины Docker Desktop.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запустим с <code>-m 512m --cpus=1.5</code>. Какие будут Max. Heap Size, число CPU и сборщик?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -XshowSettings:system -version
+docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -Xlog:gc:stdout -XshowSettings:vm -version</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">    Provider: cgroupv2
+    Effective CPU Count: 2
+    Memory Limit: 512.00M
+[0.006s][info][gc] Using Serial
+    Max. Heap Size (Estimated): 123.75M
+    Using VM: OpenJDK 64-Bit Server VM</code></pre></details>
+<div class="lab-ans" hidden><p>Память контейнера — 512 МБ, куча по умолчанию — 25% от неё: <b>128 МБ</b>. CPU — <b>2</b> (квота 1,5 округляется вверх). Сборщик — <b>Serial</b>: при памяти меньше 1792 МБ машина не считается «серверной» (как в лабе 1.2). Это самая частая причина «почему в Kubernetes у нас SerialGC».</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Типичная настройка сервиса — процент памяти и явный сборщик:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -XX:MaxRAMPercentage=75 -XX:+UseG1GC -Xlog:gc:stdout -XshowSettings:vm -version</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.003s][info][gc] Using G1
+    Max. Heap Size (Estimated): 384.00M
+    Using VM: OpenJDK 64-Bit Server VM</code></pre></details>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="jvm-22.2">
+<div class="lab-head"><span class="lab-num">Лаба 22.2</span><b>OOM killer: код 137 без OutOfMemoryError</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, как ядро Linux убивает JVM, которой разрешили кучу больше лимита контейнера, — и как это выглядит снаружи.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Eat.java</code>:</div>
+<pre data-title="Eat.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Eat {
+    public static void main(String[] args) {
+        List&lt;byte[]&gt; keep = new ArrayList&lt;&gt;();
+        for (int mb = 1; ; mb++) {
+            byte[] chunk = new byte[1 &lt;&lt; 20];
+            for (int i = 0; i &lt; chunk.length; i += 4096) chunk[i] = 1;   // реально занять страницы
+            keep.add(chunk);
+            if (mb % 50 == 0) System.out.println("занято " + mb + " МБ");
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Контейнер с <code>-m 256m</code>, а JVM мы разрешили <code>-Xmx1g</code>. Чем закончится программа?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -m 256m -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk java -Xmx1g Eat.java
+echo $LASTEXITCODE    # PowerShell; в bash: echo $?</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">занято 50 МБ
+занято 100 МБ
+занято 150 МБ
+занято 200 МБ
+занято 250 МБ
+занято 300 МБ
+занято 350 МБ
+занято 400 МБ
+код возврата: 137</code></pre></details>
+<div class="lab-ans" hidden><p>JVM не знает, что физически памяти меньше, и продолжает расти. Когда RSS процесса упрётся в 256 МБ, ядро пошлёт SIGKILL: процесс исчезает мгновенно, без <code>OutOfMemoryError</code>, без дампа и без строчки в логе приложения. Снаружи — только код возврата <b>137</b> (128 + 9) и <code>OOMKilled: true</code> у контейнера.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Теперь без явного <code>-Xmx</code> — пусть JVM сама посчитает кучу от лимита:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -m 256m -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk java -XX:MaxRAMPercentage=75 Eat.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">занято 50 МБ
+занято 100 МБ
+занято 150 МБ
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+код возврата: 1</code></pre></details>
+<p class="lab-note">Теперь падение «правильное»: <code>OutOfMemoryError: Java heap space</code> — его видно в логах, можно снять дамп (<code>-XX:+HeapDumpOnOutOfMemoryError</code>). 25% запаса оставлены под metaspace, потоки, code cache и буферы — не-кучевую память.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="jvm-22.3">
+<div class="lab-head"><span class="lab-num">Лаба 22.3</span><b>Корректное завершение: SIGTERM и shutdown hook</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить, что <code>docker stop</code> (как и удаление пода) доставляет SIGTERM в JVM и hook успевает отработать — и как это ломается, если java запущена через shell.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Graceful.java</code>:</div>
+<pre data-title="Graceful.java"><code class="java">public class Graceful {
+    public static void main(String[] args) throws Exception {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; {
+            System.out.println("SIGTERM получен: дописываю буферы, закрываю пул соединений…");
+            try { Thread.sleep(500); } catch (InterruptedException ignored) { }
+            System.out.println("завершено чисто");
+        }));
+        System.out.println("работаю, pid в контейнере = " + ProcessHandle.current().pid());
+        Thread.sleep(600_000);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run -d --name graceful -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk java Graceful.java
+docker stop graceful
+docker logs graceful
+docker rm graceful</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">работаю, pid в контейнере = 1
+SIGTERM получен: дописываю буферы, закрываю пул соединений…
+завершено чисто</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запустите то же через shell: <code>sh -c "java Graceful.java"</code>. Сколько займёт <code>docker stop</code> и выполнится ли hook?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run -d --name graceful2 -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk sh -c "java Graceful.java; echo java вышла"
+docker stop graceful2
+docker logs graceful2
+docker inspect graceful2 --format "{{.State.ExitCode}}"
+docker rm graceful2</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">docker stop занял 3 с
+работаю, pid в контейнере = 7
+137</code></pre></details>
+<p class="lab-note">Интересная деталь: в образе Temurin <code>sh</code> — это dash, который для последней команды иногда сам делает exec. Здесь после java стоит ещё одна команда, поэтому exec невозможен — классический сценарий из реальных entrypoint-скриптов.</p>
+<div class="lab-ans" hidden><p>PID 1 в контейнере теперь <code>sh</code>, а не java. Он не пересылает SIGTERM дочернему процессу, и по истечении таймаута <code>docker stop</code> (по умолчанию до 10 с) контейнер получает SIGKILL: hook не выполнится, ни «завершено чисто», ни «java вышла» в логах нет, код выхода — 137. Поэтому в Dockerfile пишут exec-форму <code>ENTRYPOINT ["java", "-jar", "app.jar"]</code> или <code>exec java …</code> в скрипте.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">22.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Под с limits.cpu: 500m. Какой GC выберет JVM по умолчанию?</p><ul><li>G1</li><li>ZGC</li><li>Serial: ActiveProcessorCount = 1 → машина «клиентского класса»</li><li>Parallel</li></ul><div class="why">Задайте сборщик явно или ActiveProcessorCount=2.</div></div>
 <div class="mcq" data-ok="0"><p>Почему при низкой средней загрузке CPU у сервиса в контейнере бывают всплески задержек по 50–100 мс?</p><ul><li>Троттлинг CFS: параллельная работа (GC) исчерпывает квоту периода, и контейнер замораживается до конца периода</li><li>Медленная сеть</li><li>JIT отключён</li><li>Kubernetes перезапускает под</li></ul><div class="why">Смотрите метрики throttled periods.</div></div>

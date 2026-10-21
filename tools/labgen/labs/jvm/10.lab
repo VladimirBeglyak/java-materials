@@ -1,0 +1,131 @@
+@chapter 10 | quiz
+@intro
+<p>Раскладку объектов в памяти показывает утилита <b>JOL</b> (Java Object Layout) из проекта OpenJDK. Скачайте её в каталог <code>lib</code> модуля <code>ch10</code> и добавьте как зависимость (Project Structure → Modules → Dependencies → + → JARs). Флаг <code>--sun-misc-unsafe-memory-access=allow</code> только убирает предупреждения JDK 24+ о том, что JOL использует <code>sun.misc.Unsafe</code>.</p>
+@end
+
+@lab 10.1 | Заголовок объекта своими глазами | 15 мин
+@goal
+<p>Увидеть mark word и указатель на класс у пустого объекта и у массива и сравнить с компактными заголовками Java 25.</p>
+@end
+@step Скачайте JOL:
+@exec
+mkdir -p lib
+cp ../../../jars/jol-cli-0.17-full.jar lib/
+@end
+@run noout
+curl -L -o lib/jol-cli.jar https://repo1.maven.org/maven2/org/openjdk/jol/jol-cli/0.17/jol-cli-0.17-full.jar ||| mv lib/jol-cli-0.17-full.jar lib/jol-cli.jar
+@end
+@run grep="^(OFF|  ?\d|Instance|Space|# Compressed|# Array base)"
+java --sun-misc-unsafe-memory-access=allow -jar lib/jol-cli.jar internals java.lang.Object
+@end
+@predict Объект без полей занимает 16 байт, из которых 4 — «дырка» выравнивания. А сколько займёт <code>new int[3]</code>?
+@answer
+<p>32 байта: 8 (mark) + 4 (класс) + 4 (длина массива) = 16 байт заголовка, затем 3 × 4 = 12 байт данных, итого 28 → выравнивание до кратного 8 даёт 32.</p>
+@end
+@file Layout.java
+import org.openjdk.jol.info.ClassLayout;
+
+public class Layout {
+    public static void main(String[] args) {
+        System.out.println(ClassLayout.parseInstance(new int[3]).toPrintable());
+        Object o = new Object();
+        System.out.println("до hashCode:   " + ClassLayout.parseInstance(o).toPrintable().lines().filter(l -> l.contains("mark")).findFirst().orElse(""));
+        System.out.printf("hashCode = %x%n", o.hashCode());
+        System.out.println("после hashCode:" + ClassLayout.parseInstance(o).toPrintable().lines().filter(l -> l.contains("mark")).findFirst().orElse(""));
+        synchronized (o) {
+            System.out.println("под synchronized:" + ClassLayout.parseInstance(o).toPrintable().lines().filter(l -> l.contains("mark")).findFirst().orElse(""));
+        }
+    }
+}
+@end
+@run grep="OFF|^  ?\d|Instance|mark|hashCode"
+javac -cp lib/jol-cli.jar Layout.java
+java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Layout ||| java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar:." Layout
+@end
+@note Обратите внимание: identity hashCode записывается прямо в mark word при первом вызове (биты 0x…01 → появилось ваше значение), а под synchronized mark word содержит указатель на запись блокировки в стеке (thin lock). Подробнее — в теме 18.
+@try
+Запустите тот же <code>internals java.lang.Object</code> с <code>-XX:+UseCompactObjectHeaders</code> (продуктовый флаг с Java 25, JEP 519). ::: Строки «object header: class» больше нет: указатель на класс поместился внутрь 8-байтного mark word (JOL пометит его «Lilliput»). Объект без полей — по-прежнему 16 байт. Заголовок короче на 4 байта, но объект уменьшается, только если эти 4 байта «перешагивают» границу выравнивания в 8 байт (лаба 10.2 покажет обратный случай). В среднем по куче экономия ощутимая — типичные объекты маленькие.
+@end
+
+@lab 10.2 | Порядок полей и «дырки» выравнивания | 15 мин
+@goal
+<p>Убедиться, что JVM переставляет поля по размеру и что поля родителя идут раньше полей наследника.</p>
+@end
+@file Fields.java
+import org.openjdk.jol.info.ClassLayout;
+
+public class Fields {
+    static class Base { boolean flag; }
+    static class Order extends Base {
+        byte status;
+        long id;
+        int qty;
+        Object ref;
+        char code;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(ClassLayout.parseClass(Order.class).toPrintable());
+    }
+}
+@end
+@predict Поля объявлены в порядке <code>status, id, qty, ref, code</code>. В каком порядке они лежат в памяти и каков размер объекта?
+@answer
+<p>JVM сначала кладёт поля родителя (<code>flag</code>), затем поля класса, сгруппированные по убыванию размера: long → int → ссылки → char → byte, заполняя «дырки» мелкими полями. Порядок объявления не важен. Итог — 32 байта, причём без единого потерянного байта: <code>byte</code> и <code>char</code> заняли щель 13–15 перед <code>long</code>, которому нужно выравнивание на 8.</p>
+@end
+@run grep="OFF|^  ?\d|Instance|Space"
+javac -cp lib/jol-cli.jar Fields.java
+java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Fields ||| java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar:." Fields
+@end
+@predict Теперь с компактными заголовками: заголовок на 4 байта короче. Станет ли объект меньше 32 байт?
+@ide VM options: <code>-XX:+UseCompactObjectHeaders --sun-misc-unsafe-memory-access=allow</code>
+@run grep="OFF|^  ?\d|Instance|Space"
+java -XX:+UseCompactObjectHeaders --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Fields ||| java -XX:+UseCompactObjectHeaders --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar:." Fields
+@end
+@answer
+<p>Нет: 8 + 20 байт полей = 28, выравнивание до 8 даёт те же 32 байта, только теперь с 4 байтами «дырки» в конце. Компактный заголовок выигрывает у объектов, где старый размер был «чуть больше» кратного 8, — например, у класса с одним полем <code>long</code>: 24 → 16 байт.</p>
+@end
+@try
+Отключите сжатые ссылки <code>-XX:-UseCompressedOops</code>. Что изменится? ::: Поле <code>ref</code> станет 8 байт, объект вырастет. Указатель на класс при этом останется 4-байтным: за него отвечает отдельный флаг <code>UseCompressedClassPointers</code>. Это то, что происходит при -Xmx ≥ 32 ГБ.
+@end
+
+@lab 10.3 | Сколько памяти на самом деле занимает коллекция | 20 мин
+@goal
+<p>Посчитать полный «след» (footprint) структуры данных — со всеми внутренними объектами — и сравнить <code>ArrayList&lt;Integer&gt;</code>, <code>int[]</code> и <code>HashMap</code>.</p>
+@end
+@file Footprint.java
+import org.openjdk.jol.info.GraphLayout;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class Footprint {
+    public static void main(String[] args) {
+        int n = 1000;
+        int[] arr = new int[n];
+        List<Integer> list = new ArrayList<>();
+        Map<Integer, Integer> map = new HashMap<>();
+        for (int i = 0; i < n; i++) { arr[i] = i + 1000; list.add(i + 1000); map.put(i + 1000, i + 1000); }
+
+        System.out.println("int[1000]:            " + GraphLayout.parseInstance((Object) arr).totalSize() + " байт");
+        System.out.println("ArrayList<Integer>:   " + GraphLayout.parseInstance(list).totalSize() + " байт");
+        System.out.println("HashMap<Int,Int>:     " + GraphLayout.parseInstance(map).totalSize() + " байт");
+        System.out.println();
+        System.out.println(GraphLayout.parseInstance(map).toFootprint());
+    }
+}
+@end
+@predict Во сколько раз <code>ArrayList&lt;Integer&gt;</code> тяжелее <code>int[]</code> на тысяче чисел больше 127? А HashMap?
+@answer
+<p>ArrayList примерно в 5 раз (4 КБ массива против ~21 КБ): 1000 объектов Integer по 16 байт + массив ссылок с запасом ёмкости. HashMap — примерно в 18 раз (~72 КБ): на каждую пару — узел <code>HashMap$Node</code> (32 байта) и два Integer, плюс таблица. Для больших наборов примитивов это повод взять массив или специализированные коллекции (fastutil, Eclipse Collections).</p>
+@end
+@run
+javac -cp lib/jol-cli.jar Footprint.java
+java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar;." Footprint ||| java --sun-misc-unsafe-memory-access=allow -cp "lib/jol-cli.jar:." Footprint
+@end
+@note Предупреждения JOL «Unable to get Instrumentation» и «Unable to attach Serviceability Agent» безвредны: для подсчёта размеров они не нужны.
+@try
+Замените <code>i + 1000</code> на <code>i % 100</code> в ArrayList. Почему след резко уменьшится? ::: Значения −128..127 берутся из кэша <code>Integer.valueOf</code> — все 1000 ссылок указывают на 100 общих объектов, а JOL считает каждый объект графа один раз.
+@end

@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 06 · ОСНОВА ЯЗЫКА</div>
   <h1>Исключения</h1>
   <p class="lead">Исключение — способ сообщить об ошибке так, чтобы её нельзя было случайно проигнорировать. Механизм прост, но именно в обработке ошибок рождается большинство инцидентов: проглоченное исключение, потерянная причина, незакрытый ресурс.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">checked / unchecked</span><span class="tag">try-with-resources</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">checked / unchecked</span><span class="tag">try-with-resources</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -228,7 +228,199 @@ try {
 </script>
 <p><b>Попробуйте:</b> (1) A = исключение, C = <code>return 3</code> — исключение исчезает без следа; поэтому <code>return</code> и <code>throw</code> в finally считаются ошибкой. (2) A = исключение и close() бросает — второе не теряется, а прикрепляется как suppressed. (3) A = <code>return 1</code> — finally всё равно выполняется.</p>
 
-<h2 id="quiz"><span class="h-num">6.8</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">6.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Головоломки с <code>finally</code>, порядок закрытия ресурсов, подавленные исключения и неожиданная оптимизация JVM, которая «съедает» стектрейсы. Модуль IDEA — <code>ch06</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-6.1">
+<div class="lab-head"><span class="lab-num">Лаба 6.1</span><b>Что вернёт метод с finally</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Разобраться, когда finally меняет результат, а когда нет.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Finally.java</code>:</div>
+<pre data-title="Finally.java"><code class="java">public class Finally {
+    static int a() { int x = 1; try { return x; } finally { x = 2; } }
+    static int b() { try { return 1; } finally { return 2; } }
+    static int c() { try { throw new RuntimeException("boom in try"); } finally { return 3; } }
+    static StringBuilder d() { StringBuilder sb = new StringBuilder("1"); try { return sb; } finally { sb.append("2"); } }
+    static void e() {
+        try { throw new IllegalStateException("основное"); }
+        finally { throw new RuntimeException("boom in finally"); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println("a() = " + a());
+        System.out.println("b() = " + b());
+        System.out.println("c() = " + c());
+        System.out.println("d() = " + d());
+        try { e(); } catch (RuntimeException ex) { System.out.println("e() бросил: " + ex.getMessage()); }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Пять ответов.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -Xlint:finally Finally.java
+java Finally</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Finally.java:3: warning: [finally] finally clause cannot complete normally
+    static int b() { try { return 1; } finally { return 2; } }
+                                                           ^
+Finally.java:4: warning: [finally] finally clause cannot complete normally
+    static int c() { try { throw new RuntimeException("boom in try"); } finally { return 3; } }
+                                                                                            ^
+Finally.java:8: warning: [finally] finally clause cannot complete normally
+        finally { throw new RuntimeException("boom in finally"); }
+                                                                 ^
+3 warnings
+a() = 1
+b() = 2
+c() = 3
+d() = 12
+e() бросил: boom in finally</code></pre></details>
+<div class="lab-ans" hidden><p>a — <b>1</b>: значение для return вычислено и сохранено до finally; изменение локальной переменной его не трогает. b — <b>2</b>: return в finally перекрывает. c — <b>3</b>: return в finally <i>проглатывает исключение</i> — самый опасный случай. d — <b>12</b>: сохранена ссылка, а объект finally изменил. e — «boom in finally»: исключение из finally заменяет основное, и оно потеряно. javac предупреждает: <code>finally clause cannot complete normally</code> (с <code>-Xlint</code>).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-6.2">
+<div class="lab-head"><span class="lab-num">Лаба 6.2</span><b>try-with-resources: порядок и подавленные исключения</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть порядок закрытия ресурсов и то, что исключение из close не теряется.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Resources.java</code>:</div>
+<pre data-title="Resources.java"><code class="java">public class Resources {
+    record Res(String name, boolean failOnClose) implements AutoCloseable {
+        Res { System.out.println("открыт " + name); }
+        @Override public void close() {
+            System.out.println("закрываю " + name);
+            if (failOnClose) throw new IllegalStateException("сбой close " + name);
+        }
+    }
+
+    public static void main(String[] args) {
+        try (var db = new Res("db", true); var file = new Res("file", true)) {
+            System.out.println("работаю");
+            throw new RuntimeException("сбой в работе");
+        } catch (RuntimeException e) {
+            System.out.println("поймали: " + e.getMessage());
+            for (Throwable s : e.getSuppressed()) System.out.println("  подавлено: " + s.getMessage());
+        } finally {
+            System.out.println("finally");
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">В каком порядке закроются ресурсы, какое исключение поймает catch и когда выполнится finally?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Resources.java
+java Resources</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">открыт db
+открыт file
+работаю
+закрываю file
+закрываю db
+поймали: сбой в работе
+  подавлено: сбой close file
+  подавлено: сбой close db
+finally</code></pre></details>
+<div class="lab-ans" hidden><p>Закрытие — в обратном порядке: сначала <code>file</code>, потом <code>db</code>. Catch получает <b>основное</b> исключение «сбой в работе», а оба сбоя close прикреплены к нему через <code>addSuppressed</code> — ничего не теряется (в отличие от finally из лабы 6.1). catch и finally выполняются после закрытия всех ресурсов.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-6.3">
+<div class="lab-head"><span class="lab-num">Лаба 6.3</span><b>Исчезающие стектрейсы: OmitStackTraceInFastThrow</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Поймать оптимизацию JIT, из-за которой в логах продакшена встречаются <code>NullPointerException</code> без стектрейса.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>FastThrow.java</code>:</div>
+<pre data-title="FastThrow.java"><code class="java">public class FastThrow {
+    static int len(String s) { return s.length(); }
+
+    public static void main(String[] args) {
+        for (int i = 1; i &lt;= 200_000; i++) {
+            try {
+                len(null);
+            } catch (NullPointerException e) {
+                if (i == 1 || i % 50_000 == 0)
+                    System.out.printf("%,7d: стек из %d кадров, сообщение: %s%n", i, e.getStackTrace().length, e.getMessage());
+            }
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Будет ли у NPE стектрейс на 200-тысячной итерации?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac FastThrow.java
+java FastThrow</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">      1: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null
+ 50,000: стек из 0 кадров, сообщение: null
+100,000: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null
+150,000: стек из 0 кадров, сообщение: null
+200,000: стек из 0 кадров, сообщение: null</code></pre></details>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:-OmitStackTraceInFastThrow</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:-OmitStackTraceInFastThrow FastThrow</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">      1: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null
+ 50,000: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null
+100,000: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null
+150,000: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null
+200,000: стек из 2 кадров, сообщение: Cannot invoke "String.length()" because "&lt;parameter1&gt;" is null</code></pre></details>
+<div class="lab-ans" hidden><p>Нет. Когда C2 компилирует горячий метод, который часто бросает встроенные исключения (NPE, ArithmeticException, ArrayIndexOutOfBounds…), он заменяет их одним заранее созданным объектом без стека и без сообщения — так быстрее. В логах это выглядит как <code>java.lang.NullPointerException</code> без единой строки <code>at</code>. Ищите самое первое появление ошибки в логе — у него стек ещё есть — или отключите оптимизацию. Заметьте, что на какой-то из промежуточных отметок стек может «вернуться»: метод деоптимизировали, и он ненадолго выполнялся без этой оптимизации.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-6.4">
+<div class="lab-head"><span class="lab-num">Лаба 6.4</span><b>Перевод исключений между слоями</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Обернуть низкоуровневое исключение в доменное, не потеряв причину, и прочитать цепочку «Caused by».</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Layers.java</code>:</div>
+<pre data-title="Layers.java"><code class="java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Layers {
+    static class ConfigException extends RuntimeException {
+        ConfigException(String msg, Throwable cause) { super(msg, cause); }
+    }
+
+    static String readConfig(Path p) {
+        try {
+            return Files.readString(p);
+        } catch (IOException e) {
+            throw new ConfigException("не удалось загрузить конфигурацию " + p, e);
+        }
+    }
+
+    public static void main(String[] args) {
+        try {
+            readConfig(Path.of("нет-такого.yml"));
+        } catch (ConfigException e) {
+            e.printStackTrace(System.out);
+            System.out.println("корневая причина: " + rootCause(e).getClass().getSimpleName());
+        }
+    }
+
+    static Throwable rootCause(Throwable t) { while (t.getCause() != null) t = t.getCause(); return t; }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Layers.java
+java Layers</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Layers$ConfigException: не удалось загрузить конфигурацию нет-такого.yml
+	at Layers.readConfig(Layers.java:15)
+	at Layers.main(Layers.java:21)
+Caused by: java.nio.file.NoSuchFileException: нет-такого.yml
+	at java.base/sun.nio.fs.WindowsException.translateToIOException(WindowsException.java:85)
+	at java.base/sun.nio.fs.WindowsException.rethrowAsIOException(WindowsException.java:103)
+	at java.base/sun.nio.fs.WindowsException.rethrowAsIOException(WindowsException.java:108)
+	at java.base/sun.nio.fs.WindowsFileSystemProvider.newByteChannel(WindowsFileSystemProvider.java:231)
+	at java.base/java.nio.file.Files.newByteChannel(Files.java:357)
+	at java.base/java.nio.file.Files.newByteChannel(Files.java:399)
+	at java.base/java.nio.file.Files.readAllBytes(Files.java:2973)
+	at java.base/java.nio.file.Files.readString(Files.java:3043)
+	at java.base/java.nio.file.Files.readString(Files.java:3006)
+	at Layers.readConfig(Layers.java:13)
+	... 1 more
+корневая причина: NoSuchFileException</code></pre></details>
+<p class="lab-note">Строка <code>... 2 more</code> означает «следующие 2 кадра совпадают с кадрами внешнего исключения выше» — JVM не повторяет их. Читайте цепочку снизу вверх: последний <code>Caused by</code> — первопричина.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>e</code> из конструктора ConfigException (передайте только сообщение). Чем это плохо?</summary><div>Стек и тип исходной ошибки (<code>NoSuchFileException</code>) пропадут — в логе останется только ваше сообщение. Причину передавайте всегда.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">6.9</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Чем checked-исключения отличаются от unchecked?</p><ul><li>Checked быстрее</li><li>Unchecked нельзя ловить</li><li>Checked компилятор заставляет обработать или объявить в throws; unchecked (RuntimeException и Error) — нет</li><li>Checked наследуют Error</li></ul><div class="why">Checked — для ожидаемых ситуаций, из которых вызывающий может восстановиться (IOException). Unchecked — ошибки программирования и нарушения контракта.</div></div>
 <div class="mcq" data-ok="1"><p>В каком порядке закрываются ресурсы в <code>try (A a = …; B b = …)</code>?</p><ul><li>a, затем b</li><li>b, затем a — в обратном порядке объявления</li><li>Одновременно</li><li>Порядок не определён</li></ul><div class="why">Как стек: последний открытый закрывается первым — он может зависеть от предыдущих.</div></div>

@@ -1,0 +1,142 @@
+@chapter 11 | quiz
+@intro
+<p>Стримы ленивы и обрабатывают элементы «вертикально» — это видно с помощью <code>peek</code>. Дальше — коллекторы на реальных данных, ловушки и честный замер параллельного стрима. Модуль IDEA — <code>ch11</code>.</p>
+@end
+
+@lab 11.1 | Трассировка конвейера: ленивость и короткое замыкание | 15 мин
+@goal
+<p>Увидеть порядок, в котором элементы проходят операции, и сколько работы реально делается.</p>
+@end
+@file Trace.java
+import java.util.List;
+import java.util.stream.Stream;
+
+public class Trace {
+    public static void main(String[] args) {
+        Stream<String> s = Stream.of("один", "два", "три", "четыре", "пять")
+                .peek(x -> System.out.println("  источник: " + x))
+                .filter(x -> x.length() > 3)
+                .peek(x -> System.out.println("  прошёл фильтр: " + x))
+                .map(String::toUpperCase);
+        System.out.println("конвейер построен, ничего не выполнено");
+        List<String> first = s.limit(2).toList();
+        System.out.println("результат: " + first);
+
+        System.out.println("--- sorted ломает «вертикальность» ---");
+        Stream.of("b", "c", "a")
+              .peek(x -> System.out.println("  до sorted: " + x))
+              .sorted()
+              .peek(x -> System.out.println("  после sorted: " + x))
+              .findFirst()
+              .ifPresent(x -> System.out.println("first = " + x));
+    }
+}
+@end
+@predict Какие элементы вообще будут прочитаны из источника в первом конвейере?
+@answer
+<p>Только «один», «два», «три», «четыре», а «пять» — никогда: <code>limit(2)</code> получил «ОДИН» и «ЧЕТЫРЕ» и прервал конвейер. Элементы идут по одному через всю цепочку, а не «сначала весь filter, потом весь map». До терминальной операции не выполняется ничего. <code>sorted</code> — операция с состоянием: ей нужно собрать все элементы, поэтому «до sorted» печатается трижды, а «после sorted» — один раз.</p>
+@end
+@run
+javac Trace.java
+java Trace
+@end
+
+@lab 11.2 | Коллекторы: группировка, разбиение, статистика | 20 мин
+@goal
+<p>Решить типичные задачи отчётности одной цепочкой.</p>
+@end
+@file Report.java
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class Report {
+    record Order(String city, String product, int qty, double price) {
+        double total() { return qty * price; }
+    }
+
+    public static void main(String[] args) {
+        List<Order> orders = List.of(
+            new Order("Москва", "кофе", 3, 250), new Order("Казань", "чай", 5, 120),
+            new Order("Москва", "чай", 1, 120), new Order("Казань", "кофе", 2, 250),
+            new Order("Пермь", "кофе", 10, 230), new Order("Москва", "кофе", 4, 250));
+
+        Map<String, Double> revenueByCity = orders.stream()
+            .collect(Collectors.groupingBy(Order::city, TreeMap::new, Collectors.summingDouble(Order::total)));
+        System.out.println("выручка по городам: " + revenueByCity);
+
+        Map<String, Set<String>> productsByCity = orders.stream()
+            .collect(Collectors.groupingBy(Order::city, TreeMap::new, Collectors.mapping(Order::product, Collectors.toCollection(TreeSet::new))));
+        System.out.println("товары по городам:  " + productsByCity);
+
+        Map<Boolean, Long> bigSmall = orders.stream().collect(Collectors.partitioningBy(o -> o.total() >= 1000, Collectors.counting()));
+        System.out.println("крупных/мелких:     " + bigSmall);
+
+        DoubleSummaryStatistics stats = orders.stream().mapToDouble(Order::total).summaryStatistics();
+        System.out.println("статистика:         " + stats);
+
+        String top = orders.stream().max(Comparator.comparingDouble(Order::total)).map(Order::toString).orElse("-");
+        System.out.println("самый крупный:      " + top);
+
+        try {
+            orders.stream().collect(Collectors.toMap(Order::city, Order::qty));
+        } catch (IllegalStateException e) {
+            System.out.println("toMap: " + e.getMessage());
+        }
+        System.out.println("toMap с merge:      " + orders.stream().collect(Collectors.toMap(Order::city, Order::qty, Integer::sum, TreeMap::new)));
+    }
+}
+@end
+@run
+javac Report.java
+java Report
+@end
+@predict Почему первый <code>toMap</code> упал, и чем его лечат?
+@answer
+<p>Ключи повторяются («Москва» трижды), а <code>toMap</code> без функции слияния не знает, что делать с конфликтом: <code>IllegalStateException: Duplicate key Москва (attempted merging values 3 and 1)</code>. Третий аргумент (<code>Integer::sum</code>) задаёт слияние, четвёртый — тип карты.</p>
+@end
+@try
+Добавьте к выручке по городам сортировку по убыванию выручки. ::: После группировки: <code>revenueByCity.entrySet().stream().sorted(Map.Entry.&lt;String, Double&gt;comparingByValue().reversed()).toList()</code>. Сортировать саму Map по значению нельзя — только её записи.
+@end
+
+@lab 11.3 | Параллельный стрим: когда быстрее, а когда неверно | 20 мин
+@goal
+<p>Сравнить последовательный и параллельный стрим на двух задачах и поймать гонку при побочных эффектах.</p>
+@end
+@file Par.java
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.LongStream;
+
+public class Par {
+    static long time(Runnable r) { long t = System.nanoTime(); r.run(); return (System.nanoTime() - t) / 1_000_000; }
+
+    public static void main(String[] args) {
+        for (int round = 0; round < 3; round++) {
+            long seq = time(() -> LongStream.range(0, 50_000_000).map(x -> x * x % 7).sum());
+            long par = time(() -> LongStream.range(0, 50_000_000).parallel().map(x -> x * x % 7).sum());
+            System.out.printf("раунд %d: последовательно %4d мс, parallel %4d мс%n", round, seq, par);
+        }
+        System.out.println("ядер: " + Runtime.getRuntime().availableProcessors());
+
+        List<Long> unsafe = new ArrayList<>();
+        try {
+            LongStream.range(0, 100_000).parallel().forEach(unsafe::add);
+            System.out.println("ArrayList из parallel forEach: " + unsafe.size() + " элементов вместо 100000");
+        } catch (Exception e) {
+            System.out.println("ArrayList из parallel forEach: " + e);
+        }
+        List<Long> safe = LongStream.range(0, 100_000).parallel().boxed().toList();
+        System.out.println("toList(): " + safe.size() + ", порядок сохранён: " + safe.get(99_999));
+    }
+}
+@end
+@predict Во сколько раз ускорится parallel и что будет с ArrayList?
+@answer
+<p>На простом счётном конвейере parallel ускоряет примерно в число физических ядер (с поправкой на прогрев и общий пул ForkJoinPool). ArrayList из нескольких потоков — гонка: элементов меньше 100 000 или <code>ArrayIndexOutOfBoundsException</code> при одновременном росте массива. Результат собирают терминальной операцией (<code>toList</code>, <code>collect</code>), а не побочными эффектами.</p>
+@end
+@run
+javac Par.java
+java Par
+@end
+@note Parallel — не «включить ускорение»: он использует общий <code>ForkJoinPool.commonPool()</code> на всё приложение, плохо делит LinkedList и стримы из I/O, а для маленьких наборов накладные расходы больше выигрыша. Меряйте.
+@end

@@ -1,0 +1,80 @@
+@chapter 23 | final
+@intro
+<p>Итоговое расследование: перед вами «сервис» с тремя проблемами сразу. Исходник специально не комментирован — найдите неполадки только инструментами из курса, а потом сверьтесь с ответами. Модуль IDEA — <code>ch23</code>.</p>
+@end
+
+@lab 23.1 | Расследование: сервис тормозит и пухнет | 45 мин
+@goal
+<p>Найти три проблемы: что ест CPU, что держит память, почему запросы стоят в очереди. Инструменты: <code>jcmd Thread.print</code>, <code>GC.class_histogram</code>, JFR, лог GC.</p>
+@end
+@file Mystery.java
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class Mystery {
+    static final Map<String, List<String>> AUDIT = new HashMap<>();
+    static final Object REGISTRY = new Object();
+    static volatile long checksum;
+
+    static void handle(int id) {
+        synchronized (REGISTRY) {
+            AUDIT.computeIfAbsent("req-" + id, k -> new ArrayList<>()).add("payload-" + "x".repeat(200));
+            long h = 0;
+            for (int i = 0; i < 200_000; i++) h = h * 31 + i;
+            checksum += h;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        for (int id = 0; ; id++) {
+            final int req = id;
+            pool.submit(() -> handle(req));
+            if (id % 100 == 0) Thread.sleep(20);
+        }
+    }
+}
+@end
+@ide VM options: <code>-Xmx256m -Xlog:gc:file=mystery-gc.log -XX:StartFlightRecording=filename=mystery.jfr,duration=20s</code>
+@exec
+javac Mystery.java
+(java -Xmx256m -Xlog:gc:file=mystery-gc.log -XX:StartFlightRecording=filename=mystery.jfr,duration=20s Mystery > mystery.out 2>&1 &)
+sleep 8
+@end
+@step Через 10–20 секунд работы снимите улики:
+@run head=24
+jcmd <pid> Thread.print ||| P=$(jcmd | grep Mystery | cut -d' ' -f1); jcmd $P Thread.print | grep -A4 '^"pool' | grep -vE "Lambda|FutureTask|^--"
+@end
+@run head=9
+jcmd <pid> GC.class_histogram ||| P=$(jcmd | grep Mystery | cut -d' ' -f1); jcmd $P GC.class_histogram | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+sleep 15
+P=$(jcmd | grep Mystery | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@run head=10
+jfr view hot-methods mystery.jfr
+@end
+@run grep="Pause Young" tail=4
+#!cat mystery-gc.log
+@end
+@predict Проблема 1: почему из 8 потоков пула работает фактически один?
+@answer
+<p>Весь <code>handle</code> — внутри <code>synchronized (REGISTRY)</code>. В дампе один поток RUNNABLE с <code>- locked &lt;…&gt; (a java.lang.Object)</code>, остальные семь — <code>BLOCKED</code> с <code>waiting to lock</code> того же адреса. Лечение: сузить критическую секцию до работы с общей картой, а вычисление вынести наружу; карту заменить на <code>ConcurrentHashMap</code>.</p>
+@end
+@predict Проблема 2: что ест CPU?
+@answer
+<p>Цикл вычисления <code>h</code> внутри <code>handle</code> — на первом месте в <code>jfr view hot-methods</code> (<code>Mystery.handle</code>). При этом он ещё и выполняется под блокировкой, поэтому на 8 потоках сервис использует одно ядро.</p>
+@end
+@predict Проблема 3: почему растёт память, и что покажет лог GC через час?
+@answer
+<p><code>AUDIT</code> — статическая карта, в которую на каждый запрос добавляется запись и никогда не удаляется: в гистограмме растут <code>String</code>, <code>byte[]</code>, <code>HashMap$Node</code>, <code>ArrayList</code>. Плюс очередь задач пула неограничена (<code>newFixedThreadPool</code> использует <code>LinkedBlockingQueue</code> без предела) — <code>FutureTask</code> и лямбды копятся, потому что задачи приходят быстрее, чем обрабатываются. В логе GC «занято после сборки» растёт до Full GC и <code>OutOfMemoryError</code>. Лечение: ограниченный кэш/запись аудита во внешнее хранилище и ограниченная очередь с политикой отказа.</p>
+@end
+@try
+Исправьте все три проблемы и повторите расследование. Какие улики должны исчезнуть? ::: В дампе — потоки пула попеременно RUNNABLE без <code>waiting to lock</code>; в гистограмме — стабильные числа между снимками; в логе GC — ровная «занятость после сборки»; загрузка CPU — несколько ядер вместо одного.
+@end

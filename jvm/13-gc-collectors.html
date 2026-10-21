@@ -26,7 +26,7 @@
   <div class="kicker">ТЕМА 13 · СБОРКА МУСОРА</div>
   <h1>Сборщики: Serial, Parallel, G1, ZGC, Shenandoah</h1>
   <p class="lead">В HotSpot пять продуктовых сборщиков, и каждый — свой компромисс между пропускной способностью, задержками и памятью. Разбираем, как устроен каждый: G1 с регионами и смешанными сборками — в живом симуляторе; ZGC с цветными указателями и барьерами чтения, дающий паузы меньше миллисекунды на терабайтных кучах; Shenandoah; Parallel для пакетной обработки. В конце — мастер выбора сборщика.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">Serial/Parallel</span><span class="tag">G1: регионы</span><span class="tag">mixed GC</span><span class="tag">ZGC</span><span class="tag">цветные указатели</span><span class="tag">Shenandoah</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">Serial/Parallel</span><span class="tag">G1: регионы</span><span class="tag">mixed GC</span><span class="tag">ZGC</span><span class="tag">цветные указатели</span><span class="tag">Shenandoah</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -177,7 +177,109 @@
 <tr><td>Барьеры</td><td>запись (card)</td><td>запись (card)</td><td>запись (SATB + post)</td><td>чтение и запись</td><td>чтение (LRB) и запись</td></tr>
 </table></div>
 
-<h2 id="quiz"><span class="h-num">13.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">13.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Лучший способ понять разницу сборщиков — прогнать один и тот же код под каждым и измерить то, что чувствует приложение: паузы. Напишем мини-аналог <i>jHiccup</i>: поток, который каждую миллисекунду засыпает и замеряет, насколько проснулся позже. Модуль IDEA — <code>ch13</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-13.1">
+<div class="lab-head"><span class="lab-num">Лаба 13.1</span><b>Один код — четыре сборщика</b><span class="lab-time">30 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить Serial, Parallel, G1 и ZGC по максимальной «икоте» приложения, числу и суммарному времени сборок.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>GcBench.java</code>:</div>
+<pre data-title="GcBench.java"><code class="java">import java.lang.management.ManagementFactory;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+
+public class GcBench {
+    static volatile long maxHiccupNanos;
+
+    public static void main(String[] args) throws Exception {
+        Thread meter = new Thread(() -&gt; {
+            while (true) {
+                long t = System.nanoTime();
+                try { Thread.sleep(1); } catch (InterruptedException e) { return; }
+                long late = System.nanoTime() - t - 1_000_000;
+                if (late &gt; maxHiccupNanos) maxHiccupNanos = late;
+            }
+        });
+        meter.setDaemon(true);
+        meter.start();
+
+        // «кэш» на ~300 МБ живых данных, в котором постоянно заменяются записи
+        Map&lt;Integer, byte[]&gt; cache = new HashMap&lt;&gt;();
+        Random rnd = new Random(42);
+        long end = System.currentTimeMillis() + 6000, ops = 0;
+        while (System.currentTimeMillis() &lt; end) {
+            cache.put(rnd.nextInt(300_000), new byte[1024]);
+            for (int i = 0; i &lt; 10; i++) { byte[] tmp = new byte[256]; }
+            ops++;
+        }
+
+        long count = 0, time = 0;
+        for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) { count += gc.getCollectionCount(); time += gc.getCollectionTime(); }
+        String names = ManagementFactory.getGarbageCollectorMXBeans().stream().map(g -&gt; g.getName()).toList().toString();
+        System.out.printf("%-58s операций: %,d   сборок: %d, суммарно %d мс   max hiccup: %.1f мс%n",
+                names, ops, count, time, maxHiccupNanos / 1e6);
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите четыре раза с разными сборщиками и одинаковой кучей (в IDEA удобно сделать четыре конфигурации запуска — Edit Configurations → Copy):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac GcBench.java
+java -Xmx1g -XX:+UseSerialGC GcBench
+java -Xmx1g -XX:+UseParallelGC GcBench
+java -Xmx1g -XX:+UseG1GC GcBench
+java -Xmx1g -XX:+UseZGC GcBench</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[Copy, MarkSweepCompact]                                   операций: 9,433,747   сборок: 42, суммарно 3833 мс   max hiccup: 173.4 мс
+[PS MarkSweep, PS Scavenge]                                операций: 22,183,614   сборок: 178, суммарно 2411 мс   max hiccup: 63.4 мс
+[G1 Young Generation, G1 Concurrent GC, G1 Old Generation] операций: 20,574,002   сборок: 291, суммарно 1899 мс   max hiccup: 39.9 мс
+[ZGC Minor Cycles, ZGC Minor Pauses, ZGC Major Cycles, ZGC Major Pauses] операций: 13,102,688   сборок: 470, суммарно 7391 мс   max hiccup: 3.2 мс</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Расставьте сборщики по максимальной паузе и по числу выполненных операций (пропускной способности) до того, как смотреть вывод.</div>
+<p class="lab-note">Цифры сильно зависят от машины: на 2–4 ядрах ZGC и G1 теряют больше пропускной способности, на 16+ — меньше. Счётчик «сборок» у ZGC и G1 включает конкурентные циклы, а «суммарно мс» у ZGC — время циклов, а не пауз.</p>
+<div class="lab-ans" hidden><p>По паузам: ZGC — единицы миллисекунд (паузы не зависят от объёма живых данных), G1 — десятки мс, Serial и Parallel — сотни мс: старое поколение они собирают с остановкой мира по всей куче. По операциям картина иная: Parallel и G1 впереди, ZGC — заметно ниже (за низкие паузы он платит процессорным временем фоновых потоков и барьерами), Serial — последний: на 1 ГБ кучи его однопоточные сборки отнимают больше всего времени. Это и есть «треугольник компромиссов».</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Увеличьте живые данные: замените 300_000 на 700_000 (≈ 700 МБ из 1 ГБ).</summary><div>Serial и Parallel начнут делать почти непрерывные полные сборки, G1 — смешанные и, возможно, Full GC, ZGC может уйти в «Allocation Stall» (потоки ждут, пока сборщик освободит память). Конкурентному сборщику нужен запас кучи.</div></details></li>
+<li><details><summary>Добавьте к G1 <code>-XX:MaxGCPauseMillis=20</code>.</summary><div>G1 уменьшит молодое поколение, чтобы уложиться в цель: пауз станет больше, каждая — короче. Цель — желание, а не гарантия.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-13.2">
+<div class="lab-head"><span class="lab-num">Лаба 13.2</span><b>Регионы G1 и humongous-объекты</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Узнать размер региона G1 и увидеть, как большие массивы попадают в особые «огромные» регионы.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Humongous.java</code>:</div>
+<pre data-title="Humongous.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Humongous {
+    public static void main(String[] args) {
+        List&lt;byte[]&gt; keep = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 30; i++) keep.add(new byte[600 * 1024]);   // 600 КБ — больше половины региона 1 МБ
+        System.gc();
+        System.out.println("массивов: " + keep.size());
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+UseG1GC -Xmx128m -XX:G1HeapRegionSize=1m -Xlog:gc,gc+heap=info</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Humongous.java
+java -XX:+UseG1GC -Xmx128m -XX:G1HeapRegionSize=1m -Xlog:gc*=info Humongous</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.007s][info][gc,init] Heap Region Size: 1M
+[0.035s][info][gc,start    ] GC(0) Pause Full (System.gc())
+[0.037s][info][gc,heap        ] GC(0) Humongous regions: 30-&gt;30
+[0.037s][info][gc             ] GC(0) Pause Full (System.gc()) 32M-&gt;31M(110M) 2.216ms
+массивов: 30</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Объект больше половины региона — humongous: он занимает регион(ы) целиком. Сколько памяти «потеряется» на 30 массивах по 600 КБ при регионе 1 МБ?</div>
+<div class="lab-ans" hidden><p>Каждый массив занимает отдельный регион 1 МБ, из которого ~424 КБ не используется: ~12 МБ впустую на 18 МБ данных. В логе видно <code>Humongous regions: 30-&gt;30</code>. Лечится увеличением региона (<code>G1HeapRegionSize=2m</code> — массив станет обычным объектом) или изменением размеров буферов в коде.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Поставьте <code>-XX:G1HeapRegionSize=2m</code>. Что станет со строкой Humongous regions?</summary><div>0: при регионе 2 МБ порог humongous — 1 МБ, массивы по 600 КБ — обычные объекты в eden/old.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">13.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Почему сборщик называется Garbage-First?</p><ul><li>Сначала собирает молодое поколение</li><li>Удаляет мусор до пометки</li><li>В смешанных сборках выбирает старые регионы с наибольшей долей мусора — максимум освобождённой памяти за единицу паузы</li><li>Это просто имя</li></ul><div class="why">Доля живого известна после конкурентной пометки.</div></div>
 <div class="mcq" data-ok="0"><p>Как ZGC перемещает объекты без длинной паузы?</p><ul><li>Конкурентно копирует, а барьер при загрузке ссылки находит новый адрес через таблицу пересылки и исправляет ссылку</li><li>Никогда не перемещает объекты</li><li>Останавливает только один поток</li><li>Использует подсчёт ссылок</li></ul><div class="why">Цветные указатели + load barriers + self-healing.</div></div>

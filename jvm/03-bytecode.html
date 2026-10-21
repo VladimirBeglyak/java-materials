@@ -31,7 +31,7 @@
   <div class="kicker">ТЕМА 03 · ПЛАТФОРМА И БАЙТКОД</div>
   <h1>Байткод и стековая машина</h1>
   <p class="lead">JVM — стековая машина: у инструкций нет регистров, они берут операнды с вершины стека операндов текущего кадра и кладут туда результат. Локальные переменные — пронумерованные слоты. Пройдите по шагам настоящий байткод (вывод <code>javap -c</code>) в симуляторе интерпретатора и посмотрите, во что javac превращает циклы, тернарный оператор, <code>switch</code>, <code>try/finally</code> и автоупаковку.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">кадр метода</span><span class="tag">стек операндов</span><span class="tag">локальные переменные</span><span class="tag">набор инструкций</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">кадр метода</span><span class="tag">стек операндов</span><span class="tag">локальные переменные</span><span class="tag">набор инструкций</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -177,7 +177,336 @@
 <pre data-title="посмотреть сгенерированный интерпретатор (нужна hsdis для дизассемблирования)"><code class="txt">java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInterpreter -version | head -50
 java -Xint -jar app.jar        # только интерпретатор: почувствуйте разницу в скорости</code></pre>
 
-<h2 id="quiz"><span class="h-num">3.6</span>Самопроверка</h2>
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">3.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Симулятор выше выполнял заранее подготовленный байткод. Теперь получите его сами из своего кода и научитесь читать <code>javap -c</code> так же свободно, как исходник. Модуль IDEA — <code>ch03</code>; в IDEA байткод открытого класса показывает View → Show Bytecode.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-3.1">
+<div class="lab-head"><span class="lab-num">Лаба 3.1</span><b>Цикл, слоты и стек операндов из своего кода</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Скомпилировать методы из симулятора, прочитать их байткод и сопоставить каждую инструкцию со строкой Java.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Loops.java</code>:</div>
+<pre data-title="Loops.java"><code class="java">public class Loops {
+    static int sum(int n) {
+        int s = 0;
+        for (int i = 1; i &lt;= n; i++) s += i;
+        return s;
+    }
+
+    static long fact(int n) {
+        long r = 1;
+        while (n &gt; 1) r *= n--;
+        return r;
+    }
+
+    int field;
+
+    int addToField(int a, long b, int c) {
+        field += a;
+        return (int) (b + c);
+    }
+
+    public static void main(String[] args) {
+        System.out.println(sum(4) + " " + fact(5) + " " + new Loops().addToField(1, 2L, 3));
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Скомпилируйте с отладочной информацией (<code>-g</code>), чтобы javap показал имена локальных переменных:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -g Loops.java
+java Loops
+javap -c -l -p Loops.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  int field;
+  public Loops();
+         0: aload_0
+         1: invokespecial #1                  // Method java/lang/Object."&lt;init&gt;":()V
+         4: return
+        Start  Length  Slot  Name   Signature
+            0       5     0  this   LLoops;
+  static int sum(int);
+         0: iconst_0
+         1: istore_1
+         2: iconst_1
+         3: istore_2
+         4: iload_2
+         5: iload_0
+         6: if_icmpgt     19
+         9: iload_1
+        10: iload_2
+        11: iadd
+        12: istore_1
+        13: iinc          2, 1
+        16: goto          4
+        19: iload_1
+        20: ireturn
+        Start  Length  Slot  Name   Signature
+            4      15     2     i   I
+            0      21     0     n   I
+            2      19     1     s   I
+  static long fact(int);
+         0: lconst_1
+         1: lstore_1
+         2: iload_0
+         3: iconst_1
+         4: if_icmple     18
+         7: lload_1
+         8: iload_0
+         9: iinc          0, -1
+        12: i2l
+        13: lmul
+        14: lstore_1
+        15: goto          2
+        18: lload_1
+        19: lreturn
+        Start  Length  Slot  Name   Signature
+            0      20     0     n   I
+            2      18     1     r   J
+  int addToField(int, long, int);
+         0: aload_0
+         1: dup
+         2: getfield      #7                  // Field field:I
+         5: iload_1
+         6: iadd
+         7: putfield      #7                  // Field field:I
+        10: lload_2
+        11: iload         4
+        13: i2l
+        14: ladd
+        15: l2i
+        16: ireturn
+        Start  Length  Slot  Name   Signature
+            0      17     0  this   LLoops;
+…</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">В методе <code>addToField(int a, long b, int c)</code> — в каких слотах лежат <code>this</code>, <code>a</code>, <code>b</code>, <code>c</code>? Какой будет <code>max_locals</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -c -l -p Loops.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  int addToField(int, long, int);
+    Code:
+         0: aload_0
+         1: dup
+         2: getfield      #7                  // Field field:I
+         5: iload_1
+         6: iadd
+         7: putfield      #7                  // Field field:I
+        10: lload_2
+        11: iload         4
+        13: i2l
+        14: ladd
+        15: l2i
+        16: ireturn
+      LineNumberTable:
+        line 17: 0
+        line 18: 10
+      LocalVariableTable:
+        Start  Length  Slot  Name   Signature
+            0      17     0  this   LLoops;
+            0      17     1     a   I
+            0      17     2     b   J
+            0      17     4     c   I</code></pre></details>
+<p class="lab-note">Обратите внимание на <code>field += a</code>: <code>aload_0, dup, getfield, iload_1, iadd, putfield</code> — <code>dup</code> нужен, потому что ссылка на объект требуется дважды: для чтения и для записи поля.</p>
+<div class="lab-ans" hidden><p><code>this</code> — 0, <code>a</code> — 1, <code>b</code> — 2 и 3 (long занимает два слота), <code>c</code> — 4. <code>locals=5</code>. Проверьте по LocalVariableTable и по инструкциям: <code>iload_1</code>, <code>lload_2</code>, <code>iload 4</code> (для слотов больше 3 нет короткой формы с подчёркиванием).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте в <code>sum</code> строку <code>int unused = 42;</code> внутри цикла. Изменился ли <code>locals</code>?</summary><div>Да, на 1 — переменной нужен слот. А если объявить две переменные в двух непересекающихся блоках <code>{ int p = 1; } { int q = 2; }</code> — javac отдаст им один и тот же слот, <code>locals</code> вырастет только на 1.</div></details></li>
+<li><details><summary>Чем <code>s += i</code> отличается в байткоде от <code>i++</code>?</summary><div><code>i++</code> — одна инструкция <code>iinc 2, 1</code>, работающая прямо в слоте. <code>s += i</code> — четыре: <code>iload_1, iload_2, iadd, istore_1</code>. <code>iinc</code> есть только для int и константы от −32768 до 32767.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-3.2">
+<div class="lab-head"><span class="lab-num">Лаба 3.2</span><b>Классика собеседований в байткоде: x = x++</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Не запоминать ответ, а увидеть, почему он такой.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Incr.java</code>:</div>
+<pre data-title="Incr.java"><code class="java">public class Incr {
+    public static void main(String[] args) {
+        int x = 5;
+        x = x++;
+        int y = 5;
+        y = ++y;
+        int z = 5;
+        z = z++ + ++z;
+        System.out.println(x + " " + y + " " + z);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатает программа? Особенно <code>z = z++ + ++z</code>.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Incr.java
+java Incr
+javap -c Incr.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">5 6 12
+Compiled from "Incr.java"
+public class Incr {
+  public Incr();
+    Code:
+         0: aload_0
+         1: invokespecial #1                  // Method java/lang/Object."&lt;init&gt;":()V
+         4: return
+
+  public static void main(java.lang.String[]);
+    Code:
+         0: iconst_5
+         1: istore_1
+         2: iload_1
+         3: iinc          1, 1
+         6: istore_1
+         7: iconst_5
+         8: istore_2
+         9: iinc          2, 1
+        12: iload_2
+        13: istore_2
+        14: iconst_5
+        15: istore_3
+        16: iload_3
+        17: iinc          3, 1
+        20: iinc          3, 1
+        23: iload_3
+        24: iadd
+        25: istore_3
+        26: getstatic     #7                  // Field java/lang/System.out:Ljava/io/PrintStream;
+        29: iload_1
+        30: iload_2
+        31: iload_3
+        32: invokedynamic #13,  0             // InvokeDynamic #0:makeConcatWithConstants:(III)Ljava/lang/String;
+        37: invokevirtual #17                 // Method java/io/PrintStream.println:(Ljava/lang/String;)V
+        40: return
+}</code></pre></details>
+<div class="lab-ans" hidden><p><code>5 6 12</code>. Для z: <code>z++</code> кладёт на стек 5, слот становится 6; <code>++z</code> делает слот 7 и кладёт 7; сумма 12 записывается в z. Выражение вычисляется слева направо, а значение постфиксного инкремента — это значение ДО увеличения.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Найдите в выводе javap две инструкции, между которыми «теряется» инкремент в <code>x = x++</code>.</summary><div><code>iload_1</code> (на стек кладётся 5) → <code>iinc 1, 1</code> (слот = 6) → <code>istore_1</code> (в слот записывается 5 со стека). Увеличение произошло, но было перезаписано.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-3.3">
+<div class="lab-head"><span class="lab-num">Лаба 3.3</span><b>Что javac делает со switch, try/finally и autoboxing</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить на своём коде каждое преобразование из таблицы «Java → байткод».</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Sugar.java</code>:</div>
+<pre data-title="Sugar.java"><code class="java">public class Sugar {
+    static int dense(int d) {
+        switch (d) { case 1: return 10; case 2: return 20; case 3: return 30; default: return 0; }
+    }
+
+    static int sparse(int code) {
+        switch (code) { case 10: return 1; case 500: return 2; case 9000: return 3; default: return 0; }
+    }
+
+    static int byString(String m) {
+        return switch (m) { case "GET" -&gt; 1; case "PUT" -&gt; 2; default -&gt; 0; };
+    }
+
+    static void withFinally() {
+        try { work(); }
+        finally { cleanup(); }
+    }
+
+    static long boxedSum() {
+        Long total = 0L;
+        for (int i = 0; i &lt; 1000; i++) total += i;
+        return total;
+    }
+
+    static void work() {}
+    static void cleanup() {}
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Sugar.java
+javap -c Sugar.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  static int dense(int);
+         1: tableswitch   { // 1 to 3
+                       1: 28
+                       2: 31
+                       3: 34
+                 default: 37
+  static int sparse(int);
+         1: lookupswitch  { // 3
+                      10: 36
+                     500: 38
+                    9000: 40
+                 default: 42
+  static int byString(java.lang.String);
+         5: invokevirtual #7                  // Method java/lang/String.hashCode:()I
+         8: lookupswitch  { // 2
+                   70454: 36
+                   79599: 50
+                 default: 61
+        39: invokevirtual #15                 // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+        53: invokevirtual #15                 // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+        62: lookupswitch  { // 2
+                       0: 88
+                       1: 92
+                 default: 96
+  static void withFinally();
+         0: invokestatic  #21                 // Method work:()V
+         3: invokestatic  #26                 // Method cleanup:()V
+        10: invokestatic  #26                 // Method cleanup:()V
+        14: athrow
+      Exception table:
+             0     3     9   any
+  static long boxedSum();
+         1: invokestatic  #29                 // Method java/lang/Long.valueOf:(J)Ljava/lang/Long;
+        15: invokevirtual #35                 // Method java/lang/Long.longValue:()J
+        21: invokestatic  #29                 // Method java/lang/Long.valueOf:(J)Ljava/lang/Long;
+        32: invokevirtual #35                 // Method java/lang/Long.longValue:()J
+  static void work();
+  static void cleanup();</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько раз вызов <code>cleanup()</code> встречается в байткоде <code>withFinally</code>, хотя в исходнике он один?</div>
+<div class="lab-ans" hidden><p>Два: копия finally для нормального выхода и копия в обработчике <code>any</code> (из таблицы исключений), который сохраняет исключение в слот, вызывает cleanup и делает <code>athrow</code>. Если бы в try был <code>return</code> или <code>catch</code>-блоки, копий было бы больше — по одной на каждый путь выхода.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите на <code>boxedSum</code>: каждая итерация <code>total += i</code> — это распаковка, сложение и новая упаковка.</div>
+<p class="lab-note">Ищите пару <code>invokevirtual Long.longValue</code> → <code>ladd</code> → <code>invokestatic Long.valueOf</code>. Кэш <code>Long.valueOf</code> покрывает только −128..127: как только сумма превысит 127 (уже на 17-й итерации), каждая итерация создаёт новый объект — почти тысяча лишних объектов на тысячу сложений.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Поменяйте <code>case 9000</code> в <code>sparse</code> на <code>case 4</code> — какой switch выберет javac?</summary><div>При значениях 4, 10, 500 таблица была бы слишком разреженной — останется <code>lookupswitch</code>. А при <code>1, 2, 4</code> javac выберет <code>tableswitch</code> с «дыркой» на 3, ведущей в default: таблица на 4 элемента дешевле двоичного поиска.</div></details></li>
+<li><details><summary>Вызовите <code>byString(null)</code>. Что будет и почему видно из байткода?</summary><div><code>NullPointerException</code>: первым делом вызывается <code>m.hashCode()</code>. С Java 21 можно написать <code>case null -&gt;</code> — тогда javac сгенерирует отдельную проверку на null до вызова hashCode.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-3.4">
+<div class="lab-head"><span class="lab-num">Лаба 3.4</span><b>Интерпретатор против JIT: почувствуйте разницу</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть цену интерпретации тех же самых инструкций.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Speed.java</code>:</div>
+<pre data-title="Speed.java"><code class="java">public class Speed {
+    static int sum(int n) {
+        int s = 0;
+        for (int i = 1; i &lt;= n; i++) s += i % 7;
+        return s;
+    }
+
+    public static void main(String[] args) {
+        for (int round = 1; round &lt;= 5; round++) {
+            long t = System.nanoTime();
+            int r = sum(50_000_000);
+            System.out.printf("раунд %d: %4d мс (r=%d)%n", round, (System.nanoTime() - t) / 1_000_000, r);
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Speed.java
+java Speed</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 1:   42 мс (r=149999998)
+раунд 2:   44 мс (r=149999998)
+раунд 3:   33 мс (r=149999998)
+раунд 4:   31 мс (r=149999998)
+раунд 5:   32 мс (r=149999998)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Насколько медленнее будет только интерпретатор (<code>-Xint</code>)?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xint</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xint Speed</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 1:  227 мс (r=149999998)
+раунд 2:  225 мс (r=149999998)
+раунд 3:  225 мс (r=149999998)
+раунд 4:  226 мс (r=149999998)
+раунд 5:  229 мс (r=149999998)</code></pre></details>
+<div class="lab-ans" hidden><p>В разы: здесь примерно в 7 раз, на коде с вызовами методов и объектами разница доходит до 20–50 раз. Шаблонный интерпретатор выполняет каждую инструкцию <code>iload/irem/iadd/iinc/if_icmpgt</code> по отдельности с переходом через таблицу диспетчеризации, а C2 превращает цикл в несколько машинных инструкций в регистрах. Заметьте ещё, что в режиме по умолчанию время раундов «гуляет» — метод перекомпилируется по ходу работы (тема 16).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-XX:TieredStopAtLevel=1</code> (только быстрый компилятор C1). Где окажется результат между <code>-Xint</code> и режимом по умолчанию?</summary><div>Обычно в 2–4 раза медленнее C2, но намного быстрее интерпретатора: C1 компилирует быстро, но почти не оптимизирует. Этот флаг иногда ставят ради быстрого старта коротких утилит.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">3.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Что лежит в слоте 0 локальных переменных экземплярного метода?</p><ul><li>Первый аргумент</li><li>Возвращаемое значение</li><li><code>this</code></li><li>Адрес возврата</li></ul><div class="why">У статических методов слот 0 — первый аргумент.</div></div>
 <div class="mcq" data-ok="0"><p>Почему после <code>new</code> почти всегда идёт <code>dup</code>?</p><ul><li>Одна ссылка уходит в вызов конструктора, вторая остаётся для дальнейшего использования</li><li>Чтобы удвоить память</li><li>Для синхронизации</li><li>Это ошибка javac</li></ul><div class="why">invokespecial &lt;init&gt; потребляет ссылку со стека.</div></div>

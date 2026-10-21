@@ -1,0 +1,197 @@
+@chapter 13 | quiz
+@intro
+<p>Буферизация, современный API <code>Files</code>, буферы NIO и сериализация — с замерами и экспериментами над файлами на диске. Модуль IDEA — <code>ch13</code>. Файлы создаются в рабочем каталоге запуска (в IDEA — корень проекта, если не задано иное в Run Configuration → Working directory).</p>
+@end
+
+@lab 13.1 | Цена небуферизованного ввода-вывода | 15 мин
+@goal
+<p>Записать и прочитать один и тот же файл побайтно с буфером и без.</p>
+@end
+@file Buffering.java
+import java.io.*;
+
+public class Buffering {
+    public static void main(String[] args) throws IOException {
+        int n = 2_000_000;
+        long t = System.nanoTime();
+        try (OutputStream out = new FileOutputStream("raw.bin")) {
+            for (int i = 0; i < n; i++) out.write(i);
+        }
+        long raw = System.nanoTime() - t;
+
+        t = System.nanoTime();
+        try (OutputStream out = new BufferedOutputStream(new FileOutputStream("buf.bin"))) {
+            for (int i = 0; i < n; i++) out.write(i);
+        }
+        long buf = System.nanoTime() - t;
+
+        t = System.nanoTime();
+        long sum = 0;
+        try (InputStream in = new BufferedInputStream(new FileInputStream("buf.bin"))) {
+            int b;
+            while ((b = in.read()) != -1) sum += b;
+        }
+        long read = System.nanoTime() - t;
+
+        System.out.printf("запись без буфера: %5d мс%nзапись с буфером:  %5d мс%nчтение с буфером:  %5d мс (сумма %d)%n",
+                raw / 1_000_000, buf / 1_000_000, read / 1_000_000, sum);
+    }
+}
+@end
+@predict Во сколько раз буферизованная запись быстрее?
+@answer
+<p>В десятки–сотни раз. Каждый <code>write(int)</code> у <code>FileOutputStream</code> — системный вызов в ОС; Buffered-обёртка копит 8 КБ в массиве и делает один вызов на 8192 байта. На Windows разница особенно заметна. Отсюда правило: побайтовый или построчный ввод-вывод — всегда через буфер (или сразу <code>Files.readAllBytes</code>/<code>Files.newBufferedWriter</code>).</p>
+@end
+@run
+javac Buffering.java
+java Buffering
+@end
+
+@lab 13.2 | Files и Path: всё в несколько строк | 20 мин
+@goal
+<p>Создать дерево каталогов, записать и прочитать текст, обойти дерево и посчитать статистику — только средствами <code>java.nio.file</code>.</p>
+@end
+@file FilesTour.java
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.List;
+import java.util.stream.Stream;
+
+public class FilesTour {
+    public static void main(String[] args) throws IOException {
+        Path root = Path.of("demo-tree");
+        Files.createDirectories(root.resolve("logs/2026"));
+        Files.writeString(root.resolve("readme.txt"), "Привет, NIO!\nВторая строка\n", StandardCharsets.UTF_8);
+        Files.write(root.resolve("logs/2026/app.log"), List.of("INFO старт", "WARN мало памяти", "INFO стоп"));
+        Files.write(root.resolve("logs/old.log"), List.of("ERROR сбой"));
+
+        System.out.println("readme: " + Files.readAllLines(root.resolve("readme.txt")));
+        System.out.println("размер app.log: " + Files.size(root.resolve("logs/2026/app.log")) + " байт");
+
+        try (Stream<Path> walk = Files.walk(root)) {
+            walk.filter(p -> p.toString().endsWith(".log"))
+                .forEach(p -> System.out.println("лог: " + root.relativize(p).toString().replace('\\', '/')));
+        }
+        try (Stream<String> lines = Files.lines(root.resolve("logs/2026/app.log"))) {
+            System.out.println("WARN строк: " + lines.filter(l -> l.startsWith("WARN")).count());
+        }
+
+        Path p = Path.of("demo-tree/logs/../readme.txt");
+        System.out.println("normalize: " + p.normalize().toString().replace('\\', '/') + ", absolute? " + p.isAbsolute());
+        try {
+            Files.createDirectory(root);
+        } catch (FileAlreadyExistsException e) {
+            System.out.println("уже существует: " + e.getFile());
+        }
+    }
+}
+@end
+@run
+javac FilesTour.java
+java FilesTour
+@end
+@predict Почему <code>Files.lines</code> и <code>Files.walk</code> обёрнуты в try-with-resources, а <code>readAllLines</code> — нет?
+@answer
+<p><code>lines</code> и <code>walk</code> возвращают ленивый Stream, за которым стоит открытый файл или дескриптор каталога. Пока стрим не закрыт, ресурс занят — в долгоживущем сервисе это утечка дескрипторов («Too many open files»). <code>readAllLines</code> читает всё сразу и закрывает файл сам — но и держит весь файл в памяти.</p>
+@end
+
+@lab 13.3 | ByteBuffer: position, limit, flip | 15 мин
+@goal
+<p>Пройти руками цикл «записали → flip → прочитали → compact», на котором построен весь NIO.</p>
+@end
+@file Buffers.java
+import java.nio.ByteBuffer;
+
+public class Buffers {
+    static void show(String step, ByteBuffer b) {
+        System.out.printf("%-22s position=%d limit=%d capacity=%d remaining=%d%n", step, b.position(), b.limit(), b.capacity(), b.remaining());
+    }
+
+    public static void main(String[] args) {
+        ByteBuffer b = ByteBuffer.allocate(8);
+        show("allocate(8)", b);
+        b.put((byte) 1).put((byte) 2).put((byte) 3);
+        show("put 3 байта", b);
+        b.flip();
+        show("flip()", b);
+        System.out.println("  прочитали: " + b.get() + ", " + b.get());
+        show("get ×2", b);
+        b.compact();
+        show("compact()", b);
+        b.put((byte) 9);
+        b.flip();
+        show("put 9, flip()", b);
+        StringBuilder rest = new StringBuilder();
+        while (b.hasRemaining()) rest.append(b.get()).append(' ');
+        System.out.println("  в буфере осталось: " + rest);
+    }
+}
+@end
+@predict Что окажется в буфере в конце: какие байты и в каком порядке?
+@answer
+<p><code>3 9</code>. <code>flip</code> ставит limit = position и position = 0 — «теперь читаем то, что записали». После чтения двух байт <code>compact</code> сдвигает непрочитанный байт 3 в начало и ставит position = 1 для дозаписи. Забытый <code>flip</code> — самая частая ошибка NIO: чтение начнётся с конца данных.</p>
+@end
+@run
+javac Buffers.java
+java Buffers
+@end
+
+@lab 13.4 | Сериализация: transient и serialVersionUID | 20 мин
+@goal
+<p>Сериализовать объект, изменить класс и получить <code>InvalidClassException</code>.</p>
+@end
+@file User.java
+import java.io.Serializable;
+
+public class User implements Serializable {
+    String login;
+    transient String password;
+    int age;
+
+    User(String login, String password, int age) { this.login = login; this.password = password; this.age = age; }
+
+    @Override public String toString() { return "User{login=" + login + ", password=" + password + ", age=" + age + "}"; }
+}
+@end
+@file Ser.java
+import java.io.*;
+
+public class Ser {
+    public static void main(String[] args) throws Exception {
+        if (args[0].equals("write")) {
+            try (var out = new ObjectOutputStream(new FileOutputStream("user.ser"))) {
+                out.writeObject(new User("anna", "s3cret", 30));
+            }
+            System.out.println("записано " + new File("user.ser").length() + " байт");
+        } else {
+            try (var in = new ObjectInputStream(new FileInputStream("user.ser"))) {
+                System.out.println("прочитано: " + in.readObject());
+            }
+        }
+    }
+}
+@end
+@ide Две конфигурации запуска: Program arguments <code>write</code> и <code>read</code>
+@run
+javac User.java Ser.java
+java Ser write
+java Ser read
+@end
+@predict Добавьте в <code>User</code> поле <code>String email;</code>, перекомпилируйте и прочитайте старый файл (<code>read</code>, без <code>write</code>). Что будет?
+@answer
+<p><code>InvalidClassException: User; local class incompatible: stream classdesc serialVersionUID = …, local class serialVersionUID = …</code>. Без явного <code>serialVersionUID</code> он вычисляется из структуры класса, и любое изменение ломает совместимость. С явным <code>private static final long serialVersionUID = 1L;</code> новое поле просто получит null. А <code>password</code> после чтения — null: transient-поля не сериализуются.</p>
+@end
+@exec
+sed -i 's/    int age;/    int age;\n    String email;/' User.java
+@end
+@run fail
+javac User.java
+java Ser read
+@end
+@exec
+sed -i '/    String email;/d' User.java
+javac User.java
+@end
+@note Встроенная сериализация Java — источник уязвимостей (десериализация недоверенных данных выполняет код классов из classpath). В новых проектах используют JSON/Protobuf, а при необходимости — фильтры <code>jdk.serialFilter</code>.
+@end

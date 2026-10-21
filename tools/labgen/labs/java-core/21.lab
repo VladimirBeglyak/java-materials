@@ -1,0 +1,158 @@
+@chapter 21 | quiz
+@intro
+<p>Сначала собираем приложение из двух «модулей» руками — <code>javac</code>, <code>jar</code>, classpath, — чтобы понять, что делают инструменты сборки. Затем тот же проект на Maven и Gradle. В IntelliJ IDEA Maven и Gradle встроены: проект открывается по <code>pom.xml</code> или <code>build.gradle.kts</code> (File → Open), а задачи запускаются из боковых окон Maven/Gradle. Для командной строки нужны установленные <code>mvn</code> и <code>gradle</code> (или wrapper-скрипты <code>mvnw</code>/<code>gradlew</code> из проекта).</p>
+@end
+
+@lab 21.1 | Сборка руками: библиотека, приложение, classpath | 20 мин
+@goal
+<p>Собрать библиотеку в jar, скомпилировать против неё приложение и поймать ошибки «забыли jar» на этапе компиляции и запуска.</p>
+@end
+@file textlib/src/com/acme/text/Slug.java
+package com.acme.text;
+
+import java.text.Normalizer;
+import java.util.Locale;
+
+public final class Slug {
+    private Slug() { }
+
+    public static String of(String title) {
+        String s = Normalizer.normalize(title, Normalizer.Form.NFD).replaceAll("\\p{M}", "");
+        return s.toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}]+", "-").replaceAll("(^-|-$)", "");
+    }
+}
+@end
+@file app/src/com/acme/app/Main.java
+package com.acme.app;
+
+import com.acme.text.Slug;
+
+public class Main {
+    public static void main(String[] args) {
+        for (String t : new String[] { "Привет, Мир!", "Café & Crème", "  Java 25 — LTS  " })
+            System.out.println("\"" + t + "\" -> " + Slug.of(t));
+    }
+}
+@end
+@step Соберите библиотеку и приложение. Разделитель путей в <code>-cp</code>: <code>;</code> в Windows, <code>:</code> в Linux/macOS:
+@run
+javac -d textlib/out textlib/src/com/acme/text/Slug.java
+jar --create --file textlib.jar -C textlib/out .
+javac -cp textlib.jar -d app/out app/src/com/acme/app/Main.java
+java -cp "app/out;textlib.jar" com.acme.app.Main
+@end
+@predict Что будет, если забыть <code>textlib.jar</code> при компиляции? А при запуске?
+@answer
+<p>При компиляции: <code>error: package com.acme.text does not exist</code> — javac не знает о классе. При запуске: <code>NoClassDefFoundError: com/acme/text/Slug</code> — class-файл Main ссылается на Slug, а в рантайме его нет. Ровно эти две ошибки инструменты сборки и избавляют вас от необходимости ловить вручную: они формируют classpath для компиляции и для запуска из одного описания зависимостей.</p>
+@end
+@run fail
+javac -d app/out2 app/src/com/acme/app/Main.java
+java -cp app/out com.acme.app.Main
+@end
+@try
+Сделайте «толстый» исполняемый jar вручную: распакуйте классы библиотеки и приложения в один каталог и упакуйте с <code>--main-class</code>. ::: <code>jar --create --file app-all.jar --main-class com.acme.app.Main -C app/out . -C textlib/out .</code> — теперь <code>java -jar app-all.jar</code> работает без -cp. Так устроены shade/shadow-плагины (и, с отличиями, Spring Boot jar).
+@end
+
+@lab 21.2 | Тот же проект на Maven | 25 мин
+@goal
+<p>Описать проект в <code>pom.xml</code>, собрать его, запустить тесты и посмотреть дерево зависимостей.</p>
+@end
+@file mvn-demo/pom.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.acme</groupId>
+    <artifactId>mvn-demo</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.20.0</version>
+        </dependency>
+    </dependencies>
+</project>
+@end
+@file mvn-demo/src/main/java/com/acme/Json.java
+package com.acme;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.Map;
+
+public class Json {
+    public static void main(String[] args) throws Exception {
+        var mapper = new ObjectMapper();
+        String json = mapper.writeValueAsString(Map.of("lang", "Java", "version", 25));
+        System.out.println(json);
+        System.out.println(mapper.readTree(json).get("version").asInt() + 1);
+    }
+}
+@end
+@step Соберите проект (первый запуск скачает плагины и зависимости в <code>~/.m2/repository</code>):
+@run timeout=600 grep="BUILD|Building|jar:|Tests|\[INFO\] --- "
+mvn -f mvn-demo/pom.xml package ||| ../../../jars/apache-maven-3.9.16/bin/mvn -B -Dmaven.repo.local=../../../m2repo -f mvn-demo/pom.xml package
+@end
+@step Посмотрите, что ещё приехало вместе с jackson-databind:
+@run timeout=300 grep="com.acme|jackson|BUILD"
+mvn -f mvn-demo/pom.xml dependency:tree ||| ../../../jars/apache-maven-3.9.16/bin/mvn -B -Dmaven.repo.local=../../../m2repo -f mvn-demo/pom.xml dependency:tree
+@end
+@predict Вы объявили одну зависимость. Почему в дереве три артефакта и почему <code>java -cp mvn-demo/target/mvn-demo-1.0-SNAPSHOT.jar com.acme.Json</code> не запустится?
+@answer
+<p>jackson-databind сам зависит от jackson-annotations и jackson-core — это <b>транзитивные</b> зависимости, Maven подтягивает их автоматически. А обычный <code>package</code> кладёт в jar только ваши классы: при запуске с одним этим jar будет <code>NoClassDefFoundError: com/fasterxml/jackson/databind/ObjectMapper</code>. В IDEA запуск работает, потому что она сама собирает classpath из pom. Для командной строки — <code>mvn exec:java</code>, плагин копирования зависимостей или «толстый» jar.</p>
+@end
+@run fail
+java -cp mvn-demo/target/mvn-demo-1.0-SNAPSHOT.jar com.acme.Json
+@end
+@try
+Добавьте в pom явную зависимость <code>jackson-core</code> версии <code>2.15.0</code> и снова посмотрите <code>dependency:tree</code>. Какая версия победит? ::: 2.15.0 — «ближайшая» в дереве (прямая зависимость побеждает транзитивную). Maven не выбирает самую новую версию — и databind 2.20 окажется в рантайме с несовместимым core 2.15: возможен <code>NoSuchMethodError</code>. Такие конфликты решают через <code>dependencyManagement</code>/BOM (<code>jackson-bom</code>).
+@end
+
+@lab 21.3 | Тот же проект на Gradle | 20 мин
+@goal
+<p>Описать тот же проект в Gradle Kotlin DSL и запустить приложение задачей <code>run</code>.</p>
+@end
+@file gradle-demo/settings.gradle.kts
+rootProject.name = "gradle-demo"
+@end
+@file gradle-demo/build.gradle.kts
+plugins {
+    application
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.20.0")
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+
+application {
+    mainClass = "com.acme.Json"
+}
+@end
+@exec
+mkdir -p gradle-demo/src/main/java/com/acme
+cp mvn-demo/src/main/java/com/acme/Json.java gradle-demo/src/main/java/com/acme/
+@end
+@step Положите тот же <code>Json.java</code> в <code>gradle-demo/src/main/java/com/acme/</code> и запустите:
+@run timeout=600 grep="Task|BUILD|lang|^26$"
+gradle -p gradle-demo run ||| GRADLE_USER_HOME=../../../gradle-home gradle --no-daemon --console=plain -p gradle-demo run 2>&1
+@end
+@run timeout=300 grep="runtimeClasspath|jackson"
+gradle -p gradle-demo dependencies --configuration runtimeClasspath ||| GRADLE_USER_HOME=../../../gradle-home gradle --no-daemon --console=plain -p gradle-demo dependencies --configuration runtimeClasspath 2>&1
+@end
+@note <code>implementation</code> в Gradle — зависимость нужна для компиляции и выполнения, но не «протекает» к потребителям вашей библиотеки (в отличие от <code>api</code>). В Maven ближайший аналог — scope <code>compile</code>. Задача <code>run</code> сама собирает classpath из всех зависимостей — поэтому здесь запуск работает сразу.
+@end

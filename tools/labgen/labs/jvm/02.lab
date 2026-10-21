@@ -1,0 +1,186 @@
+@chapter 02 | quiz
+@intro
+<p>Class-файл — обычный двоичный файл, и его можно прочитать самому. В этих лабораторных вы напишете крошечный парсер заголовка, найдёте в пуле констант то, что «спрятал» javac, научитесь читать дескрипторы и увидите, какие атрибуты зависят от флагов компиляции. Модуль IDEA — <code>ch02</code>.</p>
+@end
+
+@lab 2.1 | Читаем заголовок class-файла своим кодом | 20 мин
+@goal
+<p>Убедиться, что class-файл начинается с <code>CAFEBABE</code>, номер версии определяет минимальную JVM, а <code>javac --release</code> меняет эту версию.</p>
+@end
+@step Класс-«подопытный»:
+@file Point.java
+public class Point {
+    static final int ORIGIN = 0;
+    private final int x, y;
+
+    public Point(int x, int y) { this.x = x; this.y = y; }
+
+    public int dist2() { return x * x + y * y; }
+
+    @Override
+    public String toString() { return "Point(" + x + ", " + y + ")"; }
+}
+@end
+@step Мини-парсер: читает первые поля структуры <code>ClassFile</code> из спецификации JVMS §4.1:
+@file ClassHeader.java
+import java.io.DataInputStream;
+import java.io.FileInputStream;
+
+public class ClassHeader {
+    public static void main(String[] args) throws Exception {
+        try (var in = new DataInputStream(new FileInputStream(args[0]))) {
+            int magic = in.readInt();
+            int minor = in.readUnsignedShort();
+            int major = in.readUnsignedShort();
+            int cpCount = in.readUnsignedShort();
+            System.out.printf("magic         = %X%n", magic);
+            System.out.printf("version       = %d.%d  (Java %d)%n", major, minor, major - 44);
+            System.out.printf("constant_pool = %d записей (индексы 1..%d)%n", cpCount, cpCount - 1);
+        }
+    }
+}
+@end
+@ide Program arguments: <code>out/production/ch02/Point.class</code> (относительно корня проекта). Или из терминала — команды ниже.
+@run
+javac Point.java ClassHeader.java
+java ClassHeader Point.class
+@end
+@predict Скомпилируем <code>Point</code> для Java 8: <code>javac --release 8 Point.java</code>. Что изменится в заголовке?
+@answer
+<p><code>version = 52.0 (Java 8)</code>: major version = номер Java + 44. Пул констант тоже станет другим: для Java 8 javac собирает строку в <code>toString</code> через <code>StringBuilder</code>, а не через <code>invokedynamic</code>, — в пуле появятся ссылки на методы <code>StringBuilder</code> вместо <code>StringConcatFactory</code>. Предупреждения «source value 8 is obsolete» — JDK напоминает, что поддержку компиляции под Java 8 скоро уберут.</p>
+@end
+@run
+javac --release 8 Point.java
+java ClassHeader Point.class
+@end
+@step Сверьтесь со стандартным инструментом (сейчас <code>Point.class</code> собран под Java 8):
+@run head=8
+javap -v Point.class
+@end
+@predict Скомпилируйте <code>Point</code> под Java 25 (просто <code>javac Point.java</code>) и попробуйте загрузить его на JDK 21 (если он у вас есть). Что произойдёт?
+@answer
+<p><code>UnsupportedClassVersionError</code>: «class file version 69.0, this version of the Java Runtime only recognizes class file versions up to 65.0». Старая JVM не знает новых версий формата и отказывается даже начинать разбор. Обратная ситуация (старый class на новой JVM) работает всегда.</p>
+@end
+@output title=Вывод на JDK 21
+Error: LinkageError occurred while loading main class Point
+	java.lang.UnsupportedClassVersionError: Point has been compiled by a more recent version of the Java Runtime (class file version 69.0), this version of the Java Runtime only recognizes class file versions up to 65.0
+@end
+@try
+Почему <code>--release 8</code> лучше, чем старое <code>-source 8 -target 8</code>? ::: <code>--release</code> ещё и проверяет API: компилятор подставляет сигнатуры стандартной библиотеки Java 8 и не даст вызвать, например, <code>List.of</code>, которого там нет. С <code>-target</code> код скомпилируется и упадёт <code>NoSuchMethodError</code> уже на Java 8.
+Допишите в парсер чтение <code>access_flags</code>, <code>this_class</code> и <code>super_class</code>. Почему просто так не получится? ::: Они идут после пула констант, а записи пула имеют разную длину (тег определяет формат). Придётся разобрать пул целиком: 1 — Utf8 (u2 длина + байты), 7 — Class (u2), 10 — Methodref (u2+u2), 3/4 — Integer/Float (u4), 5/6 — Long/Double (u8 и занимают ДВА индекса) и т. д.
+@end
+
+@lab 2.2 | Пул констант: что туда кладёт javac | 20 мин
+@goal
+<p>Найти в пуле констант строки, числа и символические ссылки и понять, когда константа попадает в пул, а когда «вшивается» прямо в инструкцию.</p>
+@end
+@step Класс с разными видами констант:
+@file Consts.java
+public class Consts {
+    static final int SMALL = 100;
+    static final int BIG = 100_000;
+    static final String HELLO = "hello";
+
+    static int calc(int a) {
+        return a * 7 + 40_000 + 1_000_000;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(HELLO + calc(SMALL) + BIG);
+    }
+}
+@end
+@run grep="= (Integer|String|Utf8 hello|Fieldref|Methodref|InvokeDynamic)|ConstantValue"
+javac Consts.java
+javap -v -p Consts.class | findstr "Integer String Methodref Fieldref InvokeDynamic ConstantValue" ||| javap -v -p Consts.class | grep -E "Integer|String |Methodref|Fieldref|InvokeDynamic|ConstantValue|Utf8 hello"
+@end
+@predict Сколько записей <code>Integer</code> окажется в пуле и почему именно таких? Посмотрите заодно на байткод <code>calc</code>: <code>javap -c Consts</code>.
+@answer
+<p>Числа 7 и 100 помещаются в инструкцию (<code>bipush</code> — байт, <code>sipush</code> — до 32767), поэтому в пул не попадают как операнды кода. 40 000 и 1 000 000 не влезают в <code>short</code> — для них <code>ldc</code> и записи <code>Integer</code> в пуле. Отдельно в пуле есть <code>Integer 100</code> и <code>Integer 100000</code> — это значения атрибутов <code>ConstantValue</code> у полей SMALL и BIG. А в <code>main</code> выражение <code>HELLO + calc(SMALL) + BIG</code> использует уже подставленные константы: <code>bipush 100</code> и строку «…100000» в рецепте конкатенации.</p>
+@end
+@run grep="calc|push|ldc|imul|iadd|ireturn"
+javap -c Consts.class
+@end
+@step Посмотрите, как javac «свернул» константы в <code>main</code>: число <code>BIG</code> стало частью строки-рецепта для <code>invokedynamic</code>:
+@run grep="main|ldc|push|invoke|\\u0001"
+javap -c -v Consts.class | findstr /C:"invokedynamic" /C:"\u0001" ||| javap -c -v Consts.class | grep -E "invokedynamic|u0001" | head -4
+@end
+@note Символ <code>\u0001</code> в рецепте — место для динамического аргумента (результат <code>calc</code>), остальное — константный текст: <code>"hello" + ? + "100000"</code>.
+@try
+Уберите <code>final</code> у <code>BIG</code> и снова посмотрите на <code>main</code>. ::: Теперь это обычное статическое поле: появится <code>getstatic Consts.BIG</code>, а в рецепте конкатенации — второй <code>\u0001</code>. Константа времени компиляции — только <code>static final</code> примитив или String, инициализированный константным выражением.
+@end
+
+@lab 2.3 | Дескрипторы и Signature: что остаётся от generics | 15 мин
+@goal
+<p>Научиться читать дескрипторы методов и увидеть, где хранится информация о параметрах типов, которую «стирает» компилятор.</p>
+@end
+@file Descr.java
+import java.util.List;
+import java.util.Map;
+
+public class Descr {
+    void a() {}
+    int b(long x, double y) { return 0; }
+    String[] c(Map<String, List<Integer>> m, int[][] grid) { return null; }
+    <T extends Comparable<T>> T max(List<? extends T> xs) { return null; }
+    static boolean d(char c, byte b, short s, float f, Object o) { return true; }
+}
+@end
+@predict Запишите дескриптор каждого метода, прежде чем запускать <code>javap -s</code>. Особенно <code>c</code> и <code>max</code>.
+@answer
+<p><code>a: ()V</code>, <code>b: (JD)I</code>, <code>c: (Ljava/util/Map;[[I)[Ljava/lang/String;</code>, <code>max: (Ljava/util/List;)Ljava/lang/Comparable;</code> — тип <code>T</code> стёрт до своей границы <code>Comparable</code>, <code>d: (CBSFLjava/lang/Object;)Z</code>. Буквы: J — long, Z — boolean, L…; — класс, [ — массив.</p>
+@end
+@run
+javac Descr.java
+javap -s -p Descr.class
+@end
+@step Где же generics? В атрибуте <code>Signature</code> — его читает компилятор и рефлексия, но не JVM при выполнении:
+@run grep="Signature|#\d+ = Utf8 .*<"
+javap -v -p Descr.class | findstr Signature ||| javap -v -p Descr.class | grep -E "Signature: #"
+@end
+@try
+Напишите <code>Descr.class.getDeclaredMethod("c", Map.class, int[][].class).getGenericParameterTypes()</code> в jshell или в main. Что выведется? ::: <code>[java.util.Map&lt;java.lang.String, java.util.List&lt;java.lang.Integer&gt;&gt;, class [[I]</code> — рефлексия берёт полные типы из атрибута Signature. Поэтому Jackson и Spring умеют узнать тип элементов у поля <code>List&lt;Order&gt;</code>, но не у локальной переменной: у локальных переменных Signature хранится только в отладочной LocalVariableTypeTable.
+@end
+
+@lab 2.4 | Атрибуты отладки: откуда берутся номера строк | 15 мин
+@goal
+<p>Увидеть, что номера строк в стектрейсе и имена параметров — это необязательные атрибуты, зависящие от флагов <code>javac</code>.</p>
+@end
+@file Boom.java
+public class Boom {
+    static int divide(int numerator, int denominator) {
+        return numerator / denominator;
+    }
+
+    public static void main(String[] args) throws Exception {
+        var m = Boom.class.getDeclaredMethod("divide", int.class, int.class);
+        for (var p : m.getParameters()) System.out.println("параметр: " + p.getName());
+        divide(1, 0);
+    }
+}
+@end
+@step Обычная компиляция:
+@run fail
+javac Boom.java
+java Boom
+@end
+@predict Скомпилируем с <code>javac -g:none</code> (без отладочной информации). Что изменится в стектрейсе?
+@answer
+<p>Вместо <code>Boom.java:3</code> будет <code>Unknown Source</code>: исчез атрибут <code>LineNumberTable</code> (и <code>SourceFile</code>). JVM знает только смещение инструкции в байткоде, а сопоставить его со строкой исходника нечем.</p>
+@end
+@run fail
+javac -g:none Boom.java
+java Boom
+@end
+@predict А как получить настоящие имена параметров <code>numerator</code>, <code>denominator</code> вместо <code>arg0</code>, <code>arg1</code>?
+@answer
+<p>Флаг <code>javac -parameters</code> добавляет атрибут <code>MethodParameters</code>. Его используют Spring (<code>@PathVariable</code> без имени), Jackson-модуль parameter-names. Отладочная <code>LocalVariableTable</code> (<code>-g</code>) рефлексией не читается. В IDEA флаг включается в Settings → Build → Compiler → Java Compiler → Additional parameters.</p>
+@end
+@run fail
+javac -parameters Boom.java
+java Boom
+javap -v Boom.class | findstr /C:"MethodParameters" /C:"LineNumberTable" ||| javap -v Boom.class | grep -E "MethodParameters:|LineNumberTable:"
+@end
+@try
+Скомпилируйте с <code>-g</code> и найдите в <code>javap -v -p</code> таблицу <code>LocalVariableTable</code> метода <code>divide</code>. Что в колонках Start и Length? ::: Диапазон байткода, где переменная «жива», и слот локальных переменных. Отладчик IDEA показывает имена переменных именно отсюда; без <code>-g</code> он увидит только <code>slot_0</code>, <code>slot_1</code>.
+@end

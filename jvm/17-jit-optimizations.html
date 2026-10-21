@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 17 · ИСПОЛНЕНИЕ</div>
   <h1>Оптимизации JIT и деоптимизация</h1>
   <p class="lead">C2 делает с вашим кодом то, что не сделает ни один человек: встраивает цепочки вызовов, превращает виртуальные вызовы в прямые по профилю, выбрасывает проверки границ массивов, векторизует циклы, удаляет блокировки и объекты. Всё это — спекуляции, и когда предположение нарушается, JVM откатывается в интерпретатор. Разбираем главные оптимизации, профиль типов в месте вызова (с симулятором мономорфных и мегаморфных вызовов) и деоптимизацию.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">встраивание</span><span class="tag">девиртуализация</span><span class="tag">мегаморфные вызовы</span><span class="tag">интринсики</span><span class="tag">циклы и SIMD</span><span class="tag">деоптимизация</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">встраивание</span><span class="tag">девиртуализация</span><span class="tag">мегаморфные вызовы</span><span class="tag">интринсики</span><span class="tag">циклы и SIMD</span><span class="tag">деоптимизация</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -123,7 +123,156 @@ static void mul(float[] a, float[] b, float[] c) {
 # JFR: событие jdk.Deoptimization — причина, метод, строка; JDK Mission Control показывает частоту
 jcmd &lt;pid&gt; Compiler.CodeHeap_Analytics</code></pre>
 
-<h2 id="quiz"><span class="h-num">17.5</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">17.5</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Встраивание, профиль типов и деоптимизацию видно в диагностических журналах C2 и чувствуется в замерах. Диагностические флаги требуют <code>-XX:+UnlockDiagnosticVMOptions</code> перед ними. Модуль IDEA — <code>ch17</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-17.1">
+<div class="lab-head"><span class="lab-num">Лаба 17.1</span><b>PrintInlining: что встроилось и почему нет</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть решения JIT о встраивании и причины отказов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Inline.java</code>:</div>
+<pre data-title="Inline.java"><code class="java">public class Inline {
+    static int small(int x) { return x + 1; }
+
+    static int big(int x) {
+        int r = x;
+        for (int i = 0; i &lt; 3; i++) {
+            r = r * 31 + i; r ^= r &gt;&gt;&gt; 7; r += r &lt;&lt; 3; r ^= r &gt;&gt;&gt; 11; r = r * 17 + 5;
+            r ^= r &gt;&gt;&gt; 13; r += r &lt;&lt; 2; r ^= r &gt;&gt;&gt; 5; r = r * 13 + 7; r ^= r &gt;&gt;&gt; 3;
+        }
+        return r;
+    }
+
+    static int caller(int x) { return small(x) + big(x); }
+
+    public static void main(String[] args) {
+        long s = 0;
+        for (int i = 0; i &lt; 20_000_000; i++) s += caller(i);
+        System.out.println(s);
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Inline.java
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining Inline | findstr "Inline::"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">                                @ 1   Inline::small (4 bytes)   inline
+                                @ 1   Inline::small (4 bytes)   inline (hot)
+                                @ 5   Inline::big (84 bytes)   failed to inline: callee is too large
+                                @ 5   Inline::big (84 bytes)   inline (hot)
+                              @ 1   Inline::small (4 bytes)   inline
+                              @ 1   Inline::small (4 bytes)   inline (hot)
+                              @ 12   Inline::caller (10 bytes)   inline
+                              @ 12   Inline::caller (10 bytes)   inline (hot)
+                              @ 5   Inline::big (84 bytes)   failed to inline: callee is too large
+                              @ 5   Inline::big (84 bytes)   inline (hot)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Встроится ли <code>big</code>, байткод которого больше 35 байт (<code>MaxInlineSize</code>)?</div>
+<div class="lab-ans" hidden><p>Зависит от компилятора — и журнал показывает обе строки. C1 отказывается: <code>Inline::big (84 bytes) failed to inline: callee is too large</code> — у него лимит <code>MaxInlineSize</code> = 35 байт. C2 встраивает: <code>inline (hot)</code> — для горячих вызовов действует лимит <code>FreqInlineSize</code> = 325 байт. Размер байткода метода (84) печатается прямо в журнале.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>-XX:FreqInlineSize=50</code>. Что напишет журнал про <code>big</code> и как изменится время работы?</summary><div>«hot method too big» — big перестанет встраиваться. Сам по себе вызов дёшев, но без встраивания пропадают последующие оптимизации (свёртка, вынос из цикла), и программа обычно замедляется.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-17.2">
+<div class="lab-head"><span class="lab-num">Лаба 17.2</span><b>Моно-, би- и мегаморфный вызов</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, как число разных типов в одном месте вызова влияет на скорость.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Morph.java</code>:</div>
+<pre data-title="Morph.java"><code class="java">public class Morph {
+    interface Shape { double area(); }
+    record Sq(double a) implements Shape { public double area() { return a * a; } }
+    record Circle(double r) implements Shape { public double area() { return 3.14159 * r * r; } }
+    record Rect(double a, double b) implements Shape { public double area() { return a * b; } }
+    record Tri(double a, double h) implements Shape { public double area() { return a * h / 2; } }
+
+    static double total(Shape[] shapes) {
+        double s = 0;
+        for (Shape sh : shapes) s += sh.area();      // одно место вызова
+        return s;
+    }
+
+    public static void main(String[] args) {
+        int kinds = Integer.parseInt(args[0]);
+        Shape[] all = { new Sq(2), new Circle(1), new Rect(2, 3), new Tri(3, 4) };
+        Shape[] arr = new Shape[1000];
+        for (int i = 0; i &lt; arr.length; i++) arr[i] = all[i % kinds];
+        for (int round = 0; round &lt; 5; round++) {
+            long t = System.nanoTime(); double s = 0;
+            for (int i = 0; i &lt; 20_000; i++) s += total(arr);
+            System.out.printf("типов: %d, раунд %d: %4d мс (%s)%n", kinds, round, (System.nanoTime() - t) / 1_000_000, (long) s);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запустите с аргументом 1, 2, 3 и 4. Где будет скачок времени?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Morph.java
+java Morph 1
+java Morph 2
+java Morph 3
+java Morph 4</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">типов: 1, раунд 3:    9 мс (80000000)
+типов: 1, раунд 4:    9 мс (80000000)
+типов: 2, раунд 3:   10 мс (71415900)
+типов: 2, раунд 4:   10 мс (71415900)
+типов: 3, раунд 3:   38 мс (87602989)
+типов: 3, раунд 4:   39 мс (87602989)
+типов: 4, раунд 3:   40 мс (95707949)
+типов: 4, раунд 4:   40 мс (95707949)</code></pre></details>
+<p class="lab-note">В выводе оставлены последние два раунда каждого запуска — после прогрева.</p>
+<div class="lab-ans" hidden><p>1 и 2 типа — быстро и почти одинаково: мономорфный и биморфный вызов JIT встраивает с проверкой класса. С 3 типов вызов мегаморфный: C2 вызывает <code>area()</code> через таблицу (itable), без встраивания, — время заметно растёт. Отсюда совет: в горячем коде полиморфизм через 3+ реализации интерфейса — не бесплатный.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте <code>Shape</code> запечатанным (<code>sealed interface Shape permits Sq, Circle, Rect, Tri</code>) и замените вызов на <code>switch</code> с паттернами по типу. Изменится ли картина для 4 типов?</summary><div>Часто да: switch по запечатанной иерархии компилируется в проверки типов с встроенными телами, без виртуального вызова. Проверьте на своей машине — это и есть «измеряй, а не верь».</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-17.3">
+<div class="lab-head"><span class="lab-num">Лаба 17.3</span><b>Деоптимизация: смена профиля посреди работы</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Поймать момент, когда скомпилированный код становится неверным, и JVM откатывается в интерпретатор.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Deopt.java</code>:</div>
+<pre data-title="Deopt.java"><code class="java">public class Deopt {
+    interface Op { int apply(int x); }
+    static final class Inc implements Op { public int apply(int x) { return x + 1; } }
+    static final class Dbl implements Op { public int apply(int x) { return x * 2; } }
+
+    static int run(Op op, int n) {
+        int s = 0;
+        for (int i = 0; i &lt; n; i++) s = op.apply(s) &amp; 0xFFFF;
+        return s;
+    }
+
+    public static void main(String[] args) {
+        for (int i = 0; i &lt; 20_000; i++) run(new Inc(), 100);   // профиль: только Inc
+        System.out.println("--- впервые передаём Dbl ---");
+        for (int i = 0; i &lt; 20_000; i++) run(new Dbl(), 100);
+        System.out.println("готово");
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+PrintCompilation</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Deopt.java
+java -XX:+PrintCompilation Deopt | findstr "Deopt::run впервые готово"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">33   16       3       Deopt::run (28 bytes)
+33   18 %     4       Deopt::run @ 4 (28 bytes)
+36   20       4       Deopt::run (28 bytes)
+37   16       3       Deopt::run (28 bytes)   made not entrant: not used
+--- впервые передаём Dbl ---
+38   20       4       Deopt::run (28 bytes)   made not entrant: uncommon trap
+39   22       4       Deopt::run (28 bytes)
+39   18 %     4       Deopt::run @ 4 (28 bytes)   made not entrant: uncommon trap
+готово</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что произойдёт с C2-версией <code>run</code> после первого вызова с <code>Dbl</code>?</div>
+<div class="lab-ans" hidden><p>C2 скомпилировал <code>run</code> со встроенным <code>Inc.apply</code> и проверкой «объект — Inc?». Первый Dbl проваливает проверку — срабатывает uncommon trap: кадр переводится обратно в интерпретатор, скомпилированная версия помечается <code>made not entrant</code>. Затем метод перекомпилируется уже с биморфным профилем. В журнале это строки <code>made not entrant</code> для run сразу после вашей разделительной строки и новые компиляции.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>-Xlog:deoptimization=debug</code>. Что показывает журнал?</summary><div>Причину и место каждой деоптимизации: <code>reason=class_check</code> (не тот класс), метод, байткодный индекс. В продакшене повторяющиеся деоптимизации одного метода («deopt storm») ищут через JFR-событие <code>jdk.Deoptimization</code>.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">17.6</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Почему встраивание называют главной оптимизацией JIT?</p><ul><li>Оно уменьшает размер кода</li><li>Оно открывает остальные оптимизации: после встраивания компилятор видит код целиком</li><li>Оно ускоряет загрузку классов</li><li>Оно убирает GC</li></ul><div class="why">Escape analysis, удаление проверок, свёртка констант работают через границы встроенных вызовов.</div></div>
 <div class="mcq" data-ok="3"><p>Что такое мегаморфный вызов?</p><ul><li>Вызов статического метода</li><li>Вызов с большим числом аргументов</li><li>Вызов, который JIT встроил дважды</li><li>Виртуальный вызов, в месте которого встречалось 3+ типов получателя: без встраивания, через vtable</li></ul><div class="why">Мономорфный и биморфный — встраиваются с проверками типа.</div></div>

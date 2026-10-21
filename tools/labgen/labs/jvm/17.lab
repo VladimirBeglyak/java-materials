@@ -1,0 +1,127 @@
+@chapter 17 | quiz
+@intro
+<p>Встраивание, профиль типов и деоптимизацию видно в диагностических журналах C2 и чувствуется в замерах. Диагностические флаги требуют <code>-XX:+UnlockDiagnosticVMOptions</code> перед ними. Модуль IDEA — <code>ch17</code>.</p>
+@end
+
+@lab 17.1 | PrintInlining: что встроилось и почему нет | 20 мин
+@goal
+<p>Увидеть решения JIT о встраивании и причины отказов.</p>
+@end
+@file Inline.java
+public class Inline {
+    static int small(int x) { return x + 1; }
+
+    static int big(int x) {
+        int r = x;
+        for (int i = 0; i < 3; i++) {
+            r = r * 31 + i; r ^= r >>> 7; r += r << 3; r ^= r >>> 11; r = r * 17 + 5;
+            r ^= r >>> 13; r += r << 2; r ^= r >>> 5; r = r * 13 + 7; r ^= r >>> 3;
+        }
+        return r;
+    }
+
+    static int caller(int x) { return small(x) + big(x); }
+
+    public static void main(String[] args) {
+        long s = 0;
+        for (int i = 0; i < 20_000_000; i++) s += caller(i);
+        System.out.println(s);
+    }
+}
+@end
+@ide VM options: <code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining</code>
+@run grep="Inline::"
+javac Inline.java
+java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining Inline | findstr "Inline::" ||| java -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining Inline | grep "Inline::" | sort -u
+@end
+@predict Встроится ли <code>big</code>, байткод которого больше 35 байт (<code>MaxInlineSize</code>)?
+@answer
+<p>Зависит от компилятора — и журнал показывает обе строки. C1 отказывается: <code>Inline::big (84 bytes) failed to inline: callee is too large</code> — у него лимит <code>MaxInlineSize</code> = 35 байт. C2 встраивает: <code>inline (hot)</code> — для горячих вызовов действует лимит <code>FreqInlineSize</code> = 325 байт. Размер байткода метода (84) печатается прямо в журнале.</p>
+@end
+@try
+Добавьте <code>-XX:FreqInlineSize=50</code>. Что напишет журнал про <code>big</code> и как изменится время работы? ::: «hot method too big» — big перестанет встраиваться. Сам по себе вызов дёшев, но без встраивания пропадают последующие оптимизации (свёртка, вынос из цикла), и программа обычно замедляется.
+@end
+
+@lab 17.2 | Моно-, би- и мегаморфный вызов | 25 мин
+@goal
+<p>Измерить, как число разных типов в одном месте вызова влияет на скорость.</p>
+@end
+@file Morph.java
+public class Morph {
+    interface Shape { double area(); }
+    record Sq(double a) implements Shape { public double area() { return a * a; } }
+    record Circle(double r) implements Shape { public double area() { return 3.14159 * r * r; } }
+    record Rect(double a, double b) implements Shape { public double area() { return a * b; } }
+    record Tri(double a, double h) implements Shape { public double area() { return a * h / 2; } }
+
+    static double total(Shape[] shapes) {
+        double s = 0;
+        for (Shape sh : shapes) s += sh.area();      // одно место вызова
+        return s;
+    }
+
+    public static void main(String[] args) {
+        int kinds = Integer.parseInt(args[0]);
+        Shape[] all = { new Sq(2), new Circle(1), new Rect(2, 3), new Tri(3, 4) };
+        Shape[] arr = new Shape[1000];
+        for (int i = 0; i < arr.length; i++) arr[i] = all[i % kinds];
+        for (int round = 0; round < 5; round++) {
+            long t = System.nanoTime(); double s = 0;
+            for (int i = 0; i < 20_000; i++) s += total(arr);
+            System.out.printf("типов: %d, раунд %d: %4d мс (%s)%n", kinds, round, (System.nanoTime() - t) / 1_000_000, (long) s);
+        }
+    }
+}
+@end
+@predict Запустите с аргументом 1, 2, 3 и 4. Где будет скачок времени?
+@answer
+<p>1 и 2 типа — быстро и почти одинаково: мономорфный и биморфный вызов JIT встраивает с проверкой класса. С 3 типов вызов мегаморфный: C2 вызывает <code>area()</code> через таблицу (itable), без встраивания, — время заметно растёт. Отсюда совет: в горячем коде полиморфизм через 3+ реализации интерфейса — не бесплатный.</p>
+@end
+@run
+javac Morph.java
+java Morph 1 ||| java Morph 1 | tail -2
+java Morph 2 ||| java Morph 2 | tail -2
+java Morph 3 ||| java Morph 3 | tail -2
+java Morph 4 ||| java Morph 4 | tail -2
+@end
+@note В выводе оставлены последние два раунда каждого запуска — после прогрева.
+@try
+Сделайте <code>Shape</code> запечатанным (<code>sealed interface Shape permits Sq, Circle, Rect, Tri</code>) и замените вызов на <code>switch</code> с паттернами по типу. Изменится ли картина для 4 типов? ::: Часто да: switch по запечатанной иерархии компилируется в проверки типов с встроенными телами, без виртуального вызова. Проверьте на своей машине — это и есть «измеряй, а не верь».
+@end
+
+@lab 17.3 | Деоптимизация: смена профиля посреди работы | 20 мин
+@goal
+<p>Поймать момент, когда скомпилированный код становится неверным, и JVM откатывается в интерпретатор.</p>
+@end
+@file Deopt.java
+public class Deopt {
+    interface Op { int apply(int x); }
+    static final class Inc implements Op { public int apply(int x) { return x + 1; } }
+    static final class Dbl implements Op { public int apply(int x) { return x * 2; } }
+
+    static int run(Op op, int n) {
+        int s = 0;
+        for (int i = 0; i < n; i++) s = op.apply(s) & 0xFFFF;
+        return s;
+    }
+
+    public static void main(String[] args) {
+        for (int i = 0; i < 20_000; i++) run(new Inc(), 100);   // профиль: только Inc
+        System.out.println("--- впервые передаём Dbl ---");
+        for (int i = 0; i < 20_000; i++) run(new Dbl(), 100);
+        System.out.println("готово");
+    }
+}
+@end
+@ide VM options: <code>-XX:+PrintCompilation</code>
+@run grep="Deopt::run|впервые|готово"
+javac Deopt.java
+java -XX:+PrintCompilation Deopt | findstr "Deopt::run впервые готово" ||| java -XX:+PrintCompilation Deopt | grep -E "Deopt::run|впервые|готово"
+@end
+@predict Что произойдёт с C2-версией <code>run</code> после первого вызова с <code>Dbl</code>?
+@answer
+<p>C2 скомпилировал <code>run</code> со встроенным <code>Inc.apply</code> и проверкой «объект — Inc?». Первый Dbl проваливает проверку — срабатывает uncommon trap: кадр переводится обратно в интерпретатор, скомпилированная версия помечается <code>made not entrant</code>. Затем метод перекомпилируется уже с биморфным профилем. В журнале это строки <code>made not entrant</code> для run сразу после вашей разделительной строки и новые компиляции.</p>
+@end
+@try
+Добавьте <code>-Xlog:deoptimization=debug</code>. Что показывает журнал? ::: Причину и место каждой деоптимизации: <code>reason=class_check</code> (не тот класс), метод, байткодный индекс. В продакшене повторяющиеся деоптимизации одного метода («deopt storm») ищут через JFR-событие <code>jdk.Deoptimization</code>.
+@end

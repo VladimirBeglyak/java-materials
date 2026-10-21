@@ -1,0 +1,125 @@
+@chapter 07 | quiz
+@intro
+<p>Стирание типов, загрязнение кучи и PECS лучше всего понимаются, когда компилятор и JVM спорят у вас на глазах. Модуль IDEA — <code>ch07</code>.</p>
+@end
+
+@lab 7.1 | Стирание: List&lt;String&gt; и List&lt;Integer&gt; — один класс | 15 мин
+@goal
+<p>Убедиться, что параметры типа не существуют во время выполнения, и найти, куда javac вставил приведения.</p>
+@end
+@file Erasure.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Erasure {
+    static <T extends Comparable<T>> T max(List<T> xs) {
+        T best = xs.get(0);
+        for (T x : xs) if (x.compareTo(best) > 0) best = x;
+        return best;
+    }
+
+    public static void main(String[] args) {
+        List<String> strings = new ArrayList<>();
+        List<Integer> ints = new ArrayList<>();
+        System.out.println("один класс: " + (strings.getClass() == ints.getClass()));
+        strings.add("b"); strings.add("a");
+        String m = max(strings);
+        System.out.println("max = " + m);
+    }
+}
+@end
+@run grep="checkcast|max:|Comparable|invokestatic|invokeinterface"
+javac Erasure.java
+java Erasure
+javap -c Erasure.class
+@end
+@predict Какой тип у параметра и результата метода <code>max</code> в байткоде и где появился <code>checkcast</code>?
+@answer
+<p>После стирания <code>T</code> заменён своей границей: <code>max:(Ljava/util/List;)Ljava/lang/Comparable;</code>. Внутри <code>max</code> есть <code>checkcast Comparable</code> после <code>get</code>, а в <code>main</code> — <code>checkcast String</code> после вызова max: javac вставляет приведения в местах использования, потому что JVM о <code>String</code> в этом месте ничего не знает.</p>
+@end
+@try
+Попробуйте написать <code>if (strings instanceof List&lt;String&gt;)</code> и <code>new T[10]</code> внутри max. ::: Первое компилируется с Java 16 только потому, что тип проверки совпадает со статическим (иначе «cannot safely cast»); <code>new T[10]</code> — ошибка «generic array creation»: в рантайме неизвестно, массив чего создать.
+@end
+
+@lab 7.2 | Загрязнение кучи: ClassCastException там, где нет приведения | 15 мин
+@goal
+<p>Обойти проверки через сырой тип и увидеть, что ошибка всплывает далеко от места, где её внесли.</p>
+@end
+@file Pollution.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Pollution {
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    static void legacyAdd(List list) {
+        list.add(42);                     // сырой тип: компилятор не проверяет
+    }
+
+    public static void main(String[] args) {
+        List<String> names = new ArrayList<>();
+        names.add("Анна");
+        legacyAdd(names);
+        System.out.println("размер: " + names.size() + ", содержимое: " + names);
+        for (String n : names) System.out.println(n.toUpperCase());
+    }
+}
+@end
+@predict На какой строке и с каким сообщением программа упадёт?
+@answer
+<p>Не в <code>legacyAdd</code> и не на <code>println(names)</code> (toString работает с Object), а в цикле: <code>ClassCastException: class java.lang.Integer cannot be cast to class java.lang.String</code> — на скрытом <code>checkcast</code>, вставленном javac при чтении элемента как String. В реальном коде между «загрязнением» и падением могут быть тысячи строк. Защита — <code>Collections.checkedList(names, String.class)</code>: тогда упадёт сам <code>add</code>.</p>
+@end
+@run fail
+javac Pollution.java
+java Pollution
+@end
+@try
+Уберите <code>@SuppressWarnings</code> и скомпилируйте с <code>javac -Xlint:unchecked</code>. ::: Компилятор честно предупреждает: «unchecked call to add(E) as a member of the raw type List». Подавлять такие предупреждения можно только там, где вы доказали безопасность.
+@end
+
+@lab 7.3 | PECS на практике: copy и sum | 20 мин
+@goal
+<p>Написать обобщённые методы с правильными wildcard и проверить, какие вызовы компилируются.</p>
+@end
+@file Pecs.java
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+public class Pecs {
+    // Producer extends: из src только читаем
+    static double sum(Collection<? extends Number> src) {
+        double s = 0;
+        for (Number n : src) s += n.doubleValue();
+        return s;
+    }
+
+    // Consumer super: в dst только пишем
+    static <T> void copy(List<? extends T> src, List<? super T> dst) {
+        for (T t : src) dst.add(t);
+    }
+
+    public static void main(String[] args) {
+        List<Integer> ints = List.of(1, 2, 3);
+        List<Double> doubles = List.of(0.5, 1.5);
+        System.out.println("sum ints = " + sum(ints) + ", sum doubles = " + sum(doubles));
+
+        List<Number> numbers = new ArrayList<>();
+        List<Object> objects = new ArrayList<>();
+        copy(ints, numbers);
+        copy(doubles, numbers);
+        copy(numbers, objects);
+        System.out.println("numbers = " + numbers + ", objects = " + objects);
+    }
+}
+@end
+@run
+javac Pecs.java
+java Pecs
+@end
+@predict Какие из этих строк, добавленных в main, скомпилируются: <code>sum(numbers)</code>, <code>copy(objects, numbers)</code>, а в теле sum — <code>src.add(1)</code>?
+@answer
+<p><code>sum(numbers)</code> — да. <code>copy(objects, numbers)</code> — нет: из списка Object нельзя гарантировать Number. <code>src.add(1)</code> внутри sum — нет: <code>? extends Number</code> может оказаться <code>List&lt;Double&gt;</code>, и добавить туда Integer было бы ошибкой; в «производителя» можно добавить только <code>null</code>. Проверьте каждую строку — сообщения компилятора с capture#1 стоит научиться читать.</p>
+@end
+@try
+Почему сигнатура JDK — <code>Collections.max(Collection&lt;? extends T&gt; coll)</code> с <code>T extends Object &amp; Comparable&lt;? super T&gt;</code>? ::: <code>? super T</code> у Comparable позволяет искать максимум для типа, который унаследовал compareTo от родителя (например, <code>java.sql.Timestamp</code> сравнивается как <code>Date</code>). <code>Object &amp;</code> — трюк для совместимости: после стирания результат остаётся Object, как в Java 1.4.
+@end

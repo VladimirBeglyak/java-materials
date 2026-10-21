@@ -32,7 +32,7 @@
   <div class="kicker">ТЕМА 12 · СБОРКА МУСОРА</div>
   <h1>Сборка мусора: основы</h1>
   <p class="lead">Сборщик мусора не ищет мусор — он ищет живое: всё, до чего можно дойти по ссылкам от корней, а остальное объявляет свободным. Поверх этой идеи построены все сборщики JVM: пометка, очистка, уплотнение, копирование, поколения, барьеры записи, safepoints и конкурентная пометка. В симуляторе вы сами пометите граф объектов и увидите, почему конкурентная сборка без барьеров теряет живые объекты.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">GC roots</span><span class="tag">mark-sweep-compact</span><span class="tag">копирование</span><span class="tag">поколения</span><span class="tag">card table</span><span class="tag">трёхцветная пометка</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">GC roots</span><span class="tag">mark-sweep-compact</span><span class="tag">копирование</span><span class="tag">поколения</span><span class="tag">card table</span><span class="tag">трёхцветная пометка</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -140,7 +140,156 @@
   <div class="card"><h4>Incremental update</h4><p>Барьер <b>после</b> записи помечает новую ссылку (или делает чёрный объект снова серым), и GC пересканирует такие объекты в финальной паузе. Использовал CMS. ZGC использует цветные указатели и барьеры чтения (тема 13).</p></div>
 </div>
 
-<h2 id="quiz"><span class="h-num">12.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">12.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Сборщик нельзя «увидеть» напрямую, но можно поставить на объект датчик — <code>WeakReference</code>: она не мешает сборке и становится пустой, когда объект собран. С этим датчиком и логами GC проверим достижимость, поколения и safepoints. Модуль IDEA — <code>ch12</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-12.1">
+<div class="lab-head"><span class="lab-num">Лаба 12.1</span><b>Достижимость: что соберут, а что нет</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить на живом GC: циклические ссылки не мешают сборке, статические поля и локальные переменные — корни.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Reach.java</code>:</div>
+<pre data-title="Reach.java"><code class="java">import java.lang.ref.WeakReference;
+
+public class Reach {
+    static class Node { Node next; byte[] payload = new byte[1024]; }
+    static Object root;
+
+    static boolean collected(WeakReference&lt;?&gt; probe) {
+        for (int i = 0; i &lt; 5 &amp;&amp; probe.get() != null; i++) System.gc();
+        return probe.get() == null;
+    }
+
+    public static void main(String[] args) {
+        // 1. цикл a &lt;-&gt; b без внешних ссылок
+        Node a = new Node(), b = new Node();
+        a.next = b; b.next = a;
+        var p1 = new WeakReference&lt;&gt;(a);
+        a = null; b = null;
+        System.out.println("1. цикл собран:              " + collected(p1));
+
+        // 2. объект в статическом поле
+        root = new Node();
+        var p2 = new WeakReference&lt;&gt;(root);
+        System.out.println("2. статическое поле собрано: " + collected(p2));
+
+        // 3. объект, достижимый только через WeakReference
+        var p3 = new WeakReference&lt;&gt;(new Node());
+        System.out.println("3. только weak собран:       " + collected(p3));
+
+        // 4. локальная переменная, которая ещё используется ниже
+        Node local = new Node();
+        var p4 = new WeakReference&lt;&gt;(local);
+        System.out.println("4. живая локальная собрана:  " + collected(p4));
+        System.out.println("   (local ещё нужна: " + local.payload.length + ")");
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запишите для каждого пункта true/false.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Reach.java
+java Reach</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1. цикл собран:              true
+2. статическое поле собрано: false
+3. только weak собран:       true
+4. живая локальная собрана:  false
+   (local ещё нужна: 1024)</code></pre></details>
+<div class="lab-ans" hidden><p>1 — <b>true</b>: трассирующий GC ищет пути от корней; цикл, до которого не дойти, — мусор (подсчёт ссылок здесь ошибся бы). 2 — <b>false</b>: статическое поле загруженного класса — корень. 3 — <b>true</b>: слабая ссылка не удерживает. 4 — <b>false</b>: локальная переменная в активном кадре — корень, пока она ещё понадобится.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите последнюю строку <code>System.out.println("   (local ещё нужна…")</code> и прогоните метод в цикле много раз, чтобы его скомпилировал JIT. Может ли пункт 4 стать true?</summary><div>Да. JIT знает, где переменная используется в последний раз, и после этого не считает её корнем — объект может быть собран раньше, чем закончится метод. Поэтому для «удержания» объекта в Java 9+ есть <code>Reference.reachabilityFence(obj)</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-12.2">
+<div class="lab-head"><span class="lab-num">Лаба 12.2</span><b>Поколения в логе: возраст и продвижение в old</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть, как объекты переживают молодые сборки, «стареют» в survivor и переезжают в старое поколение.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Ages.java</code>:</div>
+<pre data-title="Ages.java"><code class="java">import java.util.ArrayDeque;
+
+public class Ages {
+    public static void main(String[] args) {
+        int window = Integer.parseInt(args.length &gt; 0 ? args[0] : "3000");
+        var recent = new ArrayDeque&lt;byte[]&gt;();                // «последние запросы» — живут недолго, но не мгновенно
+        for (int i = 0; i &lt; 30_000; i++) {
+            recent.addLast(new byte[1024]);
+            if (recent.size() &gt; window) recent.removeFirst();
+            for (int j = 0; j &lt; 20; j++) {
+                byte[] garbage = new byte[1024];             // умирает сразу
+            }
+        }
+        System.out.println("готово, в окне " + recent.size());
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите с самым простым сборщиком (Serial) и журналом возрастов. Куча 64 МБ, молодое поколение 32 МБ:</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:+UseSerialGC -Xmx64m -Xmn32m -Xlog:gc,gc+age=trace</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Ages.java
+java -XX:+UseSerialGC -Xmx64m -Xmn32m -Xlog:gc,gc+age=trace Ages</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.006s][info][gc] Using Serial
+[0.039s][debug][gc,age] GC(0) Desired survivor size 1671168 bytes, new threshold 15 (max threshold 15)
+[0.039s][trace][gc,age] GC(0) Age table:
+[0.039s][trace][gc,age] GC(0) - age   1:    1331672 bytes,    1331672 total
+[0.039s][info ][gc    ] GC(0) Pause Young (Allocation Failure) 26M-&gt;2M(60M) 0.962ms
+[0.043s][debug][gc,age] GC(1) Desired survivor size 1671168 bytes, new threshold 2 (max threshold 15)
+[0.043s][trace][gc,age] GC(1) Age table:
+[0.043s][trace][gc,age] GC(1) - age   1:    1287408 bytes,    1287408 total
+[0.043s][trace][gc,age] GC(1) - age   2:    1326624 bytes,    2614032 total
+[0.043s][info ][gc    ] GC(1) Pause Young (Allocation Failure) 28M-&gt;3M(60M) 1.230ms
+[0.047s][debug][gc,age] GC(2) Desired survivor size 1671168 bytes, new threshold 2 (max threshold 15)
+[0.047s][trace][gc,age] GC(2) Age table:
+[0.047s][trace][gc,age] GC(2) - age   1:    1292016 bytes,    1292016 total
+[0.047s][trace][gc,age] GC(2) - age   2:    1276080 bytes,    2568096 total
+[0.047s][info ][gc    ] GC(2) Pause Young (Allocation Failure) 29M-&gt;4M(60M) 1.327ms
+[0.051s][debug][gc,age] GC(3) Desired survivor size 1671168 bytes, new threshold 2 (max threshold 15)
+[0.051s][trace][gc,age] GC(3) Age table:
+[0.051s][trace][gc,age] GC(3) - age   1:    1276080 bytes,    1276080 total
+[0.051s][trace][gc,age] GC(3) - age   2:    1292016 bytes,    2568096 total
+[0.051s][info ][gc    ] GC(3) Pause Young (Allocation Failure) 29M-&gt;4M(60M) 0.698ms
+[0.055s][debug][gc,age] GC(4) Desired survivor size 1671168 bytes, new threshold 2 (max threshold 15)
+[0.055s][trace][gc,age] GC(4) Age table:
+[0.055s][trace][gc,age] GC(4) - age   1:    1277192 bytes,    1277192 total
+[0.055s][trace][gc,age] GC(4) - age   2:    1276080 bytes,    2553272 total
+[0.055s][info ][gc    ] GC(4) Pause Young (Allocation Failure) 30M-&gt;5M(60M) 0.773ms
+[0.058s][debug][gc,age] GC(5) Desired survivor size 1671168 bytes, new threshold 1 (max threshold 15)
+[0.058s][trace][gc,age] GC(5) Age table:
+[0.058s][trace][gc,age] GC(5) - age   1:    3120000 bytes,    3120000 total
+[0.058s][trace][gc,age] GC(5) - age   2:         72 bytes,    3120072 total
+[0.058s][info ][gc    ] GC(5) Pause Young (Allocation Failure) 30M-&gt;5M(60M) 0.664ms
+готово, в окне 3000</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Объект из окна живёт 3000 итераций — это примерно две молодые сборки. Какие возрасты появятся в таблице и дойдут ли объекты до порога 15?</div>
+<div class="lab-ans" hidden><p>В таблице появляются <code>age 1</code> и <code>age 2</code> — объекты переживают одну-две сборки, копируясь между survivor-пространствами. До 15 они не доживают: JVM после каждой сборки пересчитывает порог (<i>new threshold</i>) так, чтобы выжившие помещались в половину survivor (<i>Desired survivor size</i>), и когда выживших много, порог падает до 1–2. Тогда объекты продвигаются в old раньше, чем умрут, — занятость после сборки растёт (5M → 11M): это «преждевременное продвижение», мусор, который потом придётся убирать дорогой сборкой старого поколения.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>-XX:MaxTenuringThreshold=0</code>. Что изменится в логе?</summary><div>Таблица возрастов опустеет (<code>new threshold 0</code>): всё, что пережило одну молодую сборку, сразу уходит в old. Old растёт быстрее, полные сборки наступают раньше.</div></details></li>
+<li><details><summary>Передайте аргумент <code>20000</code> (окно в 20 МБ).</summary><div>Выжившие больше не помещаются в survivor и потоком идут в old, старое поколение заполняется умирающими объектами — в логе появляется <code>Pause Full</code>, на порядок дороже молодых пауз.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-12.3">
+<div class="lab-head"><span class="lab-num">Лаба 12.3</span><b>Safepoint: остановки мира в цифрах</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть каждую остановку всех потоков: что её вызвало, сколько ждали, пока потоки дойдут до safepoint, и сколько длилась операция.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xlog:safepoint -XX:+UseSerialGC -Xmx64m -Xmn32m</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xlog:safepoint -XX:+UseSerialGC -Xmx64m -Xmn32m Ages</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.039s][info][safepoint] Safepoint "SerialCollectForAllocation", Time since last: 19865600 ns, Reaching safepoint: 8200 ns, At safepoint: 1010900 ns, Leaving safepoint: 1100 ns, Total: 1020200 ns, Threads: 0 runnable, 11 total
+[0.043s][info][safepoint] Safepoint "SerialCollectForAllocation", Time since last: 2848100 ns, Reaching safepoint: 2100 ns, At safepoint: 1486200 ns, Leaving safepoint: 800 ns, Total: 1489100 ns, Threads: 0 runnable, 11 total
+[0.047s][info][safepoint] Safepoint "SerialCollectForAllocation", Time since last: 2754700 ns, Reaching safepoint: 1600 ns, At safepoint: 1405500 ns, Leaving safepoint: 500 ns, Total: 1407600 ns, Threads: 0 runnable, 11 total
+[0.051s][info][safepoint] Safepoint "SerialCollectForAllocation", Time since last: 2743100 ns, Reaching safepoint: 2900 ns, At safepoint: 718100 ns, Leaving safepoint: 2000 ns, Total: 723000 ns, Threads: 0 runnable, 11 total
+[0.054s][info][safepoint] Safepoint "SerialCollectForAllocation", Time since last: 2807500 ns, Reaching safepoint: 16200 ns, At safepoint: 691700 ns, Leaving safepoint: 5500 ns, Total: 713400 ns, Threads: 0 runnable, 11 total
+[0.058s][info][safepoint] Safepoint "SerialCollectForAllocation", Time since last: 2940500 ns, Reaching safepoint: 1800 ns, At safepoint: 519800 ns, Leaving safepoint: 600 ns, Total: 522200 ns, Threads: 0 runnable, 11 total
+готово, в окне 3000</code></pre></details>
+<p class="lab-note">Колонки: <code>Reaching safepoint</code> — время, пока все потоки дошли до точки остановки (time-to-safepoint), <code>At safepoint</code> — сама операция (здесь — сборка <code>SerialCollectForAllocation</code>), <code>Total</code> — полная пауза для приложения. В логах GC видно только второе; в инцидентах с «необъяснимыми паузами» часто виновато первое.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите <code>jcmd &lt;pid&gt; Thread.print</code> для любого процесса, запущенного с <code>-Xlog:safepoint</code>. Появится ли в логе новая строка?</summary><div>Да — <code>PrintThreads</code>: дамп потоков тоже делается в safepoint. Так же останавливают мир <code>GC.heap_dump</code>, деоптимизация, переопределение классов агентом.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">12.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Два объекта ссылаются друг на друга, других ссылок на них нет. Соберёт ли их GC?</p><ul><li>Нет, у них ненулевой счётчик ссылок</li><li>Да: они недостижимы от корней</li><li>Только Full GC</li><li>Только если вызвать System.gc()</li></ul><div class="why">JVM использует трассировку достижимости, а не подсчёт ссылок.</div></div>
 <div class="mcq" data-ok="3"><p>Почему молодая сборка обычно быстрая даже при большом eden?</p><ul><li>Она не останавливает потоки</li><li>Eden маленький</li><li>Она не трогает объекты</li><li>Копируются только живые объекты, а их в eden обычно единицы процентов</li></ul><div class="why">Стоимость копирующего сборщика пропорциональна живым данным.</div></div>

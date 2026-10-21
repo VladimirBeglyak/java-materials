@@ -1,0 +1,97 @@
+@chapter 19 | quiz
+@intro
+<p>Foreign Function &amp; Memory API (финальный с Java 22) позволяет вызвать функцию из C-библиотеки и работать с памятью вне кучи без единой строки на C — идеально для экспериментов. JNI требует компилятора C, поэтому его здесь только читаем. Модуль IDEA — <code>ch19</code>. Флаг <code>--enable-native-access=ALL-UNNAMED</code> убирает предупреждение о «restricted»-методах.</p>
+@end
+
+@lab 19.1 | Вызываем strlen из стандартной библиотеки C | 20 мин
+@goal
+<p>Найти нативную функцию, описать её сигнатуру и вызвать через downcall handle.</p>
+@end
+@file Strlen.java
+import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
+
+import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+
+public class Strlen {
+    public static void main(String[] args) throws Throwable {
+        Linker linker = Linker.nativeLinker();
+        MemorySegment fn = linker.defaultLookup().find("strlen").orElseThrow();
+        // size_t strlen(const char *s)
+        MethodHandle strlen = linker.downcallHandle(fn, FunctionDescriptor.of(JAVA_LONG, ADDRESS));
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment cStr = arena.allocateFrom("Привет, FFM!");     // UTF-8 + завершающий ноль
+            long len = (long) strlen.invokeExact(cStr);
+            System.out.println("strlen = " + len + ", Java length() = " + "Привет, FFM!".length());
+            System.out.println("размер сегмента: " + cStr.byteSize());
+        }
+    }
+}
+@end
+@predict Совпадут ли <code>strlen</code> и <code>length()</code>?
+@answer
+<p>Нет: <code>strlen</code> считает <b>байты</b> до нуля в UTF-8 (кириллица — 2 байта на букву: 6×2 + 6 = 18), а <code>length()</code> — UTF-16 символы (12). Сегмент на 1 байт больше — завершающий ноль. Ровно такие ошибки «длина в символах против длины в байтах» и ловят на границе Java и C.</p>
+@end
+@ide VM options: <code>--enable-native-access=ALL-UNNAMED</code>
+@run
+javac Strlen.java
+java --enable-native-access=ALL-UNNAMED Strlen
+@end
+@try
+Уберите <code>--enable-native-access</code>. ::: Программа работает, но печатает WARNING о вызове restricted-метода <code>downcallHandle</code>: в будущих версиях без флага это станет ошибкой. Опасные операции FFM требуют явного разрешения.
+@end
+
+@lab 19.2 | Память вне кучи: границы, время жизни, структуры | 20 мин
+@goal
+<p>Убедиться, что FFM, в отличие от Unsafe, проверяет границы и время жизни памяти.</p>
+@end
+@file OffHeap.java
+import java.lang.foreign.*;
+
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+
+public class OffHeap {
+    public static void main(String[] args) {
+        MemorySegment leaked;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment ints = arena.allocate(JAVA_INT, 10);         // int[10] вне кучи
+            for (int i = 0; i < 10; i++) ints.setAtIndex(JAVA_INT, i, i * i);
+            System.out.println("ints[9] = " + ints.getAtIndex(JAVA_INT, 9));
+            try {
+                ints.setAtIndex(JAVA_INT, 10, 1);                       // за границей
+            } catch (IndexOutOfBoundsException e) {
+                System.out.println("граница: " + e.getMessage());
+            }
+            leaked = ints;
+        }
+        try {
+            leaked.getAtIndex(JAVA_INT, 0);                             // после закрытия арены
+        } catch (IllegalStateException e) {
+            System.out.println("после close: " + e.getMessage());
+        }
+
+        // структура struct Point { int x; int y; }
+        StructLayout POINT = MemoryLayout.structLayout(JAVA_INT.withName("x"), JAVA_INT.withName("y"));
+        var X = POINT.varHandle(MemoryLayout.PathElement.groupElement("x"));
+        var Y = POINT.varHandle(MemoryLayout.PathElement.groupElement("y"));
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment p = arena.allocate(POINT);
+            X.set(p, 0L, 3); Y.set(p, 0L, 4);
+            System.out.println("Point размером " + POINT.byteSize() + " байт: x=" + X.get(p, 0L) + ", y=" + Y.get(p, 0L));
+        }
+    }
+}
+@end
+@predict Что напечатают две «ошибочные» операции — за границей сегмента и после закрытия арены?
+@answer
+<p>Оба доступа безопасно отклоняются исключениями: <code>IndexOutOfBoundsException</code> (out of bounds) и <code>IllegalStateException: Already closed</code>. С <code>sun.misc.Unsafe</code> первая операция испортила бы чужую память, а вторая читала бы освобождённую — с возможным крахом JVM. Проверки почти бесплатны: JIT убирает их там, где может доказать корректность.</p>
+@end
+@run
+javac OffHeap.java
+java OffHeap
+@end
+@try
+Прочитайте сегмент из confined-арены в другом потоке (<code>new Thread(() -&gt; ints.getAtIndex(JAVA_INT, 0)).start()</code> внутри try). ::: <code>WrongThreadException</code>: confined-арена принадлежит одному потоку. Для общего доступа — <code>Arena.ofShared()</code>, для «пусть соберёт GC» — <code>Arena.ofAuto()</code>.
+@end

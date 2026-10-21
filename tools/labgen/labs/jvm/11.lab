@@ -1,0 +1,119 @@
+@chapter 11 | quiz
+@intro
+<p>Сколько байт выделяет ваш код, можно измерить прямо из программы: <code>com.sun.management.ThreadMXBean.getThreadAllocatedBytes</code> считает выделения текущего потока (их и показывают профилировщики аллокаций). На этом счётчике проверим escape analysis и связь темпа выделения с частотой сборок. Модуль IDEA — <code>ch11</code>.</p>
+@end
+
+@lab 11.1 | Escape analysis: объекты, которых нет | 20 мин
+@goal
+<p>Увидеть, как C2 убирает выделение памяти для объектов, не покидающих метод, и как это ломается.</p>
+@end
+@file Escape.java
+import java.lang.management.ManagementFactory;
+
+public class Escape {
+    record Point(int x, int y) {
+        Point plus(Point o) { return new Point(x + o.x, y + o.y); }
+    }
+
+    static Point sink;   // «утечка» наружу
+
+    static long noEscape(int n) {
+        long s = 0;
+        for (int i = 0; i < n; i++) {
+            Point p = new Point(i, i).plus(new Point(1, 2));   // три объекта: два здесь, один в plus
+            s += p.x() + p.y();
+        }
+        return s;
+    }
+
+    static long escapes(int n) {
+        long s = 0;
+        for (int i = 0; i < n; i++) {
+            Point p = new Point(i, i);
+            sink = p;                                          // объект виден снаружи
+            s += p.x();
+        }
+        return s;
+    }
+
+    public static void main(String[] args) {
+        var mx = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();
+        long tid = Thread.currentThread().threadId();
+        for (int round = 1; round <= 5; round++) {
+            long b0 = mx.getThreadAllocatedBytes(tid);
+            noEscape(1_000_000);
+            long b1 = mx.getThreadAllocatedBytes(tid);
+            escapes(1_000_000);
+            long b2 = mx.getThreadAllocatedBytes(tid);
+            System.out.printf("раунд %d: noEscape %,12d байт   escapes %,12d байт%n", round, b1 - b0, b2 - b1);
+        }
+    }
+}
+@end
+@predict Объект <code>Point</code> с двумя int занимает 24 байта (12 заголовок + 8 поля + 4 выравнивание), каждая итерация <code>noEscape</code> создаёт три таких объекта — 72 МБ на миллион итераций. Что покажут раунды?
+@answer
+<p>Первые раунды — меньше 72 МБ, но не ноль: часть итераций выполняется ещё в интерпретаторе или C1, а с середины цикла подключается OSR-версия от C2. Как только C2 скомпилирует <code>noEscape</code> целиком, выделения падают до нуля: объекты не покидают метод, и после встраивания <code>plus</code> скалярная замена превращает их поля в локальные переменные. В <code>escapes</code> объект записывается в статическое поле — сбегает — и честно выделяется: 24 МБ на миллион. С <code>-XX:-DoEscapeAnalysis</code> noEscape стабильно выделяет все 72 МБ.</p>
+@end
+@run
+javac Escape.java
+java Escape
+@end
+@step Выключите оптимизацию и сравните:
+@ide VM options: <code>-XX:-DoEscapeAnalysis</code>
+@run
+java -XX:-DoEscapeAnalysis Escape
+@end
+@try
+Добавьте в <code>noEscape</code> строку <code>if (i == n - 1) sink = p;</code>. ::: Объект «сбегает» хотя бы на одной ветке — для C2 это GlobalEscape, и скалярная замена не применяется (C2 не умеет выделять объект «только на редкой ветке»; это частично умеет Graal). Выделения вернутся.
+Сделайте <code>plus</code> огромным (добавьте в него 50 строк вычислений) — что станет с выделениями и почему? ::: Метод перестанет встраиваться (лимит размера байткода, тема 17), объект станет аргументом невстроенного вызова — ArgEscape, — и выделения вернутся. Escape analysis работает только после встраивания.
+@end
+
+@lab 11.2 | Темп выделения → частота сборок | 15 мин
+@goal
+<p>Увидеть в логе GC, что молодые сборки происходят каждый раз, когда заполняется eden, и что их частота пропорциональна темпу выделения.</p>
+@end
+@file Rate.java
+public class Rate {
+    static byte[] last;
+
+    public static void main(String[] args) throws Exception {
+        int kbPerMs = Integer.parseInt(args[0]);
+        long end = System.currentTimeMillis() + 2000;
+        long total = 0;
+        while (System.currentTimeMillis() < end) {
+            for (int i = 0; i < kbPerMs; i++) { last = new byte[1024]; total++; }
+            Thread.sleep(1);
+        }
+        System.out.printf("выделено ~%d МБ за 2 с%n", total / 1024);
+    }
+}
+@end
+@ide VM options: <code>-Xmx256m -Xmn32m -Xlog:gc</code>, Program arguments: <code>100</code>
+@run grep="Pause Young|выделено"
+javac Rate.java
+java -Xmx256m -Xmn32m -Xlog:gc Rate 100
+@end
+@predict Увеличьте темп в 5 раз (аргумент <code>500</code>). Как изменится число сборок и длительность каждой?
+@answer
+<p>Сборок станет примерно в 5 раз больше — eden 32 МБ заполняется в 5 раз быстрее. А длительность каждой почти не изменится: молодая сборка копирует только живые объекты, а у нас живёт один последний массив. Стоимость молодой сборки ∝ числу выживших, а не выделенных объектов.</p>
+@end
+@run grep="Pause Young|выделено"
+java -Xmx256m -Xmn32m -Xlog:gc Rate 500
+@end
+@try
+Уменьшите eden: <code>-Xmn8m</code> при том же темпе. ::: Сборок станет в ~4 раза больше. Поэтому первый рычаг против частых молодых сборок — снизить темп выделения (профилировщик аллокаций), второй — дать больше места молодому поколению.
+@end
+
+@lab 11.3 | TLAB в логах | 10 мин
+@goal
+<p>Посмотреть статистику TLAB: сколько буферов выдали потокам и какая доля выделений прошла медленным путём.</p>
+@end
+@step Запустите <code>Rate</code> из лабы 11.2 с журналом TLAB:
+@ide VM options: <code>-Xlog:gc+tlab=debug -Xmx256m -Xmn32m</code>
+@run grep="TLAB totals|thrds|slow|Pause Young" head=8
+java -Xlog:gc+tlab=debug -Xmx256m -Xmn32m Rate 300
+@end
+@note Строки <code>TLAB totals</code> печатаются при каждой сборке: число потоков, получивших TLAB, сколько буферов выдано (refills), доля «отходов» (waste) и выделения вне TLAB (slow allocs). При нормальной работе медленных выделений почти нет — <code>new</code> обходится в сдвиг указателя.
+@try
+Выключите TLAB: <code>-XX:-UseTLAB</code> и запустите <code>Rate 300</code> с замером времени. ::: Каждое выделение пойдёт через атомарную операцию в общем eden; в одном потоке разница невелика, а в многопоточном коде выделение становится узким местом. Поэтому TLAB включён всегда.
+@end

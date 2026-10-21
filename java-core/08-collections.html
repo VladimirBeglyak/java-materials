@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 08 · ТИПЫ И КОЛЛЕКЦИИ</div>
   <h1>Коллекции: List, Queue, Deque</h1>
   <p class="lead">Выбор коллекции — это выбор структуры данных, а значит, сложности операций и расхода памяти. Глава о линейных коллекциях: как устроен <code>ArrayList</code>, почему <code>LinkedList</code> почти никогда не нужен, чем <code>List.of</code> отличается от <code>Arrays.asList</code> и откуда берётся <code>ConcurrentModificationException</code> в однопоточном коде.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">ArrayList</span><span class="tag">ArrayDeque</span><span class="tag">fail-fast</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">ArrayList</span><span class="tag">ArrayDeque</span><span class="tag">fail-fast</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -257,7 +257,203 @@ nums.remove(Integer.valueOf(10));     // удалит ЗНАЧЕНИЕ 10 → [3
 })();
 </script>
 
-<h2 id="quiz"><span class="h-num">8.10</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">8.10</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Заглянем внутрь <code>ArrayList</code> (рост массива), сравним его с <code>LinkedList</code> на настоящих замерах, поймаем <code>ConcurrentModificationException</code> и разберёмся с «неизменяемыми» коллекциями. Модуль IDEA — <code>ch08</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-8.1">
+<div class="lab-head"><span class="lab-num">Лаба 8.1</span><b>Как растёт ArrayList</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Подсмотреть ёмкость внутреннего массива через рефлексию и увидеть рост в 1,5 раза.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Growth.java</code>:</div>
+<pre data-title="Growth.java"><code class="java">import java.lang.reflect.Field;
+import java.util.ArrayList;
+
+public class Growth {
+    static int capacity(ArrayList&lt;?&gt; list) throws Exception {
+        Field f = ArrayList.class.getDeclaredField("elementData");
+        f.setAccessible(true);
+        return ((Object[]) f.get(list)).length;
+    }
+
+    public static void main(String[] args) throws Exception {
+        ArrayList&lt;Integer&gt; list = new ArrayList&lt;&gt;();
+        int last = -1;
+        System.out.println("пустой: ёмкость " + capacity(list));
+        for (int i = 0; i &lt; 200; i++) {
+            list.add(i);
+            int c = capacity(list);
+            if (c != last) { System.out.println("size=" + list.size() + " → ёмкость " + c); last = c; }
+        }
+        list.trimToSize();
+        System.out.println("после trimToSize: " + capacity(list));
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Поле <code>elementData</code> приватное в модуле java.base, поэтому нужен флаг открытия пакета:</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>--add-opens java.base/java.util=ALL-UNNAMED</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Growth.java
+java --add-opens java.base/java.util=ALL-UNNAMED Growth</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">пустой: ёмкость 0
+size=1 → ёмкость 10
+size=11 → ёмкость 15
+size=16 → ёмкость 22
+size=23 → ёмкость 33
+size=34 → ёмкость 49
+size=50 → ёмкость 73
+size=74 → ёмкость 109
+size=110 → ёмкость 163
+size=164 → ёмкость 244
+после trimToSize: 200</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему у пустого списка ёмкость 0, а после первого add — 10?</div>
+<div class="lab-ans" hidden><p>Конструктор без аргументов не выделяет массив (общий пустой массив-заглушка), и только первый add создаёт массив на 10 элементов. Дальше рост <code>old + old/2</code>: 10 → 15 → 22 → 33 → 49 → 73 → 109 → 163 → 244. Если размер известен заранее — <code>new ArrayList&lt;&gt;(n)</code> избавит от копирований.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Создайте <code>new ArrayList&lt;&gt;(0)</code> и добавьте элементы. Отличается ли рост?</summary><div>Да: явный ноль использует другую заглушку, и рост идёт 1 → 2 → 3 → 4 → 6 → 9… — без начального скачка до 10.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-8.2">
+<div class="lab-head"><span class="lab-num">Лаба 8.2</span><b>ArrayList против LinkedList: замер, а не легенда</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить, где LinkedList действительно выигрывает, а где проигрывает в разы.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ListBench.java</code>:</div>
+<pre data-title="ListBench.java"><code class="java">import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.function.Supplier;
+
+public class ListBench {
+    static long time(Runnable r) { long t = System.nanoTime(); r.run(); return (System.nanoTime() - t) / 1_000_000; }
+
+    static void bench(String name, Supplier&lt;List&lt;Integer&gt;&gt; factory) {
+        int n = 100_000;
+        List&lt;Integer&gt; l = factory.get();
+        long addEnd = time(() -&gt; { for (int i = 0; i &lt; n; i++) l.add(i); });
+        long iterate = time(() -&gt; { long s = 0; for (int x : l) s += x; });
+        long getMiddle = time(() -&gt; { long s = 0; for (int i = 0; i &lt; 1000; i++) s += l.get(n / 2); });
+        long addFront = time(() -&gt; { for (int i = 0; i &lt; 10_000; i++) l.add(0, i); });
+        System.out.printf("%-10s add в конец %3d мс | обход %3d мс | 1000×get(n/2) %4d мс | 10000×add(0) %4d мс%n",
+                name, addEnd, iterate, getMiddle, addFront);
+    }
+
+    public static void main(String[] args) {
+        for (int round = 0; round &lt; 2; round++) {
+            bench("ArrayList", ArrayList::new);
+            bench("LinkedList", LinkedList::new);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Где LinkedList выиграет и насколько проиграет на <code>get(n/2)</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac ListBench.java
+java ListBench</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ArrayList  add в конец   4 мс | обход   4 мс | 1000×get(n/2)    0 мс | 10000×add(0)   79 мс
+LinkedList add в конец   2 мс | обход   1 мс | 1000×get(n/2)   66 мс | 10000×add(0)    1 мс
+ArrayList  add в конец   5 мс | обход   0 мс | 1000×get(n/2)    0 мс | 10000×add(0)   74 мс
+LinkedList add в конец   1 мс | обход   4 мс | 1000×get(n/2)   62 мс | 10000×add(0)    1 мс</code></pre></details>
+<p class="lab-note">Второй раунд показательнее первого — код уже скомпилирован JIT. Для серьёзных замеров используйте JMH.</p>
+<div class="lab-ans" hidden><p>Вставка в начало: у ArrayList каждая сдвигает весь массив (O(n)), у LinkedList — O(1); выигрыш LinkedList здесь реален. <code>get(n/2)</code> у LinkedList — проход 50 000 узлов на каждый вызов, на порядки медленнее. Добавление в конец и обход на 100 000 элементах — единицы миллисекунд у обоих, и победитель меняется от запуска к запуску. На больших объёмах ArrayList выигрывает: массив лежит в памяти подряд, а узлы LinkedList разбросаны и занимают ~24–40 байт на элемент. Для очереди с двух концов вместо LinkedList берут <code>ArrayDeque</code>.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-8.3">
+<div class="lab-head"><span class="lab-num">Лаба 8.3</span><b>ConcurrentModificationException и как правильно удалять</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Поймать fail-fast итератор и узнать три корректных способа удаления.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Cme.java</code>:</div>
+<pre data-title="Cme.java"><code class="java">import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+public class Cme {
+    public static void main(String[] args) {
+        List&lt;String&gt; list = new ArrayList&lt;&gt;(List.of("a", "bb", "c", "dd", "e"));
+        try {
+            for (String s : list) if (s.length() == 2) list.remove(s);
+        } catch (Exception e) {
+            System.out.println("1. " + e.getClass().getSimpleName() + ", список: " + list);
+        }
+
+        List&lt;String&gt; l2 = new ArrayList&lt;&gt;(List.of("a", "bb", "c", "dd"));
+        for (String s : l2) if (s.equals("c")) l2.remove(s);
+        System.out.println("2. удалили предпоследний без ошибки?! " + l2);
+
+        List&lt;String&gt; l3 = new ArrayList&lt;&gt;(List.of("a", "bb", "c", "dd", "e"));
+        for (Iterator&lt;String&gt; it = l3.iterator(); it.hasNext(); ) if (it.next().length() == 2) it.remove();
+        System.out.println("3. Iterator.remove: " + l3);
+
+        List&lt;String&gt; l4 = new ArrayList&lt;&gt;(List.of("a", "bb", "c", "dd", "e"));
+        l4.removeIf(s -&gt; s.length() == 2);
+        System.out.println("4. removeIf: " + l4);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему во втором случае исключения нет?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Cme.java
+java Cme</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1. ConcurrentModificationException, список: [a, c, dd, e]
+2. удалили предпоследний без ошибки?! [a, bb, dd]
+3. Iterator.remove: [a, c, e]
+4. removeIf: [a, c, e]</code></pre></details>
+<div class="lab-ans" hidden><p>Проверка модификации происходит в <code>next()</code>. После удаления предпоследнего элемента размер стал 3, курсор итератора тоже 3 — <code>hasNext()</code> возвращает false, цикл завершается, и <code>next()</code> больше не вызывается. Последний элемент «dd» при этом не проверен! Fail-fast — это «best effort», а не гарантия. Удаляйте через <code>Iterator.remove</code> или <code>removeIf</code>.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-8.4">
+<div class="lab-head"><span class="lab-num">Лаба 8.4</span><b>Неизменяемые коллекции и представления</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Отличить <code>List.of</code>, <code>Collections.unmodifiableList</code> и <code>Arrays.asList</code> по поведению.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Views.java</code>:</div>
+<pre data-title="Views.java"><code class="java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+public class Views {
+    static void tryIt(String what, Runnable r) {
+        try { r.run(); System.out.println(what + ": ок"); }
+        catch (Exception e) { System.out.println(what + ": " + e.getClass().getSimpleName()); }
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; source = new ArrayList&lt;&gt;(List.of("a", "b"));
+        List&lt;String&gt; view = Collections.unmodifiableList(source);
+        List&lt;String&gt; copy = List.copyOf(source);
+        String[] arr = { "x", "y" };
+        List&lt;String&gt; asList = Arrays.asList(arr);
+
+        source.add("c");
+        System.out.println("view после изменения source: " + view);
+        System.out.println("copy после изменения source: " + copy);
+
+        tryIt("view.add", () -&gt; view.add("z"));
+        tryIt("asList.set", () -&gt; asList.set(0, "X"));
+        System.out.println("массив после asList.set: " + Arrays.toString(arr));
+        tryIt("asList.add", () -&gt; asList.add("z"));
+        tryIt("List.of(null)", () -&gt; List.of("a", null));
+        tryIt("List.of(..).contains(null)", () -&gt; List.of("a").contains(null));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что из этого сработает, а что бросит исключение?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Views.java
+java Views</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">view после изменения source: [a, b, c]
+copy после изменения source: [a, b]
+view.add: UnsupportedOperationException
+asList.set: ок
+массив после asList.set: [X, y]
+asList.add: UnsupportedOperationException
+List.of(null): NullPointerException
+List.of(..).contains(null): NullPointerException</code></pre></details>
+<div class="lab-ans" hidden><p><code>unmodifiableList</code> — только «окно» на source: изменения source видны (<code>[a, b, c]</code>), а запись через view — <code>UnsupportedOperationException</code>. <code>List.copyOf</code> — настоящая копия: <code>[a, b]</code>. <code>Arrays.asList</code> — представление массива фиксированной длины: <code>set</code> работает и меняет сам массив, <code>add</code> — UOE. <code>List.of</code> запрещает null: и при создании, и даже в <code>contains(null)</code> — <code>NullPointerException</code>.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">8.11</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Во сколько раз растёт внутренний массив ArrayList при переполнении?</p><ul><li>В 2 раза</li><li>На 10 элементов</li><li>В 1,5 раза: newCapacity = old + (old &gt;&gt; 1)</li><li>На 1 элемент</li></ul><div class="why">Геометрический рост даёт амортизированную O(1) для add. Если размер известен заранее — <code>new ArrayList&lt;&gt;(n)</code> избавит от копирований.</div></div>
 <div class="mcq" data-ok="0"><p>Что выбрать для очереди и стека в однопоточном коде?</p><ul><li>ArrayDeque — кольцевой массив, быстрее LinkedList и Stack</li><li>Stack — он для этого создан</li><li>LinkedList — вставка O(1)</li><li>Vector</li></ul><div class="why">Stack и Vector синхронизированы и устарели; LinkedList тратит объект-узел на элемент и плохо дружит с кэшем процессора.</div></div>

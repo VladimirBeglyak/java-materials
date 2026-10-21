@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 20 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
   <h1>SOLID и чистый код</h1>
   <p class="lead">Код читают в десять раз чаще, чем пишут, а меняют годами после написания. Принципы проектирования — это накопленный опыт о том, какой код дёшево менять. Здесь каждый принцип показан на паре «было — стало», с объяснением, какую именно боль он снимает, и с границей, за которой его применение превращается в переусложнение.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">SOLID</span><span class="tag">связность и сцепление</span><span class="tag">запахи кода</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">SOLID</span><span class="tag">связность и сцепление</span><span class="tag">запахи кода</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -221,7 +221,160 @@ class PlaceOrder {
 <tr><td><code>getUser()</code>, делающий запрос в сеть</td><td><code>fetchUser()</code>, <code>loadUser()</code></td><td>get выглядит дешёвым</td></tr>
 </table></div>
 
-<h2 id="quiz"><span class="h-num">20.10</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">20.10</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Принципы SOLID проверяются не определениями, а ответом на вопрос «что придётся менять, когда придёт новое требование». Возьмём класс, который делает всё, и проведём его через рефакторинг, сохраняя поведение: вывод программы до и после должен совпасть. В IDEA сделайте два модуля — <code>ch20-before</code> и <code>ch20-after</code> (класс <code>OrderService</code> есть в обоих), а в терминале работайте из каталога, где лежат папки <code>before</code> и <code>after</code>. Используйте автоматические рефакторинги IDEA (Ctrl+Alt+Shift+T): Extract Method, Extract Interface, Introduce Parameter.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-20.1">
+<div class="lab-head"><span class="lab-num">Лаба 20.1</span><b>До: класс, который делает всё</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в коде причины для изменения и записать их, прежде чем что-то трогать.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>before/OrderService.java</code>:</div>
+<pre data-title="before/OrderService.java"><code class="java">import java.util.List;
+
+public class OrderService {
+    record Item(String name, double price, int qty) { }
+
+    public String checkout(String customerEmail, String customerType, List&lt;Item&gt; items) {
+        double sum = 0;
+        for (Item i : items) sum += i.price() * i.qty();
+        if (customerType.equals("VIP")) sum = sum * 0.9;
+        else if (customerType.equals("EMPLOYEE")) sum = sum * 0.7;
+        String receipt = "Чек: " + items.size() + " поз., итого " + String.format(java.util.Locale.ROOT, "%.2f", sum);
+        System.out.println("[SMTP] to=" + customerEmail + " body=" + receipt);
+        System.out.println("[FILE] orders.log &lt;- " + customerEmail + ";" + sum);
+        return receipt;
+    }
+
+    public static void main(String[] args) {
+        var svc = new OrderService();
+        var items = List.of(new Item("кофе", 250, 2), new Item("круассан", 180, 1));
+        System.out.println(svc.checkout("anna@example.com", "VIP", items));
+        System.out.println(svc.checkout("boris@example.com", "REGULAR", items));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out-before before/OrderService.java
+java -cp out-before OrderService</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[SMTP] to=anna@example.com body=Чек: 2 поз., итого 612.00
+[FILE] orders.log &lt;- anna@example.com;612.0
+Чек: 2 поз., итого 612.00
+[SMTP] to=boris@example.com body=Чек: 2 поз., итого 680.00
+[FILE] orders.log &lt;- boris@example.com;680.0
+Чек: 2 поз., итого 680.00</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Назовите четыре причины, по которым этот класс придётся менять.</div>
+<div class="lab-ans" hidden><p>1) новые правила скидок (новый тип клиента) — нарушает OCP: каждый раз правим <code>if</code>; 2) формат чека; 3) способ уведомления (SMS вместо почты); 4) хранилище заказов (БД вместо файла). Четыре причины — четыре ответственности (SRP). Плюс класс невозможно протестировать без «отправки письма»: зависимости создаются и вызываются напрямую (DIP).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-20.2">
+<div class="lab-head"><span class="lab-num">Лаба 20.2</span><b>После: ответственности, абстракции, внедрение зависимостей</b><span class="lab-time">30 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Разнести ответственности по интерфейсам, сделать скидки расширяемыми без правки кода (OCP) и внедрить зависимости через конструктор (DIP) — с тем же выводом.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>after/OrderService.java</code>:</div>
+<pre data-title="after/OrderService.java"><code class="java">import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+public class OrderService {
+    record Item(String name, double price, int qty) { }
+
+    interface DiscountPolicy { double apply(double sum); }
+    interface Notifier { void send(String to, String body); }
+    interface OrderRepository { void save(String customer, double sum); }
+
+    static final Map&lt;String, DiscountPolicy&gt; DISCOUNTS = Map.of(
+        "VIP", s -&gt; s * 0.9,
+        "EMPLOYEE", s -&gt; s * 0.7);
+
+    private final Notifier notifier;
+    private final OrderRepository repository;
+
+    OrderService(Notifier notifier, OrderRepository repository) {
+        this.notifier = notifier;
+        this.repository = repository;
+    }
+
+    public String checkout(String email, String customerType, List&lt;Item&gt; items) {
+        double sum = DISCOUNTS.getOrDefault(customerType, s -&gt; s).apply(total(items));
+        String receipt = receipt(items, sum);
+        notifier.send(email, receipt);
+        repository.save(email, sum);
+        return receipt;
+    }
+
+    static double total(List&lt;Item&gt; items) { return items.stream().mapToDouble(i -&gt; i.price() * i.qty()).sum(); }
+    static String receipt(List&lt;Item&gt; items, double sum) { return "Чек: " + items.size() + " поз., итого " + String.format(Locale.ROOT, "%.2f", sum); }
+
+    public static void main(String[] args) {
+        Notifier smtp = (to, body) -&gt; System.out.println("[SMTP] to=" + to + " body=" + body);
+        OrderRepository file = (c, s) -&gt; System.out.println("[FILE] orders.log &lt;- " + c + ";" + s);
+        var svc = new OrderService(smtp, file);
+        var items = List.of(new Item("кофе", 250, 2), new Item("круассан", 180, 1));
+        System.out.println(svc.checkout("anna@example.com", "VIP", items));
+        System.out.println(svc.checkout("boris@example.com", "REGULAR", items));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out-after after/OrderService.java
+java -cp out-after OrderService</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[SMTP] to=anna@example.com body=Чек: 2 поз., итого 612.00
+[FILE] orders.log &lt;- anna@example.com;612.0
+Чек: 2 поз., итого 612.00
+[SMTP] to=boris@example.com body=Чек: 2 поз., итого 680.00
+[FILE] orders.log &lt;- boris@example.com;680.0
+Чек: 2 поз., итого 680.00</code></pre></details>
+</li>
+<li class="lab-step"><div class="lab-text">Сравните вывод «до» и «после» построчно — рефакторинг не должен менять поведение:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -cp out-before OrderService &gt; before.txt
+java -cp out-after OrderService &gt; after.txt
+fc before.txt after.txt</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">FC: различия не найдены</code></pre></details>
+<p class="lab-note"><code>fc</code> — сравнение файлов в Windows (в PowerShell пишите <code>fc.exe</code>), в bash — <code>diff before.txt after.txt</code>, в IDEA — выделить оба файла → Ctrl+D.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте тип клиента STUDENT со скидкой 15% — сколько файлов и строк изменилось в «после» и в «до»?</summary><div>«После» — одна строка в карте DISCOUNTS (в реальном проекте — новый бин-стратегия, существующий код не трогаем). «До» — ещё одна ветка в if внутри метода, который делает всё остальное, — и риск сломать соседние ветки.</div></details></li>
+<li><details><summary>Напишите «тест» без отправки писем: передайте в конструктор Notifier, который складывает письма в список, и проверьте, что VIP получил чек с суммой 612.00.</summary><div>Это и есть выигрыш DIP: зависимость подменяется тестовым двойником без моков и без сети (глава 23).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-20.3">
+<div class="lab-head"><span class="lab-num">Лаба 20.3</span><b>LSP: квадрат — не прямоугольник</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Нарушить принцип подстановки и увидеть, как корректный для родителя код ломается на наследнике.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Lsp.java</code>:</div>
+<pre data-title="Lsp.java"><code class="java">public class Lsp {
+    static class Rect {
+        protected int w, h;
+        void setWidth(int w) { this.w = w; }
+        void setHeight(int h) { this.h = h; }
+        int area() { return w * h; }
+    }
+    static class Square extends Rect {
+        @Override void setWidth(int w) { this.w = w; this.h = w; }
+        @Override void setHeight(int h) { this.w = h; this.h = h; }
+    }
+
+    static void resize(Rect r) {
+        r.setWidth(5);
+        r.setHeight(4);
+        System.out.println(r.getClass().getSimpleName() + ": ожидаем площадь 20, получили " + r.area());
+    }
+
+    public static void main(String[] args) {
+        resize(new Rect());
+        resize(new Square());
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Lsp.java
+java Lsp</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Rect: ожидаем площадь 20, получили 20
+Square: ожидаем площадь 20, получили 16</code></pre></details>
+<p class="lab-note">Square «является» прямоугольником в геометрии, но не в смысле поведения: он нарушает ожидание «ширина и высота меняются независимо». Решения — неизменяемые фигуры (record <code>Rect(int w, int h)</code> с методом <code>withWidth</code>) или общий интерфейс <code>Shape</code> без сеттеров.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">20.11</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Класс <code>ReportService</code> считает показатели, форматирует Excel и отправляет письмо. Какой принцип нарушен в первую очередь?</p><ul><li>LSP</li><li>ISP</li><li>SRP — три причины для изменения в одном классе</li><li>DIP</li></ul><div class="why">Изменение формата отчёта, правил расчёта и способа доставки исходит от разных людей и происходит независимо.</div></div>
 <div class="mcq" data-ok="1"><p>Метод подкласса бросает UnsupportedOperationException для операции, объявленной в базовом типе. Какой принцип нарушен?</p><ul><li>OCP</li><li>LSP — подтип нельзя подставить вместо базового</li><li>SRP</li><li>DRY</li></ul><div class="why">Клиент, написанный для базового типа, сломается на этом подтипе.</div></div>

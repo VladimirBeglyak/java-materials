@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 09 · ПАМЯТЬ</div>
   <h1>Области памяти JVM</h1>
   <p class="lead">«У сервиса <code>-Xmx2g</code>, а процесс занимает 3,2 ГБ и его убивает OOM killer» — классика. Куча — лишь одна из областей памяти JVM. Разбираем все: стеки потоков и кадры, кучу, metaspace, code cache, direct-буферы, структуры GC и JIT, — какие ошибки возникают в каждой, как увидеть реальное потребление через Native Memory Tracking и как посчитать память процесса до того, как это сделает Kubernetes.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">стек и кадры</span><span class="tag">heap</span><span class="tag">metaspace</span><span class="tag">code cache</span><span class="tag">direct memory</span><span class="tag">NMT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">стек и кадры</span><span class="tag">heap</span><span class="tag">metaspace</span><span class="tag">code cache</span><span class="tag">direct memory</span><span class="tag">NMT</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -127,7 +127,176 @@ jcmd &lt;pid&gt; VM.native_memory baseline        # затем через час
 jcmd &lt;pid&gt; VM.native_memory summary.diff    # что растёт</code></pre>
 <p>Если RSS процесса (<code>ps</code>, метрика контейнера) заметно больше committed NMT — память растёт вне JVM: нативные библиотеки (RocksDB, нативные компрессоры), фрагментация malloc. Помогают <code>MALLOC_ARENA_MAX=2</code> или jemalloc.</p>
 
-<h2 id="quiz"><span class="h-num">9.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">9.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Каждую область памяти можно «переполнить» отдельно и получить свою ошибку, а Native Memory Tracking покажет, куда на самом деле уходит память процесса. Модуль IDEA — <code>ch09</code>. Флаги вида <code>-Xss</code>, <code>-Xmx</code> задавайте в VM options конфигурации запуска.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-9.1">
+<div class="lab-head"><span class="lab-num">Лаба 9.1</span><b>Глубина стека: от чего она зависит</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, сколько кадров помещается в стек потока, и как на это влияют <code>-Xss</code> и размер кадра.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Depth.java</code>:</div>
+<pre data-title="Depth.java"><code class="java">public class Depth {
+    static int depth;
+
+    static void small() { depth++; small(); }
+
+    static void big(long a, long b, long c, long d) {
+        long e = a + b, f = c + d, g = e * f, h = g - a;
+        depth++;
+        big(e, f, g, h);
+    }
+
+    static int measure(Runnable r) {
+        depth = 0;
+        try { r.run(); } catch (StackOverflowError e) { /* ожидаемо */ }
+        return depth;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("маленький кадр: " + measure(Depth::small));
+        System.out.println("большой кадр:   " + measure(() -&gt; big(1, 2, 3, 4)));
+        System.out.println("маленький кадр: " + measure(Depth::small) + "  (повторно)");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Depth.java
+java Depth</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">маленький кадр: 28459
+большой кадр:   7695
+маленький кадр: 62226  (повторно)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что будет с глубиной при <code>-Xss256k</code> и при <code>-Xss4m</code>? Почему повторный замер «маленького кадра» отличается от первого?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xss256k</code>, затем <code>-Xss4m</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xss256k Depth
+java -Xss4m Depth</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">маленький кадр: 2956
+большой кадр:   976
+маленький кадр: 5278  (повторно)
+маленький кадр: 101646
+большой кадр:   39841
+маленький кадр: 103568  (повторно)</code></pre></details>
+<div class="lab-ans" hidden><p>Глубина растёт со стеком, но не строго пропорционально: при 256k она упала примерно в 10 раз, при 4m выросла примерно в 3 раза относительно умолчания (1 МБ на 64-битных Windows и Linux). Часть стека занимают служебные защитные страницы и кадры самой JVM, а глубина ещё и зависит от того, какие кадры уже скомпилированы. Повторный замер больше, потому что метод к этому моменту скомпилирован JIT: у скомпилированного кадра нет «лишних» слотов интерпретатора, и кадры меньше. Именно поэтому глубина рекурсии в Java не детерминирована.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите рекурсию не в main, а в <code>new Thread(null, r, "deep", 64 * 1024 * 1024)</code>.</summary><div>Четвёртый аргумент конструктора — размер стека именно этого потока (здесь 64 МБ). Так делают для глубоко рекурсивных алгоритмов, не меняя -Xss для всех потоков.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-9.2">
+<div class="lab-head"><span class="lab-num">Лаба 9.2</span><b>Четыре разных OutOfMemoryError</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Переполнить по очереди кучу, metaspace, прямую память и узнать каждую ошибку по сообщению.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Ooms.java</code>:</div>
+<pre data-title="Ooms.java"><code class="java">import java.lang.invoke.MethodHandles;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Ooms {
+    public static void main(String[] args) throws Exception {
+        List&lt;Object&gt; keep = new ArrayList&lt;&gt;();
+        switch (args[0]) {
+            case "heap" -&gt; { while (true) keep.add(new long[100_000]); }
+            case "direct" -&gt; { while (true) keep.add(ByteBuffer.allocateDirect(1024 * 1024)); }
+            case "meta" -&gt; {
+                // каждый скрытый класс — новые метаданные в metaspace
+                byte[] bytes = Files.readAllBytes(Path.of("Ooms$Tiny.class"));
+                var lookup = MethodHandles.lookup();
+                for (int i = 0; ; i++) {
+                    keep.add(lookup.defineHiddenClass(bytes, false).lookupClass());
+                    if (i % 10_000 == 0) System.out.println("скрытых классов: " + i);
+                }
+            }
+            case "array" -&gt; keep.add(new long[Integer.MAX_VALUE]);
+            default -&gt; System.out.println("heap | direct | meta | array");
+        }
+    }
+
+    static class Tiny { int a; void m() {} }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Компилируем и пробуем каждый вариант с маленьким лимитом соответствующей области (Program arguments: <code>heap</code>, <code>direct</code>…):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Ooms.java
+java -Xmx64m Ooms heap</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+	at Ooms.main(Ooms.java:12)</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:MaxDirectMemorySize=32m Ooms direct</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Exception in thread "main" java.lang.OutOfMemoryError: Cannot reserve 1048576 bytes of direct buffer memory (allocated: 33554432, limit: 33554432)
+	at java.base/java.nio.Bits.reserveMemory(Bits.java:178)
+	at java.base/java.nio.DirectByteBuffer.&lt;init&gt;(DirectByteBuffer.java:108)
+	at java.base/java.nio.ByteBuffer.allocateDirect(ByteBuffer.java:367)
+	at Ooms.main(Ooms.java:13)</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:MaxMetaspaceSize=32m Ooms meta</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">скрытых классов: 0
+скрытых классов: 10000
+Exception in thread "main" java.lang.OutOfMemoryError: Metaspace</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">А что выдаст <code>Ooms array</code> при <code>-Xmx64m</code> — и при <code>-Xmx64g</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xmx64m Ooms array</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Exception in thread "main" java.lang.OutOfMemoryError: Requested array size exceeds VM limit
+	at Ooms.main(Ooms.java:23)</code></pre></details>
+<div class="lab-ans" hidden><p>При 64m — <code>Java heap space</code>: массив на 16 ГБ не влезет. При любом -Xmx — может появиться другой текст: <code>Requested array size exceeds VM limit</code>, потому что максимальная длина массива в HotSpot чуть меньше <code>Integer.MAX_VALUE</code> (заголовок тоже занимает место). Это одно из немногих OOM, которые не зависят от размера кучи.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>-XX:+HeapDumpOnOutOfMemoryError</code> к варианту heap. Что появится в каталоге и чем его открыть?</summary><div>Файл <code>java_pid&lt;N&gt;.hprof</code> размером около кучи. Открывается в IntelliJ IDEA (Ultimate — Profiler, вкладка с дампом), VisualVM или Eclipse MAT; там видно, что весь объём держит <code>ArrayList keep</code> (тема 14).</div></details></li>
+<li><details><summary>Почему на direct-варианте <code>-Xmx</code> не помогает, а помогает <code>-XX:MaxDirectMemorySize</code>?</summary><div>Прямые буферы живут вне кучи; в куче только маленькие объекты-обёртки <code>DirectByteBuffer</code>. По умолчанию лимит прямой памяти равен -Xmx.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-9.3">
+<div class="lab-head"><span class="lab-num">Лаба 9.3</span><b>Native Memory Tracking: куда ушла память процесса</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, из чего складывается память JVM помимо кучи: классы, потоки, код, GC, символы.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Threads500.java</code>:</div>
+<pre data-title="Threads500.java"><code class="java">import java.util.concurrent.CountDownLatch;
+
+public class Threads500 {
+    public static void main(String[] args) throws Exception {
+        int n = Integer.parseInt(args[0]);
+        var stop = new CountDownLatch(1);
+        for (int i = 0; i &lt; n; i++) {
+            Thread t = new Thread(() -&gt; { try { stop.await(); } catch (InterruptedException ignored) {} });
+            t.setDaemon(true);
+            t.start();
+        }
+        System.out.println("pid " + ProcessHandle.current().pid() + ", потоков запущено: " + n);
+        Thread.sleep(600_000);
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:NativeMemoryTracking=summary -Xmx256m</code>, Program arguments: <code>10</code></p>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите с NMT и снимите сводку:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; VM.native_memory summary</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Total: reserved=1740186KB, committed=357018KB
+-                 Java Heap (reserved=262144KB, committed=262144KB)
+-                     Class (reserved=1048655KB, committed=207KB)
+-                    Thread (reserved=28759KB, committed=1499KB)
+                            (threads #28)
+                            (stack: reserved=28672KB, committed=1412KB, peak=1412KB)
+-                      Code (reserved=247836KB, committed=7640KB)
+-                        GC (reserved=67216KB, committed=67216KB)
+-                    Symbol (reserved=1137KB, committed=1137KB)
+-                 Metaspace (reserved=65549KB, committed=525KB)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Перезапустите с аргументом <code>500</code>. Как изменятся <code>reserved</code> и <code>committed</code> в разделе Thread?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; VM.native_memory summary</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Total: reserved=2253889KB, committed=393753KB
+-                 Java Heap (reserved=262144KB, committed=262144KB)
+-                    Thread (reserved=540384KB, committed=35640KB)
+                            (threads #526)
+                            (stack: reserved=538624KB, committed=33880KB, peak=33880KB)</code></pre></details>
+<div class="lab-ans" hidden><p><code>reserved</code> вырастет примерно на 490 × 1 МБ (под каждый стек резервируется адресное пространство размером -Xss), а <code>committed</code> — на гораздо меньшую величину: физическая память выделяется только под реально использованные страницы стека. В контейнере лимит считается по RSS (≈ committed), поэтому тысячи «спящих» потоков обходятся дешевле, чем кажется по reserved, — но не бесплатно.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте базовую точку и сравнение: <code>jcmd &lt;pid&gt; VM.native_memory baseline</code>, подождите, затем <code>VM.native_memory summary.diff</code>.</summary><div>diff показывает прирост по каждой категории с момента baseline — главный приём поиска нативной утечки (растёт Class — генерация классов, Thread — утечка потоков, Other/Internal — direct-буферы или JNI).</div></details></li>
+<li><details><summary>Сравните строку <code>Total: committed</code> с памятью процесса в диспетчере задач.</summary><div>Они близки, но не равны: NMT не видит память нативных библиотек, выделенную через malloc в обход JVM (например, в драйверах или в glibc-аренах на Linux).</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">9.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Под с лимитом 2 ГБ и <code>-Xmx2g</code> регулярно перезапускается с кодом 137 без ошибок в логе. Почему?</p><ul><li>Ошибка в коде приложения</li><li>Медленный GC</li><li>Процесс использует память и вне кучи (metaspace, стеки, code cache, GC, direct) и превышает лимит — его убивает OOM killer</li><li>Не хватает CPU</li></ul><div class="why">Куча должна составлять 60–75% лимита.</div></div>
 <div class="mcq" data-ok="0"><p>Где хранятся статические поля класса в HotSpot (Java 8+)?</p><ul><li>В куче, в объекте java.lang.Class (зеркале класса)</li><li>В PermGen</li><li>В стеке main</li><li>В code cache</li></ul><div class="why">Метаданные — в metaspace, значения статических полей — в куче.</div></div>

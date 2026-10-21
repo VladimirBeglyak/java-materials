@@ -1,0 +1,164 @@
+@chapter 04 | quiz
+@intro
+<p>Порядок инициализации, выбор перегрузки, скрытая ссылка внутреннего класса на внешний и устройство enum — всё это видно по выводу программы и по <code>javap</code>. Модуль IDEA — <code>ch04</code>.</p>
+@end
+
+@lab 4.1 | Порядок инициализации родителя и наследника | 20 мин
+@goal
+<p>Записать точный порядок выполнения статических блоков, инициализаторов полей и конструкторов — и попасть в ловушку вызова переопределённого метода из конструктора.</p>
+@end
+@file InitOrder.java
+public class InitOrder {
+    static String log(String s) { System.out.println(s); return s; }
+
+    static class Parent {
+        static String ps = log("1? Parent: static поле");
+        static { log("?  Parent: static блок"); }
+        String pf = log("?  Parent: поле экземпляра");
+        { log("?  Parent: блок экземпляра"); }
+        Parent() {
+            log("?  Parent: конструктор");
+            describe();
+        }
+        void describe() { log("   Parent.describe"); }
+    }
+
+    static class Child extends Parent {
+        static String cs = log("?  Child: static поле");
+        static { log("?  Child: static блок"); }
+        String name = log("?  Child: поле экземпляра");
+        Child() {
+            log("?  Child: конструктор");
+        }
+        @Override void describe() { log("   Child.describe, name = " + name); }
+    }
+
+    public static void main(String[] args) {
+        log("--- первый new Child() ---");
+        new Child();
+        log("--- второй new Child() ---");
+        new Child();
+    }
+}
+@end
+@predict Расставьте номера вместо «?» для первого вызова. Что напечатает <code>Child.describe</code>? Что изменится при втором <code>new Child()</code>?
+@answer
+<p>Статика: Parent static поле → Parent static блок → Child static поле → Child static блок (один раз на всю жизнь класса, при первом обращении). Затем на каждый объект: поля и блоки Parent → конструктор Parent → поля Child → конструктор Child. <code>describe()</code> из конструктора Parent вызывает версию Child, когда поле <code>name</code> ещё не инициализировано: <b>name = null</b>. Во втором вызове статических строк нет.</p>
+@end
+@run
+javac InitOrder.java
+java InitOrder
+@end
+@try
+Сделайте <code>name</code> полем <code>final String name = "constant";</code>. Что напечатает describe теперь? ::: «constant»: final-поле с константным инициализатором javac подставляет прямо в использования как константу — значение видно даже до инициализации поля. С <code>final String name = log("…")</code> снова будет null. Вывод: не вызывайте переопределяемые методы из конструктора.
+@end
+
+@lab 4.2 | Перегрузка выбирается при компиляции, переопределение — при выполнении | 15 мин
+@goal
+<p>Разделить в голове статический и динамический выбор метода.</p>
+@end
+@file Dispatch.java
+public class Dispatch {
+    static class Animal {
+        String name = "животное";
+        String sound() { return "…"; }
+        static String kind() { return "Animal.kind"; }
+    }
+    static class Cat extends Animal {
+        String name = "кот";
+        @Override String sound() { return "мяу"; }
+        static String kind() { return "Cat.kind"; }
+    }
+
+    static String describe(Animal a) { return "describe(Animal)"; }
+    static String describe(Cat c) { return "describe(Cat)"; }
+    static String describe(Object o) { return "describe(Object)"; }
+
+    public static void main(String[] args) {
+        Animal a = new Cat();
+        System.out.println("1. " + a.sound());
+        System.out.println("2. " + describe(a));
+        System.out.println("3. " + a.name);
+        System.out.println("4. " + a.kind());
+        System.out.println("5. " + describe((Cat) a));
+        System.out.println("6. " + describe(null));
+    }
+}
+@end
+@predict Шесть строк — шесть ответов.
+@answer
+<p>1 — <b>мяу</b>: переопределение, выбор по реальному классу объекта при выполнении. 2 — <b>describe(Animal)</b>: перегрузка выбирается компилятором по <i>статическому</i> типу переменной. 3 — <b>животное</b>: поля не полиморфны, Cat.name лишь скрывает поле родителя. 4 — <b>Animal.kind</b>: статические методы не переопределяются, а скрываются, вызов привязан к типу переменной (IDEA подсветит предупреждение). 5 — describe(Cat). 6 — <b>describe(Cat)</b>: null подходит ко всем, компилятор выбирает самый специфичный тип.</p>
+@end
+@run
+javac Dispatch.java
+java Dispatch
+@end
+@try
+Добавьте перегрузку <code>describe(String s)</code>. Что станет с вызовом <code>describe(null)</code>? ::: Ошибка компиляции «reference to describe is ambiguous»: String и Cat не связаны наследованием, и самого специфичного нет.
+@end
+
+@lab 4.3 | Что прячет внутренний класс | 15 мин
+@goal
+<p>Увидеть скрытое поле <code>this$0</code>, из-за которого внутренние классы удерживают внешний объект.</p>
+@end
+@file Outer.java
+import java.util.function.Supplier;
+
+public class Outer {
+    private final byte[] bigData = new byte[10_000_000];
+    private int counter = 42;
+
+    class Inner { int read() { return counter; } }
+    static class Nested { int read() { return 7; } }
+
+    Supplier<Integer> lambda() { return () -> 1; }
+    Supplier<Integer> lambdaUsingField() { return () -> counter; }
+}
+@end
+@run grep="class|this\$0|final|Outer\(|Inner\(|Nested\(|lambda"
+javac Outer.java
+javap -p Outer$Inner.class Outer$Nested.class ||| javap -p 'Outer$Inner.class' 'Outer$Nested.class'
+javap -p Outer.class
+@end
+@note В PowerShell имя с <code>$</code> возьмите в одинарные кавычки: <code>javap -p 'Outer$Inner.class'</code>.
+@predict Какие из четырёх вещей (Inner, Nested, lambda, lambdaUsingField) удерживают объект Outer с его 10 МБ?
+@answer
+<p><code>Inner</code> — да: у него поле <code>final Outer this$0</code> и конструктор <code>Inner(Outer)</code>, даже если внешний объект не используется. <code>Nested</code> — нет. <code>lambda()</code> — нет: тело <code>lambda$lambda$0</code> статическое. <code>lambdaUsingField()</code> — да: тело стало экземплярным методом, и лямбда захватывает <code>this</code>. Отсюда правило: вложенные классы по умолчанию делайте <code>static</code>.</p>
+@end
+@end
+
+@lab 4.4 | Enum изнутри | 15 мин
+@goal
+<p>Понять, во что компилируется перечисление с поведением, и поработать с <code>EnumMap</code>.</p>
+@end
+@file Op.java
+import java.util.EnumMap;
+
+public enum Op {
+    PLUS("+") { int apply(int a, int b) { return a + b; } },
+    TIMES("×") { int apply(int a, int b) { return a * b; } };
+
+    final String sign;
+    Op(String sign) { this.sign = sign; }
+    abstract int apply(int a, int b);
+
+    public static void main(String[] args) {
+        EnumMap<Op, Integer> results = new EnumMap<>(Op.class);
+        for (Op op : values()) results.put(op, op.apply(6, 7));
+        System.out.println(results);
+        System.out.println(Op.valueOf("TIMES").ordinal() + " " + TIMES.getClass() + " " + TIMES.getDeclaringClass());
+    }
+}
+@end
+@run
+javac Op.java
+java Op
+javap -p Op.class
+@end
+@predict Почему <code>TIMES.getClass()</code> не равен <code>Op.class</code>?
+@answer
+<p>Константа с телом компилируется в анонимный подкласс <code>Op$2</code> (посмотрите список файлов: <code>Op$1.class</code>, <code>Op$2.class</code>). Поэтому для сравнения типа перечисления используют <code>getDeclaringClass()</code>. В javap видны и сгенерированные компилятором <code>values()</code>, <code>valueOf(String)</code> и поле <code>$VALUES</code>; конструктор перечисления всегда private.</p>
+@end
+@try
+Вызовите <code>Op.valueOf("plus")</code>. ::: <code>IllegalArgumentException: No enum constant Op.plus</code> — valueOf чувствителен к регистру. Для разбора внешних данных пишут свой метод поиска.
+@end

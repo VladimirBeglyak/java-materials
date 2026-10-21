@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 09 · ТИПЫ И КОЛЛЕКЦИИ</div>
   <h1>HashMap изнутри, Map и Set</h1>
   <p class="lead"><code>HashMap</code> — самая используемая структура данных в Java и самый частый вопрос на собеседовании. Нужно уметь рассказать путь ключа от <code>hashCode()</code> до ячейки, объяснить коллизии, деревья и расширение таблицы — и знать, когда вместо неё взять <code>LinkedHashMap</code> или <code>TreeMap</code>.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">бакеты</span><span class="tag">resize</span><span class="tag">интерактив</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">бакеты</span><span class="tag">resize</span><span class="tag">интерактив</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -257,7 +257,161 @@ List&lt;String&gt; unique = new ArrayList&lt;&gt;(new LinkedHashSet&lt;&gt;(with
 <div class="callout info"><span class="c-title">Почему при resize не пересчитывают индекс заново</span>
 Длина таблицы — степень двойки, и при удвоении в маске появляется ровно один новый бит. Узел либо остаётся в бакете <code>i</code>, либо уходит в <code>i + oldCap</code>; достаточно проверить <code>(hash &amp; oldCap) == 0</code>. Цепочка делится на две («lo» и «hi») с сохранением относительного порядка.</div>
 
-<h2 id="quiz"><span class="h-num">9.9</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">9.9</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Заглянем в таблицу настоящей <code>HashMap</code> через рефлексию: корзины, коллизии, рост таблицы и превращение цепочки в дерево. Плюс LinkedHashMap как LRU-кэш за 10 строк. Модуль IDEA — <code>ch09</code>; для чтения приватных полей нужен VM option <code>--add-opens java.base/java.util=ALL-UNNAMED</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-9.1">
+<div class="lab-head"><span class="lab-num">Лаба 9.1</span><b>Таблица HashMap изнутри: корзины и resize</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть на размер таблицы и распределение ключей по корзинам при росте карты.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Peek.java</code>:</div>
+<pre data-title="Peek.java"><code class="java">import java.lang.reflect.Field;
+import java.util.HashMap;
+import java.util.Map;
+
+public class Peek {
+    static Object[] table(HashMap&lt;?, ?&gt; m) throws Exception {
+        Field f = HashMap.class.getDeclaredField("table");
+        f.setAccessible(true);
+        return (Object[]) f.get(m);
+    }
+
+    static String layout(HashMap&lt;?, ?&gt; m) throws Exception {
+        Object[] t = table(m);
+        if (t == null) return "таблицы ещё нет";
+        StringBuilder sb = new StringBuilder("таблица " + t.length + ": ");
+        for (Object node : t) {
+            int len = 0;
+            for (Object n = node; n != null; ) {
+                len++;
+                Field next = n.getClass().getDeclaredField("next");
+                next.setAccessible(true);
+                n = next.get(n);
+            }
+            sb.append(len == 0 ? "." : String.valueOf(len));
+        }
+        return sb.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        HashMap&lt;String, Integer&gt; m = new HashMap&lt;&gt;();
+        System.out.println("пустая: " + layout(m));
+        for (int i = 1; i &lt;= 13; i++) {
+            m.put("key" + i, i);
+            if (i == 1 || i == 12 || i == 13) System.out.println("после " + i + " put: " + layout(m));
+        }
+        System.out.println("hash(\"key1\") &amp; 15 = " + (spread("key1".hashCode()) &amp; 15) + ", &amp; 31 = " + (spread("key1".hashCode()) &amp; 31));
+    }
+
+    static int spread(int h) { return h ^ (h &gt;&gt;&gt; 16); }   // как HashMap.hash()
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>--add-opens java.base/java.util=ALL-UNNAMED</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Peek.java
+java --add-opens java.base/java.util=ALL-UNNAMED Peek</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">пустая: таблицы ещё нет
+после 1 put: таблица 16: 1...............
+после 12 put: таблица 16: 11.111111.1111..
+после 13 put: таблица 32: 11..11111.1111....11............
+hash("key1") &amp; 15 = 0, &amp; 31 = 0</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему таблица выросла с 16 до 32 именно на 13-м элементе и где окажется ключ <code>key1</code> после роста?</div>
+<div class="lab-ans" hidden><p>Порог = ёмкость × load factor = 16 × 0,75 = 12: при 13-м элементе таблица удваивается. Индекс корзины — <code>hash &amp; (n − 1)</code>; при удвоении каждый элемент либо остаётся на месте, либо сдвигается ровно на старую ёмкость (+16) — решает один новый бит хэша. Это видно по последней строке: индекс в 16-таблице и в 32-таблице отличается на 0 или на 16. Точки — пустые корзины, цифры — длины цепочек.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Создайте карту как <code>new HashMap&lt;&gt;(20)</code>. Какой будет таблица после первого put?</summary><div>32: ёмкость округляется вверх до степени двойки, и таблица создаётся лениво при первом put. Чтобы вместить 20 элементов без resize, есть <code>HashMap.newHashMap(20)</code> (Java 19+) — он сам учтёт load factor.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-9.2">
+<div class="lab-head"><span class="lab-num">Лаба 9.2</span><b>Коллизии: плохой hashCode против хорошего</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, во что превращается HashMap с одинаковым хэшем у всех ключей, и как спасает Comparable (деревья в корзинах).</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Collisions.java</code>:</div>
+<pre data-title="Collisions.java"><code class="java">import java.util.HashMap;
+import java.util.Map;
+
+public class Collisions {
+    record BadKey(int id) {
+        @Override public int hashCode() { return 42; }                  // все в одну корзину
+    }
+    record BadComparableKey(int id) implements Comparable&lt;BadComparableKey&gt; {
+        @Override public int hashCode() { return 42; }
+        public int compareTo(BadComparableKey o) { return Integer.compare(id, o.id); }
+    }
+    record GoodKey(int id) { }
+
+    static &lt;K&gt; long bench(String name, java.util.function.IntFunction&lt;K&gt; make) {
+        Map&lt;K, Integer&gt; m = new HashMap&lt;&gt;();
+        long t = System.nanoTime();
+        for (int i = 0; i &lt; 20_000; i++) m.put(make.apply(i), i);
+        for (int i = 0; i &lt; 20_000; i++) m.get(make.apply(i));
+        long ms = (System.nanoTime() - t) / 1_000_000;
+        System.out.printf("%-18s %6d мс%n", name, ms);
+        return ms;
+    }
+
+    public static void main(String[] args) {
+        bench("GoodKey", GoodKey::new);
+        bench("BadKey", BadKey::new);
+        bench("BadComparableKey", BadComparableKey::new);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Расставьте ключи по скорости и оцените разницу.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Collisions.java
+java Collisions</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">GoodKey                20 мс
+BadKey               1741 мс
+BadComparableKey       75 мс</code></pre></details>
+<div class="lab-ans" hidden><p>GoodKey — миллисекунды. BadKey — в сотни раз медленнее: все 20 000 ключей в одной корзине. После 8 элементов (TREEIFY_THRESHOLD) корзина превращается в красно-чёрное дерево, но без Comparable дерево не знает, как упорядочить ключи с одинаковым хэшем, и вынуждено обходить поддеревья — по сути линейный поиск. BadComparableKey — быстро (O(log n)): дерево упорядочивает ключи через compareTo. Защита от «хэш-атак» в Java 8+ работает только для Comparable-ключей (например, String).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-9.3">
+<div class="lab-head"><span class="lab-num">Лаба 9.3</span><b>LRU-кэш на LinkedHashMap</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сделать кэш с вытеснением давно неиспользуемых записей, используя порядок доступа LinkedHashMap.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Lru.java</code>:</div>
+<pre data-title="Lru.java"><code class="java">import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class Lru&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int max;
+
+    Lru(int max) {
+        super(16, 0.75f, true);      // true = порядок доступа, а не вставки
+        this.max = max;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) {
+        return size() &gt; max;
+    }
+
+    public static void main(String[] args) {
+        Lru&lt;String, Integer&gt; cache = new Lru&lt;&gt;(3);
+        cache.put("a", 1); cache.put("b", 2); cache.put("c", 3);
+        System.out.println("заполнен:    " + cache);
+        cache.get("a");
+        System.out.println("после get a: " + cache);
+        cache.put("d", 4);
+        System.out.println("после put d: " + cache);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой ключ вытеснит <code>put("d")</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Lru.java
+java Lru</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">заполнен:    {a=1, b=2, c=3}
+после get a: {b=2, c=3, a=1}
+после put d: {c=3, a=1, d=4}</code></pre></details>
+<div class="lab-ans" hidden><p><b>b</b>: после <code>get("a")</code> запись «a» переехала в конец списка как самая свежая, самой старой по доступу стала «b». <code>removeEldestEntry</code> вызывается после каждой вставки. Это простейший LRU; в продакшене — Caffeine (потокобезопасный, с политикой W-TinyLFU).</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">9.10</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Когда цепочка в бакете HashMap превращается в дерево?</p><ul><li>Когда в бакете 8 узлов</li><li>Когда load factor превышает 0,75</li><li>Когда в бакет добавляется узел сверх 8 и размер таблицы не меньше 64; иначе выполняется resize</li><li>Никогда, дерево только в TreeMap</li></ul><div class="why">TREEIFY_THRESHOLD = 8, MIN_TREEIFY_CAPACITY = 64. Обратно в список — при 6 узлах (UNTREEIFY_THRESHOLD).</div></div>
 <div class="mcq" data-ok="1"><p>Какая сложность get() в HashMap в худшем случае (Java 8+)?</p><ul><li>O(1)</li><li>O(log n) — бакет с коллизиями хранится деревом</li><li>O(n)</li><li>O(n log n)</li></ul><div class="why">До Java 8 худший случай был O(n) — длинный связный список, чем пользовались для DoS-атак на хэш-таблицы.</div></div>

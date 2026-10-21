@@ -23,7 +23,7 @@
   <div class="kicker">ТЕМА 21 · ЭКСПЛУАТАЦИЯ</div>
   <h1>Диагностика: jcmd, JFR, дампы, профилировщики</h1>
   <p class="lead">JVM — одна из самых наблюдаемых сред исполнения: в каждый JDK встроены швейцарский нож <code>jcmd</code>, бортовой самописец Java Flight Recorder с накладными расходами около 1%, дампы потоков и кучи. Разбираем, какой инструмент отвечает на какой вопрос, как читать дамп потоков и флеймграф, и пошагово расследуем классические инциденты: «процесс ест 100% CPU», «всё зависло», «медленно, но непонятно где».</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">jcmd</span><span class="tag">JFR и JMC</span><span class="tag">дамп потоков</span><span class="tag">async-profiler</span><span class="tag">флеймграф</span><span class="tag">расследования</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">jcmd</span><span class="tag">JFR и JMC</span><span class="tag">дамп потоков</span><span class="tag">async-profiler</span><span class="tag">флеймграф</span><span class="tag">расследования</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -148,7 +148,170 @@ jfr summary /tmp/incident.jfr
 # анализ: JDK Mission Control (автоанализ, вкладки GC, Threads, Method Profiling, Allocations, I/O, Exceptions)</code></pre>
 <p>JFR пишет события JVM (GC, компиляции, safepoints, блокировки, аллокации, исключения, I/O, CPU по потокам) в кольцевой буфер. Свои события — <code>jdk.jfr.Event</code> с аннотациями. JFR Event Streaming (Java 14+) позволяет потреблять события в реальном времени из того же процесса. Spring Boot и Micrometer умеют отправлять метрики по событиям JFR.</p>
 
-<h2 id="quiz"><span class="h-num">21.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">21.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Расследуем «сервис ест CPU» по всем правилам, только своими руками: дамп потоков с временем CPU, Java Flight Recorder и его встроенные отчёты <code>jfr view</code>. Модуль IDEA — <code>ch21</code>. Файлы <code>.jfr</code> открываются в IntelliJ IDEA Ultimate (двойной клик, Profiler) или в JDK Mission Control.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-21.1">
+<div class="lab-head"><span class="lab-num">Лаба 21.1</span><b>Какой поток ест CPU</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти горячий поток по колонке <code>cpu=</code> в двух последовательных дампах — переносимая замена <code>top -H</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Busy.java</code>:</div>
+<pre data-title="Busy.java"><code class="java">import java.util.concurrent.locks.LockSupport;
+
+public class Busy {
+    static volatile long sink;
+
+    static long hash(long x) {
+        for (int i = 0; i &lt; 1000; i++) x = x * 6364136223846793005L + 1442695040888963407L;
+        return x;
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        new Thread(() -&gt; { while (true) LockSupport.parkNanos(10_000_000); }, "idle-worker").start();
+        new Thread(() -&gt; { while (true) sink = hash(sink); }, "report-generator").start();
+        new Thread(() -&gt; { while (true) { sink += 1; LockSupport.parkNanos(1_000_000); } }, "heartbeat").start();
+        Thread.sleep(600_000);
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Снимите два дампа с интервалом в несколько секунд и сравните <code>cpu=</code> у потоков:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"main" #3 [21992] prio=5 os_prio=0 cpu=15.62ms elapsed=3.47s tid=0x000001dd46be7f80 nid=21992 waiting on condition  [0x0000009789aff000]
+"idle-worker" #35 [5176] prio=5 os_prio=0 cpu=0.00ms elapsed=3.44s tid=0x000001dd6b209860 nid=5176 waiting on condition  [0x000000978acff000]
+"report-generator" #36 [13732] prio=5 os_prio=0 cpu=1218.75ms elapsed=3.44s tid=0x000001dd6b2088c0 nid=13732 runnable  [0x000000978adfe000]
+"heartbeat" #37 [9316] prio=5 os_prio=0 cpu=0.00ms elapsed=3.44s tid=0x000001dd6b20a800 nid=9316 runnable  [0x000000978aeff000]</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"main" #3 [21992] prio=5 os_prio=0 cpu=15.62ms elapsed=7.17s tid=0x000001dd46be7f80 nid=21992 waiting on condition  [0x0000009789aff000]
+	at Busy.main(Busy.java:16)
+"idle-worker" #35 [5176] prio=5 os_prio=0 cpu=0.00ms elapsed=7.13s tid=0x000001dd6b209860 nid=5176 waiting on condition  [0x000000978acff000]
+	at Busy.lambda$main$0(Busy.java:13)
+	at Busy$$Lambda/0x0000000099040210.run(Unknown Source)
+"report-generator" #36 [13732] prio=5 os_prio=0 cpu=2250.00ms elapsed=7.13s tid=0x000001dd6b2088c0 nid=13732 runnable  [0x000000978adfe000]
+	at Busy.lambda$main$1(Busy.java:14)
+	at Busy$$Lambda/0x0000000099040438.run(Unknown Source)
+"heartbeat" #37 [9316] prio=5 os_prio=0 cpu=0.00ms elapsed=7.13s tid=0x000001dd6b20a800 nid=9316 waiting on condition  [0x000000978aeff000]
+	at Busy.lambda$main$2(Busy.java:15)
+	at Busy$$Lambda/0x0000000099041800.run(Unknown Source)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой поток виноват и что ещё в дампе указывает на виновную строку кода?</div>
+<div class="lab-ans" hidden><p><code>report-generator</code>: только у него <code>cpu=</code> растёт между снимками (сотни миллисекунд — секунды), у остальных — 0. В его стеке в обоих снимках одно и то же место: <code>Busy.lambda$main$1</code> (строка 14 — цикл с <code>hash</code>; сам <code>hash</code> встроен JIT-ом и отдельным кадром может не показываться). Несколько снимков с одинаковой верхушкой стека — простейший «профилировщик». На Linux то же самое находят через <code>top -H -p &lt;pid&gt;</code>, переводя TID в hex и ища <code>nid=0x…</code> в дампе.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="jvm-21.2">
+<div class="lab-head"><span class="lab-num">Лаба 21.2</span><b>Java Flight Recorder: запись и отчёты</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Записать профиль работающей программы и получить из него горячие методы, сборки мусора и аллокации — без внешних инструментов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Запустите <code>Busy</code> сразу с записью на 10 секунд:</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:StartFlightRecording=duration=10s,filename=busy.jfr</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:StartFlightRecording=duration=10s,filename=busy.jfr Busy</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Когда в консоли появится «Dump on exit»/«Recording … stopped» (или просто через 10 секунд), остановите программу и посмотрите отчёты:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jfr summary busy.jfr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">
+ Version: 2.1
+ Chunks: 1
+ Start: 2026-10-21 18:45:58 (UTC)
+ Duration: 10 s
+
+ Event Type                              Count  Size (bytes) 
+=============================================================
+ jdk.BooleanFlag                           491         14569
+ jdk.ExecutionSample                       489          4401
+ jdk.ActiveSetting                         376          9345
+ jdk.SystemProcess                         338         18308
+ jdk.ModuleRequire                         157          1413
+ jdk.LongFlag                              137          4260
+ jdk.InitialEnvironmentVariable            124         11330
+ jdk.NativeLibrary                          98          6440
+…</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jfr view hot-methods busy.jfr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">
+                       Java Methods that Execute the Most
+
+Method                                                          Samples Percent
+--------------------------------------------------------------- ------- -------
+Busy.lambda$main$1()                                                488  99.80%
+Busy.lambda$main$2()                                                  1   0.20%</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что окажется на первом месте в <code>hot-methods</code> и почему там нет <code>heartbeat</code>?</div>
+<div class="lab-ans" hidden><p><code>Busy.lambda$main$1()</code> — почти 100% сэмплов: это тело потока report-generator, в которое JIT встроил <code>hash</code>. JFR каждые 10–20 мс снимает стеки <b>выполняющихся</b> потоков (событие <code>jdk.ExecutionSample</code>); heartbeat и idle-worker почти всё время запаркованы и в сэмплы не попадают. Это профиль CPU, а не «где потоки проводят время».</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Другие готовые отчёты (полный список — <code>jfr view</code> без аргументов), например загрузка CPU процессом и машиной:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jfr view cpu-load busy.jfr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">
+CPU Load Statistics
+-------------------
+
+JVM User (Minimum): 0.00%
+
+JVM User (Average): 1.41%
+
+JVM User (Maximum): 2.42%
+
+JVM System (Minimum): 0.00%
+
+JVM System (Average): 0.00%
+
+…</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Подключите запись к уже работающему процессу: <code>jcmd &lt;pid&gt; JFR.start duration=30s filename=live.jfr</code>.</summary><div>Так делают в продакшене — без перезапуска. Накладные расходы профиля default ~1%, поэтому многие держат непрерывную запись: <code>-XX:StartFlightRecording=maxage=1h,disk=true</code> и делают <code>JFR.dump</code> при инциденте.</div></details></li>
+<li><details><summary>Выполните <code>jfr print --events jdk.ExecutionSample busy.jfr</code> и посмотрите на сырое событие.</summary><div>Каждое событие — время, поток, состояние и стек. Все <code>jfr view</code> — лишь агрегаты над такими событиями; IDEA и JMC строят из них флеймграф.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-21.3">
+<div class="lab-head"><span class="lab-num">Лаба 21.3</span><b>Кто выделяет память: аллокации в JFR</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти место в коде, которое создаёт больше всего мусора.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Garbage.java</code>:</div>
+<pre data-title="Garbage.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Garbage {
+    static String format(int i) { return String.format("item-%05d", i); }       // дорогой способ
+    static String concat(int i) { return "item-" + i; }
+
+    public static void main(String[] args) {
+        long end = System.currentTimeMillis() + 5000, n = 0;
+        while (System.currentTimeMillis() &lt; end) {
+            List&lt;String&gt; batch = new ArrayList&lt;&gt;();
+            for (int i = 0; i &lt; 1000; i++) batch.add(i % 2 == 0 ? format(i) : concat(i));
+            n += batch.size();
+        }
+        System.out.println("строк: " + n);
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:StartFlightRecording=filename=garbage.jfr,settings=profile</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Garbage.java
+java -XX:StartFlightRecording=filename=garbage.jfr,settings=profile Garbage</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.267s][info][jfr,startup] 
+строк: 95450000</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jfr view allocation-by-site garbage.jfr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">
+                                  Allocation by Site
+
+Method                                                             Allocation Pressure
+------------------------------------------------------------------ -------------------
+java.lang.AbstractStringBuilder.&lt;init&gt;(int)                                     19.38%
+java.util.Arrays.copyOfRange(byte[], int, int)                                  13.78%
+java.lang.Long.toString(long)                                                   10.94%
+java.util.Formatter$FormatSpecifierParser.parse()                               10.74%
+java.lang.StringBuilder.toString()                                               9.76%
+java.util.Formatter.parse(String)                                                8.15%
+java.util.Arrays.copyOf(Object[], int)                                           7.44%
+java.lang.Integer.valueOf(int)                                                   7.29%
+java.util.ArrayList.grow(int)                                                    6.96%
+…</code></pre></details>
+<p class="lab-note">Отчёт строится по событиям <code>jdk.ObjectAllocationSample</code>: JFR выборочно фиксирует выделения с их стеком. Наверху окажется путь через <code>String.format</code> — <code>Formatter</code>, регулярные выражения и <code>StringBuilder</code> внутри него выделяют в разы больше, чем простая конкатенация.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">21.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Как найти в дампе потоков поток, который top -H показал с TID 1802?</p><ul><li>По имени потока</li><li>По nid=1802 (в старых JDK — nid=0x70a в шестнадцатеричном)</li><li>По tid=0x…</li><li>Никак</li></ul><div class="why">tid — адрес структуры JVM, nid — id потока ОС.</div></div>
 <div class="mcq" data-ok="3"><p>Почему CPU-профиль не покажет, что запросы медленные из-за ожидания БД?</p><ul><li>Профилировщик не видит JDBC</li><li>БД — другой процесс</li><li>Это ошибка инструмента</li><li>Ожидающий поток не тратит CPU и не попадает в CPU-сэмплы — нужен wall-clock профиль или события JFR по I/O</li></ul><div class="why">async-profiler -e wall.</div></div>

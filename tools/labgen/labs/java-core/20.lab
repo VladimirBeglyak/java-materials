@@ -1,0 +1,143 @@
+@chapter 20 | quiz
+@intro
+<p>Принципы SOLID проверяются не определениями, а ответом на вопрос «что придётся менять, когда придёт новое требование». Возьмём класс, который делает всё, и проведём его через рефакторинг, сохраняя поведение: вывод программы до и после должен совпасть. В IDEA сделайте два модуля — <code>ch20-before</code> и <code>ch20-after</code> (класс <code>OrderService</code> есть в обоих), а в терминале работайте из каталога, где лежат папки <code>before</code> и <code>after</code>. Используйте автоматические рефакторинги IDEA (Ctrl+Alt+Shift+T): Extract Method, Extract Interface, Introduce Parameter.</p>
+@end
+
+@lab 20.1 | До: класс, который делает всё | 10 мин
+@goal
+<p>Найти в коде причины для изменения и записать их, прежде чем что-то трогать.</p>
+@end
+@file before/OrderService.java
+import java.util.List;
+
+public class OrderService {
+    record Item(String name, double price, int qty) { }
+
+    public String checkout(String customerEmail, String customerType, List<Item> items) {
+        double sum = 0;
+        for (Item i : items) sum += i.price() * i.qty();
+        if (customerType.equals("VIP")) sum = sum * 0.9;
+        else if (customerType.equals("EMPLOYEE")) sum = sum * 0.7;
+        String receipt = "Чек: " + items.size() + " поз., итого " + String.format(java.util.Locale.ROOT, "%.2f", sum);
+        System.out.println("[SMTP] to=" + customerEmail + " body=" + receipt);
+        System.out.println("[FILE] orders.log <- " + customerEmail + ";" + sum);
+        return receipt;
+    }
+
+    public static void main(String[] args) {
+        var svc = new OrderService();
+        var items = List.of(new Item("кофе", 250, 2), new Item("круассан", 180, 1));
+        System.out.println(svc.checkout("anna@example.com", "VIP", items));
+        System.out.println(svc.checkout("boris@example.com", "REGULAR", items));
+    }
+}
+@end
+@run
+javac -d out-before before/OrderService.java
+java -cp out-before OrderService
+@end
+@predict Назовите четыре причины, по которым этот класс придётся менять.
+@answer
+<p>1) новые правила скидок (новый тип клиента) — нарушает OCP: каждый раз правим <code>if</code>; 2) формат чека; 3) способ уведомления (SMS вместо почты); 4) хранилище заказов (БД вместо файла). Четыре причины — четыре ответственности (SRP). Плюс класс невозможно протестировать без «отправки письма»: зависимости создаются и вызываются напрямую (DIP).</p>
+@end
+
+@lab 20.2 | После: ответственности, абстракции, внедрение зависимостей | 30 мин
+@goal
+<p>Разнести ответственности по интерфейсам, сделать скидки расширяемыми без правки кода (OCP) и внедрить зависимости через конструктор (DIP) — с тем же выводом.</p>
+@end
+@file after/OrderService.java
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+public class OrderService {
+    record Item(String name, double price, int qty) { }
+
+    interface DiscountPolicy { double apply(double sum); }
+    interface Notifier { void send(String to, String body); }
+    interface OrderRepository { void save(String customer, double sum); }
+
+    static final Map<String, DiscountPolicy> DISCOUNTS = Map.of(
+        "VIP", s -> s * 0.9,
+        "EMPLOYEE", s -> s * 0.7);
+
+    private final Notifier notifier;
+    private final OrderRepository repository;
+
+    OrderService(Notifier notifier, OrderRepository repository) {
+        this.notifier = notifier;
+        this.repository = repository;
+    }
+
+    public String checkout(String email, String customerType, List<Item> items) {
+        double sum = DISCOUNTS.getOrDefault(customerType, s -> s).apply(total(items));
+        String receipt = receipt(items, sum);
+        notifier.send(email, receipt);
+        repository.save(email, sum);
+        return receipt;
+    }
+
+    static double total(List<Item> items) { return items.stream().mapToDouble(i -> i.price() * i.qty()).sum(); }
+    static String receipt(List<Item> items, double sum) { return "Чек: " + items.size() + " поз., итого " + String.format(Locale.ROOT, "%.2f", sum); }
+
+    public static void main(String[] args) {
+        Notifier smtp = (to, body) -> System.out.println("[SMTP] to=" + to + " body=" + body);
+        OrderRepository file = (c, s) -> System.out.println("[FILE] orders.log <- " + c + ";" + s);
+        var svc = new OrderService(smtp, file);
+        var items = List.of(new Item("кофе", 250, 2), new Item("круассан", 180, 1));
+        System.out.println(svc.checkout("anna@example.com", "VIP", items));
+        System.out.println(svc.checkout("boris@example.com", "REGULAR", items));
+    }
+}
+@end
+@run
+javac -d out-after after/OrderService.java
+java -cp out-after OrderService
+@end
+@step Сравните вывод «до» и «после» построчно — рефакторинг не должен менять поведение:
+@run
+java -cp out-before OrderService > before.txt
+java -cp out-after OrderService > after.txt
+fc before.txt after.txt ||| diff before.txt after.txt && echo "FC: различия не найдены"
+@end
+@note <code>fc</code> — сравнение файлов в Windows (в PowerShell пишите <code>fc.exe</code>), в bash — <code>diff before.txt after.txt</code>, в IDEA — выделить оба файла → Ctrl+D.
+@try
+Добавьте тип клиента STUDENT со скидкой 15% — сколько файлов и строк изменилось в «после» и в «до»? ::: «После» — одна строка в карте DISCOUNTS (в реальном проекте — новый бин-стратегия, существующий код не трогаем). «До» — ещё одна ветка в if внутри метода, который делает всё остальное, — и риск сломать соседние ветки.
+Напишите «тест» без отправки писем: передайте в конструктор Notifier, который складывает письма в список, и проверьте, что VIP получил чек с суммой 612.00. ::: Это и есть выигрыш DIP: зависимость подменяется тестовым двойником без моков и без сети (глава 23).
+@end
+
+@lab 20.3 | LSP: квадрат — не прямоугольник | 10 мин
+@goal
+<p>Нарушить принцип подстановки и увидеть, как корректный для родителя код ломается на наследнике.</p>
+@end
+@file Lsp.java
+public class Lsp {
+    static class Rect {
+        protected int w, h;
+        void setWidth(int w) { this.w = w; }
+        void setHeight(int h) { this.h = h; }
+        int area() { return w * h; }
+    }
+    static class Square extends Rect {
+        @Override void setWidth(int w) { this.w = w; this.h = w; }
+        @Override void setHeight(int h) { this.w = h; this.h = h; }
+    }
+
+    static void resize(Rect r) {
+        r.setWidth(5);
+        r.setHeight(4);
+        System.out.println(r.getClass().getSimpleName() + ": ожидаем площадь 20, получили " + r.area());
+    }
+
+    public static void main(String[] args) {
+        resize(new Rect());
+        resize(new Square());
+    }
+}
+@end
+@run
+javac Lsp.java
+java Lsp
+@end
+@note Square «является» прямоугольником в геометрии, но не в смысле поведения: он нарушает ожидание «ширина и высота меняются независимо». Решения — неизменяемые фигуры (record <code>Rect(int w, int h)</code> с методом <code>withWidth</code>) или общий интерфейс <code>Shape</code> без сеттеров.
+@end

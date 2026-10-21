@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 19 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
   <h1>Паттерны проектирования на примерах JDK</h1>
   <p class="lead">Паттерн — это название для повторяющегося решения, а не цель. Знать их нужно по двум причинам: чтобы узнавать в чужом коде (JDK и Spring построены на них) и чтобы одним словом объяснять коллеге идею. Здесь паттерны показаны через классы, которыми вы уже пользуетесь, и в современной записи — с лямбдами, record и sealed-типами.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">GoF</span><span class="tag">примеры из JDK и Spring</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">GoF</span><span class="tag">примеры из JDK и Spring</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -188,7 +188,204 @@ final class Importer2 {                            // то же через фу�
   <div class="card"><h4>Глубокое наследование</h4><p>Template Method в четыре уровня: чтобы понять метод, нужно держать в голове всю иерархию. Предпочитайте композицию (тема 04).</p></div>
 </div>
 
-<h2 id="quiz"><span class="h-num">19.6</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">19.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Паттерны лучше всего усваиваются, когда сам пишешь проблему, которую они решают, и затем решение. Четыре лабы — четыре паттерна, которые встречаются в каждом Spring-проекте. Модуль IDEA — <code>ch19</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-19.1">
+<div class="lab-head"><span class="lab-num">Лаба 19.1</span><b>Builder для объекта с необязательными полями</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Заменить «телескопический» конструктор строителем с проверкой инвариантов при <code>build()</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>HttpRequestSpec.java</code>:</div>
+<pre data-title="HttpRequestSpec.java"><code class="java">import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public record HttpRequestSpec(String method, String url, Map&lt;String, String&gt; headers, Duration timeout, int retries) {
+    public static Builder get(String url) { return new Builder("GET", url); }
+    public static Builder post(String url) { return new Builder("POST", url); }
+
+    public static final class Builder {
+        private final String method, url;
+        private final Map&lt;String, String&gt; headers = new LinkedHashMap&lt;&gt;();
+        private Duration timeout = Duration.ofSeconds(10);
+        private int retries = 0;
+
+        private Builder(String method, String url) { this.method = method; this.url = url; }
+        public Builder header(String k, String v) { headers.put(k, v); return this; }
+        public Builder timeout(Duration t) { this.timeout = t; return this; }
+        public Builder retries(int r) { this.retries = r; return this; }
+
+        public HttpRequestSpec build() {
+            if (!url.startsWith("http")) throw new IllegalStateException("url должен начинаться с http: " + url);
+            if (method.equals("POST") &amp;&amp; retries &gt; 0) throw new IllegalStateException("POST не идемпотентен — повторы запрещены");
+            return new HttpRequestSpec(method, url, Map.copyOf(headers), timeout, retries);
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(get("https://api.example.com/orders").header("Accept", "application/json").retries(3).build());
+        try {
+            post("https://api.example.com/pay").retries(2).build();
+        } catch (IllegalStateException e) {
+            System.out.println("отказ: " + e.getMessage());
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac HttpRequestSpec.java
+java HttpRequestSpec</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">HttpRequestSpec[method=GET, url=https://api.example.com/orders, headers={Accept=application/json}, timeout=PT10S, retries=3]
+отказ: POST не идемпотентен — повторы запрещены</code></pre></details>
+<p class="lab-note">Builder особенно уместен, когда проверка затрагивает несколько полей сразу (POST + retries): конструктор с 5 параметрами такую ошибку пропустил бы молча.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-19.2">
+<div class="lab-head"><span class="lab-num">Лаба 19.2</span><b>Strategy без классов: лямбды в EnumMap</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Заменить разрастающийся <code>switch</code> по типу клиента набором стратегий.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Pricing.java</code>:</div>
+<pre data-title="Pricing.java"><code class="java">import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.EnumMap;
+import java.util.Map;
+import java.util.function.UnaryOperator;
+
+public class Pricing {
+    enum Tier { REGULAR, SILVER, GOLD, EMPLOYEE }
+
+    static final Map&lt;Tier, UnaryOperator&lt;BigDecimal&gt;&gt; STRATEGIES = new EnumMap&lt;&gt;(Map.of(
+        Tier.REGULAR, p -&gt; p,
+        Tier.SILVER, p -&gt; p.multiply(new BigDecimal("0.95")),
+        Tier.GOLD, p -&gt; p.multiply(new BigDecimal("0.90")).max(p.subtract(new BigDecimal("500"))),
+        Tier.EMPLOYEE, p -&gt; p.multiply(new BigDecimal("0.70"))));
+
+    static BigDecimal price(Tier tier, BigDecimal base) {
+        return STRATEGIES.get(tier).apply(base).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    public static void main(String[] args) {
+        for (Tier t : Tier.values())
+            System.out.printf("%-9s 1000 → %8s   10000 → %9s%n", t, price(t, new BigDecimal("1000")), price(t, new BigDecimal("10000")));
+        System.out.println("стратегий: " + STRATEGIES.size() + " из " + Tier.values().length);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Pricing.java
+java Pricing</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">REGULAR   1000 →  1000.00   10000 →  10000.00
+SILVER    1000 →   950.00   10000 →   9500.00
+GOLD      1000 →   900.00   10000 →   9500.00
+EMPLOYEE  1000 →   700.00   10000 →   7000.00
+стратегий: 4 из 4</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что произойдёт, если добавить в enum <code>PLATINUM</code>, но забыть стратегию? Как сделать так, чтобы ошибка была видна сразу при старте?</div>
+<div class="lab-ans" hidden><p><code>NullPointerException</code> в момент первого расчёта для PLATINUM — возможно, через неделю в продакшене. Защита: проверка полноты в статическом блоке (<code>if (STRATEGIES.size() != Tier.values().length) throw …</code>) — тогда ошибка будет при загрузке класса. Ещё надёжнее — абстрактный метод в самом enum (каждая константа обязана его реализовать, проверяет компилятор) или <code>switch</code>-выражение без default.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-19.3">
+<div class="lab-head"><span class="lab-num">Лаба 19.3</span><b>Decorator: кэш и замер времени поверх медленного сервиса</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Добавить поведение (кэширование, метрики) без изменения исходного класса — композицией по общему интерфейсу.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Decorators.java</code>:</div>
+<pre data-title="Decorators.java"><code class="java">import java.util.HashMap;
+import java.util.Map;
+
+public class Decorators {
+    interface RateService { double rate(String currency); }
+
+    static class SlowBankRates implements RateService {
+        public double rate(String currency) {
+            try { Thread.sleep(300); } catch (InterruptedException e) { throw new RuntimeException(e); }
+            return switch (currency) { case "USD" -&gt; 92.5; case "EUR" -&gt; 100.1; default -&gt; throw new IllegalArgumentException(currency); };
+        }
+    }
+
+    static class Caching implements RateService {
+        private final RateService inner; private final Map&lt;String, Double&gt; cache = new HashMap&lt;&gt;();
+        Caching(RateService inner) { this.inner = inner; }
+        public double rate(String c) { return cache.computeIfAbsent(c, inner::rate); }
+    }
+
+    static class Timing implements RateService {
+        private final RateService inner;
+        Timing(RateService inner) { this.inner = inner; }
+        public double rate(String c) {
+            long t = System.nanoTime();
+            try { return inner.rate(c); }
+            finally { System.out.printf("  rate(%s) за %d мс%n", c, (System.nanoTime() - t) / 1_000_000); }
+        }
+    }
+
+    public static void main(String[] args) {
+        RateService svc = new Timing(new Caching(new SlowBankRates()));
+        for (String c : new String[] { "USD", "EUR", "USD", "USD", "EUR" }) System.out.println(c + " = " + svc.rate(c));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько вызовов будут долгими? А если поменять порядок: <code>new Caching(new Timing(new SlowBankRates()))</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Decorators.java
+java Decorators</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  rate(USD) за 305 мс
+USD = 92.5
+  rate(EUR) за 301 мс
+EUR = 100.1
+  rate(USD) за 0 мс
+USD = 92.5
+  rate(USD) за 0 мс
+USD = 92.5
+  rate(EUR) за 0 мс
+EUR = 100.1</code></pre></details>
+<div class="lab-ans" hidden><p>Долгими будут два первых (USD и EUR), остальные — 0 мс из кэша. При обратном порядке Timing окажется <i>внутри</i> кэша и будет печатать только для промахов: метрика покажет «все запросы по 300 мс», хотя пользователи видят в основном мгновенные ответы. Порядок декораторов — часть логики (так же важен порядок фильтров и аспектов в Spring).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-19.4">
+<div class="lab-head"><span class="lab-num">Лаба 19.4</span><b>Observer: события и утечка подписчиков</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сделать простую шину событий и увидеть, почему подписки нужно уметь отменять.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Events.java</code>:</div>
+<pre data-title="Events.java"><code class="java">import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
+
+public class Events {
+    record OrderPlaced(String id, double sum) { }
+
+    static class EventBus&lt;E&gt; {
+        private final List&lt;Consumer&lt;E&gt;&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+        Runnable subscribe(Consumer&lt;E&gt; l) { listeners.add(l); return () -&gt; listeners.remove(l); }   // возвращаем «отписку»
+        void publish(E event) { listeners.forEach(l -&gt; l.accept(event)); }
+        int size() { return listeners.size(); }
+    }
+
+    public static void main(String[] args) {
+        EventBus&lt;OrderPlaced&gt; bus = new EventBus&lt;&gt;();
+        bus.subscribe(e -&gt; System.out.println("  письмо клиенту о заказе " + e.id()));
+        Runnable unsubscribeStats = bus.subscribe(e -&gt; System.out.println("  статистика: +" + e.sum()));
+        bus.publish(new OrderPlaced("A-1", 990));
+        unsubscribeStats.run();
+        bus.publish(new OrderPlaced("A-2", 150));
+
+        for (int i = 0; i &lt; 1000; i++) {
+            byte[] screenState = new byte[100_000];                      // «экран», который давно закрыт
+            bus.subscribe(e -&gt; { int unused = screenState.length; });   // забыли отписаться
+        }
+        System.out.println("подписчиков: " + bus.size() + " — каждый держит по 100 КБ");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Events.java
+java Events</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  письмо клиенту о заказе A-1
+  статистика: +990.0
+  письмо клиенту о заказе A-2
+подписчиков: 1001 — каждый держит по 100 КБ</code></pre></details>
+<p class="lab-note">Забытые подписчики — классическая утечка памяти: шина живёт долго и держит лямбды, а лямбды держат захваченные объекты. Возвращайте из <code>subscribe</code> способ отписаться (как <code>AutoCloseable</code>/<code>Runnable</code>) и вызывайте его при закрытии компонента.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">19.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Какой паттерн реализует <code>new BufferedInputStream(new FileInputStream(f))</code>?</p><ul><li>Adapter</li><li>Decorator: обёртка с тем же интерфейсом InputStream добавляет буферизацию</li><li>Proxy</li><li>Facade</li></ul><div class="why">Интерфейс не меняется, поведение добавляется слоями. Adapter был бы, если бы интерфейс менялся: InputStreamReader превращает InputStream в Reader.</div></div>
 <div class="mcq" data-ok="2"><p>Почему double-checked locking без volatile некорректен?</p><ul><li>synchronized не работает со статическими полями</li><li>Он создаёт два экземпляра всегда</li><li>Другой поток может увидеть ненулевую ссылку на объект, конструктор которого ещё не завершён</li><li>Он медленнее простой синхронизации</li></ul><div class="why">Запись ссылки и инициализация полей могут быть переупорядочены; volatile даёт happens-before. Подробности — пособие Java Concurrency, тема 02.</div></div>

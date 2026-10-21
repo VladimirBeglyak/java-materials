@@ -1,0 +1,102 @@
+@chapter 22 | quiz
+@intro
+<p>Всё, что JVM «видит» в контейнере, проверяется одной командой <code>docker run</code>. Нужен Docker Desktop (или Docker на Linux) и образ <code>eclipse-temurin:25-jdk</code> (~200 МБ, скачается при первом запуске). Команды одинаковы для PowerShell и bash; в cmd вместо <code>${PWD}</code> пишите <code>%cd%</code>.</p>
+@end
+
+@lab 22.1 | Что JVM видит при разных лимитах | 20 мин
+@goal
+<p>Сравнить память и процессоры, которые JVM определяет без лимитов и с лимитами cgroups.</p>
+@end
+@exec
+docker pull -q eclipse-temurin:25-jdk >/dev/null 2>&1; true
+@end
+@run grep="Provider|Effective CPU|Memory Limit:|Max\. Heap|Using [A-Z]"
+docker run --rm eclipse-temurin:25-jdk java -XshowSettings:system -version ||| MSYS_NO_PATHCONV=1 docker run --rm eclipse-temurin:25-jdk java -XshowSettings:system -version 2>&1
+docker run --rm eclipse-temurin:25-jdk java -Xlog:gc:stdout -XshowSettings:vm -version ||| MSYS_NO_PATHCONV=1 docker run --rm eclipse-temurin:25-jdk java -Xlog:gc:stdout -XshowSettings:vm -version 2>&1
+@end
+@note <code>-XshowSettings:system</code> показывает, что JVM прочитала из cgroups, <code>-XshowSettings:vm</code> — итоговый размер кучи, а первая строка лога GC (<code>-Xlog:gc:stdout</code>) называет выбранный сборщик. Без лимитов контейнер видит всю память виртуальной машины Docker Desktop.
+@predict Запустим с <code>-m 512m --cpus=1.5</code>. Какие будут Max. Heap Size, число CPU и сборщик?
+@answer
+<p>Память контейнера — 512 МБ, куча по умолчанию — 25% от неё: <b>128 МБ</b>. CPU — <b>2</b> (квота 1,5 округляется вверх). Сборщик — <b>Serial</b>: при памяти меньше 1792 МБ машина не считается «серверной» (как в лабе 1.2). Это самая частая причина «почему в Kubernetes у нас SerialGC».</p>
+@end
+@run grep="Provider|Effective CPU|Memory Limit:|Max\. Heap|Using [A-Z]"
+docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -XshowSettings:system -version ||| MSYS_NO_PATHCONV=1 docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -XshowSettings:system -version 2>&1
+docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -Xlog:gc:stdout -XshowSettings:vm -version ||| MSYS_NO_PATHCONV=1 docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -Xlog:gc:stdout -XshowSettings:vm -version 2>&1
+@end
+@step Типичная настройка сервиса — процент памяти и явный сборщик:
+@run grep="Max\. Heap|Using [A-Z]"
+docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -XX:MaxRAMPercentage=75 -XX:+UseG1GC -Xlog:gc:stdout -XshowSettings:vm -version ||| MSYS_NO_PATHCONV=1 docker run --rm -m 512m --cpus=1.5 eclipse-temurin:25-jdk java -XX:MaxRAMPercentage=75 -XX:+UseG1GC -Xlog:gc:stdout -XshowSettings:vm -version 2>&1
+@end
+@end
+
+@lab 22.2 | OOM killer: код 137 без OutOfMemoryError | 20 мин
+@goal
+<p>Увидеть, как ядро Linux убивает JVM, которой разрешили кучу больше лимита контейнера, — и как это выглядит снаружи.</p>
+@end
+@file Eat.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Eat {
+    public static void main(String[] args) {
+        List<byte[]> keep = new ArrayList<>();
+        for (int mb = 1; ; mb++) {
+            byte[] chunk = new byte[1 << 20];
+            for (int i = 0; i < chunk.length; i += 4096) chunk[i] = 1;   // реально занять страницы
+            keep.add(chunk);
+            if (mb % 50 == 0) System.out.println("занято " + mb + " МБ");
+        }
+    }
+}
+@end
+@predict Контейнер с <code>-m 256m</code>, а JVM мы разрешили <code>-Xmx1g</code>. Чем закончится программа?
+@answer
+<p>JVM не знает, что физически памяти меньше, и продолжает расти. Когда RSS процесса упрётся в 256 МБ, ядро пошлёт SIGKILL: процесс исчезает мгновенно, без <code>OutOfMemoryError</code>, без дампа и без строчки в логе приложения. Снаружи — только код возврата <b>137</b> (128 + 9) и <code>OOMKilled: true</code> у контейнера.</p>
+@end
+@run fail
+docker run --rm -m 256m -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk java -Xmx1g Eat.java ||| MSYS_NO_PATHCONV=1 docker run --rm -m 256m -v "$(pwd -W):/app" -w /app eclipse-temurin:25-jdk java -Xmx1g Eat.java; echo "код возврата: $?"
+echo $LASTEXITCODE    # PowerShell; в bash: echo $? ||| true
+@end
+@step Теперь без явного <code>-Xmx</code> — пусть JVM сама посчитает кучу от лимита:
+@run fail
+docker run --rm -m 256m -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk java -XX:MaxRAMPercentage=75 Eat.java ||| MSYS_NO_PATHCONV=1 docker run --rm -m 256m -v "$(pwd -W):/app" -w /app eclipse-temurin:25-jdk java -XX:MaxRAMPercentage=75 Eat.java 2>&1 | grep -E "занято|Exception"; echo "код возврата: ${PIPESTATUS[0]}"
+@end
+@note Теперь падение «правильное»: <code>OutOfMemoryError: Java heap space</code> — его видно в логах, можно снять дамп (<code>-XX:+HeapDumpOnOutOfMemoryError</code>). 25% запаса оставлены под metaspace, потоки, code cache и буферы — не-кучевую память.
+@end
+
+@lab 22.3 | Корректное завершение: SIGTERM и shutdown hook | 15 мин
+@goal
+<p>Проверить, что <code>docker stop</code> (как и удаление пода) доставляет SIGTERM в JVM и hook успевает отработать — и как это ломается, если java запущена через shell.</p>
+@end
+@file Graceful.java
+public class Graceful {
+    public static void main(String[] args) throws Exception {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("SIGTERM получен: дописываю буферы, закрываю пул соединений…");
+            try { Thread.sleep(500); } catch (InterruptedException ignored) { }
+            System.out.println("завершено чисто");
+        }));
+        System.out.println("работаю, pid в контейнере = " + ProcessHandle.current().pid());
+        Thread.sleep(600_000);
+    }
+}
+@end
+@run
+docker run -d --name graceful -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk java Graceful.java ||| MSYS_NO_PATHCONV=1 docker rm -f graceful >/dev/null 2>&1; MSYS_NO_PATHCONV=1 docker run -d --name graceful -v "$(pwd -W):/app" -w /app eclipse-temurin:25-jdk java Graceful.java > /dev/null
+docker stop graceful ||| sleep 6; docker stop graceful > /dev/null
+docker logs graceful
+docker rm graceful ||| docker rm graceful > /dev/null
+@end
+@predict Запустите то же через shell: <code>sh -c "java Graceful.java"</code>. Сколько займёт <code>docker stop</code> и выполнится ли hook?
+@answer
+<p>PID 1 в контейнере теперь <code>sh</code>, а не java. Он не пересылает SIGTERM дочернему процессу, и по истечении таймаута <code>docker stop</code> (по умолчанию до 10 с) контейнер получает SIGKILL: hook не выполнится, ни «завершено чисто», ни «java вышла» в логах нет, код выхода — 137. Поэтому в Dockerfile пишут exec-форму <code>ENTRYPOINT ["java", "-jar", "app.jar"]</code> или <code>exec java …</code> в скрипте.</p>
+@end
+@run
+docker run -d --name graceful2 -v "${PWD}:/app" -w /app eclipse-temurin:25-jdk sh -c "java Graceful.java; echo java вышла" ||| MSYS_NO_PATHCONV=1 docker rm -f graceful2 >/dev/null 2>&1; MSYS_NO_PATHCONV=1 docker run -d --name graceful2 -v "$(pwd -W):/app" -w /app eclipse-temurin:25-jdk sh -c "java Graceful.java; echo java вышла" > /dev/null
+docker stop graceful2 ||| sleep 6; S=$(date +%s); docker stop graceful2 > /dev/null; echo "docker stop занял $(( $(date +%s) - S )) с"
+docker logs graceful2
+docker inspect graceful2 --format "{{.State.ExitCode}}"
+docker rm graceful2 ||| docker rm graceful2 > /dev/null
+@end
+@note Интересная деталь: в образе Temurin <code>sh</code> — это dash, который для последней команды иногда сам делает exec. Здесь после java стоит ещё одна команда, поэтому exec невозможен — классический сценарий из реальных entrypoint-скриптов.
+@end

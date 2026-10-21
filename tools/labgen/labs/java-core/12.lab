@@ -1,0 +1,132 @@
+@chapter 12 | quiz
+@intro
+<p>Records, sealed-иерархии и сопоставление с образцом складываются в один стиль — «алгебраические типы данных». Построим маленький калькулятор выражений и посмотрим, как компилятор проверяет полноту <code>switch</code>. Модуль IDEA — <code>ch12</code>, language level 25.</p>
+@end
+
+@lab 12.1 | Record: что генерирует компилятор | 15 мин
+@goal
+<p>Увидеть сгенерированные методы record и написать компактный конструктор с проверкой.</p>
+@end
+@file Money.java
+import java.math.BigDecimal;
+
+public record Money(BigDecimal amount, String currency) {
+    public Money {
+        if (amount.signum() < 0) throw new IllegalArgumentException("отрицательная сумма: " + amount);
+        currency = currency.toUpperCase();
+    }
+
+    public Money plus(Money other) {
+        if (!currency.equals(other.currency)) throw new IllegalArgumentException("разные валюты");
+        return new Money(amount.add(other.amount), currency);
+    }
+
+    public static void main(String[] args) {
+        Money a = new Money(new BigDecimal("10.50"), "rub"), b = new Money(new BigDecimal("4.50"), "RUB");
+        System.out.println(a.plus(b) + ", equals: " + a.equals(new Money(new BigDecimal("10.50"), "RUB")));
+        try { new Money(new BigDecimal("-1"), "rub"); } catch (IllegalArgumentException e) { System.out.println(e.getMessage()); }
+    }
+}
+@end
+@run
+javac Money.java
+java Money
+javap -p Money.class
+@end
+@predict Какие методы есть в javap, хотя вы их не писали?
+@answer
+<p>Аксессоры <code>amount()</code> и <code>currency()</code> (без «get»), канонический конструктор, <code>equals</code>, <code>hashCode</code>, <code>toString</code> — последние три помечены <code>final</code> и реализованы через <code>invokedynamic</code> с bootstrap <code>ObjectMethods</code>. Поля — <code>private final</code>. Компактный конструктор выполняется до присваивания полей, поэтому <code>currency = …toUpperCase()</code> меняет параметр, который затем запишется в поле.</p>
+@end
+
+@lab 12.2 | Sealed-иерархия и исчерпывающий switch | 25 мин
+@goal
+<p>Описать выражения как sealed-интерфейс с record-ами и вычислять их switch-ем с паттернами — без default.</p>
+@end
+@file Expr.java
+public sealed interface Expr permits Expr.Num, Expr.Add, Expr.Mul, Expr.Neg {
+    record Num(double value) implements Expr { }
+    record Add(Expr left, Expr right) implements Expr { }
+    record Mul(Expr left, Expr right) implements Expr { }
+    record Neg(Expr inner) implements Expr { }
+
+    static double eval(Expr e) {
+        return switch (e) {
+            case Num n -> n.value();
+            case Add(Expr l, Expr r) -> eval(l) + eval(r);
+            case Mul(Num(var a), Num(var b)) when a == 0 || b == 0 -> 0;     // вложенный паттерн + guard
+            case Mul(Expr l, Expr r) -> eval(l) * eval(r);
+            case Neg(Expr inner) -> -eval(inner);
+        };
+    }
+
+    static String show(Expr e) {
+        return switch (e) {
+            case Num(var v) -> String.valueOf(v);
+            case Add(var l, var r) -> "(" + show(l) + " + " + show(r) + ")";
+            case Mul(var l, var r) -> show(l) + " * " + show(r);
+            case Neg(var i) -> "-" + show(i);
+        };
+    }
+
+    static void main() {
+        Expr e = new Add(new Num(2), new Mul(new Num(3), new Neg(new Num(4))));
+        IO.println(show(e) + " = " + eval(e));
+    }
+}
+@end
+@run
+javac Expr.java
+java Expr
+@end
+@predict Добавьте в <code>permits</code> и в интерфейс новый вариант <code>record Div(Expr l, Expr r) implements Expr {}</code> и перекомпилируйте. Что скажет javac?
+@answer
+<p>Две ошибки: «the switch expression does not cover all possible input values» — в <code>eval</code> и в <code>show</code>. Это главная ценность sealed + switch без default: компилятор находит каждое место, которое нужно обновить при добавлении варианта. С <code>default -&gt;</code> вы потеряли бы эту проверку.</p>
+@end
+@exec
+cp Expr.java Expr.bak
+sed -i 's/permits Expr.Num, Expr.Add, Expr.Mul, Expr.Neg {/permits Expr.Num, Expr.Add, Expr.Mul, Expr.Neg, Expr.Div {\n    record Div(Expr l, Expr r) implements Expr { }/' Expr.java
+@end
+@run fail
+javac Expr.java
+@end
+@exec
+mv Expr.bak Expr.java
+javac Expr.java
+@end
+@try
+Поменяйте местами две ветки <code>case Mul</code>. ::: Ошибка «this case label is dominated by a preceding case label»: общий паттерн <code>Mul(Expr l, Expr r)</code> перекрывает частный, и тот стал бы недостижим. Порядок case в паттерн-switch важен.
+@end
+
+@lab 12.3 | Паттерны в instanceof и switch по null | 10 мин
+@goal
+<p>Проверить новые формы паттерн-сопоставления, включая <code>case null</code>.</p>
+@end
+@file Patterns.java
+public class Patterns {
+    static String describe(Object o) {
+        return switch (o) {
+            case null -> "это null";
+            case Integer i when i > 100 -> "большое число " + i;
+            case Integer i -> "число " + i;
+            case String s when s.isBlank() -> "пустая строка";
+            case String s -> "строка длины " + s.length();
+            case int[] arr -> "массив int из " + arr.length;
+            default -> "что-то ещё: " + o.getClass().getSimpleName();
+        };
+    }
+
+    public static void main(String[] args) {
+        Object[] samples = { 7, 500, "", "hello", new int[3], 2.5, null };
+        for (Object o : samples) System.out.println(describe(o));
+        Object x = "text";
+        if (x instanceof String s && s.length() > 2) System.out.println("instanceof с паттерном: " + s.toUpperCase());
+    }
+}
+@end
+@run
+javac Patterns.java
+java Patterns
+@end
+@try
+Уберите <code>case null</code>. Что произойдёт на последнем элементе? ::: <code>NullPointerException</code>: switch по-прежнему бросает NPE на null, если явно не обработать <code>case null</code> — для обратной совместимости.
+@end

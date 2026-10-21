@@ -1,0 +1,148 @@
+@chapter 17 | quiz
+@intro
+<p>Даты и время ломаются на границах: перевод часов, конец месяца, неделя на стыке годов, часовой пояс сервера. Все эти границы можно воспроизвести детерминированно — достаточно задать конкретные даты и зоны. Модуль IDEA — <code>ch17</code>.</p>
+@end
+
+@lab 17.1 | Один момент — разное «время на стене» | 15 мин
+@goal
+<p>Увидеть разницу между <code>Instant</code>, <code>LocalDateTime</code>, <code>ZonedDateTime</code> и <code>OffsetDateTime</code> на одном моменте.</p>
+@end
+@file Moment.java
+import java.time.*;
+
+public class Moment {
+    public static void main(String[] args) {
+        Instant launch = Instant.parse("2026-10-21T09:00:00Z");
+        System.out.println("Instant (UTC):      " + launch);
+        for (String zone : new String[] { "Europe/Moscow", "Asia/Almaty", "America/New_York", "Asia/Kolkata" }) {
+            ZonedDateTime z = launch.atZone(ZoneId.of(zone));
+            System.out.printf("%-18s  %s  (смещение %s)%n", zone, z.toLocalDateTime(), z.getOffset());
+        }
+        LocalDateTime wall = LocalDateTime.of(2026, 10, 21, 12, 0);
+        System.out.println("LocalDateTime 12:00 в Москве = " + wall.atZone(ZoneId.of("Europe/Moscow")).toInstant());
+        System.out.println("LocalDateTime 12:00 в Нью-Йорке = " + wall.atZone(ZoneId.of("America/New_York")).toInstant());
+        System.out.println("зона JVM по умолчанию: " + ZoneId.systemDefault());
+    }
+}
+@end
+@predict Одинаковы ли два последних Instant и почему <code>LocalDateTime</code> нельзя хранить как «момент события»?
+@answer
+<p>Нет — разница 7 часов. <code>LocalDateTime</code> — это «12:00 на чьих-то часах» без указания, на чьих: сам по себе он не задаёт момент. Для событий храните <code>Instant</code> (или <code>OffsetDateTime</code>/<code>timestamptz</code> в БД), а <code>LocalDateTime</code> + <code>ZoneId</code> — для будущих встреч «в 12:00 по местному времени», где правила зоны могут ещё измениться.</p>
+@end
+@run
+javac Moment.java
+java Moment
+@end
+@try
+Запустите с <code>-Duser.timezone=Asia/Tokyo</code>. Что поменялось, а что — нет? ::: Изменилась только последняя строка (зона по умолчанию). Код, который явно указывает зоны, от настроек сервера не зависит — а <code>LocalDateTime.now()</code> без аргументов зависел бы.
+@end
+
+@lab 17.2 | Перевод часов: пропущенный и повторённый час | 20 мин
+@goal
+<p>Создать время, которого не существует, и время, которое случилось дважды, и посмотреть, что с ними делает java.time.</p>
+@end
+@file Dst.java
+import java.time.*;
+
+public class Dst {
+    public static void main(String[] args) {
+        ZoneId berlin = ZoneId.of("Europe/Berlin");
+        // 29 марта 2026: 02:00 → 03:00, часа 02:xx не существует
+        ZonedDateTime gap = ZonedDateTime.of(LocalDateTime.of(2026, 3, 29, 2, 30), berlin);
+        System.out.println("02:30 в «дыре»:   " + gap);
+
+        // 25 октября 2026: 03:00 → 02:00, час 02:xx повторяется
+        ZonedDateTime overlap = ZonedDateTime.of(LocalDateTime.of(2026, 10, 25, 2, 30), berlin);
+        System.out.println("02:30 (раннее):   " + overlap);
+        System.out.println("02:30 (позднее):  " + overlap.withLaterOffsetAtOverlap());
+
+        ZonedDateTime before = ZonedDateTime.of(LocalDateTime.of(2026, 10, 24, 12, 0), berlin);
+        System.out.println("plusDays(1):      " + before.plusDays(1));
+        System.out.println("plusHours(24):    " + before.plusHours(24));
+        System.out.println("часов между полуднями: " + Duration.between(before, before.plusDays(1)).toHours());
+    }
+}
+@end
+@predict Что станет с 02:30 29 марта? Отличаются ли <code>plusDays(1)</code> и <code>plusHours(24)</code> 24 октября?
+@answer
+<p>02:30 в «дыре» сдвигается вперёд на длину перехода: <b>03:30+02:00</b>. В октябре 02:30 существует дважды: по умолчанию берётся раннее смещение (+02:00), <code>withLaterOffsetAtOverlap</code> даёт +01:00. <code>plusDays(1)</code> сохраняет «время на стене» — <b>12:00</b> следующего дня (прошло 25 часов), <code>plusHours(24)</code> прибавляет ровно 24 часа — <b>11:00</b>. «День» и «24 часа» — разные вещи: <code>Period</code> против <code>Duration</code>.</p>
+@end
+@run
+javac Dst.java
+java Dst
+@end
+
+@lab 17.3 | Конец месяца и YYYY вместо yyyy | 15 мин
+@goal
+<p>Поймать две ошибки, которые проходят все тесты, кроме тестов в последние дни месяца и года.</p>
+@end
+@file Edges.java
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
+
+public class Edges {
+    public static void main(String[] args) {
+        LocalDate jan31 = LocalDate.of(2026, 1, 31);
+        System.out.println("31 янв + 1 мес      = " + jan31.plusMonths(1));
+        System.out.println("31 янв + 1 мес + 1  = " + jan31.plusMonths(1).plusMonths(1));
+        System.out.println("31 янв + 2 мес      = " + jan31.plusMonths(2));
+
+        Locale ru = Locale.forLanguageTag("ru-RU");
+        DateTimeFormatter good = DateTimeFormatter.ofPattern("dd.MM.yyyy", ru);
+        DateTimeFormatter bad = DateTimeFormatter.ofPattern("dd.MM.YYYY", ru);
+        for (LocalDate d : new LocalDate[] { LocalDate.of(2025, 12, 28), LocalDate.of(2025, 12, 29), LocalDate.of(2026, 6, 1) }) {
+            System.out.println(d + ":  yyyy → " + d.format(good) + "   YYYY → " + d.format(bad));
+        }
+    }
+}
+@end
+@predict Что даст <code>YYYY</code> для 29 декабря 2025?
+@answer
+<p><b>29.12.2026</b> — на год вперёд! <code>Y</code> — «год недели» (week-based year): понедельник 29.12.2025 по правилам ISO уже принадлежит первой неделе 2026 года. Весь год формат совпадает с <code>yyyy</code>, а в последние дни декабря отчёты «уезжают» в следующий год. Ещё ловушка: 31 января + 1 месяц = 28 февраля, а <code>+1 мес +1 мес</code> = 28 марта, тогда как <code>+2 мес</code> = 31 марта — арифметика месяцев не ассоциативна.</p>
+@end
+@run
+javac Edges.java
+java Edges
+@end
+
+@lab 17.4 | Clock: тестируемое «сейчас» | 15 мин
+@goal
+<p>Убрать <code>now()</code> из бизнес-логики, передав <code>Clock</code>, и проверить логику на фиксированном и «ускоренном» времени.</p>
+@end
+@file Subscription.java
+import java.time.*;
+
+public class Subscription {
+    private final Clock clock;
+    private final Instant expiresAt;
+
+    Subscription(Clock clock, Instant expiresAt) {
+        this.clock = clock;
+        this.expiresAt = expiresAt;
+    }
+
+    boolean isActive() { return Instant.now(clock).isBefore(expiresAt); }
+    long daysLeft() { return Duration.between(Instant.now(clock), expiresAt).toDays(); }
+
+    public static void main(String[] args) {
+        Instant bought = Instant.parse("2026-01-01T00:00:00Z");
+        Instant expires = bought.plus(Duration.ofDays(30));
+        Clock atPurchase = Clock.fixed(bought, ZoneOffset.UTC);
+        Clock day29 = Clock.offset(atPurchase, Duration.ofDays(29));
+        Clock day31 = Clock.offset(atPurchase, Duration.ofDays(31));
+
+        for (Clock c : new Clock[] { atPurchase, day29, day31 }) {
+            var sub = new Subscription(c, expires);
+            System.out.printf("%s: активна=%b, осталось дней %d%n", Instant.now(c), sub.isActive(), sub.daysLeft());
+        }
+        System.out.println("реальные часы: " + new Subscription(Clock.systemUTC(), expires).isActive());
+    }
+}
+@end
+@run
+javac Subscription.java
+java Subscription
+@end
+@note В тестах подставляют <code>Clock.fixed</code> или <code>Clock.offset</code>, в продакшене — <code>Clock.systemUTC()</code> (в Spring — бин <code>Clock</code>). Тест с <code>Thread.sleep</code> ради «проверки истечения» больше не нужен.
+@end

@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 10 · ФУНКЦИОНАЛЬНЫЙ СТИЛЬ</div>
   <h1>Лямбды, функциональные интерфейсы, Optional</h1>
   <p class="lead">С Java 8 поведение можно передавать как значение: функцию — в метод, условие — в фильтр, действие — в обработчик. Глава объясняет, что такое лямбда с точки зрения языка и JVM, почему захваченная переменная должна быть «фактически финальной» и как пользоваться <code>Optional</code>, не делая код хуже.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">invokedynamic</span><span class="tag">method reference</span><span class="tag">Optional</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">invokedynamic</span><span class="tag">method reference</span><span class="tag">Optional</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -212,7 +212,181 @@ Optional&lt;User&gt; find(long id) { return null; }        // обесценив
 })();
 </script>
 
-<h2 id="quiz"><span class="h-num">10.8</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">10.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Лямбды — это не анонимные классы: проверим, что генерирует javac, что захватывается, когда вычисляются аргументы <code>Optional</code> и почему ссылка на метод иногда ведёт себя не так, как лямбда. Модуль IDEA — <code>ch10</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-10.1">
+<div class="lab-head"><span class="lab-num">Лаба 10.1</span><b>Анонимный класс против лямбды: файлы и this</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить, что создаёт javac для анонимного класса и для лямбды, и куда указывает <code>this</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ThisDemo.java</code>:</div>
+<pre data-title="ThisDemo.java"><code class="java">public class ThisDemo {
+    String name = "внешний объект";
+
+    void run() {
+        Runnable anon = new Runnable() {
+            String name = "анонимный класс";
+            public void run() { System.out.println("anon:   this.name = " + this.name + ", класс " + getClass().getName()); }
+        };
+        Runnable lambda = () -&gt; System.out.println("lambda: this.name = " + this.name + ", класс " + getClass().getName());
+        anon.run();
+        lambda.run();
+    }
+
+    public static void main(String[] args) { new ThisDemo().run(); }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac ThisDemo.java
+java ThisDemo</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">anon:   this.name = анонимный класс, класс ThisDemo$1
+lambda: this.name = внешний объект, класс ThisDemo</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько class-файлов появилось после javac и что в лямбде означает <code>this</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">dir /b ThisDemo*.class
+javap -p ThisDemo.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ThisDemo$1.class
+ThisDemo.class
+Compiled from "ThisDemo.java"
+public class ThisDemo {
+  java.lang.String name;
+  public ThisDemo();
+  void run();
+  public static void main(java.lang.String[]);
+  private void lambda$run$0();
+}</code></pre></details>
+<div class="lab-ans" hidden><p>Два: <code>ThisDemo.class</code> и <code>ThisDemo$1.class</code> (анонимный класс). Для лямбды отдельного файла нет: её тело — приватный метод <code>lambda$run$0</code> внутри ThisDemo, а класс-реализацию JVM генерирует в памяти при первом выполнении (invokedynamic). В лямбде <code>this</code> — внешний объект, у неё нет собственного состояния и своего <code>this</code>.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-10.2">
+<div class="lab-head"><span class="lab-num">Лаба 10.2</span><b>Захват переменных: effectively final и ловушка с циклом</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Понять, почему лямбда не может менять локальные переменные, и как обойти это правильно.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Capture.java</code>:</div>
+<pre data-title="Capture.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
+
+public class Capture {
+    public static void main(String[] args) {
+        List&lt;Supplier&lt;Integer&gt;&gt; suppliers = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 3; i++) {
+            int copy = i;                       // новая переменная на каждой итерации
+            suppliers.add(() -&gt; copy * 10);
+        }
+        suppliers.forEach(s -&gt; System.out.print(s.get() + " "));
+        System.out.println();
+
+        int counter = 0;
+        // List.of(1, 2, 3).forEach(x -&gt; counter++);    // не скомпилируется
+        AtomicInteger atomic = new AtomicInteger();
+        List.of(1, 2, 3).forEach(x -&gt; atomic.incrementAndGet());
+        int sum = List.of(1, 2, 3).stream().mapToInt(Integer::intValue).sum();
+        System.out.println("atomic = " + atomic + ", sum = " + sum + ", counter = " + counter);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатает первая строка? А что скажет компилятор, если раскомментировать строку с <code>counter++</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Capture.java
+java Capture</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">0 10 20 
+atomic = 3, sum = 6, counter = 0</code></pre></details>
+<div class="lab-ans" hidden><p><code>0 10 20</code>: каждая лямбда захватила <b>значение</b> своей переменной <code>copy</code>. Строка с <code>counter++</code> — ошибка «local variables referenced from a lambda expression must be final or effectively final»: лямбда получает копию значения, менять «оригинал» ей нечем. Счётчик через AtomicInteger работает, но идиоматичнее посчитать результат стримом (<code>count</code>, <code>sum</code>), без побочных эффектов.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Раскомментируйте строку и прочитайте сообщение компилятора. Затем замените <code>for (int i…)</code> на захват самой <code>i</code> без <code>copy</code>.</summary><div>Та же ошибка: <code>i</code> меняется в цикле, она не effectively final. А в <code>for (int x : array)</code> — можно: переменная цикла for-each своя на каждой итерации.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-10.3">
+<div class="lab-head"><span class="lab-num">Лаба 10.3</span><b>Optional: orElse против orElseGet</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что аргумент <code>orElse</code> вычисляется всегда, и выбрать правильный метод.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Opt.java</code>:</div>
+<pre data-title="Opt.java"><code class="java">import java.util.Map;
+import java.util.Optional;
+
+public class Opt {
+    static String expensiveDefault() {
+        System.out.println("   (вызван expensiveDefault — запрос в БД!)");
+        return "по умолчанию";
+    }
+
+    public static void main(String[] args) {
+        Map&lt;String, String&gt; users = Map.of("1", "Анна");
+        System.out.println("orElse, значение есть:");
+        String a = Optional.ofNullable(users.get("1")).orElse(expensiveDefault());
+        System.out.println("orElseGet, значение есть:");
+        String b = Optional.ofNullable(users.get("1")).orElseGet(Opt::expensiveDefault);
+        System.out.println("orElseGet, значения нет:");
+        String c = Optional.ofNullable(users.get("2")).orElseGet(Opt::expensiveDefault);
+        System.out.println(a + ", " + b + ", " + c);
+
+        String upper = Optional.ofNullable(users.get("1")).map(String::toUpperCase).filter(s -&gt; s.length() &gt; 2).orElse("?");
+        System.out.println("цепочка: " + upper);
+        try {
+            Optional.of(users.get("2"));
+        } catch (NullPointerException e) {
+            System.out.println("Optional.of(null) → NPE");
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько раз вызовется <code>expensiveDefault</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Opt.java
+java Opt</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">orElse, значение есть:
+   (вызван expensiveDefault — запрос в БД!)
+orElseGet, значение есть:
+orElseGet, значения нет:
+   (вызван expensiveDefault — запрос в БД!)
+Анна, Анна, по умолчанию
+цепочка: АННА
+Optional.of(null) → NPE</code></pre></details>
+<div class="lab-ans" hidden><p>Дважды: в <code>orElse</code> (хотя значение есть — аргумент метода вычисляется до вызова) и в последнем <code>orElseGet</code>, где значения действительно нет. <code>orElseGet</code> принимает Supplier и вызывает его лениво. Правило: <code>orElse</code> — для констант, <code>orElseGet</code> — для вычислений.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-10.4">
+<div class="lab-head"><span class="lab-num">Лаба 10.4</span><b>Ссылка на метод фиксирует получателя сразу</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти тонкую разницу между <code>obj::method</code> и <code>() -&gt; obj.method()</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>MethodRef.java</code>:</div>
+<pre data-title="MethodRef.java"><code class="java">import java.util.function.Supplier;
+
+public class MethodRef {
+    static String current = "первое";
+
+    public static void main(String[] args) {
+        Supplier&lt;Integer&gt; ref = current::length;
+        Supplier&lt;Integer&gt; lambda = () -&gt; current.length();
+        current = "второе значение";
+        System.out.println("ref: " + ref.get() + ", lambda: " + lambda.get());
+
+        String nothing = null;
+        Supplier&lt;Integer&gt; lazy = () -&gt; nothing.length();
+        System.out.println("лямбда с null создана");
+        try {
+            Supplier&lt;Integer&gt; eager = nothing::length;
+        } catch (NullPointerException e) {
+            System.out.println("ссылка на метод у null → NPE сразу при создании");
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что вернут <code>ref.get()</code> и <code>lambda.get()</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac MethodRef.java
+java MethodRef</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ref: 6, lambda: 15
+лямбда с null создана
+ссылка на метод у null → NPE сразу при создании</code></pre></details>
+<div class="lab-ans" hidden><p><code>ref: 6, lambda: 15</code>. В <code>current::length</code> получатель вычисляется один раз при создании ссылки (и проверяется на null — отсюда NPE сразу), лямбда читает поле при каждом вызове. Обычно разницы нет, но с изменяемыми полями и null это разные программы.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">10.9</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Почему лямбда может использовать локальную переменную, только если та effectively final?</p><ul><li>Так быстрее</li><li>Лямбда захватывает копию значения; изменяемая переменная рассинхронизировалась бы с копией, а лямбда может выполниться позже и в другом потоке</li><li>Это ограничение только для анонимных классов</li><li>Локальные переменные хранятся в куче</li></ul><div class="why">Локальная переменная живёт в кадре стека метода и исчезает при выходе из него. Поля объекта и элементы массива менять можно — они в куче.</div></div>
 <div class="mcq" data-ok="2"><p>Чем лямбда отличается от анонимного класса?</p><ul><li>Ничем, это синтаксический сахар</li><li>Лямбда медленнее</li><li>У лямбды нет своего this и отдельного class-файла: она компилируется в метод и создаётся через invokedynamic</li><li>Лямбда может иметь состояние</li></ul><div class="why"><code>this</code> в лямбде — внешний объект. Анонимный класс — настоящий класс со своим <code>this</code>, полями и файлом Outer$1.class.</div></div>

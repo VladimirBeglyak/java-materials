@@ -1,0 +1,150 @@
+@chapter 06 | quiz
+@intro
+<p>Головоломки с <code>finally</code>, порядок закрытия ресурсов, подавленные исключения и неожиданная оптимизация JVM, которая «съедает» стектрейсы. Модуль IDEA — <code>ch06</code>.</p>
+@end
+
+@lab 6.1 | Что вернёт метод с finally | 15 мин
+@goal
+<p>Разобраться, когда finally меняет результат, а когда нет.</p>
+@end
+@file Finally.java
+public class Finally {
+    static int a() { int x = 1; try { return x; } finally { x = 2; } }
+    static int b() { try { return 1; } finally { return 2; } }
+    static int c() { try { throw new RuntimeException("boom in try"); } finally { return 3; } }
+    static StringBuilder d() { StringBuilder sb = new StringBuilder("1"); try { return sb; } finally { sb.append("2"); } }
+    static void e() {
+        try { throw new IllegalStateException("основное"); }
+        finally { throw new RuntimeException("boom in finally"); }
+    }
+
+    public static void main(String[] args) {
+        System.out.println("a() = " + a());
+        System.out.println("b() = " + b());
+        System.out.println("c() = " + c());
+        System.out.println("d() = " + d());
+        try { e(); } catch (RuntimeException ex) { System.out.println("e() бросил: " + ex.getMessage()); }
+    }
+}
+@end
+@predict Пять ответов.
+@answer
+<p>a — <b>1</b>: значение для return вычислено и сохранено до finally; изменение локальной переменной его не трогает. b — <b>2</b>: return в finally перекрывает. c — <b>3</b>: return в finally <i>проглатывает исключение</i> — самый опасный случай. d — <b>12</b>: сохранена ссылка, а объект finally изменил. e — «boom in finally»: исключение из finally заменяет основное, и оно потеряно. javac предупреждает: <code>finally clause cannot complete normally</code> (с <code>-Xlint</code>).</p>
+@end
+@run
+javac -Xlint:finally Finally.java
+java Finally
+@end
+
+@lab 6.2 | try-with-resources: порядок и подавленные исключения | 15 мин
+@goal
+<p>Увидеть порядок закрытия ресурсов и то, что исключение из close не теряется.</p>
+@end
+@file Resources.java
+public class Resources {
+    record Res(String name, boolean failOnClose) implements AutoCloseable {
+        Res { System.out.println("открыт " + name); }
+        @Override public void close() {
+            System.out.println("закрываю " + name);
+            if (failOnClose) throw new IllegalStateException("сбой close " + name);
+        }
+    }
+
+    public static void main(String[] args) {
+        try (var db = new Res("db", true); var file = new Res("file", true)) {
+            System.out.println("работаю");
+            throw new RuntimeException("сбой в работе");
+        } catch (RuntimeException e) {
+            System.out.println("поймали: " + e.getMessage());
+            for (Throwable s : e.getSuppressed()) System.out.println("  подавлено: " + s.getMessage());
+        } finally {
+            System.out.println("finally");
+        }
+    }
+}
+@end
+@predict В каком порядке закроются ресурсы, какое исключение поймает catch и когда выполнится finally?
+@answer
+<p>Закрытие — в обратном порядке: сначала <code>file</code>, потом <code>db</code>. Catch получает <b>основное</b> исключение «сбой в работе», а оба сбоя close прикреплены к нему через <code>addSuppressed</code> — ничего не теряется (в отличие от finally из лабы 6.1). catch и finally выполняются после закрытия всех ресурсов.</p>
+@end
+@run
+javac Resources.java
+java Resources
+@end
+
+@lab 6.3 | Исчезающие стектрейсы: OmitStackTraceInFastThrow | 15 мин
+@goal
+<p>Поймать оптимизацию JIT, из-за которой в логах продакшена встречаются <code>NullPointerException</code> без стектрейса.</p>
+@end
+@file FastThrow.java
+public class FastThrow {
+    static int len(String s) { return s.length(); }
+
+    public static void main(String[] args) {
+        for (int i = 1; i <= 200_000; i++) {
+            try {
+                len(null);
+            } catch (NullPointerException e) {
+                if (i == 1 || i % 50_000 == 0)
+                    System.out.printf("%,7d: стек из %d кадров, сообщение: %s%n", i, e.getStackTrace().length, e.getMessage());
+            }
+        }
+    }
+}
+@end
+@predict Будет ли у NPE стектрейс на 200-тысячной итерации?
+@answer
+<p>Нет. Когда C2 компилирует горячий метод, который часто бросает встроенные исключения (NPE, ArithmeticException, ArrayIndexOutOfBounds…), он заменяет их одним заранее созданным объектом без стека и без сообщения — так быстрее. В логах это выглядит как <code>java.lang.NullPointerException</code> без единой строки <code>at</code>. Ищите самое первое появление ошибки в логе — у него стек ещё есть — или отключите оптимизацию. Заметьте, что на какой-то из промежуточных отметок стек может «вернуться»: метод деоптимизировали, и он ненадолго выполнялся без этой оптимизации.</p>
+@end
+@run
+javac FastThrow.java
+java FastThrow
+@end
+@ide VM options: <code>-XX:-OmitStackTraceInFastThrow</code>
+@run
+java -XX:-OmitStackTraceInFastThrow FastThrow
+@end
+
+@lab 6.4 | Перевод исключений между слоями | 15 мин
+@goal
+<p>Обернуть низкоуровневое исключение в доменное, не потеряв причину, и прочитать цепочку «Caused by».</p>
+@end
+@file Layers.java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Layers {
+    static class ConfigException extends RuntimeException {
+        ConfigException(String msg, Throwable cause) { super(msg, cause); }
+    }
+
+    static String readConfig(Path p) {
+        try {
+            return Files.readString(p);
+        } catch (IOException e) {
+            throw new ConfigException("не удалось загрузить конфигурацию " + p, e);
+        }
+    }
+
+    public static void main(String[] args) {
+        try {
+            readConfig(Path.of("нет-такого.yml"));
+        } catch (ConfigException e) {
+            e.printStackTrace(System.out);
+            System.out.println("корневая причина: " + rootCause(e).getClass().getSimpleName());
+        }
+    }
+
+    static Throwable rootCause(Throwable t) { while (t.getCause() != null) t = t.getCause(); return t; }
+}
+@end
+@run
+javac Layers.java
+java Layers
+@end
+@note Строка <code>... 2 more</code> означает «следующие 2 кадра совпадают с кадрами внешнего исключения выше» — JVM не повторяет их. Читайте цепочку снизу вверх: последний <code>Caused by</code> — первопричина.
+@try
+Уберите <code>e</code> из конструктора ConfigException (передайте только сообщение). Чем это плохо? ::: Стек и тип исходной ошибки (<code>NoSuchFileException</code>) пропадут — в логе останется только ваше сообщение. Причину передавайте всегда.
+@end

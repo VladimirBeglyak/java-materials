@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 20 · ЭКСПЛУАТАЦИЯ</div>
   <h1>Быстрый старт: CDS, AOT cache, CRaC, native image</h1>
   <p class="lead">Spring Boot-сервис стартует за 5–10 секунд и ещё минуту прогревается — для автоскейлинга, serverless и CLI это много. Куда уходит время старта, и как его сократить на разных уровнях: общий архив классов (CDS), AOT-кэш проекта Leyden (Java 24–25), снимок прогретого процесса (CRaC) и полная компиляция в исполняемый файл (GraalVM Native Image) — с их ценой и ограничениями.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">фазы старта</span><span class="tag">CDS/AppCDS</span><span class="tag">AOT cache (JEP 483/514/515)</span><span class="tag">CRaC</span><span class="tag">GraalVM Native Image</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">фазы старта</span><span class="tag">CDS/AppCDS</span><span class="tag">AOT cache (JEP 483/514/515)</span><span class="tag">CRaC</span><span class="tag">GraalVM Native Image</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -102,7 +102,138 @@ java -XX:SharedArchiveFile=app.jsa -jar app/app.jar             # старт б�
 </script>
 <p class="hint">Цифры — порядок величин для типичного Spring Boot-приложения; реальные зависят от приложения, железа и версий — измеряйте.</p>
 
-<h2 id="quiz"><span class="h-num">20.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">20.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Измерим время старта небольшого приложения и ускорим его тремя способами, встроенными в JDK 25: стандартным CDS, архивом своих классов (AppCDS) и AOT-кэшем проекта Leyden. AOT-кэш работает только с classpath из jar-файлов, поэтому приложение сначала соберём в jar. Модуль IDEA — <code>ch20</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-20.1">
+<div class="lab-head"><span class="lab-num">Лаба 20.1</span><b>Приложение, которому есть что грузить</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Собрать jar, который на старте загружает около тысячи классов (HTTP-клиент, XML, регулярные выражения, стримы), и измерить время до конца <code>main</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>app-src/StartApp.java</code>:</div>
+<pre data-title="app-src/StartApp.java"><code class="java">import java.io.StringReader;
+import java.lang.management.ManagementFactory;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import javax.xml.parsers.DocumentBuilderFactory;
+import org.xml.sax.InputSource;
+
+public class StartApp {
+    public static void main(String[] args) throws Exception {
+        var client = HttpClient.newHttpClient();
+        var req = HttpRequest.newBuilder(URI.create("http://localhost/health")).build();
+        var doc = DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new InputSource(new StringReader("&lt;cfg&gt;&lt;port&gt;8080&lt;/port&gt;&lt;/cfg&gt;")));
+        String port = doc.getElementsByTagName("port").item(0).getTextContent();
+        var words = Pattern.compile("\\s+").splitAsStream("быстрый старт JVM на JDK 25").collect(Collectors.toList());
+        int sum = IntStream.rangeClosed(1, 100).filter(i -&gt; i % 3 == 0).sum();
+
+        long uptime = ManagementFactory.getRuntimeMXBean().getUptime();
+        int classes = ManagementFactory.getClassLoadingMXBean().getLoadedClassCount();
+        System.out.printf("готов: port=%s, слов=%d, sum=%d, метод=%s | %d мс, классов %d%n",
+                port, words.size(), sum, req.method(), uptime, classes);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d app-out app-src/StartApp.java
+jar --create --file app.jar --main-class StartApp -C app-out .
+java -jar app.jar
+java -jar app.jar
+java -jar app.jar</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">готов: port=8080, слов=6, sum=1683, метод=GET | 230 мс, классов 2325
+готов: port=8080, слов=6, sum=1683, метод=GET | 225 мс, классов 2325
+готов: port=8080, слов=6, sum=1683, метод=GET | 228 мс, классов 2325</code></pre></details>
+<p class="lab-note">Запустите несколько раз: первый запуск после компиляции обычно медленнее — файлы ещё не в кэше ОС. Сравнивайте установившиеся значения.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-Xshare:off</code>.</summary><div>Время вырастет в 1,5–2 раза: стандартный CDS-архив JDK (<code>lib/server/classes.jsa</code>) включён по умолчанию и уже ускоряет загрузку классов java.base. Вы как раз отключили его.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-20.2">
+<div class="lab-head"><span class="lab-num">Лаба 20.2</span><b>AppCDS: архив своих классов</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Записать динамический архив классов при первом запуске и использовать его при следующих.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<p class="lab-ide"><span>IDEA</span>VM options первого запуска: <code>-XX:ArchiveClassesAtExit=app.jsa</code>; следующих: <code>-XX:SharedArchiveFile=app.jsa</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:ArchiveClassesAtExit=app.jsa -jar app.jar
+java -XX:SharedArchiveFile=app.jsa -jar app.jar
+java -XX:SharedArchiveFile=app.jsa -jar app.jar</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">готов: port=8080, слов=6, sum=1683, метод=GET | 232 мс, классов 2325
+[0.301s][warning][cds] Skipping jdk/internal/event/SecurityProviderServiceEvent: JFR event class
+[0.301s][warning][cds] Skipping jdk/internal/event/Event: JFR event class
+[0.302s][warning][cds] Skipping jdk/internal/event/SecurityProviderServiceEvent: Not in loaded state
+[0.302s][warning][cds] Skipping jdk/internal/event/X509CertificateEvent: JFR event class
+[0.302s][warning][cds] Skipping jdk/internal/event/X509CertificateEvent: Not in loaded state
+[0.302s][warning][cds] Skipping jdk/internal/event/SocketReadEvent: Not in loaded state
+[0.302s][warning][cds] Skipping jdk/internal/event/SocketReadEvent: JFR event class
+[0.302s][warning][cds] Skipping jdk/internal/event/Event: Not in loaded state
+[0.302s][warning][cds] Skipping jdk/internal/event/SocketWriteEvent: JFR event class
+[0.302s][warning][cds] Skipping jdk/internal/event/SocketWriteEvent: Not in loaded state
+готов: port=8080, слов=6, sum=1683, метод=GET | 178 мс, классов 2298
+готов: port=8080, слов=6, sum=1683, метод=GET | 161 мс, классов 2298</code></pre></details>
+<p class="lab-note">Предупреждения <code>[cds] Skipping … JFR event class</code> при создании архива — норма: служебные классы JFR в архив не попадают.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Откуда теперь загружаются классы HTTP-клиента и <code>StartApp</code>? Проверьте через <code>-Xlog:class+load</code>.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:SharedArchiveFile=app.jsa -Xlog:class+load -jar app.jar</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.038s][info][class,load] StartApp source: shared objects file (top)
+[0.041s][info][class,load] jdk.internal.net.http.HttpClientImpl source: shared objects file (top)</code></pre></details>
+<div class="lab-ans" hidden><p>Из архива: <code>source: shared objects file (top)</code> — «top» означает динамический архив поверх базового CDS JDK. Классы не читаются из jar и не разбираются заново, а отображаются в память почти готовыми. Время до <code>main</code> падает ещё на 20–40%.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Перекомпилируйте StartApp (поменяйте текст) и пересоберите jar, не обновляя архив.</summary><div>JVM заметит, что jar изменился (проверяется время модификации и размер), напишет предупреждение и проигнорирует архив — приложение работает, просто без ускорения. Архив пересоздают при каждой сборке.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-20.3">
+<div class="lab-head"><span class="lab-num">Лаба 20.3</span><b>AOT-кэш Leyden (JDK 25)</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Создать AOT-кэш одной командой (JEP 514) и сравнить с AppCDS: кэш хранит классы уже загруженными и связанными, а также профили методов (JEP 515).</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<p class="lab-ide"><span>IDEA</span>VM options обучающего запуска: <code>-XX:AOTCacheOutput=app.aot</code>; рабочих: <code>-XX:AOTCache=app.aot</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:AOTCacheOutput=app.aot -jar app.jar
+java -XX:AOTCache=app.aot -jar app.jar
+java -XX:AOTCache=app.aot -jar app.jar</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">готов: port=8080, слов=6, sum=1683, метод=GET | 307 мс, классов 2342
+[0.374s][warning][aot] Skipping jdk/internal/event/Event: Not in loaded state
+[0.374s][warning][aot] Skipping jdk/internal/event/Event: JFR event class
+[0.374s][warning][aot] Skipping jdk/internal/event/SecurityProviderServiceEvent: Not in loaded state
+[0.374s][warning][aot] Skipping jdk/internal/event/SecurityProviderServiceEvent: JFR event class
+[0.374s][warning][aot] Skipping jdk/internal/event/SocketReadEvent: Not in loaded state
+[0.374s][warning][aot] Skipping jdk/internal/event/SocketReadEvent: JFR event class
+[0.375s][warning][aot] Skipping jdk/internal/event/SocketWriteEvent: Not in loaded state
+[0.375s][warning][aot] Skipping jdk/internal/event/SocketWriteEvent: JFR event class
+[0.375s][warning][aot] Skipping jdk/internal/event/X509CertificateEvent: Not in loaded state
+[0.375s][warning][aot] Skipping jdk/internal/event/X509CertificateEvent: JFR event class
+Temporary AOTConfiguration recorded: app.aot.config
+Launching child process C:\jdk-25\bin\java to assemble AOT cache app.aot using configuration app.aot.config
+Picked up JAVA_TOOL_OPTIONS: -Djava.class.path=app.jar -XX:AOTCacheOutput=app.aot -XX:AOTConfiguration=app.aot.config -XX:AOTMode=create
+Reading AOTConfiguration app.aot.config and writing AOTCache app.aot
+AOTCache creation is complete: app.aot 23920640 bytes
+Removed temporary AOT configuration file app.aot.config
+готов: port=8080, слов=6, sum=1683, метод=GET | 136 мс, классов 2439
+готов: port=8080, слов=6, sum=1683, метод=GET | 134 мс, классов 2439</code></pre></details>
+<p class="lab-note">Обучающий запуск выполняет приложение, а затем сам запускает дочернюю JVM, которая собирает кэш (строки «Launching child process…», «AOTCache creation is complete»). «Picked up JAVA_TOOL_OPTIONS» — параметры, которые JVM передала дочернему процессу.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему AOT-кэш быстрее AppCDS, хотя и тот и другой — «архив классов»?</div>
+<div class="lab-ans" hidden><p>AppCDS сохраняет разобранные классы, но их всё равно нужно загрузить, связать и инициализировать при каждом старте. AOT-кэш сохраняет состояние после обучающего запуска: классы уже загружены и слинкованы, разрешены вызовы <code>invokedynamic</code> (лямбды, конкатенация), есть профили для JIT. Цена — обучающий прогон и требование одинаковых JDK, флагов и classpath.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сравните размеры артефактов:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">ls -l app.jsa app.aot</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">8257536 байт  app.jsa
+23920640 байт  app.aot</code></pre></details>
+<p class="lab-note">В PowerShell: <code>Get-ChildItem app.jsa, app.aot</code> (колонка Length).</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с кэшем, но другим GC: <code>-XX:AOTCache=app.aot -XX:+UseSerialGC</code>.</summary><div>Кэш может быть отклонён (в журнале <code>-Xlog:aot</code> будет причина): часть содержимого зависит от конфигурации JVM. Флаги рабочего запуска должны совпадать с обучающим.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">20.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Что сохраняет CDS-архив?</p><ul><li>Скомпилированный машинный код приложения</li><li>Снимок кучи процесса</li><li>Разобранные и проверенные метаданные классов, отображаемые в память при старте</li><li>Логи старта</li></ul><div class="why">Классы не нужно читать из jar, разбирать и верифицировать.</div></div>
 <div class="mcq" data-ok="0"><p>Чем опасен CRaC-снимок с точки зрения безопасности?</p><ul><li>В нём сохранена вся память процесса, включая загруженные секреты</li><li>Он отключает TLS</li><li>Он требует root в продакшене</li><li>Он раскрывает исходный код</li></ul><div class="why">Секреты получайте после restore.</div></div>

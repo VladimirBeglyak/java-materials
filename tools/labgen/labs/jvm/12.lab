@@ -1,0 +1,107 @@
+@chapter 12 | quiz
+@intro
+<p>Сборщик нельзя «увидеть» напрямую, но можно поставить на объект датчик — <code>WeakReference</code>: она не мешает сборке и становится пустой, когда объект собран. С этим датчиком и логами GC проверим достижимость, поколения и safepoints. Модуль IDEA — <code>ch12</code>.</p>
+@end
+
+@lab 12.1 | Достижимость: что соберут, а что нет | 20 мин
+@goal
+<p>Проверить на живом GC: циклические ссылки не мешают сборке, статические поля и локальные переменные — корни.</p>
+@end
+@file Reach.java
+import java.lang.ref.WeakReference;
+
+public class Reach {
+    static class Node { Node next; byte[] payload = new byte[1024]; }
+    static Object root;
+
+    static boolean collected(WeakReference<?> probe) {
+        for (int i = 0; i < 5 && probe.get() != null; i++) System.gc();
+        return probe.get() == null;
+    }
+
+    public static void main(String[] args) {
+        // 1. цикл a <-> b без внешних ссылок
+        Node a = new Node(), b = new Node();
+        a.next = b; b.next = a;
+        var p1 = new WeakReference<>(a);
+        a = null; b = null;
+        System.out.println("1. цикл собран:              " + collected(p1));
+
+        // 2. объект в статическом поле
+        root = new Node();
+        var p2 = new WeakReference<>(root);
+        System.out.println("2. статическое поле собрано: " + collected(p2));
+
+        // 3. объект, достижимый только через WeakReference
+        var p3 = new WeakReference<>(new Node());
+        System.out.println("3. только weak собран:       " + collected(p3));
+
+        // 4. локальная переменная, которая ещё используется ниже
+        Node local = new Node();
+        var p4 = new WeakReference<>(local);
+        System.out.println("4. живая локальная собрана:  " + collected(p4));
+        System.out.println("   (local ещё нужна: " + local.payload.length + ")");
+    }
+}
+@end
+@predict Запишите для каждого пункта true/false.
+@answer
+<p>1 — <b>true</b>: трассирующий GC ищет пути от корней; цикл, до которого не дойти, — мусор (подсчёт ссылок здесь ошибся бы). 2 — <b>false</b>: статическое поле загруженного класса — корень. 3 — <b>true</b>: слабая ссылка не удерживает. 4 — <b>false</b>: локальная переменная в активном кадре — корень, пока она ещё понадобится.</p>
+@end
+@run
+javac Reach.java
+java Reach
+@end
+@try
+Уберите последнюю строку <code>System.out.println("   (local ещё нужна…")</code> и прогоните метод в цикле много раз, чтобы его скомпилировал JIT. Может ли пункт 4 стать true? ::: Да. JIT знает, где переменная используется в последний раз, и после этого не считает её корнем — объект может быть собран раньше, чем закончится метод. Поэтому для «удержания» объекта в Java 9+ есть <code>Reference.reachabilityFence(obj)</code>.
+@end
+
+@lab 12.2 | Поколения в логе: возраст и продвижение в old | 20 мин
+@goal
+<p>Посмотреть, как объекты переживают молодые сборки, «стареют» в survivor и переезжают в старое поколение.</p>
+@end
+@file Ages.java
+import java.util.ArrayDeque;
+
+public class Ages {
+    public static void main(String[] args) {
+        int window = Integer.parseInt(args.length > 0 ? args[0] : "3000");
+        var recent = new ArrayDeque<byte[]>();                // «последние запросы» — живут недолго, но не мгновенно
+        for (int i = 0; i < 30_000; i++) {
+            recent.addLast(new byte[1024]);
+            if (recent.size() > window) recent.removeFirst();
+            for (int j = 0; j < 20; j++) {
+                byte[] garbage = new byte[1024];             // умирает сразу
+            }
+        }
+        System.out.println("готово, в окне " + recent.size());
+    }
+}
+@end
+@step Запустите с самым простым сборщиком (Serial) и журналом возрастов. Куча 64 МБ, молодое поколение 32 МБ:
+@ide VM options: <code>-XX:+UseSerialGC -Xmx64m -Xmn32m -Xlog:gc,gc+age=trace</code>
+@run
+javac Ages.java
+java -XX:+UseSerialGC -Xmx64m -Xmn32m -Xlog:gc,gc+age=trace Ages
+@end
+@predict Объект из окна живёт 3000 итераций — это примерно две молодые сборки. Какие возрасты появятся в таблице и дойдут ли объекты до порога 15?
+@answer
+<p>В таблице появляются <code>age 1</code> и <code>age 2</code> — объекты переживают одну-две сборки, копируясь между survivor-пространствами. До 15 они не доживают: JVM после каждой сборки пересчитывает порог (<i>new threshold</i>) так, чтобы выжившие помещались в половину survivor (<i>Desired survivor size</i>), и когда выживших много, порог падает до 1–2. Тогда объекты продвигаются в old раньше, чем умрут, — занятость после сборки растёт (5M → 11M): это «преждевременное продвижение», мусор, который потом придётся убирать дорогой сборкой старого поколения.</p>
+@end
+@try
+Добавьте <code>-XX:MaxTenuringThreshold=0</code>. Что изменится в логе? ::: Таблица возрастов опустеет (<code>new threshold 0</code>): всё, что пережило одну молодую сборку, сразу уходит в old. Old растёт быстрее, полные сборки наступают раньше.
+Передайте аргумент <code>20000</code> (окно в 20 МБ). ::: Выжившие больше не помещаются в survivor и потоком идут в old, старое поколение заполняется умирающими объектами — в логе появляется <code>Pause Full</code>, на порядок дороже молодых пауз.
+@end
+
+@lab 12.3 | Safepoint: остановки мира в цифрах | 15 мин
+@goal
+<p>Увидеть каждую остановку всех потоков: что её вызвало, сколько ждали, пока потоки дойдут до safepoint, и сколько длилась операция.</p>
+@end
+@ide VM options: <code>-Xlog:safepoint -XX:+UseSerialGC -Xmx64m -Xmn32m</code>
+@run grep="Safepoint|готово" head=8
+java -Xlog:safepoint -XX:+UseSerialGC -Xmx64m -Xmn32m Ages
+@end
+@note Колонки: <code>Reaching safepoint</code> — время, пока все потоки дошли до точки остановки (time-to-safepoint), <code>At safepoint</code> — сама операция (здесь — сборка <code>SerialCollectForAllocation</code>), <code>Total</code> — полная пауза для приложения. В логах GC видно только второе; в инцидентах с «необъяснимыми паузами» часто виновато первое.
+@try
+Запустите <code>jcmd &lt;pid&gt; Thread.print</code> для любого процесса, запущенного с <code>-Xlog:safepoint</code>. Появится ли в логе новая строка? ::: Да — <code>PrintThreads</code>: дамп потоков тоже делается в safepoint. Так же останавливают мир <code>GC.heap_dump</code>, деоптимизация, переопределение классов агентом.
+@end

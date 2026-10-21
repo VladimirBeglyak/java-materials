@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 23 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
   <h1>Тестирование: JUnit 5, AssertJ, Mockito</h1>
   <p class="lead">Тест — это исполняемое утверждение о том, как должен вести себя код. Хорошие тесты позволяют менять код без страха; плохие — ломаются при каждом рефакторинге и ничего не ловят. Разберём инструменты (жизненный цикл JUnit, утверждения, моки) и, главное, признаки теста, который стоит своих денег.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">JUnit 5</span><span class="tag">AssertJ</span><span class="tag">Mockito</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">JUnit 5</span><span class="tag">AssertJ</span><span class="tag">Mockito</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -202,7 +202,239 @@ class CheckoutServiceTest {
   <div class="card"><h4>Плавающие тесты</h4><p>Причины: время, порядок, общие данные, гонки, <code>Thread.sleep</code> вместо ожидания условия (Awaitility). Плавающий тест чинят или удаляют сразу — иначе команда перестаёт верить сборке.</p></div>
 </div>
 
-<h2 id="quiz"><span class="h-num">23.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">23.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Пишем и запускаем настоящие тесты. Из командной строки удобнее всего JUnit Console Launcher — один jar, который находит и запускает тесты; в IDEA те же тесты запускаются зелёной стрелкой рядом с классом. Нужны jar-файлы в <code>lib</code> модуля <code>ch23</code>: JUnit (console standalone), AssertJ, Mockito и его зависимости. Здесь используется JUnit 6 — актуальная версия на момент написания; API Jupiter (<code>org.junit.jupiter.api</code>) в нём тот же, что в JUnit 5, весь код главы работает без изменений.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-23.1">
+<div class="lab-head"><span class="lab-num">Лаба 23.1</span><b>Первый тест и Console Launcher</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Протестировать класс с логикой, увидеть отчёт об успехе и о падении.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">curl -L -O --output-dir lib https://repo1.maven.org/maven2/org/junit/platform/junit-platform-console-standalone/6.1.3/junit-platform-console-standalone-6.1.3.jar
+curl -L -O --output-dir lib https://repo1.maven.org/maven2/org/assertj/assertj-core/3.27.7/assertj-core-3.27.7.jar
+curl -L -O --output-dir lib https://repo1.maven.org/maven2/org/mockito/mockito-core/5.24.0/mockito-core-5.24.0.jar
+curl -L -O --output-dir lib https://repo1.maven.org/maven2/net/bytebuddy/byte-buddy/1.17.7/byte-buddy-1.17.7.jar
+curl -L -O --output-dir lib https://repo1.maven.org/maven2/net/bytebuddy/byte-buddy-agent/1.17.7/byte-buddy-agent-1.17.7.jar
+curl -L -O --output-dir lib https://repo1.maven.org/maven2/org/objenesis/objenesis/3.3/objenesis-3.3.jar</code></pre>
+<p class="lab-note">В Maven/Gradle-проекте всё это — три строки зависимостей (<code>org.junit.jupiter:junit-jupiter</code>, <code>org.assertj:assertj-core</code>, <code>org.mockito:mockito-junit-jupiter</code>) со scope test.</p>
+<pre data-title="main/Discount.java"><code class="java">public class Discount {
+    /** Скидка: 5% от 1000, 10% от 5000, не больше 1500; для отрицательной суммы — исключение. */
+    public static double of(double sum) {
+        if (sum &lt; 0) throw new IllegalArgumentException("сумма не может быть отрицательной: " + sum);
+        double rate = sum &gt;= 5000 ? 0.10 : sum &gt;= 1000 ? 0.05 : 0;
+        return Math.min(sum * rate, 1500);
+    }
+}</code></pre>
+<pre data-title="test/DiscountTest.java"><code class="java">import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import static org.assertj.core.api.Assertions.*;
+
+class DiscountTest {
+    @Test
+    @DisplayName("без скидки до 1000")
+    void noDiscountBelowThreshold() {
+        assertThat(Discount.of(999.99)).isZero();
+    }
+
+    @ParameterizedTest(name = "{0} → {1}")
+    @CsvSource({ "1000, 50", "4999, 249.95", "5000, 500", "20000, 1500" })
+    void discountByThresholds(double sum, double expected) {
+        assertThat(Discount.of(sum)).isCloseTo(expected, within(0.001));
+    }
+
+    @Test
+    void negativeSumIsRejected() {
+        assertThatThrownBy(() -&gt; Discount.of(-1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("отрицательной");
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Компилируем код и тесты раздельно (как Maven: <code>src/main</code> и <code>src/test</code>) и запускаем лаунчер. Маску <code>lib/*</code> (все jar каталога) понимает только сам <code>java -cp</code>, поэтому лаунчер запускается как обычный главный класс. В bash замените <code>;</code> на <code>:</code>:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out/main main/Discount.java
+javac -d out/test -cp "out/main;lib/*" test/DiscountTest.java
+java -cp "out/main;out/test;lib/*" org.junit.platform.console.ConsoleLauncher execute --scan-classpath</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">├─ JUnit Platform Suite ✔
+├─ JUnit Jupiter ✔
+│  └─ DiscountTest ✔
+│     ├─ discountByThresholds(double, double) ✔
+│     │  ├─ "1000" → "50" ✔
+│     │  ├─ "4999" → "249.95" ✔
+│     │  ├─ "5000" → "500" ✔
+│     │  └─ "20000" → "1500" ✔
+│     ├─ negativeSumIsRejected() ✔
+│     └─ без скидки до 1000 ✔
+└─ JUnit Vintage ✔
+[         6 tests successful      ]
+[         0 tests failed          ]</code></pre></details>
+<p class="lab-ide"><span>IDEA</span>Те же тесты в IDEA: отметьте каталог <code>test</code> как Test Sources Root (ПКМ → Mark Directory as), добавьте jar-ы из <code>lib</code> в зависимости модуля и нажмите ▶ рядом с <code>class DiscountTest</code>.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сломайте код: замените в <code>Discount</code> условие <code>sum &gt;= 5000</code> на <code>sum &gt; 5000</code>. Какой тест упадёт и что напишет AssertJ?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out/main main/Discount.java
+java -cp "out/main;out/test;lib/*" org.junit.platform.console.ConsoleLauncher execute --scan-classpath</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">├─ JUnit Platform Suite ✔
+├─ JUnit Jupiter ✔
+│  └─ DiscountTest ✔
+│     ├─ discountByThresholds(double, double) ✔
+│     │  ├─ "1000" → "50" ✔
+│     │  ├─ "4999" → "249.95" ✔
+│     │  ├─ "5000" → "500" ✘ 
+│     │  │        Expecting actual:
+│     │  │        to be close to:
+│     │  │        by less than 0.001 but difference was 250.0.
+│     │  │        (a difference of exactly 0.001 being considered valid)
+│     │  └─ "20000" → "1500" ✔
+│     ├─ negativeSumIsRejected() ✔
+│     └─ без скидки до 1000 ✔
+└─ JUnit Vintage ✔
+Expecting actual:
+  250.0
+to be close to:
+  500.0
+by less than 0.001 but difference was 250.0.
+(a difference of exactly 0.001 being considered valid)
+[         5 tests successful      ]
+[         1 tests failed          ]</code></pre></details>
+<div class="lab-ans" hidden><p>Упадёт только параметризованный случай <code>5000 → 500</code>: AssertJ напишет «Expecting actual: 250.0 to be close to: 500.0 by less than 0.001 but difference was 250.0» — граница превратилась в «больше», и 5000 попала в 5%. Остальные случаи зелёные. Хорошие тесты проверяют именно границы (999.99, 1000, 4999, 5000) — там и живут ошибки на единицу.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-23.2">
+<div class="lab-head"><span class="lab-num">Лаба 23.2</span><b>Жизненный цикл: экземпляр теста на каждый метод</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть порядок вызова <code>@BeforeAll</code>, <code>@BeforeEach</code>, тестов и <code>@AfterEach</code> и то, что каждый тест получает новый экземпляр класса.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>test/LifecycleTest.java</code>:</div>
+<pre data-title="test/LifecycleTest.java"><code class="java">import org.junit.jupiter.api.*;
+
+class LifecycleTest {
+    private int counter = 0;
+
+    LifecycleTest() { System.out.println("  конструктор, экземпляр @" + Integer.toHexString(System.identityHashCode(this))); }
+
+    @BeforeAll static void beforeAll() { System.out.println("@BeforeAll (static)"); }
+    @BeforeEach void beforeEach(TestInfo info) { System.out.println("  @BeforeEach перед " + info.getDisplayName()); }
+
+    @Test void first() { counter++; System.out.println("    first: counter=" + counter); }
+    @Test void second() { counter++; System.out.println("    second: counter=" + counter); }
+
+    @AfterEach void afterEach() { System.out.println("  @AfterEach"); }
+    @AfterAll static void afterAll() { System.out.println("@AfterAll (static)"); }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Чему будет равен <code>counter</code> во втором тесте?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out/test -cp "out/main;lib/*" test/LifecycleTest.java
+java -cp "out/main;out/test;lib/*" org.junit.platform.console.ConsoleLauncher execute --select-class LifecycleTest</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">@BeforeAll (static)
+  конструктор, экземпляр @66746f57
+  @BeforeEach перед second()
+    second: counter=1
+  @AfterEach
+  конструктор, экземпляр @25a6944c
+  @BeforeEach перед first()
+    first: counter=1
+  @AfterEach
+@AfterAll (static)
+│     ├─ second() ✔
+│     └─ first() ✔</code></pre></details>
+<div class="lab-ans" hidden><p><b>1</b>: JUnit создаёт новый экземпляр класса на каждый тестовый метод, поэтому поля не «перетекают» между тестами — тесты независимы. Отсюда же <code>static</code> у <code>@BeforeAll</code>: на момент его вызова экземпляра ещё нет. Порядок методов не гарантирован — тесты не должны зависеть друг от друга.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-23.3">
+<div class="lab-head"><span class="lab-num">Лаба 23.3</span><b>Mockito: подменяем зависимость</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Протестировать сервис, не трогая настоящий платёжный шлюз: задать поведение мока, проверить вызовы и аргументы.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>main/CheckoutService.java</code>:</div>
+<pre data-title="main/CheckoutService.java"><code class="java">public class CheckoutService {
+    public interface PaymentGateway { String charge(String card, long amountCents); }
+    public interface Notifier { void receipt(String email, String paymentId); }
+
+    private final PaymentGateway gateway;
+    private final Notifier notifier;
+
+    public CheckoutService(PaymentGateway gateway, Notifier notifier) { this.gateway = gateway; this.notifier = notifier; }
+
+    public String checkout(String email, String card, long amountCents) {
+        if (amountCents &lt;= 0) throw new IllegalArgumentException("сумма должна быть положительной");
+        String paymentId = gateway.charge(card, amountCents);
+        notifier.receipt(email, paymentId);
+        return paymentId;
+    }
+}</code></pre>
+<pre data-title="test/CheckoutServiceTest.java"><code class="java">import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+class CheckoutServiceTest {
+    CheckoutService.PaymentGateway gateway = mock(CheckoutService.PaymentGateway.class);
+    CheckoutService.Notifier notifier = mock(CheckoutService.Notifier.class);
+    CheckoutService service = new CheckoutService(gateway, notifier);
+
+    @Test
+    void chargesAndSendsReceipt() {
+        when(gateway.charge("4242", 1999)).thenReturn("pay-1");
+
+        String id = service.checkout("anna@example.com", "4242", 1999);
+
+        assertThat(id).isEqualTo("pay-1");
+        verify(notifier).receipt("anna@example.com", "pay-1");
+    }
+
+    @Test
+    void noReceiptWhenPaymentFails() {
+        when(gateway.charge(anyString(), anyLong())).thenThrow(new IllegalStateException("карта отклонена"));
+
+        assertThatThrownBy(() -&gt; service.checkout("anna@example.com", "0000", 500)).hasMessage("карта отклонена");
+        verifyNoInteractions(notifier);
+    }
+
+    @Test
+    void invalidAmountNeverReachesGateway() {
+        assertThatIllegalArgumentException().isThrownBy(() -&gt; service.checkout("a@b.c", "4242", 0));
+        verifyNoInteractions(gateway, notifier);
+    }
+
+    @Test
+    void captorShowsExactArguments() {
+        when(gateway.charge(any(), anyLong())).thenReturn("pay-7");
+        service.checkout("boris@example.com", "5555", 4200);
+        ArgumentCaptor&lt;Long&gt; amount = ArgumentCaptor.forClass(Long.class);
+        verify(gateway).charge(eq("5555"), amount.capture());
+        assertThat(amount.getValue()).isEqualTo(4200L);
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>Mockito в JDK 21+ подключает своего агента динамически и печатает об этом предупреждение. Чтобы его убрать, добавьте в VM options конфигурации тестов <code>-javaagent:lib/mockito-core-5.24.0.jar</code> (в Maven/Gradle это настраивается в плагине тестов).</p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d out/main main/CheckoutService.java
+javac -d out/test -cp "out/main;lib/*" test/CheckoutServiceTest.java
+java -cp "out/main;out/test;lib/*" org.junit.platform.console.ConsoleLauncher execute --select-class CheckoutServiceTest</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">WARNING: A Java agent has been loaded dynamically (lib\byte-buddy-agent-1.17.7.jar)
+├─ JUnit Platform Suite ✔
+├─ JUnit Jupiter ✔
+│  └─ CheckoutServiceTest ✔
+│     ├─ invalidAmountNeverReachesGateway() ✔
+│     ├─ noReceiptWhenPaymentFails() ✔
+│     ├─ chargesAndSendsReceipt() ✔
+│     └─ captorShowsExactArguments() ✔
+└─ JUnit Vintage ✔
+[         4 tests successful      ]
+[         0 tests failed          ]</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Уберите из <code>CheckoutService.checkout</code> строку <code>notifier.receipt(...)</code>. Какие тесты это заметят?</div>
+<div class="lab-ans" hidden><p>Только <code>chargesAndSendsReceipt</code>: <code>verify(notifier).receipt(…)</code> упадёт с «Wanted but not invoked: notifier.receipt(…) — Actually, there were zero interactions with this mock». Остальные три теста зелёные — они проверяют другие сценарии. Тест без <code>verify</code> или <code>assertThat</code> ничего не проверяет: убедитесь, что каждый тест может упасть (поломайте код и посмотрите).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>when(gateway.charge("4242", 1999))</code> на <code>when(gateway.charge("4242", 2000))</code>. Что произойдёт и почему?</summary><div>Мок без подходящей заглушки вернёт значение по умолчанию — <code>null</code>; тест упадёт на <code>isEqualTo("pay-1")</code>. Mockito в строгом режиме (<code>MockitoExtension</code>) ещё и сообщит о «unnecessary stubbing / argument mismatch» — подсказка, что заглушка не совпала с вызовом.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">23.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>В тестовом классе поле <code>List&lt;String&gt; items = new ArrayList&lt;&gt;()</code>. Первый тест добавляет в него элемент. Что увидит второй тест?</p><ul><li>Список с одним элементом</li><li>Пустой список: JUnit создаёт новый экземпляр класса на каждый тест</li><li>null</li><li>Зависит от порядка</li></ul><div class="why">Lifecycle.PER_METHOD по умолчанию. Общим было бы static-поле — и это источник зависимых тестов.</div></div>
 <div class="mcq" data-ok="2"><p>Что вернёт метод мока, для которого не задана заглушка и тип результата — <code>Optional&lt;User&gt;</code>?</p><ul><li>null</li><li>Исключение</li><li>Optional.empty()</li><li>Optional с моком User</li></ul><div class="why">Mockito возвращает «пустые» значения: 0, false, пустые коллекции, Optional.empty(); для прочих объектов — null.</div></div>

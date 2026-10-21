@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 13 · ПЛАТФОРМА ИЗНУТРИ</div>
   <h1>I/O, NIO, сериализация</h1>
   <p class="lead">Ввод-вывод в Java — три поколения API: потоки байтов и символов из <code>java.io</code>, каналы и буферы из <code>java.nio</code> и удобный класс <code>Files</code>. Нужно понимать, чем байты отличаются от символов, зачем нужна буферизация и почему встроенную сериализацию объектов считают ошибкой проектирования.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">InputStream</span><span class="tag">Files</span><span class="tag">ByteBuffer</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">InputStream</span><span class="tag">Files</span><span class="tag">ByteBuffer</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -221,7 +221,214 @@ while (in.read(buf) != -1) {        // канал ПИШЕТ в буфер
 }
 // На практике проще: Files.copy(src, dst) или in.transferTo(out) — без копирования через пользовательскую память.</code></pre>
 
-<h2 id="quiz"><span class="h-num">13.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">13.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Буферизация, современный API <code>Files</code>, буферы NIO и сериализация — с замерами и экспериментами над файлами на диске. Модуль IDEA — <code>ch13</code>. Файлы создаются в рабочем каталоге запуска (в IDEA — корень проекта, если не задано иное в Run Configuration → Working directory).</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-13.1">
+<div class="lab-head"><span class="lab-num">Лаба 13.1</span><b>Цена небуферизованного ввода-вывода</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Записать и прочитать один и тот же файл побайтно с буфером и без.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Buffering.java</code>:</div>
+<pre data-title="Buffering.java"><code class="java">import java.io.*;
+
+public class Buffering {
+    public static void main(String[] args) throws IOException {
+        int n = 2_000_000;
+        long t = System.nanoTime();
+        try (OutputStream out = new FileOutputStream("raw.bin")) {
+            for (int i = 0; i &lt; n; i++) out.write(i);
+        }
+        long raw = System.nanoTime() - t;
+
+        t = System.nanoTime();
+        try (OutputStream out = new BufferedOutputStream(new FileOutputStream("buf.bin"))) {
+            for (int i = 0; i &lt; n; i++) out.write(i);
+        }
+        long buf = System.nanoTime() - t;
+
+        t = System.nanoTime();
+        long sum = 0;
+        try (InputStream in = new BufferedInputStream(new FileInputStream("buf.bin"))) {
+            int b;
+            while ((b = in.read()) != -1) sum += b;
+        }
+        long read = System.nanoTime() - t;
+
+        System.out.printf("запись без буфера: %5d мс%nзапись с буфером:  %5d мс%nчтение с буфером:  %5d мс (сумма %d)%n",
+                raw / 1_000_000, buf / 1_000_000, read / 1_000_000, sum);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз буферизованная запись быстрее?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Buffering.java
+java Buffering</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">запись без буфера:  2406 мс
+запись с буфером:     35 мс
+чтение с буфером:     33 мс (сумма 254991808)</code></pre></details>
+<div class="lab-ans" hidden><p>В десятки–сотни раз. Каждый <code>write(int)</code> у <code>FileOutputStream</code> — системный вызов в ОС; Buffered-обёртка копит 8 КБ в массиве и делает один вызов на 8192 байта. На Windows разница особенно заметна. Отсюда правило: побайтовый или построчный ввод-вывод — всегда через буфер (или сразу <code>Files.readAllBytes</code>/<code>Files.newBufferedWriter</code>).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-13.2">
+<div class="lab-head"><span class="lab-num">Лаба 13.2</span><b>Files и Path: всё в несколько строк</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Создать дерево каталогов, записать и прочитать текст, обойти дерево и посчитать статистику — только средствами <code>java.nio.file</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>FilesTour.java</code>:</div>
+<pre data-title="FilesTour.java"><code class="java">import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.List;
+import java.util.stream.Stream;
+
+public class FilesTour {
+    public static void main(String[] args) throws IOException {
+        Path root = Path.of("demo-tree");
+        Files.createDirectories(root.resolve("logs/2026"));
+        Files.writeString(root.resolve("readme.txt"), "Привет, NIO!\nВторая строка\n", StandardCharsets.UTF_8);
+        Files.write(root.resolve("logs/2026/app.log"), List.of("INFO старт", "WARN мало памяти", "INFO стоп"));
+        Files.write(root.resolve("logs/old.log"), List.of("ERROR сбой"));
+
+        System.out.println("readme: " + Files.readAllLines(root.resolve("readme.txt")));
+        System.out.println("размер app.log: " + Files.size(root.resolve("logs/2026/app.log")) + " байт");
+
+        try (Stream&lt;Path&gt; walk = Files.walk(root)) {
+            walk.filter(p -&gt; p.toString().endsWith(".log"))
+                .forEach(p -&gt; System.out.println("лог: " + root.relativize(p).toString().replace('\\', '/')));
+        }
+        try (Stream&lt;String&gt; lines = Files.lines(root.resolve("logs/2026/app.log"))) {
+            System.out.println("WARN строк: " + lines.filter(l -&gt; l.startsWith("WARN")).count());
+        }
+
+        Path p = Path.of("demo-tree/logs/../readme.txt");
+        System.out.println("normalize: " + p.normalize().toString().replace('\\', '/') + ", absolute? " + p.isAbsolute());
+        try {
+            Files.createDirectory(root);
+        } catch (FileAlreadyExistsException e) {
+            System.out.println("уже существует: " + e.getFile());
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac FilesTour.java
+java FilesTour</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">readme: [Привет, NIO!, Вторая строка]
+размер app.log: 60 байт
+лог: logs/2026/app.log
+лог: logs/old.log
+WARN строк: 1
+normalize: demo-tree/readme.txt, absolute? false
+уже существует: demo-tree</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему <code>Files.lines</code> и <code>Files.walk</code> обёрнуты в try-with-resources, а <code>readAllLines</code> — нет?</div>
+<div class="lab-ans" hidden><p><code>lines</code> и <code>walk</code> возвращают ленивый Stream, за которым стоит открытый файл или дескриптор каталога. Пока стрим не закрыт, ресурс занят — в долгоживущем сервисе это утечка дескрипторов («Too many open files»). <code>readAllLines</code> читает всё сразу и закрывает файл сам — но и держит весь файл в памяти.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-13.3">
+<div class="lab-head"><span class="lab-num">Лаба 13.3</span><b>ByteBuffer: position, limit, flip</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Пройти руками цикл «записали → flip → прочитали → compact», на котором построен весь NIO.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Buffers.java</code>:</div>
+<pre data-title="Buffers.java"><code class="java">import java.nio.ByteBuffer;
+
+public class Buffers {
+    static void show(String step, ByteBuffer b) {
+        System.out.printf("%-22s position=%d limit=%d capacity=%d remaining=%d%n", step, b.position(), b.limit(), b.capacity(), b.remaining());
+    }
+
+    public static void main(String[] args) {
+        ByteBuffer b = ByteBuffer.allocate(8);
+        show("allocate(8)", b);
+        b.put((byte) 1).put((byte) 2).put((byte) 3);
+        show("put 3 байта", b);
+        b.flip();
+        show("flip()", b);
+        System.out.println("  прочитали: " + b.get() + ", " + b.get());
+        show("get ×2", b);
+        b.compact();
+        show("compact()", b);
+        b.put((byte) 9);
+        b.flip();
+        show("put 9, flip()", b);
+        StringBuilder rest = new StringBuilder();
+        while (b.hasRemaining()) rest.append(b.get()).append(' ');
+        System.out.println("  в буфере осталось: " + rest);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что окажется в буфере в конце: какие байты и в каком порядке?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Buffers.java
+java Buffers</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">allocate(8)            position=0 limit=8 capacity=8 remaining=8
+put 3 байта            position=3 limit=8 capacity=8 remaining=5
+flip()                 position=0 limit=3 capacity=8 remaining=3
+  прочитали: 1, 2
+get ×2                 position=2 limit=3 capacity=8 remaining=1
+compact()              position=1 limit=8 capacity=8 remaining=7
+put 9, flip()          position=0 limit=2 capacity=8 remaining=2
+  в буфере осталось: 3 9 </code></pre></details>
+<div class="lab-ans" hidden><p><code>3 9</code>. <code>flip</code> ставит limit = position и position = 0 — «теперь читаем то, что записали». После чтения двух байт <code>compact</code> сдвигает непрочитанный байт 3 в начало и ставит position = 1 для дозаписи. Забытый <code>flip</code> — самая частая ошибка NIO: чтение начнётся с конца данных.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-13.4">
+<div class="lab-head"><span class="lab-num">Лаба 13.4</span><b>Сериализация: transient и serialVersionUID</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сериализовать объект, изменить класс и получить <code>InvalidClassException</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>User.java</code>:</div>
+<pre data-title="User.java"><code class="java">import java.io.Serializable;
+
+public class User implements Serializable {
+    String login;
+    transient String password;
+    int age;
+
+    User(String login, String password, int age) { this.login = login; this.password = password; this.age = age; }
+
+    @Override public String toString() { return "User{login=" + login + ", password=" + password + ", age=" + age + "}"; }
+}</code></pre>
+<pre data-title="Ser.java"><code class="java">import java.io.*;
+
+public class Ser {
+    public static void main(String[] args) throws Exception {
+        if (args[0].equals("write")) {
+            try (var out = new ObjectOutputStream(new FileOutputStream("user.ser"))) {
+                out.writeObject(new User("anna", "s3cret", 30));
+            }
+            System.out.println("записано " + new File("user.ser").length() + " байт");
+        } else {
+            try (var in = new ObjectInputStream(new FileInputStream("user.ser"))) {
+                System.out.println("прочитано: " + in.readObject());
+            }
+        }
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>Две конфигурации запуска: Program arguments <code>write</code> и <code>read</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac User.java Ser.java
+java Ser write
+java Ser read</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">записано 71 байт
+прочитано: User{login=anna, password=null, age=30}</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Добавьте в <code>User</code> поле <code>String email;</code>, перекомпилируйте и прочитайте старый файл (<code>read</code>, без <code>write</code>). Что будет?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac User.java
+java Ser read</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Exception in thread "main" java.io.InvalidClassException: User; local class incompatible: stream classdesc serialVersionUID = 2173313405103386327, local class serialVersionUID = 3145526739960588064
+	at java.base/java.io.ObjectStreamClass.initNonProxy(ObjectStreamClass.java:496)
+	at java.base/java.io.ObjectInputStream.readNonProxyDesc(ObjectInputStream.java:1927)
+	at java.base/java.io.ObjectInputStream.readClassDesc(ObjectInputStream.java:1785)
+	at java.base/java.io.ObjectInputStream.readOrdinaryObject(ObjectInputStream.java:2101)
+	at java.base/java.io.ObjectInputStream.readObject0(ObjectInputStream.java:1620)
+	at java.base/java.io.ObjectInputStream.readObject(ObjectInputStream.java:487)
+	at java.base/java.io.ObjectInputStream.readObject(ObjectInputStream.java:445)
+	at Ser.main(Ser.java:12)</code></pre></details>
+<p class="lab-note">Встроенная сериализация Java — источник уязвимостей (десериализация недоверенных данных выполняет код классов из classpath). В новых проектах используют JSON/Protobuf, а при необходимости — фильтры <code>jdk.serialFilter</code>.</p>
+<div class="lab-ans" hidden><p><code>InvalidClassException: User; local class incompatible: stream classdesc serialVersionUID = …, local class serialVersionUID = …</code>. Без явного <code>serialVersionUID</code> он вычисляется из структуры класса, и любое изменение ломает совместимость. С явным <code>private static final long serialVersionUID = 1L;</code> новое поле просто получит null. А <code>password</code> после чтения — null: transient-поля не сериализуются.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">13.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Зачем нужен BufferedInputStream поверх FileInputStream?</p><ul><li>Он шифрует данные</li><li>Чтение по одному байту без буфера — системный вызов на каждый байт; буфер читает блоками по 8 КБ</li><li>Он нужен для текстовых файлов</li><li>Без него файл нельзя закрыть</li></ul><div class="why">Системный вызов стоит сотни наносекунд–микросекунды. Буферизация сокращает их число на три порядка.</div></div>
 <div class="mcq" data-ok="2"><p>Что делает flip() у ByteBuffer?</p><ul><li>Разворачивает порядок байтов</li><li>Очищает буфер</li><li>Устанавливает limit = position и position = 0: переключает буфер с записи на чтение</li><li>Удваивает ёмкость</li></ul><div class="why">Забытый flip — самая частая ошибка NIO: чтение начнётся с текущей позиции и вернёт мусор или ничего.</div></div>

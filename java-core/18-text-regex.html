@@ -22,7 +22,7 @@
   <div class="kicker">ТЕМА 18 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
   <h1>Текст: Unicode, форматирование и регулярные выражения</h1>
   <p class="lead">Тема 03 объяснила, как строка устроена в памяти. Здесь — как с текстом работать правильно: почему <code>length()</code> не считает символы, как <code>toUpperCase()</code> ломает логин в турецкой локали, как писать регулярные выражения, которые не подвешивают сервер, и какие методы строк экономят десятки строк кода.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">code points</span><span class="tag">Locale</span><span class="tag">Pattern / Matcher</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">code points</span><span class="tag">Locale</span><span class="tag">Pattern / Matcher</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -191,7 +191,137 @@ p.matcher("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!").matches();   // 30 букв «a» �
   <div class="card"><h4>Когда regex не нужен</h4><p>Проверка «только цифры» — цикл или <code>chars().allMatch(Character::isDigit)</code>. Разбор JSON, XML, HTML, CSV — парсер. Email — простая проверка на «@» и письмо с подтверждением; «полный» regex по RFC нечитаем и всё равно не гарантирует, что ящик существует.</p></div>
 </div>
 
-<h2 id="quiz"><span class="h-num">18.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">18.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Unicode, нормализация, регулярные выражения для разбора логов и катастрофический перебор — с замером времени. Модуль IDEA — <code>ch18</code>. Если в консоли IDEA эмодзи отображаются квадратиками — это шрифт консоли, а не ошибка программы.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-18.1">
+<div class="lab-head"><span class="lab-num">Лаба 18.1</span><b>char — не символ</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посчитать «длину» строки с эмодзи и диакритикой тремя способами и сравнить две одинаково выглядящие строки.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Unicode.java</code>:</div>
+<pre data-title="Unicode.java"><code class="java">import java.text.Normalizer;
+
+public class Unicode {
+    public static void main(String[] args) {
+        String s = "Java☕👍🏽";
+        System.out.println("length()        = " + s.length());
+        System.out.println("codePointCount  = " + s.codePointCount(0, s.length()));
+        System.out.println("кодовые точки:   " + s.codePoints().mapToObj(cp -&gt; String.format("U+%04X", cp)).toList());
+        System.out.println("substring(0,6)  = " + s.substring(0, 6).codePoints().mapToObj(cp -&gt; String.format("U+%04X", cp)).toList() + " ← половина суррогатной пары");
+
+        String composed = "é";                 // U+00E9
+        String decomposed = "é";         // e + комбинируемое ударение
+        System.out.println("выглядят одинаково, equals = " + composed.equals(decomposed)
+                + ", длины " + composed.length() + " и " + decomposed.length());
+        System.out.println("после NFC equals = " + Normalizer.normalize(decomposed, Normalizer.Form.NFC).equals(composed));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие числа дадут <code>length()</code> и <code>codePointCount</code> для «Java☕👍🏽»?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Unicode.java
+java Unicode</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">length()        = 9
+codePointCount  = 7
+кодовые точки:   [U+004A, U+0061, U+0076, U+0061, U+2615, U+1F44D, U+1F3FD]
+substring(0,6)  = [U+004A, U+0061, U+0076, U+0061, U+2615, U+D83D] ← половина суррогатной пары
+выглядят одинаково, equals = false, длины 1 и 2
+после NFC equals = true</code></pre></details>
+<div class="lab-ans" hidden><p><code>length()</code> = 9: «Java» — 4, ☕ (U+2615, внутри BMP) — 1, 👍 (U+1F44D) — 2 char-а (суррогатная пара), модификатор тона 🏽 (U+1F3FD) — ещё 2. <code>codePointCount</code> = 7. А пользователь видит 6 «символов»: 👍🏽 — одна графема из двух кодовых точек (для графем — <code>BreakIterator</code> или <code>\X</code> в regex). <code>substring</code> по индексам char может разрезать пару и оставить «сироту» U+D83D.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-18.2">
+<div class="lab-head"><span class="lab-num">Лаба 18.2</span><b>Разбор лога регулярным выражением</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Вытащить поля из строк лога именованными группами и посчитать статистику.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>LogParse.java</code>:</div>
+<pre data-title="LogParse.java"><code class="java">import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+public class LogParse {
+    private static final Pattern LINE = Pattern.compile(
+        "^(?&lt;time&gt;\\d{2}:\\d{2}:\\d{2}) \\[(?&lt;level&gt;[A-Z]+)\\s*] (?&lt;logger&gt;[\\w.]+) - (?&lt;msg&gt;.*?)(?: took (?&lt;ms&gt;\\d+)ms)?$");
+
+    public static void main(String[] args) {
+        List&lt;String&gt; log = List.of(
+            "10:15:01 [INFO ] app.web.Controller - GET /orders took 35ms",
+            "10:15:02 [WARN ] app.db.Pool - pool almost exhausted",
+            "10:15:03 [INFO ] app.web.Controller - GET /orders/42 took 120ms",
+            "это не строка лога",
+            "10:15:05 [ERROR] app.pay.Gateway - timeout calling bank took 3000ms");
+
+        List&lt;Map&lt;String, String&gt;&gt; parsed = new ArrayList&lt;&gt;();
+        for (String l : log) {
+            Matcher m = LINE.matcher(l);
+            if (!m.matches()) { System.out.println("не разобрано: " + l); continue; }
+            parsed.add(Map.of("level", m.group("level"), "logger", m.group("logger"),
+                    "ms", Objects.requireNonNullElse(m.group("ms"), "-")));
+        }
+        parsed.forEach(System.out::println);
+        System.out.println("по уровням: " + parsed.stream().collect(Collectors.groupingBy(p -&gt; p.get("level"), TreeMap::new, Collectors.counting())));
+        System.out.println("замена с backreference: " + "2026-10-21".replaceAll("(\\d{4})-(\\d{2})-(\\d{2})", "$3.$2.$1"));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac LogParse.java
+java LogParse</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">не разобрано: это не строка лога
+{logger=app.web.Controller, ms=35, level=INFO}
+{logger=app.db.Pool, ms=-, level=WARN}
+{logger=app.web.Controller, ms=120, level=INFO}
+{logger=app.pay.Gateway, ms=3000, level=ERROR}
+по уровням: {ERROR=1, INFO=2, WARN=1}
+замена с backreference: 21.10.2026</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Зачем в группе <code>msg</code> ленивый квантификатор <code>.*?</code>?</div>
+<div class="lab-ans" hidden><p>Жадный <code>.*</code> захватил бы и « took 35ms» — необязательная группа <code>(?: took …)?</code> «согласилась» бы ничего не совпадать, и <code>ms</code> всегда был бы null. Ленивый <code>.*?</code> берёт минимум, оставляя хвост необязательной группе. Pattern компилируйте один раз в <code>static final</code> — компиляция дороже сопоставления.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-18.3">
+<div class="lab-head"><span class="lab-num">Лаба 18.3</span><b>ReDoS: регулярка, которая вешает сервис</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить экспоненциальный рост времени на «злом» шаблоне — и выяснить, от чего современная Java уже защищает, а от чего нет.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Redos.java</code>:</div>
+<pre data-title="Redos.java"><code class="java">import java.util.regex.Pattern;
+
+public class Redos {
+    static long ms(Pattern p, String in) {
+        long t = System.nanoTime();
+        p.matcher(in).matches();
+        return (System.nanoTime() - t) / 1_000_000;
+    }
+
+    public static void main(String[] args) {
+        Pattern classic = Pattern.compile("^(a+)+$");          // хрестоматийный ReDoS
+        Pattern counted = Pattern.compile("^(a+){2,40}$");     // то же, но со счётным квантификатором
+        Pattern csv = Pattern.compile("^(.*?,){11}P");          // «найти 12-е поле CSV»
+        Pattern safe = Pattern.compile("^a{2,}$");
+        for (int n = 16; n &lt;= 26; n += 2) {
+            String in = "a".repeat(n) + "!";                     // почти совпадает
+            System.out.printf("n=%2d: (a+)+ %4d мс | (a+){2,40} %5d мс | (.*?,){11}P %5d мс | a{2,} %d мс%n",
+                    n, ms(classic, in), ms(counted, in), ms(csv, "a,".repeat(n) + "!"), ms(safe, in));
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой из шаблонов «взорвётся», а какой — нет, хотя по учебникам должен?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Redos.java
+java Redos</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">n=16: (a+)+    0 мс | (a+){2,40}     3 мс | (.*?,){11}P    12 мс | a{2,} 0 мс
+n=18: (a+)+    0 мс | (a+){2,40}     9 мс | (.*?,){11}P    31 мс | a{2,} 0 мс
+n=20: (a+)+    0 мс | (a+){2,40}    80 мс | (.*?,){11}P    96 мс | a{2,} 0 мс
+n=22: (a+)+    0 мс | (a+){2,40}   230 мс | (.*?,){11}P    79 мс | a{2,} 0 мс
+n=24: (a+)+    0 мс | (a+){2,40}   216 мс | (.*?,){11}P   152 мс | a{2,} 0 мс
+n=26: (a+)+    0 мс | (a+){2,40}   865 мс | (.*?,){11}P   422 мс | a{2,} 0 мс</code></pre></details>
+<div class="lab-ans" hidden><p>Хрестоматийный <code>(a+)+</code> на современной Java отрабатывает мгновенно: с JDK 9 движок запоминает уже проверенные позиции для жадных циклов <code>*</code> и <code>+</code> над группой. А вот <code>(a+){2,40}</code> и <code>(.*?,){11}P</code> растут примерно вдвое на каждые +2 символа: для счётных и ленивых повторов эта защита не работает, и движок перебирает экспоненциально много разбиений строки. 30–40 символов — уже секунды на один запрос. Лечение: убрать вложенные квантификаторы (<code>a{2,}</code>), использовать possessive-квантификаторы (<code>(a+)++</code>) или атомарные группы <code>(?&gt;…)</code>, ограничивать длину входа, а для CSV — парсер вместо регулярки.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">18.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Что вернёт <code>"a.b.c".split(".")</code>?</p><ul><li>["a", "b", "c"]</li><li>["a.b.c"]</li><li>Пустой массив: точка в regex означает «любой символ», все элементы пустые и отброшены</li><li>Исключение</li></ul><div class="why">Аргумент split — регулярное выражение. Нужно <code>split("\\.")</code> или <code>split(Pattern.quote("."))</code>.</div></div>
 <div class="mcq" data-ok="1"><p>Чем <code>matches()</code> отличается от <code>find()</code>?</p><ul><li>Ничем</li><li>matches требует совпадения всей строки, find ищет очередное вхождение в любом месте</li><li>find работает только с группами</li><li>matches быстрее</li></ul><div class="why"><code>"abc123".matches("\\d+")</code> → false, а find() найдёт «123».</div></div>

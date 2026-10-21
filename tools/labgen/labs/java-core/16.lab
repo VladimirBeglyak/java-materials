@@ -1,0 +1,116 @@
+@chapter 16 | questions
+@intro
+<p>Итоговый мини-проект на материале глав 1–15: утилита, которая читает текстовый файл и строит частотный словарь слов. По дороге понадобятся <code>Files</code>, строки и Unicode, records, коллекции, стримы и коллекторы, исключения и немного производительности. Модуль IDEA — <code>ch16</code>. Сначала попробуйте написать каждый шаг сами, затем сверьтесь с кодом.</p>
+@end
+
+@lab 16.1 | Мини-проект: частотный словарь | 60 мин
+@goal
+<p>Написать программу <code>WordFreq &lt;файл&gt; [N]</code>, которая печатает N самых частых слов, общее число слов и уникальных слов, и корректно обрабатывает ошибки.</p>
+@end
+@step Подготовьте входной файл:
+@file text.txt
+Java — это язык. Java — это платформа! Платформа Java включает JVM,
+а JVM исполняет байткод. Байткод создаёт компилятор javac;
+компилятор javac входит в JDK. JDK, JVM, JRE: три буквы — три смысла.
+@end
+@step Шаг 1. Модель результата и чтение файла. Подумайте: как разбить текст на слова, учитывая кириллицу, тире и пунктуацию, и как привести слова к одному регистру?
+@file WordFreq.java
+import java.io.IOException;
+import java.nio.charset.MalformedInputException;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+public class WordFreq {
+    record Stats(long totalWords, int uniqueWords, List<Map.Entry<String, Long>> top) { }
+
+    private static final Pattern NOT_LETTER = Pattern.compile("[^\\p{L}\\p{N}]+");   // всё, кроме букв и цифр Unicode
+
+    static Stats analyze(String text, int n) {
+        Map<String, Long> freq = NOT_LETTER.splitAsStream(text)
+                .filter(w -> !w.isEmpty())
+                .map(w -> w.toLowerCase(Locale.ROOT))
+                .collect(Collectors.groupingBy(w -> w, Collectors.counting()));
+
+        List<Map.Entry<String, Long>> top = freq.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed()
+                        .thenComparing(Map.Entry.comparingByKey()))
+                .limit(n)
+                .toList();
+
+        long total = freq.values().stream().mapToLong(Long::longValue).sum();
+        return new Stats(total, freq.size(), top);
+    }
+
+    public static void main(String[] args) {
+        if (args.length == 0) {
+            System.err.println("использование: WordFreq <файл> [N]");
+            System.exit(2);
+        }
+        int n = args.length > 1 ? Integer.parseInt(args[1]) : 5;
+        try {
+            String text = Files.readString(Path.of(args[0]));
+            Stats s = analyze(text, n);
+            System.out.printf("слов: %d, уникальных: %d%n", s.totalWords(), s.uniqueWords());
+            s.top().forEach(e -> System.out.printf("%-12s %d%n", e.getKey(), e.getValue()));
+        } catch (NoSuchFileException e) {
+            System.err.println("файл не найден: " + e.getFile());
+            System.exit(1);
+        } catch (MalformedInputException e) {
+            System.err.println("файл не в UTF-8");
+            System.exit(1);
+        } catch (IOException e) {
+            System.err.println("ошибка чтения: " + e);
+            System.exit(1);
+        }
+    }
+}
+@end
+@ide Program arguments: <code>text.txt 5</code> (файл — в рабочем каталоге конфигурации запуска)
+@run
+javac WordFreq.java
+java WordFreq text.txt 5
+@end
+@predict Почему для сортировки нужен <code>thenComparing(comparingByKey())</code>, если вывод и так выглядит правильно?
+@answer
+<p>У нескольких слов одинаковая частота: «java» и «jvm» — по 3, ещё несколько — по 2. Без второго ключа их порядок зависит от порядка обхода HashMap — он не гарантирован и может меняться между версиями JDK и запусками с другими данными. Детерминированный вывод — обязательное свойство утилиты (и условие стабильных тестов).</p>
+@end
+@step Шаг 2. Ошибки: проверьте поведение на несуществующем файле и файле в другой кодировке.
+@exec
+printf '\xcf\xf0\xe8\xe2\xe5\xf2' > cp1251.txt
+@end
+@run fail
+java WordFreq nope.txt
+java WordFreq cp1251.txt
+@end
+@note Файл <code>cp1251.txt</code> — слово «Привет» в кодировке windows-1251 (создайте его, сохранив текст в этой кодировке, например, в Notepad++ или IDEA: File → File Properties → File Encoding). <code>Files.readString</code> по умолчанию требует корректный UTF-8 и бросает <code>MalformedInputException</code>, а не молча портит текст.
+@step Шаг 3. Производительность: сгенерируйте файл побольше и замерьте.
+@file Gen.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Random;
+
+public class Gen {
+    public static void main(String[] args) throws Exception {
+        String[] words = { "java", "jvm", "поток", "память", "класс", "объект", "строка", "карта", "стрим", "тест" };
+        Random r = new Random(1);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 2_000_000; i++) sb.append(words[r.nextInt(words.length)]).append(i % 12 == 0 ? ".\n" : " ");
+        Files.writeString(Path.of("big.txt"), sb);
+        System.out.println("big.txt: " + Files.size(Path.of("big.txt")) / 1024 / 1024 + " МБ");
+    }
+}
+@end
+@run
+javac Gen.java
+java Gen
+java WordFreq big.txt 3 ||| S=$(date +%s%N); java WordFreq big.txt 3; echo "время: $(( ($(date +%s%N) - S) / 1000000 )) мс"
+@end
+@note Время в Windows замерьте в PowerShell: <code>Measure-Command { java WordFreq big.txt 3 }</code>.
+@try
+Ускорьте подсчёт: замените <code>groupingBy(…, counting())</code> на цикл с <code>HashMap.merge(w, 1L, Long::sum)</code>, затем попробуйте <code>.parallel()</code> на стриме слов. Что даёт больший выигрыш и почему? ::: Ручной цикл обычно быстрее за счёт отсутствия промежуточных объектов коллектора; parallel может ускорить разбиение и подсчёт на многоядерной машине (groupingByConcurrent), но чтение файла остаётся последовательным. Меряйте оба варианта несколько раз.
+Вынесите <code>analyze</code> в отдельный класс и напишите для него тесты JUnit 5 (глава 23): пустой текст, регистр, пунктуация, равные частоты. ::: Хорошая проверка дизайна: чистую функцию «текст → Stats» тестировать легко, а <code>main</code> с <code>System.exit</code> — трудно. Отсюда правило: логика отдельно, ввод-вывод отдельно.
+@end

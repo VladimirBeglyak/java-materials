@@ -24,7 +24,7 @@
   <div class="kicker">ТЕМА 14 · СБОРКА МУСОРА</div>
   <h1>Логи GC, настройка и OutOfMemoryError</h1>
   <p class="lead">Настройка GC начинается не с флагов, а с измерений: что говорит лог, как меняется занятость кучи после сборок, сколько времени уходит на паузы. Учимся читать строки лога G1 и ZGC, отличать утечку от маленькой кучи по графику, разбираем каждый вид <code>OutOfMemoryError</code> с порядком действий и анализ дампа кучи.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">-Xlog:gc</span><span class="tag">чтение логов</span><span class="tag">утечка vs мало кучи</span><span class="tag">виды OOM</span><span class="tag">heap dump</span><span class="tag">MAT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">-Xlog:gc</span><span class="tag">чтение логов</span><span class="tag">утечка vs мало кучи</span><span class="tag">виды OOM</span><span class="tag">heap dump</span><span class="tag">MAT</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -144,7 +144,157 @@ jcmd &lt;pid&gt; GC.class_histogram | head -30                          # быс
   <li>Тонкие флаги (<code>G1NewSizePercent</code>, <code>InitiatingHeapOccupancyPercent</code>, <code>ConcGCThreads</code>) — только по данным лога и с повторным замером.</li>
 </ol>
 
-<h2 id="quiz"><span class="h-num">14.7</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">14.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Полный цикл расследования на своей утечке: логи GC в файл, тренд «занято после сборки», гистограмма классов на живом процессе, дамп кучи и его анализ в IDE. Модуль IDEA — <code>ch14</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-14.1">
+<div class="lab-head"><span class="lab-num">Лаба 14.1</span><b>Лог GC «как в продакшене»</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Включить подробный лог сборок в файл с ротацией и научиться находить в нём главное.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Service.java</code>:</div>
+<pre data-title="Service.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Service {
+    // «сессии», которые никто не удаляет — классическая утечка
+    static final List&lt;byte[]&gt; SESSIONS = new ArrayList&lt;&gt;();
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        boolean leak = args.length &gt; 0 &amp;&amp; args[0].equals("leak");
+        for (int i = 0; ; i++) {
+            byte[] request = new byte[50 * 1024];              // временные данные запроса
+            if (leak) SESSIONS.add(new byte[2 * 1024]);        // 2 КБ «навсегда» на каждый запрос
+            if (i % 20 == 0) Thread.sleep(5);
+        }
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx64m -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10m</code>, Program arguments: <code>leak</code></p>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите с утечкой и логом в файл; дождитесь <code>OutOfMemoryError</code> (меньше минуты):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Service.java
+java -Xmx64m -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10m Service leak</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">pid 12808
+
+Exception: java.lang.OutOfMemoryError thrown from the UncaughtExceptionHandler in thread "main"</code></pre></details>
+<p class="lab-note">Последняя строка — не опечатка: памяти не хватило даже на печать стектрейса, поэтому JVM сообщает, что OOM вылетел из обработчика неперехваченных исключений.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Найдите в логе строки пауз — это тренд, по которому ставят диагноз:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">findstr /C:"Pause" gc.log</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[2026-10-21T21:35:44.847+0300][0.235s][info][gc,start    ] GC(0) Pause Young (Normal) (G1 Evacuation Pause)
+[2026-10-21T21:35:44.850+0300][0.237s][info][gc          ] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 35M-&gt;2M(64M) 2.521ms
+[2026-10-21T21:35:45.008+0300][0.395s][info][gc,start    ] GC(1) Pause Young (Normal) (G1 Evacuation Pause)
+[2026-10-21T21:35:45.009+0300][0.396s][info][gc          ] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 30M-&gt;3M(64M) 1.079ms
+[2026-10-21T21:35:45.204+0300][0.592s][info][gc,start    ] GC(2) Pause Young (Normal) (G1 Evacuation Pause)
+[2026-10-21T21:35:45.208+0300][0.596s][info][gc          ] GC(2) Pause Young (Normal) (G1 Evacuation Pause) 37M-&gt;5M(64M) 4.050ms
+…</code></pre></details>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[2026-10-21T21:35:54.163+0300][9.551s][info][gc,start       ] GC(349) Pause Young (Concurrent Start) (G1 Evacuation Pause)
+[2026-10-21T21:35:54.163+0300][9.551s][info][gc             ] GC(349) Pause Young (Concurrent Start) (G1 Evacuation Pause) 63M-&gt;63M(64M) 0.500ms
+[2026-10-21T21:35:54.163+0300][9.551s][info][gc,start       ] GC(351) Pause Full (G1 Compaction Pause)
+[2026-10-21T21:35:54.166+0300][9.554s][info][gc             ] GC(351) Pause Full (G1 Compaction Pause) 63M-&gt;63M(64M) 2.713ms
+[2026-10-21T21:35:54.166+0300][9.554s][info][gc,start       ] GC(352) Pause Full (G1 Compaction Pause)
+[2026-10-21T21:35:54.168+0300][9.556s][info][gc             ] GC(352) Pause Full (G1 Compaction Pause) 63M-&gt;63M(64M) 2.572ms
+…</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что в этих строках доказывает утечку, а не «просто маленькую кучу»?</div>
+<div class="lab-ans" hidden><p>Число <b>после</b> стрелки — занятость кучи после сборки — растёт от сборки к сборке и не возвращается: сначала единицы МБ, в конце — почти 64 МБ, молодые сборки сменяются <code>Pause Full</code>, а Full GC уже ничего не освобождает. При «маленькой, но достаточной» куче значение после сборки стабильно на одном уровне.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите без <code>leak</code> на минуту. Как выглядят строки Pause?</summary><div>Только молодые сборки, после каждой — одна и та же маленькая занятость: временные массивы умирают молодыми. Полных сборок нет. Это здоровая картина.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-14.2">
+<div class="lab-head"><span class="lab-num">Лаба 14.2</span><b>Ловим утечку на живом процессе: гистограмма и дамп</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Не дожидаясь падения, найти класс, который растёт, и снять дамп кучи для анализа.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите <code>Service leak</code> с <code>-Xmx256m</code> (падать он будет долго). Снимите две гистограммы с интервалом в несколько секунд:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; GC.class_histogram</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:         20454       24514808  [B (java.base@25.0.2)
+   2:          1734         229336  java.lang.Class (java.base@25.0.2)
+   3:          1461         209976  [Ljava.lang.Object; (java.base@25.0.2)
+   4:          8714         209136  java.lang.String (java.base@25.0.2)
+   5:           455          65768  [Ljdk.internal.vm.FillerElement; (java.base@25.0.2)
+…</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; GC.class_histogram</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:         39874       64597688  [B (java.base@25.0.2)
+   2:          1461         280232  [Ljava.lang.Object; (java.base@25.0.2)
+   3:          1732         229096  java.lang.Class (java.base@25.0.2)
+   4:          8714         209136  java.lang.String (java.base@25.0.2)
+   5:           525         102776  [Ljdk.internal.vm.FillerElement; (java.base@25.0.2)
+…</code></pre></details>
+<p class="lab-note"><code>[B</code> — это <code>byte[]</code>. Число экземпляров растёт между снимками — значит, их кто-то удерживает. Гистограмма с <code>GC.class_histogram</code> сначала делает полную сборку, поэтому в ней только живые объекты.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Снимите дамп кучи:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; GC.heap_dump service.hprof</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+Dumping heap to service.hprof ...
+Heap dump file created [72324093 bytes in 0.059 secs]</code></pre></details>
+<p class="lab-ide"><span>IDEA</span>Откройте <code>service.hprof</code>: в IntelliJ IDEA Ultimate — двойной клик по файлу (Profiler); в Community — VisualVM или Eclipse MAT. Отсортируйте классы по <b>Retained size</b> и найдите путь к GC root.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой объект будет на вершине дерева доминаторов и какой путь к корню вы увидите?</div>
+<div class="lab-ans" hidden><p><code>java.util.ArrayList</code> с retained size почти во всю занятую кучу, путь к корню: <code>Service.SESSIONS</code> (статическое поле класса) → <code>ArrayList.elementData</code> → тысячи <code>byte[2048]</code>. Retained size — сколько освободится, если удалить объект: именно он отвечает на вопрос «кто держит память».</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему в продакшене дамп кучи на 8 ГБ — рискованная операция?</summary><div>Дамп делается в safepoint: процесс стоит всё время записи (секунды — минуты), а файл занимает место, сравнимое с кучей. Снимайте с инстанса, выведенного из балансировки, и следите за диском. <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=…</code> снимает дамп автоматически в момент падения.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-14.3">
+<div class="lab-head"><span class="lab-num">Лаба 14.3</span><b>OOM в одном потоке — «зомби»-сервис</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что <code>OutOfMemoryError</code> в рабочем потоке не останавливает JVM, и включить правильное поведение для продакшена.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Zombie.java</code>:</div>
+<pre data-title="Zombie.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Zombie {
+    public static void main(String[] args) throws Exception {
+        Thread worker = new Thread(() -&gt; {
+            List&lt;long[]&gt; hog = new ArrayList&lt;&gt;();
+            while (true) hog.add(new long[100_000]);
+        }, "worker");
+        worker.start();
+        for (int i = 1; i &lt;= 3; i++) {
+            Thread.sleep(500);
+            System.out.println("main: я жив, worker " + worker.getState());
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатает <code>main</code> после того, как worker получит OOM при <code>-Xmx64m</code>?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx64m</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Zombie.java
+java -Xmx64m Zombie</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Exception in thread "worker" java.lang.OutOfMemoryError: Java heap space
+	at Zombie.lambda$main$0(Zombie.java:8)
+	at Zombie$$Lambda/0x000000008f040210.run(Unknown Source)
+	at java.base/java.lang.Thread.runWith(Thread.java:1487)
+	at java.base/java.lang.Thread.run(Thread.java:1474)
+main: я жив, worker TERMINATED
+main: я жив, worker TERMINATED
+main: я жив, worker TERMINATED</code></pre></details>
+<div class="lab-ans" hidden><p>Ошибка напечатается в stderr (<code>Exception in thread "worker" java.lang.OutOfMemoryError: Java heap space</code>), поток умрёт (<code>TERMINATED</code>), а процесс продолжит жить: main печатает «я жив». В реальном сервисе так появляется «зомби»: часть пулов мертва или в неконсистентном состоянии, а health-check по-прежнему зелёный.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Включите флаг, который превращает OOM в немедленное завершение процесса — пусть оркестратор перезапустит под:</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx64m -XX:+ExitOnOutOfMemoryError</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xmx64m -XX:+ExitOnOutOfMemoryError Zombie</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Terminating due to java.lang.OutOfMemoryError: Java heap space</code></pre></details>
+<p class="lab-note">В продакшене обычно ставят пару: <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps</code> (сначала снять дамп для расследования) и <code>-XX:+ExitOnOutOfMemoryError</code> (затем умереть). Вариант <code>-XX:+CrashOnOutOfMemoryError</code> дополнительно пишет hs_err и core-файл.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">14.8</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>По какому признаку в логах GC отличить утечку от слишком маленькой кучи?</p><ul><li>По длине пауз</li><li>По тренду занятости после сборок: при утечке он растёт, при малой куче стабилен у предела</li><li>По числу потоков GC</li><li>Никак</li></ul><div class="why">Живые данные (после GC) — главный индикатор.</div></div>
 <div class="mcq" data-ok="3"><p>Что такое retained size в анализе дампа?</p><ul><li>Размер объекта без ссылок</li><li>Размер класса в metaspace</li><li>Объём, занимаемый строками</li><li>Объём памяти, который освободится, если объект станет недостижим (всё, над чем он доминирует)</li></ul><div class="why">Shallow — сам объект, retained — его «империя».</div></div>

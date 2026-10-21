@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 18 · ИСПОЛНЕНИЕ</div>
   <h1>Потоки, safepoints и блокировки в JVM</h1>
   <p class="lead">Как Java-поток связан с потоком ОС и виртуальным потоком, почему «пауза GC 5 мс» иногда превращается в 500 мс ожидания safepoint, как JVM реализует <code>synchronized</code> — от бесплатной блокировки без конкуренции до нативного монитора с очередями, и что изменилось с удалением biased locking и приходом виртуальных потоков. Это нижний уровень того, что в пособии по конкурентности описано с точки зрения API.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">потоки ОС</span><span class="tag">safepoint</span><span class="tag">time-to-safepoint</span><span class="tag">handshakes</span><span class="tag">ObjectMonitor</span><span class="tag">виртуальные потоки</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">потоки ОС</span><span class="tag">safepoint</span><span class="tag">time-to-safepoint</span><span class="tag">handshakes</span><span class="tag">ObjectMonitor</span><span class="tag">виртуальные потоки</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -98,7 +98,163 @@
 jcmd &lt;pid&gt; Thread.dump_to_file -format=json threads.json   # дамп с виртуальными потоками
 # JFR: jdk.VirtualThreadPinned, jdk.VirtualThreadSubmitFailed</code></pre>
 
-<h2 id="quiz"><span class="h-num">18.5</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">18.5</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Блокировки и потоки лучше всего видны в дампе потоков: кто чем владеет, кто чего ждёт. Устроим конкуренцию за монитор, настоящий deadlock и сравним платформенные потоки с виртуальными. Модуль IDEA — <code>ch18</code>. В IDEA дамп потоков работающей программы снимается кнопкой «камера» (Dump Threads) в окне Run.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-18.1">
+<div class="lab-head"><span class="lab-num">Лаба 18.1</span><b>Дамп потоков: владелец монитора и очередь</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в дампе потоков владельца монитора, ожидающих на входе (<code>BLOCKED</code>) и ожидающих в <code>wait()</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Monitors.java</code>:</div>
+<pre data-title="Monitors.java"><code class="java">public class Monitors {
+    static final Object LOCK = new Object();
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        new Thread(() -&gt; { synchronized (LOCK) { sleep(60_000); } }, "owner").start();
+        Thread.sleep(100);
+        for (int i = 1; i &lt;= 2; i++)
+            new Thread(() -&gt; { synchronized (LOCK) { } }, "blocked-" + i).start();
+        Object other = new Object();
+        new Thread(() -&gt; { synchronized (other) { try { other.wait(); } catch (InterruptedException e) { } } }, "waiter").start();
+        Thread.sleep(60_000);
+    }
+
+    static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { } }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"owner" #35 [12460] prio=5 os_prio=0 cpu=0.00ms elapsed=2.42s tid=0x0000022b34c8c8a0 nid=12460 waiting on condition  [0x000000f18d9ff000]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+	at java.lang.Thread.sleepNanos0(java.base@25.0.2/Native Method)
+	at java.lang.Thread.sleepNanos(java.base@25.0.2/Thread.java:509)
+	at java.lang.Thread.sleep(java.base@25.0.2/Thread.java:540)
+	at Monitors.sleep(Monitors.java:15)
+	at Monitors.lambda$main$0(Monitors.java:6)
+	- locked &lt;0x0000000627c1fad0&gt; (a java.lang.Object)
+--
+"blocked-1" #36 [26080] prio=5 os_prio=0 cpu=0.00ms elapsed=2.32s tid=0x0000022b34c93220 nid=26080 waiting for monitor entry  [0x000000f18daff000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Monitors.lambda$main$1(Monitors.java:9)
+	- waiting to lock &lt;0x0000000627c1fad0&gt; (a java.lang.Object)
+	at Monitors$$Lambda/0x000000000c040438.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.2/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.2/Thread.java:1474)
+
+"blocked-2" #37 [1912] prio=5 os_prio=0 cpu=0.00ms elapsed=2.32s tid=0x0000022b34c95e00 nid=1912 waiting for monitor entry  [0x000000f18dbff000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Monitors.lambda$main$1(Monitors.java:9)
+	- waiting to lock &lt;0x0000000627c1fad0&gt; (a java.lang.Object)
+	at Monitors$$Lambda/0x000000000c040438.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.2/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.2/Thread.java:1474)
+
+"waiter" #38 [18076] prio=5 os_prio=0 cpu=0.00ms elapsed=2.32s tid=0x0000022b34c9a200 nid=18076 in Object.wait()  [0x000000f18dcfe000]
+   java.lang.Thread.State: WAITING (on object monitor)
+	at java.lang.Object.wait0(java.base@25.0.2/Native Method)
+	- waiting on &lt;0x0000000627c77f90&gt; (a java.lang.Object)
+	at java.lang.Object.wait(java.base@25.0.2/Object.java:389)
+	at java.lang.Object.wait(java.base@25.0.2/Object.java:351)
+	at Monitors.lambda$main$2(Monitors.java:11)
+	- locked &lt;0x0000000627c77f90&gt; (a java.lang.Object)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему у <code>waiter</code> в дампе есть и «locked», и «waiting on» для одного и того же объекта?</div>
+<div class="lab-ans" hidden><p>Строка <code>- locked</code> — информация из байткода о том, что поток вошёл в synchronized (other), а <code>- waiting on</code> — что он вызвал <code>wait()</code> и при этом <b>освободил</b> монитор. Поток в <code>WAITING (on object monitor)</code> монитором не владеет — иначе notify() было бы невозможно вызвать. У <code>blocked-N</code>: <code>BLOCKED (on object monitor)</code> и <code>waiting to lock &lt;адрес&gt;</code> — тот же адрес, что «locked» у owner: по адресу вы находите виновника.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>synchronized</code> на <code>ReentrantLock</code>. Как изменится дамп?</summary><div>Ждущие потоки станут <code>WAITING (parking)</code> с <code>parking to wait for &lt;… ReentrantLock$NonfairSync&gt;</code>, а владельца покажет только секция «Locked ownable synchronizers» (видна при <code>jcmd Thread.print -l</code>).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-18.2">
+<div class="lab-head"><span class="lab-num">Лаба 18.2</span><b>Настоящий deadlock — и JVM его находит</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Устроить взаимную блокировку двух потоков и прочитать готовый диагноз в конце дампа.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Deadlock.java</code>:</div>
+<pre data-title="Deadlock.java"><code class="java">public class Deadlock {
+    public static void main(String[] args) {
+        Object a = new Object(), b = new Object();
+        new Thread(() -&gt; { synchronized (a) { pause(); synchronized (b) { } } }, "T1").start();
+        new Thread(() -&gt; { synchronized (b) { pause(); synchronized (a) { } } }, "T2").start();
+        System.out.println("pid " + ProcessHandle.current().pid() + " — сейчас всё зависнет");
+    }
+
+    static void pause() { try { Thread.sleep(200); } catch (InterruptedException e) { } }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Found one Java-level deadlock:
+=============================
+"T1":
+  waiting to lock monitor 0x000001bafb66c3c0 (object 0x0000000627c1f8d0, a java.lang.Object),
+  which is held by "T2"
+
+"T2":
+  waiting to lock monitor 0x000001baf0231d40 (object 0x0000000627c1f8c0, a java.lang.Object),
+  which is held by "T1"
+
+Java stack information for the threads listed above:
+===================================================
+"T1":
+	at Deadlock.lambda$main$0(Deadlock.java:4)
+	- waiting to lock &lt;0x0000000627c1f8d0&gt; (a java.lang.Object)
+	- locked &lt;0x0000000627c1f8c0&gt; (a java.lang.Object)
+	at Deadlock$$Lambda/0x000000000c040210.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.2/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.2/Thread.java:1474)
+"T2":
+	at Deadlock.lambda$main$1(Deadlock.java:5)
+	- waiting to lock &lt;0x0000000627c1f8c0&gt; (a java.lang.Object)
+	- locked &lt;0x0000000627c1f8d0&gt; (a java.lang.Object)
+	at Deadlock$$Lambda/0x000000000c040440.run(Unknown Source)
+	at java.lang.Thread.runWith(java.base@25.0.2/Thread.java:1487)
+	at java.lang.Thread.run(java.base@25.0.2/Thread.java:1474)
+
+Found 1 deadlock.</code></pre></details>
+<p class="lab-note">В отличие от взаимоблокировки на инициализации классов (лаба 6.3), deadlock на мониторах и <code>j.u.c.</code>-блокировках JVM находит сама — секция <code>Found one Java-level deadlock</code> в конце дампа с цепочкой «кто кого ждёт». Программно то же даёт <code>ThreadMXBean.findDeadlockedThreads()</code>.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="jvm-18.3">
+<div class="lab-head"><span class="lab-num">Лаба 18.3</span><b>10 000 потоков: платформенные против виртуальных</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить стоимость и время запуска большого числа блокирующихся задач на обычных и виртуальных потоках.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ManyThreads.java</code>:</div>
+<pre data-title="ManyThreads.java"><code class="java">import java.time.Duration;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
+
+public class ManyThreads {
+    public static void main(String[] args) {
+        boolean virtual = args[0].equals("virtual");
+        long t = System.nanoTime();
+        try (var ex = virtual ? Executors.newVirtualThreadPerTaskExecutor()
+                              : Executors.newFixedThreadPool(200)) {
+            IntStream.range(0, 10_000).forEach(i -&gt; ex.submit(() -&gt; {
+                Thread.sleep(Duration.ofMillis(100));     // имитация блокирующего вызова
+                return i;
+            }));
+        }
+        System.out.printf("%s: 10 000 задач по 100 мс за %d мс%n",
+                virtual ? "виртуальные" : "пул из 200 ", (System.nanoTime() - t) / 1_000_000);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Пул из 200 потоков и 10 000 задач по 100 мс. Сколько займёт? А на виртуальных потоках?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac ManyThreads.java
+java ManyThreads pool
+java ManyThreads virtual</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">пул из 200 : 10 000 задач по 100 мс за 5053 мс
+виртуальные: 10 000 задач по 100 мс за 173 мс</code></pre></details>
+<div class="lab-ans" hidden><p>Пул: 10 000 / 200 = 50 «волн» по 100 мс — около 5 секунд. Виртуальные: все 10 000 задач спят одновременно, ведь при <code>sleep</code> виртуальный поток отпускает поток-носитель — около 100–200 мс. Носителей при этом столько, сколько ядер. Виртуальные потоки ускоряют не вычисления, а ожидание.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>Thread.sleep</code> на вычисление на 100 мс (цикл). Что станет с виртуальными потоками?</summary><div>Ускорения не будет: CPU-работа занимает носитель, параллелизм ограничен числом ядер — как у пула размером в число ядер.</div></details></li>
+<li><details><summary>Оберните sleep в <code>synchronized (ManyThreads.class) { … }</code> и запустите на JDK 21 и на 25.</summary><div>На 21 виртуальный поток внутри synchronized «приколот» к носителю (pinning), и задачи выполнятся по одной — очень долго. С Java 24 (JEP 491) synchronized больше не приколачивает носитель, но задачи всё равно идут последовательно: монитор один.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">18.6</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Лог GC показывает паузу 5 мс, а запросы стоят 300 мс в тот же момент. Самая вероятная причина?</p><ul><li>Ошибка в логе</li><li>Медленная сеть</li><li>Долгое время до safepoint: какой-то поток долго не доходил до точки остановки</li><li>Слишком маленький eden</li></ul><div class="why">Смотрите «Reaching safepoint» в -Xlog:safepoint.</div></div>
 <div class="mcq" data-ok="0"><p>Когда synchronized-блокировка «раздувается» в ObjectMonitor?</p><ul><li>При конкуренции, которую не решило короткое вращение, или при вызове wait()</li><li>При каждом входе</li><li>Только при сборке мусора</li><li>Никогда</li></ul><div class="why">Без конкуренции — дешёвая CAS-блокировка в заголовке.</div></div>

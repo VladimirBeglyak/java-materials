@@ -1,0 +1,185 @@
+@chapter 05 | quiz
+@intro
+<p>Иерархию загрузчиков, делегирование и «один класс — два Class-объекта» проще всего понять, создав всё это своими руками. Модуль IDEA — <code>ch05</code>. В лабе 5.3 понадобится отдельный каталог с «плагином» вне <code>src</code> — его удобнее компилировать из терминала.</p>
+@end
+
+@lab 5.1 | Кто загрузил этот класс | 10 мин
+@goal
+<p>Увидеть три встроенных загрузчика и то, что у классов ядра загрузчик — <code>null</code>.</p>
+@end
+@file WhoLoaded.java
+public class WhoLoaded {
+    static void show(Class<?> c) {
+        ClassLoader l = c.getClassLoader();
+        System.out.printf("%-34s модуль %-15s загрузчик %s%n",
+                c.getName(), c.getModule().getName(), l == null ? "bootstrap (null)" : l.getName());
+    }
+
+    public static void main(String[] args) throws Exception {
+        show(String.class);
+        show(java.sql.Connection.class);
+        show(Class.forName("com.sun.net.httpserver.HttpServer"));
+        show(Class.forName("com.sun.source.tree.Tree"));
+        show(WhoLoaded.class);
+
+        ClassLoader cl = WhoLoaded.class.getClassLoader();
+        while (cl != null) {
+            System.out.println("  " + cl.getName() + " -> родитель " + cl.getParent());
+            cl = cl.getParent();
+        }
+    }
+}
+@end
+@predict Какие загрузчики окажутся у <code>String</code>, <code>java.sql.Connection</code>, <code>HttpServer</code>, <code>com.sun.source.tree.Tree</code> и <code>WhoLoaded</code>?
+@answer
+<p><code>String</code> — <code>null</code> (bootstrap, написан на C++ и не имеет Java-объекта); <code>java.sql.Connection</code> и <code>HttpServer</code> — <code>platform</code> (модули java.sql и jdk.httpserver); <code>Tree</code> из модуля <code>jdk.compiler</code> — <code>app</code>: модули инструментов JDK (компилятор, jshell) отданы прикладному загрузчику, не всё из JDK грузит platform; <code>WhoLoaded</code> — <code>app</code>. Цепочка родителей: app → platform → null.</p>
+@end
+@run
+javac WhoLoaded.java
+java WhoLoaded
+@end
+@try
+Выполните <code>jcmd &lt;pid&gt; VM.classloaders</code> для любого работающего процесса (например, <code>Sleeper</code> из темы 01). ::: Дерево загрузчиков с числом загруженных ими классов — то же, что вы напечатали, но взгляд со стороны JVM. В Spring Boot-приложении там появится <code>LaunchedClassLoader</code>.
+@end
+
+@lab 5.2 | Делегирование в логе: свой загрузчик-шпион | 15 мин
+@goal
+<p>Подсмотреть, какие запросы приходят загрузчику и сколько из них он передаёт родителю.</p>
+@end
+@file SpyLoader.java
+public class SpyLoader extends ClassLoader {
+    SpyLoader(ClassLoader parent) { super("spy", parent); }
+
+    @Override
+    protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+        System.out.println("  spy.loadClass(" + name + ")");
+        return super.loadClass(name, resolve);   // стандартное делегирование: кэш -> родитель -> findClass
+    }
+
+    public static void main(String[] args) throws Exception {
+        var spy = new SpyLoader(SpyLoader.class.getClassLoader());
+        System.out.println("1) загружаем java.util.ArrayList:");
+        Class<?> c = spy.loadClass("java.util.ArrayList");
+        System.out.println("   получили " + c + ", загрузчик = " + c.getClassLoader());
+        System.out.println("2) загружаем Target:");
+        Class<?> t = spy.loadClass("Target");
+        System.out.println("   получили " + t + ", загрузчик = " + t.getClassLoader().getName());
+        System.out.println("3) создаём экземпляр Target:");
+        t.getDeclaredConstructor().newInstance();
+    }
+}
+
+class Target {
+    Target() { System.out.println("   Target создан, внутри используется " + new java.util.StringJoiner(",").add("a").add("b")); }
+}
+@end
+@predict Пройдёт ли запрос <code>StringJoiner</code> из конструктора <code>Target</code> через шпиона?
+@answer
+<p>Нет. Шпион лишь получил запрос и делегировал его родителю (app), который и <b>определил</b> класс Target. Ссылки из байткода класса разрешаются через его <i>определяющий</i> загрузчик — app, а не spy. Поэтому в логе только два запроса. Чтобы шпион видел всё, он должен сам определять классы (лаба 7.1).</p>
+@end
+@run
+javac SpyLoader.java
+java SpyLoader
+@end
+@try
+Переопределите <code>findClass</code> вместо <code>loadClass</code> и добавьте туда печать. Вызовется ли он для <code>Target</code>? ::: Нет: findClass вызывается только если родитель класс не нашёл. Target лежит в classpath — его найдёт app-загрузчик.
+@end
+
+@lab 5.3 | Один байткод — два класса | 25 мин
+@goal
+<p>Загрузить один и тот же class-файл двумя загрузчиками и получить знаменитое <code>ClassCastException: Plugin cannot be cast to Plugin</code>.</p>
+@end
+@step «Плагин» кладём в отдельный каталог <code>plugin-src</code> — рядом с <code>src</code>, не внутри него, чтобы его не было в classpath приложения:
+@file plugin-src/Plugin.java
+public class Plugin {
+    public static int counter = 0;
+    public String hello() { counter++; return "привет из плагина, counter=" + counter; }
+}
+@end
+@file Host.java
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Path;
+
+public class Host {
+    public static void main(String[] args) throws Exception {
+        URL[] urls = { Path.of("plugins").toUri().toURL() };
+        var l1 = new URLClassLoader("L1", urls, ClassLoader.getPlatformClassLoader());
+        var l2 = new URLClassLoader("L2", urls, ClassLoader.getPlatformClassLoader());
+
+        Class<?> a = l1.loadClass("Plugin"), b = l2.loadClass("Plugin");
+        System.out.println("имена равны:   " + a.getName().equals(b.getName()));
+        System.out.println("классы равны:  " + (a == b));
+
+        Object pa = a.getDeclaredConstructor().newInstance();
+        Object pb = b.getDeclaredConstructor().newInstance();
+        System.out.println(a.getMethod("hello").invoke(pa));
+        System.out.println(a.getMethod("hello").invoke(pa));
+        System.out.println(b.getMethod("hello").invoke(pb));
+
+        System.out.println("pb instanceof a? " + a.isInstance(pb));
+        a.cast(pb);
+    }
+}
+@end
+@step Скомпилируйте плагин в каталог <code>plugins</code>, а хост — как обычно (IDEA: запуск из терминала в каталоге модуля):
+@run fail
+javac -d plugins plugin-src/Plugin.java
+javac Host.java
+java Host
+@end
+@predict Почему третий вызов печатает <code>counter=1</code>, а не 3?
+@answer
+<p>У каждого из двух классов <code>Plugin</code> свои статические поля: класс — это пара «имя + определяющий загрузчик». Отсюда же <code>ClassCastException: Cannot cast Plugin to Plugin</code>. При обычном приведении <code>(Plugin) obj</code> в коде сообщение ещё подробнее: <i>class Plugin cannot be cast to class Plugin (Plugin is in unnamed module of loader 'L2'; Plugin is in unnamed module of loader 'L1')</i> — имя загрузчика в сообщении и есть подсказка. Так изолируют плагины, веб-приложения в Tomcat и версии библиотек.</p>
+@end
+@try
+Создайте <code>l2</code> с родителем <code>l1</code> вместо platform. Что изменится? ::: <code>a == b</code> станет true: l2 сначала спросит родителя l1, тот уже загрузил Plugin. Счётчик станет общим (1, 2, 3), исключения не будет.
+Запустите <code>java -Xlog:class+load Host</code> и найдите строки с Plugin. ::: Две строки <code>Plugin source: file:/…/plugins/</code> — JVM действительно загрузила и разобрала файл дважды.
+@end
+
+@lab 5.4 | ClassNotFoundException против NoClassDefFoundError | 15 мин
+@goal
+<p>Вызвать обе ошибки и научиться по стектрейсу понимать, какая именно ситуация произошла.</p>
+@end
+@file Errors.java
+public class Errors {
+    public static void main(String[] args) {
+        try {
+            Class.forName("com.example.Nope");
+        } catch (ClassNotFoundException e) {
+            System.out.println("1) " + e);
+        }
+        try {
+            new Helper().run();
+        } catch (NoClassDefFoundError e) {
+            System.out.println("2) " + e);
+        }
+        for (int i = 0; i < 2; i++) {
+            try {
+                System.out.println(Broken.VALUE);
+            } catch (Throwable e) {
+                System.out.println("3." + i + ") " + e);
+            }
+        }
+    }
+}
+
+class Helper { void run() { System.out.println("Helper работает"); } }
+
+class Broken {
+    static final int VALUE = Integer.parseInt("не число");
+}
+@end
+@step Скомпилируйте, затем удалите <code>Helper.class</code> — как будто jar с ним забыли положить в рантайм:
+@run fail
+javac Errors.java
+del Helper.class ||| rm Helper.class
+java Errors
+@end
+@predict Почему для <code>Broken</code> первая и вторая попытки дают разные ошибки?
+@answer
+<p>Первая попытка запускает инициализацию класса; исключение в статическом инициализаторе оборачивается в <code>ExceptionInInitializerError</code>, класс помечается как «ошибочный». Повторно JVM инициализацию не выполняет и сразу бросает <code>NoClassDefFoundError: Could not initialize class Broken</code>, указывая причину <code>ExceptionInInitializerError</code>. В логах продакшена часто видна только вторая ошибка — ищите первую выше.</p>
+@end
+@try
+Почему <code>VALUE</code> здесь не подставляется в байткод как константа, как в лабе 2.2? ::: <code>Integer.parseInt(...)</code> — не константное выражение, поэтому <code>VALUE</code> — обычное статическое поле, и обращение к нему инициализирует класс.
+@end

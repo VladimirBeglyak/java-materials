@@ -1,0 +1,183 @@
+@chapter 19 | quiz
+@intro
+<p>Паттерны лучше всего усваиваются, когда сам пишешь проблему, которую они решают, и затем решение. Четыре лабы — четыре паттерна, которые встречаются в каждом Spring-проекте. Модуль IDEA — <code>ch19</code>.</p>
+@end
+
+@lab 19.1 | Builder для объекта с необязательными полями | 15 мин
+@goal
+<p>Заменить «телескопический» конструктор строителем с проверкой инвариантов при <code>build()</code>.</p>
+@end
+@file HttpRequestSpec.java
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public record HttpRequestSpec(String method, String url, Map<String, String> headers, Duration timeout, int retries) {
+    public static Builder get(String url) { return new Builder("GET", url); }
+    public static Builder post(String url) { return new Builder("POST", url); }
+
+    public static final class Builder {
+        private final String method, url;
+        private final Map<String, String> headers = new LinkedHashMap<>();
+        private Duration timeout = Duration.ofSeconds(10);
+        private int retries = 0;
+
+        private Builder(String method, String url) { this.method = method; this.url = url; }
+        public Builder header(String k, String v) { headers.put(k, v); return this; }
+        public Builder timeout(Duration t) { this.timeout = t; return this; }
+        public Builder retries(int r) { this.retries = r; return this; }
+
+        public HttpRequestSpec build() {
+            if (!url.startsWith("http")) throw new IllegalStateException("url должен начинаться с http: " + url);
+            if (method.equals("POST") && retries > 0) throw new IllegalStateException("POST не идемпотентен — повторы запрещены");
+            return new HttpRequestSpec(method, url, Map.copyOf(headers), timeout, retries);
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(get("https://api.example.com/orders").header("Accept", "application/json").retries(3).build());
+        try {
+            post("https://api.example.com/pay").retries(2).build();
+        } catch (IllegalStateException e) {
+            System.out.println("отказ: " + e.getMessage());
+        }
+    }
+}
+@end
+@run
+javac HttpRequestSpec.java
+java HttpRequestSpec
+@end
+@note Builder особенно уместен, когда проверка затрагивает несколько полей сразу (POST + retries): конструктор с 5 параметрами такую ошибку пропустил бы молча.
+@end
+
+@lab 19.2 | Strategy без классов: лямбды в EnumMap | 15 мин
+@goal
+<p>Заменить разрастающийся <code>switch</code> по типу клиента набором стратегий.</p>
+@end
+@file Pricing.java
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.util.EnumMap;
+import java.util.Map;
+import java.util.function.UnaryOperator;
+
+public class Pricing {
+    enum Tier { REGULAR, SILVER, GOLD, EMPLOYEE }
+
+    static final Map<Tier, UnaryOperator<BigDecimal>> STRATEGIES = new EnumMap<>(Map.of(
+        Tier.REGULAR, p -> p,
+        Tier.SILVER, p -> p.multiply(new BigDecimal("0.95")),
+        Tier.GOLD, p -> p.multiply(new BigDecimal("0.90")).max(p.subtract(new BigDecimal("500"))),
+        Tier.EMPLOYEE, p -> p.multiply(new BigDecimal("0.70"))));
+
+    static BigDecimal price(Tier tier, BigDecimal base) {
+        return STRATEGIES.get(tier).apply(base).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    public static void main(String[] args) {
+        for (Tier t : Tier.values())
+            System.out.printf("%-9s 1000 → %8s   10000 → %9s%n", t, price(t, new BigDecimal("1000")), price(t, new BigDecimal("10000")));
+        System.out.println("стратегий: " + STRATEGIES.size() + " из " + Tier.values().length);
+    }
+}
+@end
+@run
+javac Pricing.java
+java Pricing
+@end
+@predict Что произойдёт, если добавить в enum <code>PLATINUM</code>, но забыть стратегию? Как сделать так, чтобы ошибка была видна сразу при старте?
+@answer
+<p><code>NullPointerException</code> в момент первого расчёта для PLATINUM — возможно, через неделю в продакшене. Защита: проверка полноты в статическом блоке (<code>if (STRATEGIES.size() != Tier.values().length) throw …</code>) — тогда ошибка будет при загрузке класса. Ещё надёжнее — абстрактный метод в самом enum (каждая константа обязана его реализовать, проверяет компилятор) или <code>switch</code>-выражение без default.</p>
+@end
+
+@lab 19.3 | Decorator: кэш и замер времени поверх медленного сервиса | 20 мин
+@goal
+<p>Добавить поведение (кэширование, метрики) без изменения исходного класса — композицией по общему интерфейсу.</p>
+@end
+@file Decorators.java
+import java.util.HashMap;
+import java.util.Map;
+
+public class Decorators {
+    interface RateService { double rate(String currency); }
+
+    static class SlowBankRates implements RateService {
+        public double rate(String currency) {
+            try { Thread.sleep(300); } catch (InterruptedException e) { throw new RuntimeException(e); }
+            return switch (currency) { case "USD" -> 92.5; case "EUR" -> 100.1; default -> throw new IllegalArgumentException(currency); };
+        }
+    }
+
+    static class Caching implements RateService {
+        private final RateService inner; private final Map<String, Double> cache = new HashMap<>();
+        Caching(RateService inner) { this.inner = inner; }
+        public double rate(String c) { return cache.computeIfAbsent(c, inner::rate); }
+    }
+
+    static class Timing implements RateService {
+        private final RateService inner;
+        Timing(RateService inner) { this.inner = inner; }
+        public double rate(String c) {
+            long t = System.nanoTime();
+            try { return inner.rate(c); }
+            finally { System.out.printf("  rate(%s) за %d мс%n", c, (System.nanoTime() - t) / 1_000_000); }
+        }
+    }
+
+    public static void main(String[] args) {
+        RateService svc = new Timing(new Caching(new SlowBankRates()));
+        for (String c : new String[] { "USD", "EUR", "USD", "USD", "EUR" }) System.out.println(c + " = " + svc.rate(c));
+    }
+}
+@end
+@predict Сколько вызовов будут долгими? А если поменять порядок: <code>new Caching(new Timing(new SlowBankRates()))</code>?
+@answer
+<p>Долгими будут два первых (USD и EUR), остальные — 0 мс из кэша. При обратном порядке Timing окажется <i>внутри</i> кэша и будет печатать только для промахов: метрика покажет «все запросы по 300 мс», хотя пользователи видят в основном мгновенные ответы. Порядок декораторов — часть логики (так же важен порядок фильтров и аспектов в Spring).</p>
+@end
+@run
+javac Decorators.java
+java Decorators
+@end
+
+@lab 19.4 | Observer: события и утечка подписчиков | 15 мин
+@goal
+<p>Сделать простую шину событий и увидеть, почему подписки нужно уметь отменять.</p>
+@end
+@file Events.java
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
+
+public class Events {
+    record OrderPlaced(String id, double sum) { }
+
+    static class EventBus<E> {
+        private final List<Consumer<E>> listeners = new CopyOnWriteArrayList<>();
+        Runnable subscribe(Consumer<E> l) { listeners.add(l); return () -> listeners.remove(l); }   // возвращаем «отписку»
+        void publish(E event) { listeners.forEach(l -> l.accept(event)); }
+        int size() { return listeners.size(); }
+    }
+
+    public static void main(String[] args) {
+        EventBus<OrderPlaced> bus = new EventBus<>();
+        bus.subscribe(e -> System.out.println("  письмо клиенту о заказе " + e.id()));
+        Runnable unsubscribeStats = bus.subscribe(e -> System.out.println("  статистика: +" + e.sum()));
+        bus.publish(new OrderPlaced("A-1", 990));
+        unsubscribeStats.run();
+        bus.publish(new OrderPlaced("A-2", 150));
+
+        for (int i = 0; i < 1000; i++) {
+            byte[] screenState = new byte[100_000];                      // «экран», который давно закрыт
+            bus.subscribe(e -> { int unused = screenState.length; });   // забыли отписаться
+        }
+        System.out.println("подписчиков: " + bus.size() + " — каждый держит по 100 КБ");
+    }
+}
+@end
+@run
+javac Events.java
+java Events
+@end
+@note Забытые подписчики — классическая утечка памяти: шина живёт долго и держит лямбды, а лямбды держат захваченные объекты. Возвращайте из <code>subscribe</code> способ отписаться (как <code>AutoCloseable</code>/<code>Runnable</code>) и вызывайте его при закрытии компонента.
+@end

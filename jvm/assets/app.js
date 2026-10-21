@@ -291,9 +291,63 @@
     upd();
   }
 
+
+  /* ---------- Практикум: лабораторные ----------
+     .lab[data-lab] > .lab-steps > .lab-step — галочка «сделал» на каждом шаге (сохраняется);
+     .lab-step.predict — поле прогноза (сохраняется) и кнопка «Сверить», открывающая .lab-ans. */
+  function initLabs() {
+    var labs = document.querySelectorAll(".lab[data-lab]");
+    if (!labs.length) return;
+    var LK = KEY + "-labs", st = {};
+    try { st = JSON.parse(localStorage.getItem(LK) || "{}") || {}; } catch (e) {}
+    var put = function () { try { localStorage.setItem(LK, JSON.stringify(st)); } catch (e) {} };
+    var intro = document.querySelector(".lab-intro");
+    if (intro) {
+      var tm = document.createElement("label"); tm.className = "lab-mode";
+      tm.innerHTML = '<input type="checkbox"> Режим «набираю руками»: скрыть кнопки copy в лабораторных';
+      var tb = tm.querySelector("input");
+      try { tb.checked = localStorage.getItem(KEY + "-typing") === "1"; } catch (e) {}
+      document.body.classList.toggle("typing-mode", tb.checked);
+      tb.addEventListener("change", function () {
+        document.body.classList.toggle("typing-mode", tb.checked);
+        try { localStorage.setItem(KEY + "-typing", tb.checked ? "1" : "0"); } catch (e) {}
+      });
+      intro.appendChild(tm);
+    }
+    labs.forEach(function (lab) {
+      var id = lab.getAttribute("data-lab"), rec = st[id] || (st[id] = { d: {}, g: {} });
+      var steps = lab.querySelectorAll(".lab-step"), prog = lab.querySelector(".lab-prog");
+      function upd() {
+        var n = 0; steps.forEach(function (s, i) { if (rec.d[i]) n++; });
+        prog.textContent = "сделано " + n + " / " + steps.length;
+        prog.classList.toggle("full", n === steps.length);
+      }
+      steps.forEach(function (s, i) {
+        var l = document.createElement("label"); l.className = "lab-chk";
+        l.innerHTML = '<input type="checkbox"> сделал';
+        var cb = l.querySelector("input"); cb.checked = !!rec.d[i]; s.classList.toggle("done", cb.checked);
+        cb.addEventListener("change", function () { if (cb.checked) rec.d[i] = 1; else delete rec.d[i]; s.classList.toggle("done", cb.checked); put(); upd(); });
+        s.appendChild(l);
+        if (s.classList.contains("predict")) {
+          var ans = s.querySelector(".lab-ans"), g = document.createElement("div"); g.className = "lab-guess";
+          g.innerHTML = '<textarea placeholder="Ваш прогноз: что произойдёт и почему?"></textarea><button class="btn primary" type="button">Сверить</button>';
+          var ta = g.querySelector("textarea"), b = g.querySelector("button");
+          ta.value = rec.g[i] || "";
+          ta.addEventListener("input", function () { rec.g[i] = ta.value; put(); });
+          b.addEventListener("click", function () {
+            var open = ans.hidden; ans.hidden = !open; b.textContent = open ? "Скрыть ответ" : "Сверить";
+            if (open && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event("change")); }
+          });
+          s.insertBefore(g, s.querySelector(".lab-text").nextSibling);
+        }
+      });
+      upd();
+    });
+  }
+
   window.SG = { pages: PAGES, state: state, esc: esc };
   document.addEventListener("DOMContentLoaded", function () {
     current = document.body.getAttribute("data-page") || "00";
-    buildSidebar(); decorateHead(); buildToc(); highlightAll(); initSteppers(); initMcq(); buildFooter(); updateProgress();
+    buildSidebar(); decorateHead(); buildToc(); highlightAll(); initSteppers(); initMcq(); initLabs(); buildFooter(); updateProgress();
   });
 })();

@@ -1,0 +1,133 @@
+@chapter 08 | quiz
+@intro
+<p>Соберите два настоящих модуля, нарушьте их границы, узнайте, какие модули JDK нужны вашему коду, и соберите из них собственный маленький runtime. Здесь удобнее всего терминал: в IDEA модулям JPMS соответствуют отдельные модули проекта с файлом <code>module-info.java</code>, а команды ниже повторяют то, что IDEA делает при сборке.</p>
+@end
+
+@lab 8.1 | Два модуля: exports, requires и что бывает без них | 25 мин
+@goal
+<p>Собрать модули <code>com.greet</code> и <code>com.app</code> и проверить три уровня доступа: экспортированный пакет, неэкспортированный пакет и рефлексия.</p>
+@end
+@file mods/com.greet/module-info.java
+module com.greet {
+    exports com.greet.api;
+}
+@end
+@file mods/com.greet/com/greet/api/Greeter.java
+package com.greet.api;
+
+import com.greet.impl.Secret;
+
+public class Greeter {
+    public static String hello(String who) { return "Привет, " + who + Secret.suffix(); }
+}
+@end
+@file mods/com.greet/com/greet/impl/Secret.java
+package com.greet.impl;
+
+public class Secret {
+    public static String suffix() { return "!"; }
+    private String token = "s3cr3t";
+}
+@end
+@file mods/com.app/module-info.java
+module com.app {
+    requires com.greet;
+}
+@end
+@file mods/com.app/com/app/Main.java
+package com.app;
+
+import com.greet.api.Greeter;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        System.out.println(Greeter.hello("модули"));
+        System.out.println("мой модуль: " + Main.class.getModule());
+        Class<?> secret = Class.forName("com.greet.impl.Secret");
+        var f = secret.getDeclaredField("token");
+        f.setAccessible(true);
+        System.out.println("token = " + f.get(secret.getDeclaredConstructor().newInstance()));
+    }
+}
+@end
+@step Компиляция всех модулей сразу и запуск по имени модуля:
+@run fail
+javac -d out --module-source-path mods --module com.greet,com.app
+java --module-path out -m com.app/com.app.Main
+@end
+@note <code>--module-source-path mods</code> говорит javac, что каждый подкаталог <code>mods</code> — исходники модуля с тем же именем; <code>--module</code> перечисляет, какие модули собрать.
+@predict Компиляция прошла, приветствие напечаталось. Что случится на <code>setAccessible(true)</code>?
+@answer
+<p><code>InaccessibleObjectException: Unable to make field private java.lang.String com.greet.impl.Secret.token accessible: module com.greet does not "opens com.greet.impl" to module com.app</code>. <code>Class.forName</code> и <code>getDeclaredField</code> работают, а глубокая рефлексия в неоткрытый пакет запрещена. Исправление — в модуле-владельце: <code>opens com.greet.impl to com.app;</code> или запуск с <code>--add-opens com.greet/com.greet.impl=com.app</code>.</p>
+@end
+@step Проверьте исправление флагом командной строки, не трогая код:
+@ide VM options: <code>--add-opens com.greet/com.greet.impl=com.app</code>
+@run
+java --module-path out --add-opens com.greet/com.greet.impl=com.app -m com.app/com.app.Main
+@end
+@try
+Импортируйте в <code>Main</code> класс <code>com.greet.impl.Secret</code> и вызовите <code>Secret.suffix()</code> напрямую. ::: Ошибка компиляции: «package com.greet.impl is not visible … (package com.greet.impl is declared in module com.greet, which does not export it)». Модули проверяют доступ и при компиляции, и в рантайме.
+Уберите <code>requires com.greet</code> из <code>com.app</code>. ::: «package com.greet.api is not visible»: без requires модуль не читает другой модуль, даже если тот экспортирует пакет.
+@end
+
+@lab 8.2 | Сильная инкапсуляция JDK | 10 мин
+@goal
+<p>Попробовать залезть в приватное поле <code>String</code> и понять, откуда в реальных проектах берутся <code>--add-opens java.base/…</code>.</p>
+@end
+@file DeepReflection.java
+public class DeepReflection {
+    public static void main(String[] args) throws Exception {
+        var f = String.class.getDeclaredField("value");
+        System.out.println("поле найдено: " + f);
+        f.setAccessible(true);
+        byte[] v = (byte[]) f.get("hello");
+        System.out.println("внутри строки " + v.length + " байт, coder = Latin-1");
+    }
+}
+@end
+@run fail
+java DeepReflection.java
+@end
+@predict Каким флагом это «разрешить» и почему в продакшене так лучше не делать?
+@answer
+<p><code>--add-opens java.base/java.lang=ALL-UNNAMED</code> (код из classpath живёт в безымянном модуле). С Java 17 (JEP 403) это единственный способ — раньше хватало предупреждения. Флаг открывает весь пакет всем библиотекам из classpath; правильнее обновить библиотеку, которая требует такого доступа.</p>
+@end
+@ide VM options: <code>--add-opens java.base/java.lang=ALL-UNNAMED</code>
+@run
+java --add-opens java.base/java.lang=ALL-UNNAMED DeepReflection.java
+@end
+
+@lab 8.3 | jdeps и jlink: свой runtime на 45 МБ | 20 мин
+@goal
+<p>Узнать, какие модули JDK реально нужны приложению, и собрать из них урезанный runtime.</p>
+@end
+@file Tiny.java
+import java.net.http.HttpClient;
+import java.util.logging.Logger;
+
+public class Tiny {
+    public static void main(String[] args) {
+        Logger.getLogger("tiny").info("клиент: " + HttpClient.newHttpClient().version());
+        System.out.println("модули в runtime: " + ModuleLayer.boot().modules().size());
+    }
+}
+@end
+@run
+javac -d tiny-out Tiny.java
+jdeps --print-module-deps tiny-out
+java -cp tiny-out Tiny
+@end
+@predict jdeps показал три модуля. Сколько модулей окажется в рантайме, собранном только из них, и во сколько раз он меньше полного JDK?
+@answer
+<p>Ровно три: jlink добавляет транзитивные зависимости, но <code>java.net.http</code> и <code>java.logging</code> зависят только от <code>java.base</code>. Размер — около 45 МБ против ~370 МБ у полного JDK (в 8 раз меньше). На этом построены минимальные Docker-образы: <code>jlink</code> в стадии сборки, копирование результата в образ без JDK.</p>
+@end
+@run
+jlink --add-modules java.net.http,java.logging --strip-debug --no-header-files --no-man-pages --output tiny-jre
+tiny-jre/bin/java -cp tiny-out Tiny
+tiny-jre/bin/java --list-modules
+#!echo "размер tiny-jre: $(du -sm tiny-jre | cut -f1) МБ, полный JDK: $(du -sm "$(dirname "$(dirname "$(which java)")")" | cut -f1) МБ"
+@end
+@note Размер каталога в Windows: свойства папки в проводнике или <code>(Get-ChildItem tiny-jre -Recurse | Measure-Object Length -Sum).Sum / 1MB</code> в PowerShell. Для сравнения в последней строке вывода — размер полного JDK.
+@try
+Выполните <code>java --describe-module java.sql</code>. Что значит <code>requires transitive java.logging</code>? ::: Кто требует java.sql, автоматически читает и java.logging: типы из java.logging есть в публичном API java.sql (например, <code>Driver.getParentLogger()</code> возвращает <code>Logger</code>).
+@end

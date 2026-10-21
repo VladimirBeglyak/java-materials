@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 07 · ТИПЫ И КОЛЛЕКЦИИ</div>
   <h1>Generics и стирание типов</h1>
   <p class="lead">Обобщённые типы переносят ошибки приведения из времени выполнения во время компиляции. Но существуют они только для компилятора: в байткоде параметров типов нет. Это одно решение объясняет все странности — от запрета <code>new T()</code> до правила PECS.</p>
-  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">type erasure</span><span class="tag">wildcards</span><span class="tag">PECS</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">type erasure</span><span class="tag">wildcards</span><span class="tag">PECS</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -211,7 +211,147 @@ abstract class Builder&lt;B extends Builder&lt;B&gt;&gt; {     // self-type: м�
 <div class="callout info"><span class="c-title">PECS одной строкой</span>
 <code>static &lt;T&gt; void copy(List&lt;? super T&gt; dst, List&lt;? extends T&gt; src)</code> — из <code>src</code> читаем (producer → extends), в <code>dst</code> пишем (consumer → super). Так объявлен <code>Collections.copy</code>.</div>
 
-<h2 id="quiz"><span class="h-num">7.8</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">7.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Стирание типов, загрязнение кучи и PECS лучше всего понимаются, когда компилятор и JVM спорят у вас на глазах. Модуль IDEA — <code>ch07</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-7.1">
+<div class="lab-head"><span class="lab-num">Лаба 7.1</span><b>Стирание: List&lt;String&gt; и List&lt;Integer&gt; — один класс</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что параметры типа не существуют во время выполнения, и найти, куда javac вставил приведения.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Erasure.java</code>:</div>
+<pre data-title="Erasure.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Erasure {
+    static &lt;T extends Comparable&lt;T&gt;&gt; T max(List&lt;T&gt; xs) {
+        T best = xs.get(0);
+        for (T x : xs) if (x.compareTo(best) &gt; 0) best = x;
+        return best;
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; strings = new ArrayList&lt;&gt;();
+        List&lt;Integer&gt; ints = new ArrayList&lt;&gt;();
+        System.out.println("один класс: " + (strings.getClass() == ints.getClass()));
+        strings.add("b"); strings.add("a");
+        String m = max(strings);
+        System.out.println("max = " + m);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Erasure.java
+java Erasure
+javap -c Erasure.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  static &lt;T extends java.lang.Comparable&lt;T&gt;&gt; T max(java.util.List&lt;T&gt;);
+         2: invokeinterface #7,  2            // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+         7: checkcast     #13                 // class java/lang/Comparable
+        12: invokeinterface #15,  1           // InterfaceMethod java/util/List.iterator:()Ljava/util/Iterator;
+        19: invokeinterface #19,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        28: invokeinterface #25,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        33: checkcast     #13                 // class java/lang/Comparable
+        39: invokeinterface #29,  2           // InterfaceMethod java/lang/Comparable.compareTo:(Ljava/lang/Object;)I
+        20: invokeinterface #42,  1           // InterfaceMethod java/util/List.getClass:()Ljava/lang/Class;
+        26: invokeinterface #46,  1           // InterfaceMethod java/util/List.getClass:()Ljava/lang/Class;
+        50: invokeinterface #59,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+        59: invokeinterface #59,  2           // InterfaceMethod java/util/List.add:(Ljava/lang/Object;)Z
+        66: invokestatic  #65                 // Method max:(Ljava/util/List;)Ljava/lang/Comparable;
+        69: checkcast     #71                 // class java/lang/String</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой тип у параметра и результата метода <code>max</code> в байткоде и где появился <code>checkcast</code>?</div>
+<div class="lab-ans" hidden><p>После стирания <code>T</code> заменён своей границей: <code>max:(Ljava/util/List;)Ljava/lang/Comparable;</code>. Внутри <code>max</code> есть <code>checkcast Comparable</code> после <code>get</code>, а в <code>main</code> — <code>checkcast String</code> после вызова max: javac вставляет приведения в местах использования, потому что JVM о <code>String</code> в этом месте ничего не знает.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Попробуйте написать <code>if (strings instanceof List&lt;String&gt;)</code> и <code>new T[10]</code> внутри max.</summary><div>Первое компилируется с Java 16 только потому, что тип проверки совпадает со статическим (иначе «cannot safely cast»); <code>new T[10]</code> — ошибка «generic array creation»: в рантайме неизвестно, массив чего создать.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-7.2">
+<div class="lab-head"><span class="lab-num">Лаба 7.2</span><b>Загрязнение кучи: ClassCastException там, где нет приведения</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Обойти проверки через сырой тип и увидеть, что ошибка всплывает далеко от места, где её внесли.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Pollution.java</code>:</div>
+<pre data-title="Pollution.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+
+public class Pollution {
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    static void legacyAdd(List list) {
+        list.add(42);                     // сырой тип: компилятор не проверяет
+    }
+
+    public static void main(String[] args) {
+        List&lt;String&gt; names = new ArrayList&lt;&gt;();
+        names.add("Анна");
+        legacyAdd(names);
+        System.out.println("размер: " + names.size() + ", содержимое: " + names);
+        for (String n : names) System.out.println(n.toUpperCase());
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">На какой строке и с каким сообщением программа упадёт?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Pollution.java
+java Pollution</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">размер: 2, содержимое: [Анна, 42]
+АННА
+Exception in thread "main" java.lang.ClassCastException: class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')
+	at Pollution.main(Pollution.java:15)</code></pre></details>
+<div class="lab-ans" hidden><p>Не в <code>legacyAdd</code> и не на <code>println(names)</code> (toString работает с Object), а в цикле: <code>ClassCastException: class java.lang.Integer cannot be cast to class java.lang.String</code> — на скрытом <code>checkcast</code>, вставленном javac при чтении элемента как String. В реальном коде между «загрязнением» и падением могут быть тысячи строк. Защита — <code>Collections.checkedList(names, String.class)</code>: тогда упадёт сам <code>add</code>.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>@SuppressWarnings</code> и скомпилируйте с <code>javac -Xlint:unchecked</code>.</summary><div>Компилятор честно предупреждает: «unchecked call to add(E) as a member of the raw type List». Подавлять такие предупреждения можно только там, где вы доказали безопасность.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-7.3">
+<div class="lab-head"><span class="lab-num">Лаба 7.3</span><b>PECS на практике: copy и sum</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Написать обобщённые методы с правильными wildcard и проверить, какие вызовы компилируются.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Pecs.java</code>:</div>
+<pre data-title="Pecs.java"><code class="java">import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+public class Pecs {
+    // Producer extends: из src только читаем
+    static double sum(Collection&lt;? extends Number&gt; src) {
+        double s = 0;
+        for (Number n : src) s += n.doubleValue();
+        return s;
+    }
+
+    // Consumer super: в dst только пишем
+    static &lt;T&gt; void copy(List&lt;? extends T&gt; src, List&lt;? super T&gt; dst) {
+        for (T t : src) dst.add(t);
+    }
+
+    public static void main(String[] args) {
+        List&lt;Integer&gt; ints = List.of(1, 2, 3);
+        List&lt;Double&gt; doubles = List.of(0.5, 1.5);
+        System.out.println("sum ints = " + sum(ints) + ", sum doubles = " + sum(doubles));
+
+        List&lt;Number&gt; numbers = new ArrayList&lt;&gt;();
+        List&lt;Object&gt; objects = new ArrayList&lt;&gt;();
+        copy(ints, numbers);
+        copy(doubles, numbers);
+        copy(numbers, objects);
+        System.out.println("numbers = " + numbers + ", objects = " + objects);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Pecs.java
+java Pecs</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">sum ints = 6.0, sum doubles = 2.0
+numbers = [1, 2, 3, 0.5, 1.5], objects = [1, 2, 3, 0.5, 1.5]</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие из этих строк, добавленных в main, скомпилируются: <code>sum(numbers)</code>, <code>copy(objects, numbers)</code>, а в теле sum — <code>src.add(1)</code>?</div>
+<div class="lab-ans" hidden><p><code>sum(numbers)</code> — да. <code>copy(objects, numbers)</code> — нет: из списка Object нельзя гарантировать Number. <code>src.add(1)</code> внутри sum — нет: <code>? extends Number</code> может оказаться <code>List&lt;Double&gt;</code>, и добавить туда Integer было бы ошибкой; в «производителя» можно добавить только <code>null</code>. Проверьте каждую строку — сообщения компилятора с capture#1 стоит научиться читать.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему сигнатура JDK — <code>Collections.max(Collection&lt;? extends T&gt; coll)</code> с <code>T extends Object &amp; Comparable&lt;? super T&gt;</code>?</summary><div><code>? super T</code> у Comparable позволяет искать максимум для типа, который унаследовал compareTo от родителя (например, <code>java.sql.Timestamp</code> сравнивается как <code>Date</code>). <code>Object &amp;</code> — трюк для совместимости: после стирания результат остаётся Object, как в Java 1.4.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">7.9</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Почему нельзя написать <code>new T()</code> или <code>T[] arr = new T[10]</code> в обобщённом классе?</p><ul><li>Это запрещено стилем кодирования</li><li>Из-за стирания типов: в рантайме T неизвестен, остаётся Object или граница типа</li><li>T — зарезервированное слово</li><li>Можно, если T extends Object</li></ul><div class="why">Информация о T существует только при компиляции. Обход: передать <code>Class&lt;T&gt;</code> или <code>Supplier&lt;T&gt;</code>.</div></div>
 <div class="mcq" data-ok="3"><p>Скомпилируется ли класс с методами <code>void process(List&lt;String&gt; l)</code> и <code>void process(List&lt;Integer&gt; l)</code>?</p><ul><li>Да, это перегрузка</li><li>Да, с предупреждением</li><li>Только если один из них static</li><li>Нет: после стирания оба имеют сигнатуру process(List) — name clash</li></ul><div class="why">Перегрузка различается по стёртым сигнатурам, а они одинаковы.</div></div>

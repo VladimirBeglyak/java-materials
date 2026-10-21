@@ -1,0 +1,168 @@
+@chapter 03 | quiz
+@intro
+<p>Симулятор выше выполнял заранее подготовленный байткод. Теперь получите его сами из своего кода и научитесь читать <code>javap -c</code> так же свободно, как исходник. Модуль IDEA — <code>ch03</code>; в IDEA байткод открытого класса показывает View → Show Bytecode.</p>
+@end
+
+@lab 3.1 | Цикл, слоты и стек операндов из своего кода | 20 мин
+@goal
+<p>Скомпилировать методы из симулятора, прочитать их байткод и сопоставить каждую инструкцию со строкой Java.</p>
+@end
+@file Loops.java
+public class Loops {
+    static int sum(int n) {
+        int s = 0;
+        for (int i = 1; i <= n; i++) s += i;
+        return s;
+    }
+
+    static long fact(int n) {
+        long r = 1;
+        while (n > 1) r *= n--;
+        return r;
+    }
+
+    int field;
+
+    int addToField(int a, long b, int c) {
+        field += a;
+        return (int) (b + c);
+    }
+
+    public static void main(String[] args) {
+        System.out.println(sum(4) + " " + fact(5) + " " + new Loops().addToField(1, 2L, 3));
+    }
+}
+@end
+@step Скомпилируйте с отладочной информацией (<code>-g</code>), чтобы javap показал имена локальных переменных:
+@run grep="^  \S|^\s+\d+: |stack=|Start|^\s+\d+\s+\d+\s+\d+" head=60
+javac -g Loops.java
+java Loops
+javap -c -l -p Loops.class
+@end
+@predict В методе <code>addToField(int a, long b, int c)</code> — в каких слотах лежат <code>this</code>, <code>a</code>, <code>b</code>, <code>c</code>? Какой будет <code>max_locals</code>?
+@answer
+<p><code>this</code> — 0, <code>a</code> — 1, <code>b</code> — 2 и 3 (long занимает два слота), <code>c</code> — 4. <code>locals=5</code>. Проверьте по LocalVariableTable и по инструкциям: <code>iload_1</code>, <code>lload_2</code>, <code>iload 4</code> (для слотов больше 3 нет короткой формы с подчёркиванием).</p>
+@end
+@run
+javap -c -l -p Loops.class ||| javap -c -l -p Loops.class | sed -n '/int addToField/,/^$/p'
+@end
+@note Обратите внимание на <code>field += a</code>: <code>aload_0, dup, getfield, iload_1, iadd, putfield</code> — <code>dup</code> нужен, потому что ссылка на объект требуется дважды: для чтения и для записи поля.
+@try
+Добавьте в <code>sum</code> строку <code>int unused = 42;</code> внутри цикла. Изменился ли <code>locals</code>? ::: Да, на 1 — переменной нужен слот. А если объявить две переменные в двух непересекающихся блоках <code>{ int p = 1; } { int q = 2; }</code> — javac отдаст им один и тот же слот, <code>locals</code> вырастет только на 1.
+Чем <code>s += i</code> отличается в байткоде от <code>i++</code>? ::: <code>i++</code> — одна инструкция <code>iinc 2, 1</code>, работающая прямо в слоте. <code>s += i</code> — четыре: <code>iload_1, iload_2, iadd, istore_1</code>. <code>iinc</code> есть только для int и константы от −32768 до 32767.
+@end
+
+@lab 3.2 | Классика собеседований в байткоде: x = x++ | 10 мин
+@goal
+<p>Не запоминать ответ, а увидеть, почему он такой.</p>
+@end
+@file Incr.java
+public class Incr {
+    public static void main(String[] args) {
+        int x = 5;
+        x = x++;
+        int y = 5;
+        y = ++y;
+        int z = 5;
+        z = z++ + ++z;
+        System.out.println(x + " " + y + " " + z);
+    }
+}
+@end
+@predict Что напечатает программа? Особенно <code>z = z++ + ++z</code>.
+@answer
+<p><code>5 6 12</code>. Для z: <code>z++</code> кладёт на стек 5, слот становится 6; <code>++z</code> делает слот 7 и кладёт 7; сумма 12 записывается в z. Выражение вычисляется слева направо, а значение постфиксного инкремента — это значение ДО увеличения.</p>
+@end
+@run
+javac Incr.java
+java Incr
+javap -c Incr.class
+@end
+@try
+Найдите в выводе javap две инструкции, между которыми «теряется» инкремент в <code>x = x++</code>. ::: <code>iload_1</code> (на стек кладётся 5) → <code>iinc 1, 1</code> (слот = 6) → <code>istore_1</code> (в слот записывается 5 со стека). Увеличение произошло, но было перезаписано.
+@end
+
+@lab 3.3 | Что javac делает со switch, try/finally и autoboxing | 25 мин
+@goal
+<p>Проверить на своём коде каждое преобразование из таблицы «Java → байткод».</p>
+@end
+@file Sugar.java
+public class Sugar {
+    static int dense(int d) {
+        switch (d) { case 1: return 10; case 2: return 20; case 3: return 30; default: return 0; }
+    }
+
+    static int sparse(int code) {
+        switch (code) { case 10: return 1; case 500: return 2; case 9000: return 3; default: return 0; }
+    }
+
+    static int byString(String m) {
+        return switch (m) { case "GET" -> 1; case "PUT" -> 2; default -> 0; };
+    }
+
+    static void withFinally() {
+        try { work(); }
+        finally { cleanup(); }
+    }
+
+    static long boxedSum() {
+        Long total = 0L;
+        for (int i = 0; i < 1000; i++) total += i;
+        return total;
+    }
+
+    static void work() {}
+    static void cleanup() {}
+}
+@end
+@run grep="static|switch|tableswitch|lookupswitch|hashCode|equals|cleanup|valueOf|longValue|Exception table|any|athrow|^\s+\d+: \d+$|default"
+javac Sugar.java
+javap -c Sugar.class
+@end
+@predict Сколько раз вызов <code>cleanup()</code> встречается в байткоде <code>withFinally</code>, хотя в исходнике он один?
+@answer
+<p>Два: копия finally для нормального выхода и копия в обработчике <code>any</code> (из таблицы исключений), который сохраняет исключение в слот, вызывает cleanup и делает <code>athrow</code>. Если бы в try был <code>return</code> или <code>catch</code>-блоки, копий было бы больше — по одной на каждый путь выхода.</p>
+@end
+@step Посмотрите на <code>boxedSum</code>: каждая итерация <code>total += i</code> — это распаковка, сложение и новая упаковка.
+@note Ищите пару <code>invokevirtual Long.longValue</code> → <code>ladd</code> → <code>invokestatic Long.valueOf</code>. Кэш <code>Long.valueOf</code> покрывает только −128..127: как только сумма превысит 127 (уже на 17-й итерации), каждая итерация создаёт новый объект — почти тысяча лишних объектов на тысячу сложений.
+@try
+Поменяйте <code>case 9000</code> в <code>sparse</code> на <code>case 4</code> — какой switch выберет javac? ::: При значениях 4, 10, 500 таблица была бы слишком разреженной — останется <code>lookupswitch</code>. А при <code>1, 2, 4</code> javac выберет <code>tableswitch</code> с «дыркой» на 3, ведущей в default: таблица на 4 элемента дешевле двоичного поиска.
+Вызовите <code>byString(null)</code>. Что будет и почему видно из байткода? ::: <code>NullPointerException</code>: первым делом вызывается <code>m.hashCode()</code>. С Java 21 можно написать <code>case null -&gt;</code> — тогда javac сгенерирует отдельную проверку на null до вызова hashCode.
+@end
+
+@lab 3.4 | Интерпретатор против JIT: почувствуйте разницу | 10 мин
+@goal
+<p>Увидеть цену интерпретации тех же самых инструкций.</p>
+@end
+@file Speed.java
+public class Speed {
+    static int sum(int n) {
+        int s = 0;
+        for (int i = 1; i <= n; i++) s += i % 7;
+        return s;
+    }
+
+    public static void main(String[] args) {
+        for (int round = 1; round <= 5; round++) {
+            long t = System.nanoTime();
+            int r = sum(50_000_000);
+            System.out.printf("раунд %d: %4d мс (r=%d)%n", round, (System.nanoTime() - t) / 1_000_000, r);
+        }
+    }
+}
+@end
+@run
+javac Speed.java
+java Speed
+@end
+@predict Насколько медленнее будет только интерпретатор (<code>-Xint</code>)?
+@answer
+<p>В разы: здесь примерно в 7 раз, на коде с вызовами методов и объектами разница доходит до 20–50 раз. Шаблонный интерпретатор выполняет каждую инструкцию <code>iload/irem/iadd/iinc/if_icmpgt</code> по отдельности с переходом через таблицу диспетчеризации, а C2 превращает цикл в несколько машинных инструкций в регистрах. Заметьте ещё, что в режиме по умолчанию время раундов «гуляет» — метод перекомпилируется по ходу работы (тема 16).</p>
+@end
+@ide VM options: <code>-Xint</code>
+@run
+java -Xint Speed
+@end
+@try
+Запустите с <code>-XX:TieredStopAtLevel=1</code> (только быстрый компилятор C1). Где окажется результат между <code>-Xint</code> и режимом по умолчанию? ::: Обычно в 2–4 раза медленнее C2, но намного быстрее интерпретатора: C1 компилирует быстро, но почти не оптимизирует. Этот флаг иногда ставят ради быстрого старта коротких утилит.
+@end

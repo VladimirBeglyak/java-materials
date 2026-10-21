@@ -1,0 +1,213 @@
+@chapter 22 | quiz
+@intro
+<p>Для экспериментов с JDBC не нужен сервер БД: встраиваемая H2 работает прямо в JVM и поддерживает режим совместимости с PostgreSQL. Скачайте один jar в каталог <code>lib</code> модуля <code>ch22</code> и добавьте его как зависимость модуля (Project Structure → Modules → Dependencies → + → JARs). Все примеры работают и с настоящим PostgreSQL — меняется только URL подключения и драйвер.</p>
+@end
+
+@lab 22.1 | Запрос от подключения до ResultSet | 20 мин
+@goal
+<p>Пройти полный цикл: подключение, создание таблицы, вставка через PreparedStatement, выборка, закрытие ресурсов.</p>
+@end
+@exec
+mkdir -p lib
+cp ../../../jars/h2-2.5.252.jar lib/h2.jar
+@end
+@run noout
+curl -L -o lib/h2.jar https://repo1.maven.org/maven2/com/h2database/h2/2.5.252/h2-2.5.252.jar ||| ls lib/h2.jar
+@end
+@file Basics.java
+import java.sql.*;
+
+public class Basics {
+    static final String URL = "jdbc:h2:mem:shop;MODE=PostgreSQL;DB_CLOSE_DELAY=-1";
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection(URL, "sa", "")) {
+            System.out.println("подключено: " + c.getMetaData().getDatabaseProductName() + " " + c.getMetaData().getDatabaseProductVersion());
+            try (Statement st = c.createStatement()) {
+                st.execute("CREATE TABLE product(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name VARCHAR(100) NOT NULL, price NUMERIC(10,2))");
+            }
+            String insert = "INSERT INTO product(name, price) VALUES (?, ?)";
+            try (PreparedStatement ps = c.prepareStatement(insert, Statement.RETURN_GENERATED_KEYS)) {
+                for (Object[] row : new Object[][] { { "Кофе", 250.0 }, { "Чай", 120.5 }, { "Какао", null } }) {
+                    ps.setString(1, (String) row[0]);
+                    if (row[1] == null) ps.setNull(2, Types.NUMERIC); else ps.setBigDecimal(2, new java.math.BigDecimal(row[1].toString()));
+                    ps.executeUpdate();
+                    try (ResultSet keys = ps.getGeneratedKeys()) { keys.next(); System.out.println("вставлен id=" + keys.getLong(1)); }
+                }
+            }
+            try (PreparedStatement ps = c.prepareStatement("SELECT id, name, price FROM product WHERE price IS NULL OR price > ? ORDER BY id");) {
+                ps.setBigDecimal(1, new java.math.BigDecimal("100"));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        long id = rs.getLong("id");
+                        String name = rs.getString("name");
+                        double p = rs.getDouble("price");
+                        boolean priceIsNull = rs.wasNull();          // сразу после чтения именно этой колонки
+                        System.out.printf("%d %-6s getDouble=%-6s wasNull=%s getBigDecimal=%s%n",
+                                id, name, p, priceIsNull, rs.getBigDecimal("price"));
+                    }
+                }
+            }
+        }
+    }
+}
+@end
+@ide Classpath: <code>lib/h2.jar</code> как зависимость модуля
+@run
+javac Basics.java
+java -cp "lib/h2.jar;." Basics ||| java -cp "lib/h2.jar:." Basics
+@end
+@predict Что вернёт <code>rs.getDouble("price")</code> для «Какао», у которого цена NULL?
+@answer
+<p><b>0.0</b>, и отличить его от настоящего нуля можно только вызовом <code>rs.wasNull()</code> сразу после чтения. Примитивные геттеры (<code>getInt</code>, <code>getDouble</code>, <code>getLong</code>) не умеют возвращать null; объектные (<code>getBigDecimal</code>, <code>getObject(…, Long.class)</code>) возвращают null честно. Для денег — всегда BigDecimal.</p>
+@end
+@note Каждый <code>Connection</code>, <code>Statement</code> и <code>ResultSet</code> — ресурс; try-with-resources закрывает их в обратном порядке. Незакрытые соединения в приложении с пулом — классическая причина «зависаний» под нагрузкой.
+@end
+
+@lab 22.2 | SQL-инъекция своими руками | 15 мин
+@goal
+<p>Собрать запрос конкатенацией, «взломать» его входной строкой и убедиться, что PreparedStatement защищает.</p>
+@end
+@file Injection.java
+import java.sql.*;
+
+public class Injection {
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:h2:mem:auth", "sa", "")) {
+            try (Statement st = c.createStatement()) {
+                st.execute("CREATE TABLE users(login VARCHAR(50), password VARCHAR(50))");
+                st.execute("INSERT INTO users VALUES ('admin', 'S3cret!'), ('anna', 'qwerty')");
+            }
+            String login = "admin", password = "' OR '1'='1";
+
+            String sql = "SELECT count(*) FROM users WHERE login = '" + login + "' AND password = '" + password + "'";
+            System.out.println("SQL: " + sql);
+            try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+                rs.next();
+                System.out.println("Statement:         найдено " + rs.getInt(1) + " → " + (rs.getInt(1) > 0 ? "ВХОД РАЗРЕШЁН" : "отказ"));
+            }
+            try (PreparedStatement ps = c.prepareStatement("SELECT count(*) FROM users WHERE login = ? AND password = ?")) {
+                ps.setString(1, login);
+                ps.setString(2, password);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    System.out.println("PreparedStatement: найдено " + rs.getInt(1) + " → " + (rs.getInt(1) > 0 ? "ВХОД РАЗРЕШЁН" : "отказ"));
+                }
+            }
+        }
+    }
+}
+@end
+@predict Пароль — <code>' OR '1'='1</code>. Что вернут оба запроса?
+@answer
+<p>Statement: условие превращается в <code>login = 'admin' AND password = '' OR '1'='1'</code>, а так как AND связывает сильнее OR, условие истинно для всех строк — найдено 2, вход разрешён. PreparedStatement передаёт пароль как значение, а не как часть SQL: ищется пароль, буквально равный строке <code>' OR '1'='1</code>, — 0, отказ. (И пароли, конечно, хранят только в виде хэша.)</p>
+@end
+@run
+javac Injection.java
+java -cp "lib/h2.jar;." Injection ||| java -cp "lib/h2.jar:." Injection
+@end
+
+@lab 22.3 | Транзакции: всё или ничего | 20 мин
+@goal
+<p>Перевести деньги между счетами, уронить операцию посередине и проверить, что откат вернул всё как было.</p>
+@end
+@file Transfer.java
+import java.math.BigDecimal;
+import java.sql.*;
+
+public class Transfer {
+    static void transfer(Connection c, int from, int to, BigDecimal amount, boolean failInTheMiddle) throws SQLException {
+        boolean oldAutoCommit = c.getAutoCommit();
+        c.setAutoCommit(false);
+        try (PreparedStatement debit = c.prepareStatement("UPDATE account SET balance = balance - ? WHERE id = ?");
+             PreparedStatement credit = c.prepareStatement("UPDATE account SET balance = balance + ? WHERE id = ?")) {
+            debit.setBigDecimal(1, amount); debit.setInt(2, from); debit.executeUpdate();
+            if (failInTheMiddle) throw new SQLException("сбой сети между двумя UPDATE");
+            credit.setBigDecimal(1, amount); credit.setInt(2, to); credit.executeUpdate();
+            c.commit();
+        } catch (SQLException e) {
+            c.rollback();
+            throw e;
+        } finally {
+            c.setAutoCommit(oldAutoCommit);
+        }
+    }
+
+    static void print(Connection c, String when) throws SQLException {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("SELECT id, balance FROM account ORDER BY id")) {
+            StringBuilder sb = new StringBuilder(when + ": ");
+            while (rs.next()) sb.append("счёт ").append(rs.getInt(1)).append(" = ").append(rs.getBigDecimal(2)).append("  ");
+            System.out.println(sb);
+        }
+    }
+
+    public static void main(String[] args) throws SQLException {
+        try (Connection c = DriverManager.getConnection("jdbc:h2:mem:bank", "sa", "")) {
+            try (Statement st = c.createStatement()) {
+                st.execute("CREATE TABLE account(id INT PRIMARY KEY, balance NUMERIC(12,2) CHECK (balance >= 0))");
+                st.execute("INSERT INTO account VALUES (1, 1000), (2, 500)");
+            }
+            print(c, "начало     ");
+            transfer(c, 1, 2, new BigDecimal("300"), false);
+            print(c, "перевод 300");
+            try { transfer(c, 1, 2, new BigDecimal("100"), true); } catch (SQLException e) { System.out.println("ошибка: " + e.getMessage()); }
+            print(c, "после сбоя ");
+            try { transfer(c, 2, 1, new BigDecimal("5000"), false); } catch (SQLException e) { System.out.println("ошибка: " + e.getMessage().lines().findFirst().orElse("")); }
+            print(c, "после CHECK");
+        }
+    }
+}
+@end
+@predict Какими будут балансы после «сбоя сети» и после попытки перевести 5000 со счёта, где 800?
+@answer
+<p>После сбоя — <b>700 и 800</b>, как после первого перевода: списание выполнилось, но откат его отменил. Без транзакции (autoCommit = true) деньги бы «исчезли» — 600 и 800. Перевод 5000 нарушает <code>CHECK (balance &gt;= 0)</code>: БД отклоняет UPDATE, мы откатываем транзакцию — балансы не меняются. Правило: несколько изменений, которые должны быть атомарными, — в одной транзакции; ограничения целостности — в схеме БД, а не только в коде.</p>
+@end
+@run
+javac Transfer.java
+java -cp "lib/h2.jar;." Transfer ||| java -cp "lib/h2.jar:." Transfer
+@end
+
+@lab 22.4 | Пакетная вставка: 1 запрос против 10 000 | 15 мин
+@goal
+<p>Измерить разницу между построчной вставкой с автокоммитом и пакетной в одной транзакции.</p>
+@end
+@file Batch.java
+import java.sql.*;
+
+public class Batch {
+    public static void main(String[] args) throws SQLException {
+        String url = "jdbc:h2:./batchdb;MODE=PostgreSQL";            // файловая БД: commit пишет на диск
+        try (Connection c = DriverManager.getConnection(url, "sa", "")) {
+            try (Statement st = c.createStatement()) {
+                st.execute("DROP TABLE IF EXISTS event");
+                st.execute("CREATE TABLE event(id INT, payload VARCHAR(50))");
+            }
+            int n = 10_000;
+            long t = System.nanoTime();
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO event VALUES (?, ?)")) {
+                for (int i = 0; i < n; i++) { ps.setInt(1, i); ps.setString(2, "e" + i); ps.executeUpdate(); }
+            }
+            long single = (System.nanoTime() - t) / 1_000_000;
+
+            c.setAutoCommit(false);
+            t = System.nanoTime();
+            try (PreparedStatement ps = c.prepareStatement("INSERT INTO event VALUES (?, ?)")) {
+                for (int i = 0; i < n; i++) {
+                    ps.setInt(1, i); ps.setString(2, "e" + i); ps.addBatch();
+                    if (i % 1000 == 999) ps.executeBatch();
+                }
+                ps.executeBatch();
+            }
+            c.commit();
+            long batch = (System.nanoTime() - t) / 1_000_000;
+            System.out.printf("по одной строке с автокоммитом: %d мс%nпакетами по 1000 в транзакции:  %d мс%n", single, batch);
+        }
+    }
+}
+@end
+@run
+javac Batch.java
+java -cp "lib/h2.jar;." Batch ||| java -cp "lib/h2.jar:." Batch
+@end
+@note С H2 в одном процессе выигрыш скромнее, чем с сетевой БД: там к каждой строке добавляется сетевой round-trip (доли миллисекунды — миллисекунды), и пакет даёт ускорение в десятки раз. Для PostgreSQL добавьте в URL <code>reWriteBatchedInserts=true</code> — драйвер склеит пакет в многострочный INSERT.
+@end

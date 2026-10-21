@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 15 · ПЛАТФОРМА ИЗНУТРИ</div>
   <h1>Загрузка классов, рефлексия, JIT</h1>
   <p class="lead">Spring создаёт бины по аннотациям, Hibernate подменяет объекты прокси, а <code>@Transactional</code> «не работает» при вызове из того же класса. За всей этой «магией» стоят три механизма JVM: динамическая загрузка классов, рефлексия и генерация кода на лету. Глава объясняет их — и то, как JIT превращает байткод в быстрый машинный код.</p>
-  <div class="meta"><span class="tag">~3,5 часа</span><span class="tag">ClassLoader</span><span class="tag">reflection</span><span class="tag">proxy</span><span class="tag">JIT</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~3,5 часа</span><span class="tag">ClassLoader</span><span class="tag">reflection</span><span class="tag">proxy</span><span class="tag">JIT</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -240,7 +240,173 @@ long ms = (System.nanoTime() - start) / 1_000_000;</code></pre>
 <div class="callout info"><span class="c-title">Класс = имя + загрузчик</span>
 Один и тот же class-файл, загруженный двумя разными загрузчиками, — это два разных класса для JVM: <code>ClassCastException: com.shop.Order cannot be cast to com.shop.Order</code>. Так серверы приложений, OSGi и плагины изолируют версии библиотек, а Spring Boot DevTools перезагружает код: старый загрузчик выбрасывается целиком вместе с классами.</div>
 
-<h2 id="quiz"><span class="h-num">15.9</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">15.9</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Рефлексия, аннотации и динамические прокси — фундамент Spring, Hibernate и JUnit. Напишем по маленькому «фреймворку» на каждый механизм. Модуль IDEA — <code>ch15</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-15.1">
+<div class="lab-head"><span class="lab-num">Лаба 15.1</span><b>Свой валидатор на аннотациях</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Объявить аннотацию с <code>RetentionPolicy.RUNTIME</code>, разметить поля и проверить объект рефлексией — как это делает Bean Validation.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Range.java</code>:</div>
+<pre data-title="Range.java"><code class="java">import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.FIELD)
+public @interface Range {
+    int min() default 0;
+    int max() default Integer.MAX_VALUE;
+    String message() default "значение вне диапазона";
+}</code></pre>
+<pre data-title="Validator.java"><code class="java">import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Validator {
+    static class Order {
+        @Range(min = 1, max = 100, message = "количество 1..100") int qty;
+        @Range(min = 0) int discount;
+        String comment;                           // без аннотации — не проверяется
+        Order(int qty, int discount) { this.qty = qty; this.discount = discount; }
+    }
+
+    static List&lt;String&gt; validate(Object o) throws IllegalAccessException {
+        List&lt;String&gt; errors = new ArrayList&lt;&gt;();
+        for (Field f : o.getClass().getDeclaredFields()) {
+            Range r = f.getAnnotation(Range.class);
+            if (r == null) continue;
+            f.setAccessible(true);
+            int v = f.getInt(o);
+            if (v &lt; r.min() || v &gt; r.max()) errors.add(f.getName() + "=" + v + ": " + r.message());
+        }
+        return errors;
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("ok:    " + validate(new Order(5, 10)));
+        System.out.println("плохо: " + validate(new Order(500, -1)));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Range.java Validator.java
+java Validator</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ok:    []
+плохо: [qty=500: количество 1..100, discount=-1: значение вне диапазона]</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Поменяйте в <code>Range</code> <code>RUNTIME</code> на <code>CLASS</code> и перекомпилируйте оба файла. Что напечатает валидатор?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Range.java Validator.java
+java Validator</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ok:    []
+плохо: []</code></pre></details>
+<div class="lab-ans" hidden><p>Пустые списки ошибок: аннотация останется в class-файле, но JVM не загрузит её для рефлексии — <code>getAnnotation</code> вернёт null. <code>SOURCE</code> отбросил бы её ещё компилятор (так устроены <code>@Override</code>, <code>@SuppressWarnings</code>). Для фреймворков нужен RUNTIME.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-15.2">
+<div class="lab-head"><span class="lab-num">Лаба 15.2</span><b>Динамический прокси: логирование и замер времени</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Обернуть любой интерфейс прокси, который логирует вызовы, — тот же механизм, что у Spring AOP для интерфейсов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ProxyDemo.java</code>:</div>
+<pre data-title="ProxyDemo.java"><code class="java">import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
+import java.util.Arrays;
+
+public class ProxyDemo {
+    interface PaymentService {
+        String pay(String user, int amount);
+        int balance(String user);
+    }
+
+    static class RealPaymentService implements PaymentService {
+        public String pay(String user, int amount) { return "оплачено " + amount + " для " + user; }
+        public int balance(String user) { return 1000; }
+    }
+
+    @SuppressWarnings("unchecked")
+    static &lt;T&gt; T logging(T target, Class&lt;T&gt; iface) {
+        InvocationHandler h = (proxy, method, args) -&gt; {
+            long t = System.nanoTime();
+            System.out.println("→ " + method.getName() + (args == null ? "()" : Arrays.toString(args)));
+            Object result = method.invoke(target, args);
+            System.out.printf("← %s = %s (%d мкс)%n", method.getName(), result, (System.nanoTime() - t) / 1000);
+            return result;
+        };
+        return (T) Proxy.newProxyInstance(iface.getClassLoader(), new Class&lt;?&gt;[] { iface }, h);
+    }
+
+    public static void main(String[] args) {
+        PaymentService svc = logging(new RealPaymentService(), PaymentService.class);
+        svc.pay("anna", 250);
+        svc.balance("anna");
+        System.out.println("класс прокси: " + svc.getClass().getName() + ", это Proxy? " + Proxy.isProxyClass(svc.getClass()));
+        System.out.println("toString тоже идёт через handler: " + svc);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac ProxyDemo.java
+java ProxyDemo</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">→ pay[anna, 250]
+← pay = оплачено 250 для anna (9394 мкс)
+→ balance[anna]
+← balance = 1000 (2346 мкс)
+класс прокси: $Proxy0, это Proxy? true
+→ toString()
+← toString = ProxyDemo$RealPaymentService@36baf30c (188 мкс)
+toString тоже идёт через handler: ProxyDemo$RealPaymentService@36baf30c</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Почему вызов <code>toString()</code> тоже залогировался, и что будет, если вызвать <code>pay</code> из метода <code>balance</code> внутри RealPaymentService?</div>
+<div class="lab-ans" hidden><p>Прокси перехватывает все методы интерфейса и ещё <code>equals</code>, <code>hashCode</code>, <code>toString</code> из Object. А вызов <code>this.pay(…)</code> внутри реального объекта идёт мимо прокси — логирования не будет. Это та самая «самовызов не проходит через прокси», из-за которой в Spring не срабатывает <code>@Transactional</code> на методе, вызванном из того же бина.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="java-core-15.3">
+<div class="lab-head"><span class="lab-num">Лаба 15.3</span><b>Рефлексия: цена и обход private</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Вызвать приватный метод своего класса, сравнить стоимость прямого и рефлексивного вызова и упереться в границы модулей.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ReflectCost.java</code>:</div>
+<pre data-title="ReflectCost.java"><code class="java">import java.lang.reflect.Method;
+
+public class ReflectCost {
+    private int secret(int x) { return x * 2 + 1; }
+
+    public static void main(String[] args) throws Exception {
+        ReflectCost obj = new ReflectCost();
+        Method m = ReflectCost.class.getDeclaredMethod("secret", int.class);
+        m.setAccessible(true);                 // в своём модуле/classpath — можно
+        System.out.println("secret(20) = " + m.invoke(obj, 20));
+
+        for (int round = 0; round &lt; 3; round++) {
+            long t = System.nanoTime(); long a = 0;
+            for (int i = 0; i &lt; 5_000_000; i++) a += obj.secret(i);
+            long direct = System.nanoTime() - t;
+            t = System.nanoTime(); long b = 0;
+            for (int i = 0; i &lt; 5_000_000; i++) b += (int) m.invoke(obj, i);
+            long refl = System.nanoTime() - t;
+            System.out.printf("раунд %d: прямой %3d мс, через Method.invoke %3d мс%n", round, direct / 1_000_000, refl / 1_000_000);
+        }
+
+        try {
+            Method value = String.class.getDeclaredMethod("isLatin1");
+            value.setAccessible(true);
+        } catch (RuntimeException e) {
+            System.out.println("JDK закрыт: " + e.getClass().getSimpleName());
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac ReflectCost.java
+java ReflectCost</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">secret(20) = 41
+раунд 0: прямой   5 мс, через Method.invoke  67 мс
+раунд 1: прямой   7 мс, через Method.invoke  73 мс
+раунд 2: прямой   0 мс, через Method.invoke  34 мс
+JDK закрыт: InaccessibleObjectException</code></pre></details>
+<p class="lab-note">Рефлексивный вызов медленнее из-за упаковки аргументов в массив Object[], проверок и боксинга результата; фреймворки кэшируют <code>Method</code> или переходят на <code>MethodHandle</code> и генерацию байткода. Доступ к приватным членам классов JDK закрыт модульной системой (Java 17+) — нужен <code>--add-opens</code>.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">15.10</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>В чём разница между ClassNotFoundException и NoClassDefFoundError?</p><ul><li>Это одно и то же</li><li>Первое — класс не найден при явной загрузке по имени; второе — класс был при компиляции, но не найден или не смог инициализироваться при выполнении</li><li>Первое бросает компилятор</li><li>Второе возникает только в тестах</li></ul><div class="why">NoClassDefFoundError часто следует за ExceptionInInitializerError: static-инициализация упала, и класс помечен как непригодный.</div></div>
 <div class="mcq" data-ok="2"><p>Почему рефлексия медленнее прямого вызова и где это важно?</p><ul><li>Она всегда в 1000 раз медленнее</li><li>Она выполняется в отдельном потоке</li><li>Проверки доступа, упаковка аргументов, труднее инлайнить JIT-у; заметно только в горячих циклах — при старте фреймворков это не проблема</li><li>Она не медленнее</li></ul><div class="why">Современные JDK реализуют Method.invoke через method handles; для горячих путей применяют MethodHandle/LambdaMetafactory или генерацию кода.</div></div>

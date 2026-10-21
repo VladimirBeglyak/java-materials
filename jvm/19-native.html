@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 19 · ИСПОЛНЕНИЕ</div>
   <h1>Нативный код: JNI и Foreign Function API</h1>
   <p class="lead">JVM постоянно вызывает нативный код — сама стандартная библиотека полна <code>native</code>-методов, а Netty, RocksDB, драйверы GPU, сжатие и криптография работают через нативные библиотеки. Разбираем классический JNI (как устроен переход Java ↔ C, локальные и глобальные ссылки, почему это опасно), новый Foreign Function &amp; Memory API (финальный в Java 22) с арендами памяти и <code>jextract</code>, и судьбу <code>sun.misc.Unsafe</code>.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">JNI</span><span class="tag">локальные/глобальные ссылки</span><span class="tag">FFM API</span><span class="tag">Arena</span><span class="tag">MemorySegment</span><span class="tag">jextract</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">JNI</span><span class="tag">локальные/глобальные ссылки</span><span class="tag">FFM API</span><span class="tag">Arena</span><span class="tag">MemorySegment</span><span class="tag">jextract</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -108,7 +108,107 @@ try (Arena arena = Arena.ofConfined()) {
 Платформа движется к «целостности по умолчанию»: всё, что может нарушить гарантии JVM (глубокая рефлексия в JDK, динамические агенты, нативный доступ, Unsafe), требует явного разрешения в командной строке. Готовьтесь: <code>--enable-native-access=ALL-UNNAMED</code> для Netty/RocksDB, явный <code>-javaagent</code> для Mockito, обновление библиотек, использующих Unsafe.
 </div>
 
-<h2 id="quiz"><span class="h-num">19.4</span>Самопроверка</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">19.4</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Foreign Function &amp; Memory API (финальный с Java 22) позволяет вызвать функцию из C-библиотеки и работать с памятью вне кучи без единой строки на C — идеально для экспериментов. JNI требует компилятора C, поэтому его здесь только читаем. Модуль IDEA — <code>ch19</code>. Флаг <code>--enable-native-access=ALL-UNNAMED</code> убирает предупреждение о «restricted»-методах.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-19.1">
+<div class="lab-head"><span class="lab-num">Лаба 19.1</span><b>Вызываем strlen из стандартной библиотеки C</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти нативную функцию, описать её сигнатуру и вызвать через downcall handle.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Strlen.java</code>:</div>
+<pre data-title="Strlen.java"><code class="java">import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
+
+import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+
+public class Strlen {
+    public static void main(String[] args) throws Throwable {
+        Linker linker = Linker.nativeLinker();
+        MemorySegment fn = linker.defaultLookup().find("strlen").orElseThrow();
+        // size_t strlen(const char *s)
+        MethodHandle strlen = linker.downcallHandle(fn, FunctionDescriptor.of(JAVA_LONG, ADDRESS));
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment cStr = arena.allocateFrom("Привет, FFM!");     // UTF-8 + завершающий ноль
+            long len = (long) strlen.invokeExact(cStr);
+            System.out.println("strlen = " + len + ", Java length() = " + "Привет, FFM!".length());
+            System.out.println("размер сегмента: " + cStr.byteSize());
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Совпадут ли <code>strlen</code> и <code>length()</code>?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>--enable-native-access=ALL-UNNAMED</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Strlen.java
+java --enable-native-access=ALL-UNNAMED Strlen</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">strlen = 18, Java length() = 12
+размер сегмента: 19</code></pre></details>
+<div class="lab-ans" hidden><p>Нет: <code>strlen</code> считает <b>байты</b> до нуля в UTF-8 (кириллица — 2 байта на букву: 6×2 + 6 = 18), а <code>length()</code> — UTF-16 символы (12). Сегмент на 1 байт больше — завершающий ноль. Ровно такие ошибки «длина в символах против длины в байтах» и ловят на границе Java и C.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>--enable-native-access</code>.</summary><div>Программа работает, но печатает WARNING о вызове restricted-метода <code>downcallHandle</code>: в будущих версиях без флага это станет ошибкой. Опасные операции FFM требуют явного разрешения.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-19.2">
+<div class="lab-head"><span class="lab-num">Лаба 19.2</span><b>Память вне кучи: границы, время жизни, структуры</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что FFM, в отличие от Unsafe, проверяет границы и время жизни памяти.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>OffHeap.java</code>:</div>
+<pre data-title="OffHeap.java"><code class="java">import java.lang.foreign.*;
+
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+
+public class OffHeap {
+    public static void main(String[] args) {
+        MemorySegment leaked;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment ints = arena.allocate(JAVA_INT, 10);         // int[10] вне кучи
+            for (int i = 0; i &lt; 10; i++) ints.setAtIndex(JAVA_INT, i, i * i);
+            System.out.println("ints[9] = " + ints.getAtIndex(JAVA_INT, 9));
+            try {
+                ints.setAtIndex(JAVA_INT, 10, 1);                       // за границей
+            } catch (IndexOutOfBoundsException e) {
+                System.out.println("граница: " + e.getMessage());
+            }
+            leaked = ints;
+        }
+        try {
+            leaked.getAtIndex(JAVA_INT, 0);                             // после закрытия арены
+        } catch (IllegalStateException e) {
+            System.out.println("после close: " + e.getMessage());
+        }
+
+        // структура struct Point { int x; int y; }
+        StructLayout POINT = MemoryLayout.structLayout(JAVA_INT.withName("x"), JAVA_INT.withName("y"));
+        var X = POINT.varHandle(MemoryLayout.PathElement.groupElement("x"));
+        var Y = POINT.varHandle(MemoryLayout.PathElement.groupElement("y"));
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment p = arena.allocate(POINT);
+            X.set(p, 0L, 3); Y.set(p, 0L, 4);
+            System.out.println("Point размером " + POINT.byteSize() + " байт: x=" + X.get(p, 0L) + ", y=" + Y.get(p, 0L));
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатают две «ошибочные» операции — за границей сегмента и после закрытия арены?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac OffHeap.java
+java OffHeap</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ints[9] = 81
+граница: Out of bound access on segment MemorySegment{ kind: native, address: 0x2e13ef00f50, byteSize: 40 }; new offset = 40; new length = 4
+после close: Already closed
+Point размером 8 байт: x=3, y=4</code></pre></details>
+<div class="lab-ans" hidden><p>Оба доступа безопасно отклоняются исключениями: <code>IndexOutOfBoundsException</code> (out of bounds) и <code>IllegalStateException: Already closed</code>. С <code>sun.misc.Unsafe</code> первая операция испортила бы чужую память, а вторая читала бы освобождённую — с возможным крахом JVM. Проверки почти бесплатны: JIT убирает их там, где может доказать корректность.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Прочитайте сегмент из confined-арены в другом потоке (<code>new Thread(() -&gt; ints.getAtIndex(JAVA_INT, 0)).start()</code> внутри try).</summary><div><code>WrongThreadException</code>: confined-арена принадлежит одному потоку. Для общего доступа — <code>Arena.ofShared()</code>, для «пусть соберёт GC» — <code>Arena.ofAuto()</code>.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">19.5</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Почему JNI передаёт объекты в C как хэндлы, а не как прямые адреса?</p><ul><li>Для экономии памяти</li><li>GC может перемещать объекты; хэндлы остаются валидными</li><li>C не поддерживает указатели</li><li>Для шифрования</li></ul><div class="why">Прямой доступ к массиву — только в «критической» секции, блокирующей перемещение.</div></div>
 <div class="mcq" data-ok="3"><p>Что произойдёт при обращении к MemorySegment после закрытия его арены?</p><ul><li>Порча памяти</li><li>Падение JVM</li><li>Вернутся нули</li><li>IllegalStateException — время жизни проверяется</li></ul><div class="why">Безопасность — главное преимущество FFM.</div></div>

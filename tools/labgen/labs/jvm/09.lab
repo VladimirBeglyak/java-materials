@@ -1,0 +1,159 @@
+@chapter 09 | quiz
+@intro
+<p>Каждую область памяти можно «переполнить» отдельно и получить свою ошибку, а Native Memory Tracking покажет, куда на самом деле уходит память процесса. Модуль IDEA — <code>ch09</code>. Флаги вида <code>-Xss</code>, <code>-Xmx</code> задавайте в VM options конфигурации запуска.</p>
+@end
+
+@lab 9.1 | Глубина стека: от чего она зависит | 15 мин
+@goal
+<p>Измерить, сколько кадров помещается в стек потока, и как на это влияют <code>-Xss</code> и размер кадра.</p>
+@end
+@file Depth.java
+public class Depth {
+    static int depth;
+
+    static void small() { depth++; small(); }
+
+    static void big(long a, long b, long c, long d) {
+        long e = a + b, f = c + d, g = e * f, h = g - a;
+        depth++;
+        big(e, f, g, h);
+    }
+
+    static int measure(Runnable r) {
+        depth = 0;
+        try { r.run(); } catch (StackOverflowError e) { /* ожидаемо */ }
+        return depth;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("маленький кадр: " + measure(Depth::small));
+        System.out.println("большой кадр:   " + measure(() -> big(1, 2, 3, 4)));
+        System.out.println("маленький кадр: " + measure(Depth::small) + "  (повторно)");
+    }
+}
+@end
+@run
+javac Depth.java
+java Depth
+@end
+@predict Что будет с глубиной при <code>-Xss256k</code> и при <code>-Xss4m</code>? Почему повторный замер «маленького кадра» отличается от первого?
+@answer
+<p>Глубина растёт со стеком, но не строго пропорционально: при 256k она упала примерно в 10 раз, при 4m выросла примерно в 3 раза относительно умолчания (1 МБ на 64-битных Windows и Linux). Часть стека занимают служебные защитные страницы и кадры самой JVM, а глубина ещё и зависит от того, какие кадры уже скомпилированы. Повторный замер больше, потому что метод к этому моменту скомпилирован JIT: у скомпилированного кадра нет «лишних» слотов интерпретатора, и кадры меньше. Именно поэтому глубина рекурсии в Java не детерминирована.</p>
+@end
+@ide VM options: <code>-Xss256k</code>, затем <code>-Xss4m</code>
+@run
+java -Xss256k Depth
+java -Xss4m Depth
+@end
+@try
+Запустите рекурсию не в main, а в <code>new Thread(null, r, "deep", 64 * 1024 * 1024)</code>. ::: Четвёртый аргумент конструктора — размер стека именно этого потока (здесь 64 МБ). Так делают для глубоко рекурсивных алгоритмов, не меняя -Xss для всех потоков.
+@end
+
+@lab 9.2 | Четыре разных OutOfMemoryError | 25 мин
+@goal
+<p>Переполнить по очереди кучу, metaspace, прямую память и узнать каждую ошибку по сообщению.</p>
+@end
+@file Ooms.java
+import java.lang.invoke.MethodHandles;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Ooms {
+    public static void main(String[] args) throws Exception {
+        List<Object> keep = new ArrayList<>();
+        switch (args[0]) {
+            case "heap" -> { while (true) keep.add(new long[100_000]); }
+            case "direct" -> { while (true) keep.add(ByteBuffer.allocateDirect(1024 * 1024)); }
+            case "meta" -> {
+                // каждый скрытый класс — новые метаданные в metaspace
+                byte[] bytes = Files.readAllBytes(Path.of("Ooms$Tiny.class"));
+                var lookup = MethodHandles.lookup();
+                for (int i = 0; ; i++) {
+                    keep.add(lookup.defineHiddenClass(bytes, false).lookupClass());
+                    if (i % 10_000 == 0) System.out.println("скрытых классов: " + i);
+                }
+            }
+            case "array" -> keep.add(new long[Integer.MAX_VALUE]);
+            default -> System.out.println("heap | direct | meta | array");
+        }
+    }
+
+    static class Tiny { int a; void m() {} }
+}
+@end
+@step Компилируем и пробуем каждый вариант с маленьким лимитом соответствующей области (Program arguments: <code>heap</code>, <code>direct</code>…):
+@run fail
+javac Ooms.java
+java -Xmx64m Ooms heap
+@end
+@run fail
+java -XX:MaxDirectMemorySize=32m Ooms direct
+@end
+@run fail grep="скрытых|Error|Exception" head=8
+java -XX:MaxMetaspaceSize=32m Ooms meta
+@end
+@predict А что выдаст <code>Ooms array</code> при <code>-Xmx64m</code> — и при <code>-Xmx64g</code>?
+@answer
+<p>При 64m — <code>Java heap space</code>: массив на 16 ГБ не влезет. При любом -Xmx — может появиться другой текст: <code>Requested array size exceeds VM limit</code>, потому что максимальная длина массива в HotSpot чуть меньше <code>Integer.MAX_VALUE</code> (заголовок тоже занимает место). Это одно из немногих OOM, которые не зависят от размера кучи.</p>
+@end
+@run fail
+java -Xmx64m Ooms array
+@end
+@try
+Добавьте <code>-XX:+HeapDumpOnOutOfMemoryError</code> к варианту heap. Что появится в каталоге и чем его открыть? ::: Файл <code>java_pid&lt;N&gt;.hprof</code> размером около кучи. Открывается в IntelliJ IDEA (Ultimate — Profiler, вкладка с дампом), VisualVM или Eclipse MAT; там видно, что весь объём держит <code>ArrayList keep</code> (тема 14).
+Почему на direct-варианте <code>-Xmx</code> не помогает, а помогает <code>-XX:MaxDirectMemorySize</code>? ::: Прямые буферы живут вне кучи; в куче только маленькие объекты-обёртки <code>DirectByteBuffer</code>. По умолчанию лимит прямой памяти равен -Xmx.
+@end
+
+@lab 9.3 | Native Memory Tracking: куда ушла память процесса | 20 мин
+@goal
+<p>Увидеть, из чего складывается память JVM помимо кучи: классы, потоки, код, GC, символы.</p>
+@end
+@file Threads500.java
+import java.util.concurrent.CountDownLatch;
+
+public class Threads500 {
+    public static void main(String[] args) throws Exception {
+        int n = Integer.parseInt(args[0]);
+        var stop = new CountDownLatch(1);
+        for (int i = 0; i < n; i++) {
+            Thread t = new Thread(() -> { try { stop.await(); } catch (InterruptedException ignored) {} });
+            t.setDaemon(true);
+            t.start();
+        }
+        System.out.println("pid " + ProcessHandle.current().pid() + ", потоков запущено: " + n);
+        Thread.sleep(600_000);
+    }
+}
+@end
+@ide VM options: <code>-XX:NativeMemoryTracking=summary -Xmx256m</code>, Program arguments: <code>10</code>
+@exec
+javac Threads500.java
+(java -XX:NativeMemoryTracking=summary -Xmx256m Threads500 10 > t10.out 2>&1 &)
+sleep 3
+@end
+@step Запустите с NMT и снимите сводку:
+@run grep="Total|Java Heap|Class \(|Thread \(|threads|Code \(|GC \(|Metaspace \(|Symbol \(|stack:"
+jcmd <pid> VM.native_memory summary ||| P=$(jcmd | grep "Threads500 10" | cut -d' ' -f1); jcmd $P VM.native_memory summary
+@end
+@exec
+P=$(jcmd | grep "Threads500 10" | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+(java -XX:NativeMemoryTracking=summary -Xmx256m Threads500 500 > t500.out 2>&1 &)
+sleep 4
+@end
+@predict Перезапустите с аргументом <code>500</code>. Как изменятся <code>reserved</code> и <code>committed</code> в разделе Thread?
+@answer
+<p><code>reserved</code> вырастет примерно на 490 × 1 МБ (под каждый стек резервируется адресное пространство размером -Xss), а <code>committed</code> — на гораздо меньшую величину: физическая память выделяется только под реально использованные страницы стека. В контейнере лимит считается по RSS (≈ committed), поэтому тысячи «спящих» потоков обходятся дешевле, чем кажется по reserved, — но не бесплатно.</p>
+@end
+@run grep="Total|Java Heap|Thread \(|threads|stack:"
+jcmd <pid> VM.native_memory summary ||| P=$(jcmd | grep "Threads500 500" | cut -d' ' -f1); jcmd $P VM.native_memory summary
+@end
+@exec
+P=$(jcmd | grep "Threads500 500" | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@try
+Сделайте базовую точку и сравнение: <code>jcmd &lt;pid&gt; VM.native_memory baseline</code>, подождите, затем <code>VM.native_memory summary.diff</code>. ::: diff показывает прирост по каждой категории с момента baseline — главный приём поиска нативной утечки (растёт Class — генерация классов, Thread — утечка потоков, Other/Internal — direct-буферы или JNI).
+Сравните строку <code>Total: committed</code> с памятью процесса в диспетчере задач. ::: Они близки, но не равны: NMT не видит память нативных библиотек, выделенную через malloc в обход JVM (например, в драйверах или в glibc-аренах на Linux).
+@end

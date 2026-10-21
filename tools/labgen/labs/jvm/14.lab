@@ -1,0 +1,123 @@
+@chapter 14 | quiz
+@intro
+<p>Полный цикл расследования на своей утечке: логи GC в файл, тренд «занято после сборки», гистограмма классов на живом процессе, дамп кучи и его анализ в IDE. Модуль IDEA — <code>ch14</code>.</p>
+@end
+
+@lab 14.1 | Лог GC «как в продакшене» | 15 мин
+@goal
+<p>Включить подробный лог сборок в файл с ротацией и научиться находить в нём главное.</p>
+@end
+@file Service.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Service {
+    // «сессии», которые никто не удаляет — классическая утечка
+    static final List<byte[]> SESSIONS = new ArrayList<>();
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        boolean leak = args.length > 0 && args[0].equals("leak");
+        for (int i = 0; ; i++) {
+            byte[] request = new byte[50 * 1024];              // временные данные запроса
+            if (leak) SESSIONS.add(new byte[2 * 1024]);        // 2 КБ «навсегда» на каждый запрос
+            if (i % 20 == 0) Thread.sleep(5);
+        }
+    }
+}
+@end
+@ide VM options: <code>-Xmx64m -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10m</code>, Program arguments: <code>leak</code>
+@step Запустите с утечкой и логом в файл; дождитесь <code>OutOfMemoryError</code> (меньше минуты):
+@run fail timeout=180 tail=3
+javac Service.java
+java -Xmx64m -Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10m Service leak
+@end
+@note Последняя строка — не опечатка: памяти не хватило даже на печать стектрейса, поэтому JVM сообщает, что OOM вылетел из обработчика неперехваченных исключений.
+@step Найдите в логе строки пауз — это тренд, по которому ставят диагноз:
+@run grep="Pause" head=6
+findstr /C:"Pause" gc.log ||| grep "Pause" gc.log
+@end
+@run grep="Pause" tail=6
+#!grep "Pause" gc.log
+@end
+@predict Что в этих строках доказывает утечку, а не «просто маленькую кучу»?
+@answer
+<p>Число <b>после</b> стрелки — занятость кучи после сборки — растёт от сборки к сборке и не возвращается: сначала единицы МБ, в конце — почти 64 МБ, молодые сборки сменяются <code>Pause Full</code>, а Full GC уже ничего не освобождает. При «маленькой, но достаточной» куче значение после сборки стабильно на одном уровне.</p>
+@end
+@try
+Запустите без <code>leak</code> на минуту. Как выглядят строки Pause? ::: Только молодые сборки, после каждой — одна и та же маленькая занятость: временные массивы умирают молодыми. Полных сборок нет. Это здоровая картина.
+@end
+
+@lab 14.2 | Ловим утечку на живом процессе: гистограмма и дамп | 25 мин
+@goal
+<p>Не дожидаясь падения, найти класс, который растёт, и снять дамп кучи для анализа.</p>
+@end
+@exec
+(java -Xmx256m Service leak > svc.out 2>&1 &)
+sleep 3
+@end
+@step Запустите <code>Service leak</code> с <code>-Xmx256m</code> (падать он будет долго). Снимите две гистограммы с интервалом в несколько секунд:
+@run head=8
+jcmd <pid> GC.class_histogram ||| P=$(jcmd | grep "Service leak" | cut -d' ' -f1); jcmd $P GC.class_histogram | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+sleep 5
+@end
+@run head=8
+jcmd <pid> GC.class_histogram ||| P=$(jcmd | grep "Service leak" | cut -d' ' -f1); jcmd $P GC.class_histogram | sed 's/^[0-9]*:/12345:/'
+@end
+@note <code>[B</code> — это <code>byte[]</code>. Число экземпляров растёт между снимками — значит, их кто-то удерживает. Гистограмма с <code>GC.class_histogram</code> сначала делает полную сборку, поэтому в ней только живые объекты.
+@step Снимите дамп кучи:
+@run
+jcmd <pid> GC.heap_dump service.hprof ||| P=$(jcmd | grep "Service leak" | cut -d' ' -f1); jcmd $P GC.heap_dump $PWD/service.hprof | sed 's/^[0-9]*:/12345:/'
+@end
+@exec
+P=$(jcmd | grep "Service leak" | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; rm -f service.hprof; true
+@end
+@ide Откройте <code>service.hprof</code>: в IntelliJ IDEA Ultimate — двойной клик по файлу (Profiler); в Community — VisualVM или Eclipse MAT. Отсортируйте классы по <b>Retained size</b> и найдите путь к GC root.
+@predict Какой объект будет на вершине дерева доминаторов и какой путь к корню вы увидите?
+@answer
+<p><code>java.util.ArrayList</code> с retained size почти во всю занятую кучу, путь к корню: <code>Service.SESSIONS</code> (статическое поле класса) → <code>ArrayList.elementData</code> → тысячи <code>byte[2048]</code>. Retained size — сколько освободится, если удалить объект: именно он отвечает на вопрос «кто держит память».</p>
+@end
+@try
+Почему в продакшене дамп кучи на 8 ГБ — рискованная операция? ::: Дамп делается в safepoint: процесс стоит всё время записи (секунды — минуты), а файл занимает место, сравнимое с кучей. Снимайте с инстанса, выведенного из балансировки, и следите за диском. <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=…</code> снимает дамп автоматически в момент падения.
+@end
+
+@lab 14.3 | OOM в одном потоке — «зомби»-сервис | 15 мин
+@goal
+<p>Увидеть, что <code>OutOfMemoryError</code> в рабочем потоке не останавливает JVM, и включить правильное поведение для продакшена.</p>
+@end
+@file Zombie.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Zombie {
+    public static void main(String[] args) throws Exception {
+        Thread worker = new Thread(() -> {
+            List<long[]> hog = new ArrayList<>();
+            while (true) hog.add(new long[100_000]);
+        }, "worker");
+        worker.start();
+        for (int i = 1; i <= 3; i++) {
+            Thread.sleep(500);
+            System.out.println("main: я жив, worker " + worker.getState());
+        }
+    }
+}
+@end
+@predict Что напечатает <code>main</code> после того, как worker получит OOM при <code>-Xmx64m</code>?
+@answer
+<p>Ошибка напечатается в stderr (<code>Exception in thread "worker" java.lang.OutOfMemoryError: Java heap space</code>), поток умрёт (<code>TERMINATED</code>), а процесс продолжит жить: main печатает «я жив». В реальном сервисе так появляется «зомби»: часть пулов мертва или в неконсистентном состоянии, а health-check по-прежнему зелёный.</p>
+@end
+@ide VM options: <code>-Xmx64m</code>
+@run fail
+javac Zombie.java
+java -Xmx64m Zombie
+@end
+@step Включите флаг, который превращает OOM в немедленное завершение процесса — пусть оркестратор перезапустит под:
+@ide VM options: <code>-Xmx64m -XX:+ExitOnOutOfMemoryError</code>
+@run fail
+java -Xmx64m -XX:+ExitOnOutOfMemoryError Zombie
+@end
+@note В продакшене обычно ставят пару: <code>-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/dumps</code> (сначала снять дамп для расследования) и <code>-XX:+ExitOnOutOfMemoryError</code> (затем умереть). Вариант <code>-XX:+CrashOnOutOfMemoryError</code> дополнительно пишет hs_err и core-файл.
+@end

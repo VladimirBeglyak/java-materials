@@ -1,0 +1,114 @@
+@chapter 18 | quiz
+@intro
+<p>Блокировки и потоки лучше всего видны в дампе потоков: кто чем владеет, кто чего ждёт. Устроим конкуренцию за монитор, настоящий deadlock и сравним платформенные потоки с виртуальными. Модуль IDEA — <code>ch18</code>. В IDEA дамп потоков работающей программы снимается кнопкой «камера» (Dump Threads) в окне Run.</p>
+@end
+
+@lab 18.1 | Дамп потоков: владелец монитора и очередь | 20 мин
+@goal
+<p>Найти в дампе потоков владельца монитора, ожидающих на входе (<code>BLOCKED</code>) и ожидающих в <code>wait()</code>.</p>
+@end
+@file Monitors.java
+public class Monitors {
+    static final Object LOCK = new Object();
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        new Thread(() -> { synchronized (LOCK) { sleep(60_000); } }, "owner").start();
+        Thread.sleep(100);
+        for (int i = 1; i <= 2; i++)
+            new Thread(() -> { synchronized (LOCK) { } }, "blocked-" + i).start();
+        Object other = new Object();
+        new Thread(() -> { synchronized (other) { try { other.wait(); } catch (InterruptedException e) { } } }, "waiter").start();
+        Thread.sleep(60_000);
+    }
+
+    static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { } }
+}
+@end
+@exec
+javac Monitors.java
+(java Monitors > mon.out 2>&1 &)
+sleep 2
+@end
+@run
+jcmd <pid> Thread.print ||| P=$(jcmd | grep Monitors | cut -d' ' -f1); jcmd $P Thread.print | grep -A7 -E '^"(owner|blocked-1|blocked-2|waiter)"'
+@end
+@exec
+P=$(jcmd | grep Monitors | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@predict Почему у <code>waiter</code> в дампе есть и «locked», и «waiting on» для одного и того же объекта?
+@answer
+<p>Строка <code>- locked</code> — информация из байткода о том, что поток вошёл в synchronized (other), а <code>- waiting on</code> — что он вызвал <code>wait()</code> и при этом <b>освободил</b> монитор. Поток в <code>WAITING (on object monitor)</code> монитором не владеет — иначе notify() было бы невозможно вызвать. У <code>blocked-N</code>: <code>BLOCKED (on object monitor)</code> и <code>waiting to lock &lt;адрес&gt;</code> — тот же адрес, что «locked» у owner: по адресу вы находите виновника.</p>
+@end
+@try
+Замените <code>synchronized</code> на <code>ReentrantLock</code>. Как изменится дамп? ::: Ждущие потоки станут <code>WAITING (parking)</code> с <code>parking to wait for &lt;… ReentrantLock$NonfairSync&gt;</code>, а владельца покажет только секция «Locked ownable synchronizers» (видна при <code>jcmd Thread.print -l</code>).
+@end
+
+@lab 18.2 | Настоящий deadlock — и JVM его находит | 15 мин
+@goal
+<p>Устроить взаимную блокировку двух потоков и прочитать готовый диагноз в конце дампа.</p>
+@end
+@file Deadlock.java
+public class Deadlock {
+    public static void main(String[] args) {
+        Object a = new Object(), b = new Object();
+        new Thread(() -> { synchronized (a) { pause(); synchronized (b) { } } }, "T1").start();
+        new Thread(() -> { synchronized (b) { pause(); synchronized (a) { } } }, "T2").start();
+        System.out.println("pid " + ProcessHandle.current().pid() + " — сейчас всё зависнет");
+    }
+
+    static void pause() { try { Thread.sleep(200); } catch (InterruptedException e) { } }
+}
+@end
+@exec
+javac Deadlock.java
+(java Deadlock > dl.out 2>&1 &)
+sleep 2
+@end
+@run
+jcmd <pid> Thread.print ||| P=$(jcmd | grep "Deadlock" | grep -v grep | cut -d' ' -f1); jcmd $P Thread.print | sed -n '/Found one Java-level deadlock/,/Found 1 deadlock/p'
+@end
+@exec
+P=$(jcmd | grep Deadlock | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@note В отличие от взаимоблокировки на инициализации классов (лаба 6.3), deadlock на мониторах и <code>j.u.c.</code>-блокировках JVM находит сама — секция <code>Found one Java-level deadlock</code> в конце дампа с цепочкой «кто кого ждёт». Программно то же даёт <code>ThreadMXBean.findDeadlockedThreads()</code>.
+@end
+
+@lab 18.3 | 10 000 потоков: платформенные против виртуальных | 20 мин
+@goal
+<p>Сравнить стоимость и время запуска большого числа блокирующихся задач на обычных и виртуальных потоках.</p>
+@end
+@file ManyThreads.java
+import java.time.Duration;
+import java.util.concurrent.Executors;
+import java.util.stream.IntStream;
+
+public class ManyThreads {
+    public static void main(String[] args) {
+        boolean virtual = args[0].equals("virtual");
+        long t = System.nanoTime();
+        try (var ex = virtual ? Executors.newVirtualThreadPerTaskExecutor()
+                              : Executors.newFixedThreadPool(200)) {
+            IntStream.range(0, 10_000).forEach(i -> ex.submit(() -> {
+                Thread.sleep(Duration.ofMillis(100));     // имитация блокирующего вызова
+                return i;
+            }));
+        }
+        System.out.printf("%s: 10 000 задач по 100 мс за %d мс%n",
+                virtual ? "виртуальные" : "пул из 200 ", (System.nanoTime() - t) / 1_000_000);
+    }
+}
+@end
+@predict Пул из 200 потоков и 10 000 задач по 100 мс. Сколько займёт? А на виртуальных потоках?
+@answer
+<p>Пул: 10 000 / 200 = 50 «волн» по 100 мс — около 5 секунд. Виртуальные: все 10 000 задач спят одновременно, ведь при <code>sleep</code> виртуальный поток отпускает поток-носитель — около 100–200 мс. Носителей при этом столько, сколько ядер. Виртуальные потоки ускоряют не вычисления, а ожидание.</p>
+@end
+@run
+javac ManyThreads.java
+java ManyThreads pool
+java ManyThreads virtual
+@end
+@try
+Замените <code>Thread.sleep</code> на вычисление на 100 мс (цикл). Что станет с виртуальными потоками? ::: Ускорения не будет: CPU-работа занимает носитель, параллелизм ограничен числом ядер — как у пула размером в число ядер.
+Оберните sleep в <code>synchronized (ManyThreads.class) { … }</code> и запустите на JDK 21 и на 25. ::: На 21 виртуальный поток внутри synchronized «приколот» к носителю (pinning), и задачи выполнятся по одной — очень долго. С Java 24 (JEP 491) synchronized больше не приколачивает носитель, но задачи всё равно идут последовательно: монитор один.
+@end

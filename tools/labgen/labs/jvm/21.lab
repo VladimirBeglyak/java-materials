@@ -1,0 +1,119 @@
+@chapter 21 | quiz
+@intro
+<p>Расследуем «сервис ест CPU» по всем правилам, только своими руками: дамп потоков с временем CPU, Java Flight Recorder и его встроенные отчёты <code>jfr view</code>. Модуль IDEA — <code>ch21</code>. Файлы <code>.jfr</code> открываются в IntelliJ IDEA Ultimate (двойной клик, Profiler) или в JDK Mission Control.</p>
+@end
+
+@lab 21.1 | Какой поток ест CPU | 20 мин
+@goal
+<p>Найти горячий поток по колонке <code>cpu=</code> в двух последовательных дампах — переносимая замена <code>top -H</code>.</p>
+@end
+@file Busy.java
+import java.util.concurrent.locks.LockSupport;
+
+public class Busy {
+    static volatile long sink;
+
+    static long hash(long x) {
+        for (int i = 0; i < 1000; i++) x = x * 6364136223846793005L + 1442695040888963407L;
+        return x;
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        new Thread(() -> { while (true) LockSupport.parkNanos(10_000_000); }, "idle-worker").start();
+        new Thread(() -> { while (true) sink = hash(sink); }, "report-generator").start();
+        new Thread(() -> { while (true) { sink += 1; LockSupport.parkNanos(1_000_000); } }, "heartbeat").start();
+        Thread.sleep(600_000);
+    }
+}
+@end
+@exec
+javac Busy.java
+(java Busy > busy.out 2>&1 &)
+sleep 3
+@end
+@step Снимите два дампа с интервалом в несколько секунд и сравните <code>cpu=</code> у потоков:
+@run grep="^\x22(idle-worker|report-generator|heartbeat|main)"
+jcmd <pid> Thread.print ||| P=$(jcmd | grep Busy | cut -d' ' -f1); jcmd $P Thread.print
+@end
+@exec
+sleep 3
+@end
+@run grep="^\x22(idle-worker|report-generator|heartbeat|main)|at Busy"
+jcmd <pid> Thread.print ||| P=$(jcmd | grep Busy | cut -d' ' -f1); jcmd $P Thread.print
+@end
+@predict Какой поток виноват и что ещё в дампе указывает на виновную строку кода?
+@answer
+<p><code>report-generator</code>: только у него <code>cpu=</code> растёт между снимками (сотни миллисекунд — секунды), у остальных — 0. В его стеке в обоих снимках одно и то же место: <code>Busy.lambda$main$1</code> (строка 14 — цикл с <code>hash</code>; сам <code>hash</code> встроен JIT-ом и отдельным кадром может не показываться). Несколько снимков с одинаковой верхушкой стека — простейший «профилировщик». На Linux то же самое находят через <code>top -H -p &lt;pid&gt;</code>, переводя TID в hex и ища <code>nid=0x…</code> в дампе.</p>
+@end
+@exec
+P=$(jcmd | grep Busy | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+
+@lab 21.2 | Java Flight Recorder: запись и отчёты | 25 мин
+@goal
+<p>Записать профиль работающей программы и получить из него горячие методы, сборки мусора и аллокации — без внешних инструментов.</p>
+@end
+@step Запустите <code>Busy</code> сразу с записью на 10 секунд:
+@ide VM options: <code>-XX:StartFlightRecording=duration=10s,filename=busy.jfr</code>
+@exec
+(java -XX:StartFlightRecording=duration=10s,filename=busy.jfr Busy > busy2.out 2>&1 &)
+sleep 13
+P=$(jcmd | grep Busy | cut -d' ' -f1); taskkill //F //PID $P >/dev/null 2>&1; true
+@end
+@run noout
+java -XX:StartFlightRecording=duration=10s,filename=busy.jfr Busy ||| true
+@end
+@step Когда в консоли появится «Dump on exit»/«Recording … stopped» (или просто через 10 секунд), остановите программу и посмотрите отчёты:
+@run head=16
+jfr summary busy.jfr
+@end
+@run head=12
+jfr view hot-methods busy.jfr
+@end
+@predict Что окажется на первом месте в <code>hot-methods</code> и почему там нет <code>heartbeat</code>?
+@answer
+<p><code>Busy.lambda$main$1()</code> — почти 100% сэмплов: это тело потока report-generator, в которое JIT встроил <code>hash</code>. JFR каждые 10–20 мс снимает стеки <b>выполняющихся</b> потоков (событие <code>jdk.ExecutionSample</code>); heartbeat и idle-worker почти всё время запаркованы и в сэмплы не попадают. Это профиль CPU, а не «где потоки проводят время».</p>
+@end
+@step Другие готовые отчёты (полный список — <code>jfr view</code> без аргументов), например загрузка CPU процессом и машиной:
+@run head=14
+jfr view cpu-load busy.jfr
+@end
+@try
+Подключите запись к уже работающему процессу: <code>jcmd &lt;pid&gt; JFR.start duration=30s filename=live.jfr</code>. ::: Так делают в продакшене — без перезапуска. Накладные расходы профиля default ~1%, поэтому многие держат непрерывную запись: <code>-XX:StartFlightRecording=maxage=1h,disk=true</code> и делают <code>JFR.dump</code> при инциденте.
+Выполните <code>jfr print --events jdk.ExecutionSample busy.jfr</code> и посмотрите на сырое событие. ::: Каждое событие — время, поток, состояние и стек. Все <code>jfr view</code> — лишь агрегаты над такими событиями; IDEA и JMC строят из них флеймграф.
+@end
+
+@lab 21.3 | Кто выделяет память: аллокации в JFR | 15 мин
+@goal
+<p>Найти место в коде, которое создаёт больше всего мусора.</p>
+@end
+@file Garbage.java
+import java.util.ArrayList;
+import java.util.List;
+
+public class Garbage {
+    static String format(int i) { return String.format("item-%05d", i); }       // дорогой способ
+    static String concat(int i) { return "item-" + i; }
+
+    public static void main(String[] args) {
+        long end = System.currentTimeMillis() + 5000, n = 0;
+        while (System.currentTimeMillis() < end) {
+            List<String> batch = new ArrayList<>();
+            for (int i = 0; i < 1000; i++) batch.add(i % 2 == 0 ? format(i) : concat(i));
+            n += batch.size();
+        }
+        System.out.println("строк: " + n);
+    }
+}
+@end
+@ide VM options: <code>-XX:StartFlightRecording=filename=garbage.jfr,settings=profile</code>
+@run
+javac Garbage.java
+java -XX:StartFlightRecording=filename=garbage.jfr,settings=profile Garbage ||| java -XX:StartFlightRecording=filename=garbage.jfr,settings=profile Garbage 2>&1 | grep -v "Started recording\|Use jcmd\|^$"
+@end
+@run head=14
+jfr view allocation-by-site garbage.jfr
+@end
+@note Отчёт строится по событиям <code>jdk.ObjectAllocationSample</code>: JFR выборочно фиксирует выделения с их стеком. Наверху окажется путь через <code>String.format</code> — <code>Formatter</code>, регулярные выражения и <code>StringBuilder</code> внутри него выделяют в разы больше, чем простая конкатенация.
+@end

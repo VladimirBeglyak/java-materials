@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 23 · ЭКСПЛУАТАЦИЯ</div>
   <h1>Практикум и собеседование</h1>
   <p class="lead">Закрепление курса: тренажёр из 36 вопросов о JVM с самопроверкой и сохранением прогресса, задачи «что будет напечатано» на загрузку и инициализацию классов, разбор производственных инцидентов и итоговый тест.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">36 вопросов</span><span class="tag">задачи на вывод</span><span class="tag">инциденты</span><span class="tag">итоговый тест</span></div>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">36 вопросов</span><span class="tag">задачи на вывод</span><span class="tag">инциденты</span><span class="tag">итоговый тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -120,7 +120,119 @@
 <details class="q"><summary>После перехода на Java 21 и виртуальные потоки пропускная способность упала.</summary><div class="a"><p>Закрепление носителей (pinning) в synchronized-блоках с блокирующим I/O (до Java 24) — потоки-носители заняты, параллелизм упал до числа ядер; проверить jdk.VirtualThreadPinned в JFR. Также ThreadLocal-кэши (каждый виртуальный поток создаёт свой экземпляр дорогого объекта), ограниченные пулы соединений, теперь ставшие узким местом. Обновиться до 24+ или заменить synchronized на ReentrantLock, ограничить конкурентность семафором.</p></div></details>
 </div>
 
-<h2 id="final"><span class="h-num">23.4</span>Итоговый тест</h2>
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">23.4</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Итоговое расследование: перед вами «сервис» с тремя проблемами сразу. Исходник специально не комментирован — найдите неполадки только инструментами из курса, а потом сверьтесь с ответами. Модуль IDEA — <code>ch23</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-23.1">
+<div class="lab-head"><span class="lab-num">Лаба 23.1</span><b>Расследование: сервис тормозит и пухнет</b><span class="lab-time">45 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти три проблемы: что ест CPU, что держит память, почему запросы стоят в очереди. Инструменты: <code>jcmd Thread.print</code>, <code>GC.class_histogram</code>, JFR, лог GC.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Mystery.java</code>:</div>
+<pre data-title="Mystery.java"><code class="java">import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public class Mystery {
+    static final Map&lt;String, List&lt;String&gt;&gt; AUDIT = new HashMap&lt;&gt;();
+    static final Object REGISTRY = new Object();
+    static volatile long checksum;
+
+    static void handle(int id) {
+        synchronized (REGISTRY) {
+            AUDIT.computeIfAbsent("req-" + id, k -&gt; new ArrayList&lt;&gt;()).add("payload-" + "x".repeat(200));
+            long h = 0;
+            for (int i = 0; i &lt; 200_000; i++) h = h * 31 + i;
+            checksum += h;
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid());
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        for (int id = 0; ; id++) {
+            final int req = id;
+            pool.submit(() -&gt; handle(req));
+            if (id % 100 == 0) Thread.sleep(20);
+        }
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-Xmx256m -Xlog:gc:file=mystery-gc.log -XX:StartFlightRecording=filename=mystery.jfr,duration=20s</code></p>
+</li>
+<li class="lab-step"><div class="lab-text">Через 10–20 секунд работы снимите улики:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"pool-1-thread-1" #40 [32056] prio=5 os_prio=0 cpu=140.62ms elapsed=8.20s tid=0x0000022e2ca6cd90 nid=32056 runnable  [0x00000082b01fe000]
+   java.lang.Thread.State: RUNNABLE
+	at Mystery.handle(Mystery.java:17)
+	- locked &lt;0x00000000fce30090&gt; (a java.lang.Object)
+	at Mystery.lambda$main$0(Mystery.java:27)
+"pool-1-thread-2" #41 [30112] prio=5 os_prio=0 cpu=125.00ms elapsed=8.18s tid=0x0000022e2ca70c10 nid=30112 waiting for monitor entry  [0x00000082b02ff000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Mystery.handle(Mystery.java:14)
+	- waiting to lock &lt;0x00000000fce30090&gt; (a java.lang.Object)
+	at Mystery.lambda$main$0(Mystery.java:27)
+"pool-1-thread-3" #42 [3724] prio=5 os_prio=0 cpu=171.88ms elapsed=8.18s tid=0x0000022e2ca72b50 nid=3724 waiting for monitor entry  [0x00000082b03ff000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Mystery.handle(Mystery.java:14)
+	- waiting to lock &lt;0x00000000fce30090&gt; (a java.lang.Object)
+	at Mystery.lambda$main$0(Mystery.java:27)
+"pool-1-thread-4" #43 [11036] prio=5 os_prio=0 cpu=140.62ms elapsed=8.18s tid=0x0000022e2ca72380 nid=11036 waiting for monitor entry  [0x00000082b04ff000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Mystery.handle(Mystery.java:14)
+	- waiting to lock &lt;0x00000000fce30090&gt; (a java.lang.Object)
+	at Mystery.lambda$main$0(Mystery.java:27)
+"pool-1-thread-5" #44 [20528] prio=5 os_prio=0 cpu=203.12ms elapsed=8.18s tid=0x0000022e2ca6e500 nid=20528 waiting for monitor entry  [0x00000082b05ff000]
+   java.lang.Thread.State: BLOCKED (on object monitor)
+	at Mystery.handle(Mystery.java:14)
+	- waiting to lock &lt;0x00000000fce30090&gt; (a java.lang.Object)
+…</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; GC.class_histogram</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+ num     #instances         #bytes  class name (module)
+-------------------------------------------------------
+   1:        101020       11724592  [B (java.base@25.0.2)
+   2:         45194        2585536  [Ljava.lang.Object; (java.base@25.0.2)
+   3:        100045        2401080  java.lang.String (java.base@25.0.2)
+   4:         45120        1443840  java.util.HashMap$Node (java.base@25.0.2)
+   5:         42924        1030176  java.util.ArrayList (java.base@25.0.2)
+   6:          1715         390384  [Ljava.util.HashMap$Node; (java.base@25.0.2)
+…</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">jfr view hot-methods mystery.jfr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">
+                             Java Methods that Execute the Most
+
+Method                                                                       Samples Percent
+---------------------------------------------------------------------------- ------- -------
+Mystery.handle(int)                                                              646  95.85%
+Mystery.lambda$main$0(int)                                                        10   1.48%
+java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor$Worker)       2   0.30%
+java.util.HashMap.computeIfAbsent(Object, Function)                                2   0.30%
+jdk.jfr.internal.event.EventWriter.endEvent()                                      2   0.30%
+…</code></pre></details>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[7.654s][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 48M-&gt;18M(256M) 6.265ms
+[14.492s][info][gc] GC(2) Pause Young (Normal) (G1 Evacuation Pause) 43M-&gt;32M(87M) 3.162ms
+[19.764s][info][gc] GC(3) Pause Young (Normal) (G1 Evacuation Pause) 51M-&gt;43M(87M) 3.859ms
+[20.577s][info][gc] GC(4) Pause Young (Concurrent Start) (G1 Humongous Allocation) 47M-&gt;46M(87M) 1.642ms</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Проблема 1: почему из 8 потоков пула работает фактически один?</div>
+<div class="lab-ans" hidden><p>Весь <code>handle</code> — внутри <code>synchronized (REGISTRY)</code>. В дампе один поток RUNNABLE с <code>- locked &lt;…&gt; (a java.lang.Object)</code>, остальные семь — <code>BLOCKED</code> с <code>waiting to lock</code> того же адреса. Лечение: сузить критическую секцию до работы с общей картой, а вычисление вынести наружу; карту заменить на <code>ConcurrentHashMap</code>.</p></div>
+</li>
+<li class="lab-step predict"><div class="lab-text">Проблема 2: что ест CPU?</div>
+<div class="lab-ans" hidden><p>Цикл вычисления <code>h</code> внутри <code>handle</code> — на первом месте в <code>jfr view hot-methods</code> (<code>Mystery.handle</code>). При этом он ещё и выполняется под блокировкой, поэтому на 8 потоках сервис использует одно ядро.</p></div>
+</li>
+<li class="lab-step predict"><div class="lab-text">Проблема 3: почему растёт память, и что покажет лог GC через час?</div>
+<div class="lab-ans" hidden><p><code>AUDIT</code> — статическая карта, в которую на каждый запрос добавляется запись и никогда не удаляется: в гистограмме растут <code>String</code>, <code>byte[]</code>, <code>HashMap$Node</code>, <code>ArrayList</code>. Плюс очередь задач пула неограничена (<code>newFixedThreadPool</code> использует <code>LinkedBlockingQueue</code> без предела) — <code>FutureTask</code> и лямбды копятся, потому что задачи приходят быстрее, чем обрабатываются. В логе GC «занято после сборки» растёт до Full GC и <code>OutOfMemoryError</code>. Лечение: ограниченный кэш/запись аудита во внешнее хранилище и ограниченная очередь с политикой отказа.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Исправьте все три проблемы и повторите расследование. Какие улики должны исчезнуть?</summary><div>В дампе — потоки пула попеременно RUNNABLE без <code>waiting to lock</code>; в гистограмме — стабильные числа между снимками; в логе GC — ровная «занятость после сборки»; загрузка CPU — несколько ядер вместо одного.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="final"><span class="h-num">23.5</span>Итоговый тест</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Где хранятся значения статических полей класса в HotSpot (Java 8+)?</p><ul><li>В metaspace</li><li>В стеке потока main</li><li>В куче, в объекте java.lang.Class</li><li>В code cache</li></ul><div class="why">Метаданные — metaspace, значения — в зеркале класса в куче.</div></div>
 <div class="mcq" data-ok="0"><p>Какая инструкция используется для вызова метода через ссылку интерфейсного типа?</p><ul><li>invokeinterface</li><li>invokevirtual</li><li>invokestatic</li><li>invokedynamic</li></ul><div class="why">Через itable.</div></div>

@@ -18,7 +18,7 @@
   <div class="kicker">ТЕМА 01 · ПЛАТФОРМА И БАЙТКОД</div>
   <h1>Архитектура JVM и запуск</h1>
   <p class="lead">JVM — это спецификация абстрактной машины и её реализации, из которых в продакшене почти всегда работает HotSpot. Здесь — карта подсистем (загрузка классов, области памяти, движок исполнения, сборщик мусора, нативный интерфейс), что именно происходит между командой <code>java -jar app.jar</code> и первой строкой <code>main</code>, как JVM сама подбирает настройки под машину и как читать её флаги.</p>
-  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">спецификация и HotSpot</span><span class="tag">подсистемы</span><span class="tag">запуск по шагам</span><span class="tag">эргономика</span><span class="tag">флаги</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">спецификация и HotSpot</span><span class="tag">подсистемы</span><span class="tag">запуск по шагам</span><span class="tag">эргономика</span><span class="tag">флаги</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
@@ -149,7 +149,247 @@ java -XX:+PrintCommandLineFlags -version
 jcmd &lt;pid&gt; VM.flags -all | grep ':='        # := отмечает значения, изменённые эргономикой или вами
 jcmd &lt;pid&gt; VM.command_line</code></pre>
 
-<h2 id="quiz"><span class="h-num">1.6</span>Самопроверка</h2>
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">1.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Здесь вы сами увидите то, о чём шла речь выше: сколько работы JVM делает до первой строки <code>main</code>, какие настройки она выбирает «сама» на вашей машине и как прочитать флаги живого процесса. Создайте в IDEA модуль <code>ch01</code> и кладите классы в папку <code>src</code> (пакет по умолчанию).</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="jvm-1.1">
+<div class="lab-head"><span class="lab-num">Лаба 1.1</span><b>Что JVM успевает сделать до main</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, сколько классов загружается и сколько миллисекунд проходит до вызова <code>main</code>, и как на это влияет архив CDS.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте класс <code>Hello</code>. Он печатает, сколько прошло от старта процесса и сколько классов уже загружено:</div>
+<pre data-title="Hello.java"><code class="java">import java.lang.management.ManagementFactory;
+
+public class Hello {
+    public static void main(String[] args) {
+        var rt = ManagementFactory.getRuntimeMXBean();
+        long sinceStart = System.currentTimeMillis() - rt.getStartTime();
+        int classes = ManagementFactory.getClassLoadingMXBean().getLoadedClassCount();
+        System.out.println("JVM:            " + rt.getVmName() + " " + rt.getVmVersion());
+        System.out.println("до main прошло: ~" + sinceStart + " мс");
+        System.out.println("классов загружено: " + classes);
+        System.out.println("pid: " + ProcessHandle.current().pid());
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>Запустите зелёным ▶ рядом с <code>main</code>. Затем откройте встроенный терминал (Alt+F12) — дальше часть команд удобнее запускать из него.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите тот же класс из терминала без отдельной компиляции — лаунчер сам скомпилирует один файл в память (JEP 330):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java Hello.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">JVM:            OpenJDK 64-Bit Server VM 25.0.2+10-69
+до main прошло: ~380 мс
+классов загружено: 2610
+pid: 32272</code></pre></details>
+<p class="lab-note">Цифра «классов загружено» включает и классы самого компилятора javac, который лаунчер запустил ради однофайлового режима. Чтобы увидеть «чистую» JVM, скомпилируйте заранее.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Скомпилируйте и запустите как обычно:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Hello.java
+java Hello</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">JVM:            OpenJDK 64-Bit Server VM 25.0.2+10-69
+до main прошло: ~18 мс
+классов загружено: 781
+pid: 22356</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Выключим CDS — архив заранее разобранных классов JDK (<code>-Xshare:off</code>). Что произойдёт с числом классов и со временем до <code>main</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xshare:off Hello</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">JVM:            OpenJDK 64-Bit Server VM 25.0.2+10-69
+до main прошло: ~43 мс
+классов загружено: 791
+pid: 27724</code></pre></details>
+<div class="lab-ans" hidden><p>Число классов почти не изменится — JVM загружает те же классы. Время вырастет заметно (обычно в 1,5–3 раза): без архива каждый класс java.base приходится читать из модуля <code>lib/modules</code>, разбирать и проверять заново. CDS ускоряет именно эту работу.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите, какие именно классы и откуда загружаются. Вывод длинный — в IDEA добавьте флаг в <b>VM options</b> и воспользуйтесь поиском по консоли (Ctrl+F):</div>
+<p class="lab-ide"><span>IDEA</span>Run → Edit Configurations… → Modify options → <b>Add VM options</b> → <code>-Xlog:class+load</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xlog:class+load Hello</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.016s][info][class,load] java.lang.Object source: shared objects file
+[0.016s][info][class,load] java.io.Serializable source: shared objects file
+[0.016s][info][class,load] java.lang.Comparable source: shared objects file
+[0.016s][info][class,load] java.lang.CharSequence source: shared objects file
+[0.016s][info][class,load] java.lang.constant.Constable source: shared objects file
+[0.016s][info][class,load] java.lang.constant.ConstantDesc source: shared objects file
+[0.016s][info][class,load] java.lang.String source: shared objects file
+[0.016s][info][class,load] java.lang.reflect.AnnotatedElement source: shared objects file
+[0.016s][info][class,load] java.lang.reflect.GenericDeclaration source: shared objects file
+[0.016s][info][class,load] java.lang.reflect.Type source: shared objects file
+[0.016s][info][class,load] java.lang.invoke.TypeDescriptor source: shared objects file
+[0.016s][info][class,load] java.lang.invoke.TypeDescriptor$OfField source: shared objects file
+…</code></pre></details>
+<p class="lab-note"><code>source: shared objects file</code> — класс взят из архива CDS, <code>source: jrt:/java.base</code> — прочитан из модуля, <code>source: file:/…</code> — ваш класс из каталога.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Найдите в логе строку с <code>Hello</code>: какие классы загружены непосредственно до и после него?</summary><div>Прямо перед Hello — классы, нужные загрузчику (<code>java.security.Permissions</code> и др.), сразу после — те, которыми лаунчер ищет метод <code>main</code> (<code>MethodFinder</code>), и только потом <code>ManagementFactory</code> и весь JMX. Классы загружаются лениво — по первому обращению.</div></details></li>
+<li><details><summary>Удалите из кода работу с ManagementFactory, оставьте только println. Сколько классов теперь?</summary><div>Около 440 вместо ~780: JMX тянет за собой сотни классов. Подсчитать можно и без кода: <code>java -Xlog:class+load Hello | find /c "source:"</code> (Windows) или <code>| grep -c source:</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-1.2">
+<div class="lab-head"><span class="lab-num">Лаба 1.2</span><b>Эргономика: что JVM выбрала на вашей машине</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Узнать размер кучи, сборщик и число процессоров, которые JVM определила автоматически, и заставить её выбрать иначе.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте класс <code>Ergo</code>:</div>
+<pre data-title="Ergo.java"><code class="java">import java.lang.management.ManagementFactory;
+
+public class Ergo {
+    public static void main(String[] args) {
+        Runtime rt = Runtime.getRuntime();
+        System.out.println("CPU для JVM:   " + rt.availableProcessors());
+        System.out.println("max heap (MB): " + rt.maxMemory() / 1024 / 1024);
+        System.out.println("init heap(MB): " + rt.totalMemory() / 1024 / 1024);
+        for (var gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+            System.out.println("сборщик:       " + gc.getName());
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Ergo.java
+java Ergo</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">CPU для JVM:   18
+max heap (MB): 8056
+init heap(MB): 508
+сборщик:       G1 Young Generation
+сборщик:       G1 Concurrent GC
+сборщик:       G1 Old Generation</code></pre></details>
+<p class="lab-note">На машине, где снят вывод, 18 логических процессоров и 32 ГБ памяти: max heap = ¼ физической памяти, выбран G1. У вас числа будут свои — сверьте их с диспетчером задач.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запустим с <code>-XX:ActiveProcessorCount=1 -Xmx256m</code> (как в маленьком контейнере). Какой сборщик выберет JVM?</div>
+<p class="lab-ide"><span>IDEA</span>VM options: <code>-XX:ActiveProcessorCount=1 -Xmx256m</code></p>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:ActiveProcessorCount=1 -Xmx256m Ergo</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">CPU для JVM:   1
+max heap (MB): 247
+init heap(MB): 247
+сборщик:       Copy
+сборщик:       MarkSweepCompact</code></pre></details>
+<div class="lab-ans" hidden><p><b>Serial</b> (в выводе — <code>Copy</code> и <code>MarkSweepCompact</code>). Если процессоров меньше двух или памяти меньше 1792 МБ, машина считается не «серверной», и эргономика выбирает однопоточный SerialGC вместо G1. Это частая неожиданность в контейнерах с <code>cpu: 1</code>.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сверьте с тем, что JVM говорит о себе сама. Флаг <code>-XX:+PrintFlagsFinal</code> печатает все ~700 флагов с итоговыми значениями; <code>{ergonomic}</code> отмечает выбранные автоматически:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -XX:+PrintFlagsFinal -version | findstr /R "MaxHeapSize UseG1GC UseSerialGC ParallelGCThreads"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">      int ActiveProcessorCount                     = -1                                        {product} {default}
+     uint ConcGCThreads                            = 4                                         {product} {ergonomic}
+   size_t InitialHeapSize                          = 528482304                                 {product} {ergonomic}
+   size_t MaxHeapSize                              = 8447328256                                {product} {ergonomic}
+     uint ParallelGCThreads                        = 14                                        {product} {default}
+   size_t SoftMaxHeapSize                          = 8447328256                             {manageable} {ergonomic}
+     bool UseG1GC                                  = true                                      {product} {ergonomic}
+     bool UseSerialGC                              = false                                     {product} {default}</code></pre></details>
+<p class="lab-note">В PowerShell/cmd фильтр — <code>findstr</code>, в bash/macOS — <code>grep -E "MaxHeapSize|UseG1GC"</code>.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-XX:MaxRAMPercentage=50</code> — как изменился max heap?</summary><div>Куча стала равна половине физической памяти: MaxRAMPercentage задаёт долю памяти машины (или лимита контейнера) под кучу, по умолчанию 25%.</div></details></li>
+<li><details><summary>Почему <code>max heap</code> из Runtime чуть меньше, чем <code>-Xmx</code>? Попробуйте <code>-Xmx256m -XX:+UseSerialGC</code>.</summary><div><code>maxMemory()</code> не учитывает одно из пространств выживших (survivor): в любой момент одно из них пустое и недоступно для объектов.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-1.3">
+<div class="lab-head"><span class="lab-num">Лаба 1.3</span><b>Флаги живого процесса: jcmd</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Подключиться к работающей JVM и прочитать её командную строку, флаги и системные свойства — без перезапуска.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте программу, которая просто ждёт:</div>
+<pre data-title="Sleeper.java"><code class="java">public class Sleeper {
+    public static void main(String[] args) throws Exception {
+        System.out.println("pid " + ProcessHandle.current().pid() + ", жду 10 минут…");
+        Thread.sleep(600_000);
+    }
+}</code></pre>
+<p class="lab-ide"><span>IDEA</span>Запустите с VM options <code>-Xmx300m -XX:+UseParallelGC</code>. Процесс будет висеть — это и нужно.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Во втором окне терминала найдите процесс и спросите его о флагах. Вместо <code>&lt;pid&gt;</code> подставьте число из вывода:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd
+jcmd &lt;pid&gt; VM.command_line
+jcmd &lt;pid&gt; VM.flags</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345 Sleeper
+jvm_args: -Xmx300m -XX:+UseParallelGC 
+java_command: Sleeper
+-XX:MaxHeapSize=314572800
+-XX:MaxNewSize=104857600</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какое значение <code>MaxHeapSize</code> покажет VM.flags и почему оно записано в байтах?</div>
+<div class="lab-ans" hidden><p><code>-XX:MaxHeapSize=314572800</code> = 300 × 1024 × 1024. <code>-Xmx</code> — лишь короткий синоним флага <code>MaxHeapSize</code>; внутри все размеры хранятся в байтах. VM.flags показывает только флаги, отличные от значения по умолчанию или выставленные эргономикой.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите полный список команд, которые понимает процесс, и остановите его:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; help</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">12345:
+The following commands are available:
+Compiler.CodeHeap_Analytics
+Compiler.codecache
+Compiler.codelist
+Compiler.directives_add
+Compiler.directives_clear
+Compiler.directives_print
+Compiler.directives_remove
+Compiler.memory
+Compiler.queue
+GC.class_histogram
+GC.finalizer_info
+GC.heap_dump
+GC.heap_info
+GC.run
+GC.run_finalization
+JFR.check
+JFR.configure
+JFR.dump
+…</code></pre></details>
+<p class="lab-note">Остановите процесс кнопкой ■ в IDEA или Ctrl+C. Эту же процедуру вы будете делать в продакшене — <code>jcmd</code> входит в любой JDK.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Выполните <code>jcmd &lt;pid&gt; VM.system_properties</code> и найдите <code>java.class.path</code> — куда IDEA положила скомпилированный класс?</summary><div>В <code>…/out/production/ch01</code> (или <code>target/classes</code> в Maven-проекте) — IDEA компилирует в свой каталог и передаёт его через <code>-classpath</code>.</div></details></li>
+<li><details><summary>Измените флаг на лету: <code>jcmd &lt;pid&gt; VM.set_flag PrintConcurrentLocks true</code>. А получится ли так поменять MaxHeapSize?</summary><div>Нет — «only 'writeable' flags can be set». Менять на лету можно только manageable-флаги (список: <code>java -XX:+PrintFlagsFinal -version</code> с пометкой <code>{manageable}</code>).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-1.4">
+<div class="lab-head"><span class="lab-num">Лаба 1.4</span><b>Кто ещё живёт в «однопоточной» программе</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть служебные потоки JVM: GC, JIT-компиляторы, обработчик ссылок, диспетчер сигналов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте класс, который печатает все Java-потоки процесса:</div>
+<pre data-title="Threads.java"><code class="java">public class Threads {
+    public static void main(String[] args) {
+        Thread.getAllStackTraces().keySet().stream()
+              .sorted((a, b) -&gt; a.getName().compareTo(b.getName()))
+              .forEach(t -&gt; System.out.printf("%-22s daemon=%-5s prio=%d group=%s%n",
+                      t.getName(), t.isDaemon(), t.getPriority(),
+                      t.getThreadGroup() == null ? "-" : t.getThreadGroup().getName()));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Threads.java
+java Threads</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Attach Listener        daemon=true  prio=5 group=system
+Common-Cleaner         daemon=true  prio=8 group=InnocuousThreadGroup
+Finalizer              daemon=true  prio=8 group=system
+Notification Thread    daemon=true  prio=9 group=system
+Reference Handler      daemon=true  prio=10 group=system
+Signal Dispatcher      daemon=true  prio=9 group=system
+main                   daemon=false prio=5 group=main</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Это Java-потоки. Будут ли среди них потоки сборщика мусора и JIT-компилятора?</div>
+<div class="lab-ans" hidden><p>Нет. Потоки GC (<code>GC Thread#0</code>, <code>G1 Main Marker</code>…), JIT (<code>C2 CompilerThread0</code>, <code>C1 CompilerThread0</code>) и <code>VM Thread</code> — нативные потоки JVM, у них нет объекта <code>java.lang.Thread</code>. Их видно только в дампе потоков (<code>jcmd &lt;pid&gt; Thread.print</code>) или в ОС.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Снимите полный дамп потоков работающего <code>Sleeper</code> из лабы 1.3 и найдите там нативные потоки:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">jcmd &lt;pid&gt; Thread.print</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">"main" #3 [14476] prio=5 os_prio=0 cpu=0.00ms elapsed=2.45s tid=0x0000020097d0b530 nid=14476 waiting on condition  [0x00000030feaff000]
+"Reference Handler" #15 [10124] daemon prio=10 os_prio=2 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e617f0 nid=10124 waiting on condition  [0x00000030ff2ff000]
+"Finalizer" #16 [4272] daemon prio=8 os_prio=1 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e62fd0 nid=4272 in Object.wait()  [0x00000030ff3ff000]
+"Signal Dispatcher" #17 [25700] daemon prio=9 os_prio=2 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e64d10 nid=25700 waiting on condition  [0x0000000000000000]
+"Attach Listener" #18 [12628] daemon prio=5 os_prio=2 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e658d0 nid=12628 waiting on condition  [0x0000000000000000]
+"Service Thread" #19 [30828] daemon prio=9 os_prio=0 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e66490 nid=30828 runnable  [0x0000000000000000]
+"Monitor Deflation Thread" #20 [31604] daemon prio=9 os_prio=0 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e67180 nid=31604 runnable  [0x0000000000000000]
+"C2 CompilerThread0" #21 [12868] daemon prio=9 os_prio=2 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e70080 nid=12868 waiting on condition  [0x0000000000000000]
+"C1 CompilerThread0" #29 [30668] daemon prio=9 os_prio=2 cpu=0.00ms elapsed=2.43s tid=0x00000200b9e72ca0 nid=30668 waiting on condition  [0x0000000000000000]
+"Notification Thread" #33 [32600] daemon prio=9 os_prio=0 cpu=0.00ms elapsed=2.43s tid=0x00000200c10b57c0 nid=32600 runnable  [0x0000000000000000]
+"Common-Cleaner" #34 [27176] daemon prio=8 os_prio=1 cpu=0.00ms elapsed=2.43s tid=0x00000200c10a6e90 nid=27176 in Object.wait()  [0x00000030ffbff000]
+"VM Thread" os_prio=2 cpu=0.00ms elapsed=2.44s tid=0x00000200b9e53930 nid=30956 runnable  
+"VM Periodic Task Thread" os_prio=2 cpu=0.00ms elapsed=2.44s tid=0x00000200b9e3ee70 nid=10288 waiting on condition  
+"G1 Service" os_prio=2 cpu=0.00ms elapsed=2.45s tid=0x00000200b9d08750 nid=19192 runnable  
+"G1 Refine#0" os_prio=2 cpu=0.00ms elapsed=2.45s tid=0x00000200b9d07b40 nid=26084 runnable  
+"G1 Main Marker" os_prio=2 cpu=0.00ms elapsed=2.45s tid=0x0000020097dbddf0 nid=22908 runnable  
+"G1 Conc#0" os_prio=2 cpu=0.00ms elapsed=2.45s tid=0x0000020097dbeb10 nid=26368 runnable  
+"GC Thread#0" os_prio=2 cpu=0.00ms elapsed=2.45s tid=0x0000020097db4f70 nid=12152 runnable  </code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сколько потоков <code>GC Thread#N</code> у вас и как это связано с числом процессоров? Запустите Sleeper с <code>-XX:ParallelGCThreads=2</code> и проверьте.</summary><div>При ≤ 8 ядрах ParallelGCThreads = числу ядер, дальше ≈ 8 + 5/8 от остатка. G1 создаёт рабочие потоки лениво, поэтому в начале их может быть меньше.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">1.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Что определяет спецификация JVM, а что оставляет реализации?</p><ul><li>Определяет алгоритм GC и раскладку объектов</li><li>Определяет только синтаксис Java</li><li>Определяет формат class-файла, инструкции и загрузку классов; GC, JIT и раскладка объектов — на усмотрение реализации</li><li>Ничего не определяет, всё — HotSpot</li></ul><div class="why">Поэтому OpenJ9 и HotSpot исполняют одни и те же class-файлы по-разному внутри.</div></div>
 <div class="mcq" data-ok="0"><p>Программа запустила поток и main() завершился. Когда закончится процесс?</p><ul><li>Когда завершатся все не-daemon потоки (затем shutdown hooks)</li><li>Сразу после main</li><li>Никогда</li><li>Через 30 секунд</li></ul><div class="why">DestroyJavaVM ждёт не-daemon потоки — частая причина «зависших» утилит.</div></div>
