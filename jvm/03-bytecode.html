@@ -31,19 +31,132 @@
   <div class="kicker">ТЕМА 03 · ПЛАТФОРМА И БАЙТКОД</div>
   <h1>Байткод и стековая машина</h1>
   <p class="lead">JVM — стековая машина: у инструкций нет регистров, они берут операнды с вершины стека операндов текущего кадра и кладут туда результат. Локальные переменные — пронумерованные слоты. Пройдите по шагам настоящий байткод (вывод <code>javap -c</code>) в симуляторе интерпретатора и посмотрите, во что javac превращает циклы, тернарный оператор, <code>switch</code>, <code>try/finally</code> и автоупаковку.</p>
-  <div class="meta"><span class="tag">~2 часа</span><span class="tag">кадр метода</span><span class="tag">стек операндов</span><span class="tag">локальные переменные</span><span class="tag">набор инструкций</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">кадр метода</span><span class="tag">стек потока</span><span class="tag">стек операндов</span><span class="tag">локальные переменные</span><span class="tag">набор инструкций</span><span class="tag">javap</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
 </header>
 
 <nav class="toc" data-auto></nav>
 
-<h2 id="frame"><span class="h-num">3.1</span>Кадр метода</h2>
-<p>При каждом вызове метода в стеке потока создаётся <b>кадр</b> (frame):</p>
+<h2 id="frame"><span class="h-num">3.1</span>Кадр метода и стек потока</h2>
+<p><b>Кадр метода</b> (stack frame) — блок памяти, который JVM создаёт при <i>каждом вызове</i> метода и уничтожает, когда метод завершается. В нём лежит всё, что нужно одному конкретному вызову: два одновременных вызова одного метода (рекурсия или два потока) — это два независимых кадра.</p>
+
+<h3>Что внутри кадра</h3>
 <ul>
-  <li><b>массив локальных переменных</b> размера <code>max_locals</code>: слот 0 — <code>this</code> (у экземплярных методов), затем аргументы, затем локальные переменные; <code>long</code> и <code>double</code> занимают по два слота; слоты переиспользуются для переменных из непересекающихся блоков;</li>
-  <li><b>стек операндов</b> глубиной не более <code>max_stack</code> — оба размера вычисляет javac и проверяет верификатор;</li>
-  <li>ссылка на <b>пул констант времени выполнения</b> класса и адрес возврата.</li>
+  <li><b>Массив локальных переменных</b> размера <code>max_locals</code> — пронумерованные слоты: слот 0 — <code>this</code> (у экземплярных методов), затем аргументы, затем локальные переменные. <code>long</code> и <code>double</code> занимают по два слота; слоты переиспользуются для переменных из непересекающихся блоков. Это «долговременная» память вызова — живёт, пока метод выполняется.</li>
+  <li><b>Стек операндов</b> глубиной не больше <code>max_stack</code> — «черновик» для текущего вычисления (разбор ниже).</li>
+  <li><b>Служебная информация</b>: ссылка на пул констант времени выполнения класса (чтобы <code>invokevirtual #7</code> знал, какой метод имеется в виду), адрес возврата в вызывающий метод, ссылка на предыдущий кадр.</li>
 </ul>
-<p>Типы закодированы в инструкциях: <code>iadd</code> складывает int, <code>ladd</code> — long, <code>dadd</code> — double. Поэтому байткод проверяем статически: верификатор знает тип каждого значения в каждой точке.</p>
+<p>Оба размера вычисляет javac и записывает в class-файл — в выводе <code>javap -c</code> это строка <code>stack=2, locals=3</code>. Поэтому кадр выделяется одним куском заранее известного размера: вызов метода в JVM дешёвый.</p>
+
+<h3>Стек операндов: зачем он и как работает</h3>
+<p>У JVM нет регистров, как у процессора, поэтому у инструкций нет операндов вида «сложи регистр 1 и регистр 2». Правило другое: <b>инструкция берёт входные значения с вершины стека операндов и кладёт результат туда же</b>. <code>iadd</code> ничего не указывает явно — она снимает два int и кладёт их сумму. Стек работает по принципу LIFO: последним положил — первым снимешь.</p>
+<p>Как выглядит <code>int c = a + b;</code>, если <code>a</code> в слоте 1, <code>b</code> — в слоте 2, а <code>c</code> попадёт в слот 3:</p>
+<div class="table-wrap"><table>
+<tr><th>Инструкция</th><th>Что делает</th><th>Стек операндов после</th><th>Слоты 1 / 2 / 3</th></tr>
+<tr><td><code>iload_1</code></td><td>значение слота 1 (a) → на стек</td><td><code>[a]</code></td><td>a / b / —</td></tr>
+<tr><td><code>iload_2</code></td><td>значение слота 2 (b) → на стек</td><td><code>[a, b]</code></td><td>a / b / —</td></tr>
+<tr><td><code>iadd</code></td><td>снять два int, сложить, положить сумму</td><td><code>[a+b]</code></td><td>a / b / —</td></tr>
+<tr><td><code>istore_3</code></td><td>снять вершину → в слот 3 (c)</td><td><code>[]</code></td><td>a / b / a+b</td></tr>
+</table></div>
+<p>Видно разделение ролей: <b>load</b> переносит значение <i>из локальной переменной на стек</i>, арифметика работает <i>только со стеком</i>, <b>store</b> переносит <i>со стека в локальную переменную</i>. Так же устроены вызовы: аргументы сначала кладутся на стек операндов вызывающего, инструкция <code>invoke…</code> их снимает и передаёт в слоты нового кадра, а возвращённое значение появляется на стеке операндов вызывающего метода.</p>
+<p>Типы закодированы в самих инструкциях: <code>iadd</code> складывает int, <code>ladd</code> — long, <code>dadd</code> — double. Поэтому байткод проверяем статически: верификатор знает тип каждого значения в каждом слоте и на каждой позиции стека в любой точке метода (неверный байткод вы сломаете своими руками в лабе 6.2).</p>
+
+<h3>Где хранится кадр: стек потока</h3>
+<p>Кадры живут в <b>стеке потока</b> — у каждого потока он свой. Кадры лежат друг на друге в порядке вызовов: вызов метода кладёт новый кадр на вершину, <code>return</code> снимает его, и выполнение продолжается в кадре ниже. В HotSpot стек Java-потока — это обычный нативный стек потока ОС; его размер задаёт <code>-Xss</code> (по умолчанию 1 МБ на 64-битных Windows и Linux, тема 09).</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 330" role="img" aria-label="Кадры в стеках двух потоков и объекты в общей куче">
+  <defs><marker id="frAr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker></defs>
+  <text x="20" y="24" font-weight="700">Стек потока main</text>
+  <rect x="20" y="36" width="250" height="78" rx="8" class="box-acc"/>
+  <text x="34" y="58" class="mono" font-size="13" font-weight="700">Text.count(s)  ← вершина</text>
+  <text x="34" y="80" class="mono" font-size="12">слоты: s=ref, len=6</text>
+  <text x="34" y="100" class="mono" font-size="12">стек операндов: [6, 2]</text>
+  <rect x="20" y="122" width="250" height="78" rx="8" class="box"/>
+  <text x="34" y="144" class="mono" font-size="13" font-weight="700">Main.main(args)</text>
+  <text x="34" y="166" class="mono" font-size="12">слоты: args=ref, t=ref, n=?</text>
+  <text x="34" y="186" class="mono" font-size="12">ждёт результат count</text>
+  <text x="20" y="226" class="muted" font-size="12.5">новые кадры кладутся сверху,</text>
+  <text x="20" y="244" class="muted" font-size="12.5">return снимает верхний</text>
+
+  <text x="570" y="24" font-weight="700">Стек потока worker</text>
+  <rect x="570" y="36" width="230" height="78" rx="8" class="box"/>
+  <text x="584" y="58" class="mono" font-size="13" font-weight="700">Task.run()</text>
+  <text x="584" y="80" class="mono" font-size="12">слоты: this=ref, t=ref</text>
+  <text x="584" y="100" class="mono" font-size="12">свои кадры, свои слоты</text>
+
+  <rect x="320" y="36" width="210" height="164" rx="9" class="box-info"/>
+  <text x="336" y="60" font-weight="700">Куча (общая)</text>
+  <rect x="340" y="76" width="170" height="42" rx="7" class="box"/>
+  <text x="354" y="102" class="mono" font-size="12.5">String "Привет"</text>
+  <rect x="340" y="132" width="170" height="42" rx="7" class="box"/>
+  <text x="354" y="158" class="mono" font-size="12.5">String[] args</text>
+
+  <path d="M238,80 C290,80 300,94 338,94" class="ln" marker-end="url(#frAr)"/>
+  <path d="M238,166 C300,166 296,106 338,104" class="ln-dash" marker-end="url(#frAr)"/>
+  <path d="M238,158 C290,158 300,152 338,152" class="ln-dash" marker-end="url(#frAr)"/>
+  <path d="M570,76 C545,76 540,96 512,96" class="ln-acc" marker-end="url(#frAr)"/>
+
+  <rect x="20" y="266" width="780" height="50" rx="9" class="box-warn"/>
+  <text x="38" y="288" font-size="13.5">В слотах лежат <tspan font-weight="700">значения примитивов</tspan> и <tspan font-weight="700">ссылки</tspan>; сами объекты — всегда в куче.</text>
+  <text x="38" y="307" font-size="13.5">Кадр принадлежит одному потоку, а объект, на который ведёт ссылка, могут видеть многие потоки.</text>
+</svg>
+<figcaption>Кадры живут в стеке своего потока и содержат ссылки на объекты в общей куче. Оранжевая стрелка — второй поток ссылается на тот же объект String.</figcaption>
+</figure>
+
+<div class="widget stepper" id="frSim">
+  <div class="widget-title">Стек вызовов по шагам: main → count → length</div>
+<pre style="margin:0 0 12px"><code class="java">public class Main {
+    public static void main(String[] args) {
+        String t = "Привет";
+        int n = Text.count(t);
+        System.out.println(n);
+    }
+}
+class Text {
+    static int count(String s) {
+        int len = s.length();
+        return len * 2;
+    }
+}</code></pre>
+  <div class="lanes st-stage">
+    <div class="node" id="frStack" style="display:flex;flex-direction:column-reverse;gap:6px;min-height:200px">
+      <div class="node" data-from="1" data-to="7"><b>Main.main</b><small data-from="1" data-to="2">слоты: args, t="Привет", n=—<br>стек операндов: []</small><small data-from="2" data-to="6">слоты: args, t, n=—<br>стек операндов: [] (t передана в count)</small><small data-from="6" data-to="7">слоты: args, t, n=12<br>стек операндов: [] (12 → istore n)</small></div>
+      <div class="node acc" data-from="2" data-to="6"><b>Text.count</b><small data-from="2" data-to="3">слоты: s=ref на "Привет", len=—<br>стек операндов: [] </small><small data-from="3" data-to="4">слоты: s, len=—<br>стек операндов: [] (s передана в length)</small><small data-from="4" data-to="5">слоты: s, len=6<br>стек операндов: [] (6 → istore len)</small><small data-from="5" data-to="6">слоты: s, len=6<br>стек операндов: [6, 2] → imul → [12] → ireturn</small></div>
+      <div class="node info" data-from="3" data-to="4"><b>String.length</b><small>слоты: this=ref на "Привет"<br>стек операндов: [6] → ireturn</small></div>
+      <div class="node bad" data-from="7" data-to="8"><b>Main.main</b><small>NullPointerException в Text.count: кадр count снят без return, catch в main нет — кадр main тоже снят, поток завершается со стектрейсом</small></div>
+    </div>
+    <div class="node" id="frHeap"><b>Куча</b><small>String "Привет" (value, coder, hash…)</small><small>String[] args</small><small data-from="7" data-to="8">объект NullPointerException со снимком стека</small></div>
+  </div>
+  <section class="st-step" data-t="Вызов main" data-hl="frStack" data-log="JVM создаёт кадр Main.main: слот 0 = args (ссылка), слоты 1–2 под t и n"><p>Лаунчер вызывает <code>main</code> — в стеке потока создаётся первый кадр. Слот 0 — <code>args</code> (метод статический, <code>this</code> нет). <code>ldc "Привет"</code> + <code>astore_1</code> кладут в слот 1 <b>ссылку</b> на строку из пула — сам объект лежит в куче.</p></section>
+  <section class="st-step" data-t="Вызов count" data-hl="frStack" data-log="aload_1 → invokestatic Text.count: аргумент снят со стека операндов main и записан в слот 0 нового кадра"><p><code>aload_1</code> кладёт ссылку <code>t</code> на стек операндов main, <code>invokestatic Text.count</code> снимает её и создаёт <b>новый кадр сверху</b>. Аргумент оказывается в слоте 0 кадра count под именем <code>s</code>. Скопирована ссылка, а не строка: <code>t</code> и <code>s</code> указывают на один объект (передача «по значению ссылки»).</p></section>
+  <section class="st-step" data-t="Вызов length" data-hl="frStack frHeap" data-log="aload_0 → invokevirtual String.length: ещё один кадр, this = та же строка"><p><code>aload_0</code> + <code>invokevirtual String.length</code> — ещё один кадр. Для экземплярного метода объект-получатель передаётся неявно и попадает в слот 0 как <code>this</code>. Сейчас в стеке три кадра — ровно столько строк <code>at …</code> вы увидели бы в стектрейсе, если бы здесь произошла ошибка.</p></section>
+  <section class="st-step" data-t="return из length" data-hl="frStack" data-log="ireturn: кадр length снят, 6 положено на стек операндов count, istore_1 → len"><p><code>ireturn</code> снимает 6 со стека операндов length, <b>кадр уничтожается целиком</b>, а значение кладётся на стек операндов вызывающего — count. <code>istore_1</code> сохраняет его в слот <code>len</code>. Всё, что было в кадре length, исчезло — поэтому локальные переменные не нужно «освобождать».</p></section>
+  <section class="st-step" data-t="Вычисление и return" data-hl="frStack" data-log="iload_1, iconst_2, imul → [12], ireturn: кадр count снят, 12 на стеке main, istore_2 → n"><p><code>iload_1</code>, <code>iconst_2</code> → стек <code>[6, 2]</code>; <code>imul</code> → <code>[12]</code>; <code>ireturn</code> снимает кадр count и передаёт 12 в main.</p></section>
+  <section class="st-step" data-t="Снова в main" data-hl="frStack" data-log="istore_2: n = 12; println; return → кадр main снят, стек потока пуст"><p><code>istore_2</code> — <code>n = 12</code>, затем <code>println</code> (ещё несколько кадров появятся и исчезнут) и <code>return</code>: кадр main снят, стек потока пуст, поток завершается.</p></section>
+  <section class="st-step" data-t="А если исключение?" data-hl="frStack frHeap" data-log="t = null → NPE в count: JVM ищет обработчик в таблице исключений count, затем main — снимает кадры (unwinding)"><p>Пусть <code>t = null</code>. В count <code>invokevirtual length</code> бросает <code>NullPointerException</code>. JVM ищет обработчик в таблице исключений текущего метода; не нашла — <b>снимает кадр</b> и ищет в вызывающем, и так далее (раскрутка стека). Стектрейс исключения — это снимок кадров, сделанный в момент создания объекта исключения: <code>at Text.count(Main.java:10)</code>, <code>at Main.main(Main.java:4)</code>.</p></section>
+</div>
+
+<h3>Что из этого следует на практике</h3>
+<ul>
+  <li><b>Стектрейс — распечатка кадров.</b> Каждая строка <code>at Класс.метод(Файл.java:строка)</code> — один кадр, сверху — тот, где произошла ошибка. Номер строки JVM восстанавливает по смещению инструкции через атрибут <code>LineNumberTable</code> (лаба 2.4).</li>
+  <li><b>Локальные переменные потокобезопасны сами по себе</b>: кадр принадлежит одному потоку, и до его слотов не дотянется никто другой. Но если в переменной ссылка, объект лежит в <b>куче</b> — и его могут менять другие потоки. «Локальная переменная» ≠ «локальный объект».</li>
+  <li><b><code>StackOverflowError</code></b> — кадры не поместились в стек потока, чаще всего из-за бесконечной рекурсии. Глубина зависит от <code>-Xss</code> и от размера кадра: больше локальных переменных — меньше глубина, а у скомпилированного JIT метода кадр меньше (лаба 9.1).</li>
+  <li><b>Кадры — корни сборки мусора.</b> Пока ссылка лежит в слоте активного кадра (и ещё понадобится), объект жив (тема 12, лаба 12.1).</li>
+  <li><b>Передача параметров — всегда по значению.</b> В слоты нового кадра копируются значения: для примитивов — само число, для объектов — ссылка. Поэтому метод может изменить объект, но не может переназначить переменную вызывающего.</li>
+  <li><b>После JIT кадры выглядят иначе.</b> Скомпилированный код держит значения в регистрах процессора, а встроенные (inlined) методы вообще не получают своего кадра. Если оптимистичное предположение JIT нарушится, JVM при деоптимизации восстанавливает из этого состояния «интерпретаторские» кадры (темы 16–17).</li>
+  <li><b>Виртуальные потоки</b> не держат фиксированный стек ОС: при блокировке их кадры копируются из стека потока-носителя в кучу (объект <code>StackChunk</code>) и возвращаются при продолжении. Поэтому миллион «спящих» виртуальных потоков не требует миллиона стеков по 1 МБ (тема 18).</li>
+</ul>
+
+<h3>Почему JVM — стековая машина</h3>
+<p>Компактный байткод (у большинства инструкций нет операндов — один байт), независимость от числа регистров конкретного процессора, простая генерация кода компилятором и простая верификация. На скорость это не влияет: горячий код JIT всё равно переводит в регистровый машинный код, и стек операндов в нём фактически исчезает.</p>
+
+<div class="callout info"><span class="c-title">Как увидеть самому</span>
+<ul style="margin:6px 0 0">
+  <li><b>Отладчик IntelliJ IDEA</b>: брейкпоинт → окно Debug, панель <b>Frames</b> — стек кадров потока, панель <b>Variables</b> — слоты выбранного кадра. Щёлкая по кадрам, вы «ходите» по стеку вверх и вниз; «Drop Frame» (Reset Frame) снимает верхний кадр и перезапускает метод.</li>
+  <li><b><code>javap -c -l -p</code></b> — <code>stack=…, locals=…</code> и <code>LocalVariableTable</code> с номерами слотов (лаба 3.2).</li>
+  <li><b><code>StackWalker</code></b> и <b><code>jcmd &lt;pid&gt; Thread.print</code></b> — кадры из самой программы и снаружи (лаба 3.1, темы 1 и 18).</li>
+  <li>Симулятор ниже — то же самое по одной инструкции.</li>
+</ul>
+</div>
 
 <h2 id="sim"><span class="h-num">3.2</span>Симулятор интерпретатора</h2>
 <div class="widget" id="vmW">
@@ -178,11 +291,88 @@
 java -Xint -jar app.jar        # только интерпретатор: почувствуйте разницу в скорости</code></pre>
 
 
+
+
 <!-- hands-on:start -->
 <h2 id="hands-on"><span class="h-num">3.6</span>Практикум: пишем и запускаем</h2>
-<div class="lab-intro"><p>Симулятор выше выполнял заранее подготовленный байткод. Теперь получите его сами из своего кода и научитесь читать <code>javap -c</code> так же свободно, как исходник. Модуль IDEA — <code>ch03</code>; в IDEA байткод открытого класса показывает View → Show Bytecode.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab-intro"><p>Сначала посмотрим на кадры работающей программы, затем — на их содержимое в байткоде. Симулятор выше выполнял заранее подготовленный байткод. Теперь получите его сами из своего кода и научитесь читать <code>javap -c</code> так же свободно, как исходник. Модуль IDEA — <code>ch03</code>; в IDEA байткод открытого класса показывает View → Show Bytecode.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
 <div class="lab" data-lab="jvm-3.1">
-<div class="lab-head"><span class="lab-num">Лаба 3.1</span><b>Цикл, слоты и стек операндов из своего кода</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-head"><span class="lab-num">Лаба 3.1</span><b>Кадры своими глазами: StackWalker и отладчик</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что каждый вызов — отдельный кадр со своими слотами, а у каждого потока — свой стек кадров.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Frames.java</code>:</div>
+<pre data-title="Frames.java"><code class="java">public class Frames {
+    static void show(String where) {
+        System.out.println("— " + where + ":");
+        StackWalker.getInstance().forEach(f -&gt; System.out.printf("    %s.%s  строка %d, bci %d%n",
+                f.getClassName(), f.getMethodName(), f.getLineNumber(), f.getByteCodeIndex()));
+    }
+
+    static int fact(int n) {
+        if (n == 1) {
+            show("fact(1) — дно рекурсии");
+            return 1;
+        }
+        return n * fact(n - 1);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        show("main");
+        System.out.println("fact(4) = " + fact(4));
+        Thread worker = new Thread(() -&gt; show("поток worker"), "worker");
+        worker.start();
+        worker.join();
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько кадров напечатает <code>show</code>, вызванный из <code>fact(1)</code>, и чем будет отличаться стек потока <code>worker</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Frames.java
+java Frames</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">— main:
+    Frames.show  строка 4, bci 20
+    Frames.main  строка 17, bci 2
+— fact(1) — дно рекурсии:
+    Frames.show  строка 4, bci 20
+    Frames.fact  строка 10, bci 7
+    Frames.fact  строка 13, bci 16
+    Frames.fact  строка 13, bci 16
+    Frames.fact  строка 13, bci 16
+    Frames.main  строка 18, bci 9
+fact(4) = 24
+— поток worker:
+    Frames.show  строка 4, bci 20
+    Frames.lambda$main$0  строка 19, bci 2
+    java.lang.Thread.run  строка 1474, bci 19</code></pre></details>
+<div class="lab-ans" hidden><p>Шесть: <code>show</code>, четыре кадра <code>fact</code> (для n = 1, 2, 3, 4 — у каждого свой слот <code>n</code> и своё место возврата, bci) и <code>main</code>. У потока worker стек начинается не с <code>main</code>, а с методов <code>Thread.run…</code> и лямбды — это <b>другой стек</b>: кадров main в нём нет. <code>bci</code> — смещение инструкции в байткоде, на которой «стоит» кадр: у вызывающих кадров это сама инструкция вызова (<code>invokestatic fact</code> на смещении 16 — проверьте по javap). После возврата выполнение продолжится со следующей инструкции, а номер строки JVM вычисляет из bci через LineNumberTable.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Теперь посмотрите на те же кадры в отладчике и убедитесь, что у каждого вызова свои локальные переменные:</div>
+<p class="lab-ide"><span>IDEA</span>Поставьте брейкпоинт на строке <code>show("fact(1) — дно рекурсии");</code> и запустите Debug (Shift+F9). В окне Debug слева панель <b>Frames</b> — четыре строки <code>fact</code> и <code>main</code>; щёлкайте по ним: в панели <b>Variables</b> значение <code>n</code> будет 1, 2, 3, 4 — это слоты разных кадров. В выпадающем списке потоков над Frames видны все потоки процесса.</p>
+<p class="lab-note">Попробуйте в отладчике «Reset Frame» (стрелка назад на панели Frames, раньше «Drop Frame»): верхний кадр снимается, и метод выполняется заново — наглядная демонстрация того, что вызов метода — это просто кадр на стеке.</p>
+</li>
+<li class="lab-step"><div class="lab-text">Сравните размеры кадров, которые javac записал в class-файл:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -v -p Frames.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  public Frames();
+      stack=1, locals=1, args_size=1
+  static void show(java.lang.String);
+      stack=2, locals=1, args_size=1
+  static int fact(int);
+      stack=3, locals=1, args_size=1
+  public static void main(java.lang.String[]) throws java.lang.InterruptedException;
+      stack=4, locals=2, args_size=1
+  private static void lambda$main$0();
+      stack=1, locals=0, args_size=0
+  private static void lambda$show$0(java.lang.StackWalker$StackFrame);
+      stack=6, locals=1, args_size=1
+  public static #141= #75 of #24;         // StackFrame=class java/lang/StackWalker$StackFrame of class java/lang/StackWalker
+  public static final #146= #142 of #144; // Lookup=class java/lang/invoke/MethodHandles$Lookup of class java/lang/invoke/MethodHandles</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте рекурсию бесконечной (уберите условие n == 1) и поймайте <code>StackOverflowError</code>: сколько строк <code>at Frames.fact</code> в стектрейсе?</summary><div>Ровно 1024 — по умолчанию JVM сохраняет в исключении не больше 1024 кадров (<code>-XX:MaxJavaStackTraceDepth</code>), хотя реальная глубина — десятки тысяч.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="jvm-3.2">
+<div class="lab-head"><span class="lab-num">Лаба 3.2</span><b>Цикл, слоты и стек операндов из своего кода</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
 <div class="lab-goal"><p>Скомпилировать методы из симулятора, прочитать их байткод и сопоставить каждую инструкцию со строкой Java.</p></div>
 <ol class="lab-steps">
 <li class="lab-step"><div class="lab-text">Создайте файл <code>Loops.java</code>:</div>
@@ -311,8 +501,8 @@ javap -c -l -p Loops.class</code></pre>
 <li><details><summary>Чем <code>s += i</code> отличается в байткоде от <code>i++</code>?</summary><div><code>i++</code> — одна инструкция <code>iinc 2, 1</code>, работающая прямо в слоте. <code>s += i</code> — четыре: <code>iload_1, iload_2, iadd, istore_1</code>. <code>iinc</code> есть только для int и константы от −32768 до 32767.</div></details></li>
 </ul></div>
 </div>
-<div class="lab" data-lab="jvm-3.2">
-<div class="lab-head"><span class="lab-num">Лаба 3.2</span><b>Классика собеседований в байткоде: x = x++</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab" data-lab="jvm-3.3">
+<div class="lab-head"><span class="lab-num">Лаба 3.3</span><b>Классика собеседований в байткоде: x = x++</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
 <div class="lab-goal"><p>Не запоминать ответ, а увидеть, почему он такой.</p></div>
 <ol class="lab-steps">
 <li class="lab-step"><div class="lab-text">Создайте файл <code>Incr.java</code>:</div>
@@ -376,8 +566,8 @@ public class Incr {
 <li><details><summary>Найдите в выводе javap две инструкции, между которыми «теряется» инкремент в <code>x = x++</code>.</summary><div><code>iload_1</code> (на стек кладётся 5) → <code>iinc 1, 1</code> (слот = 6) → <code>istore_1</code> (в слот записывается 5 со стека). Увеличение произошло, но было перезаписано.</div></details></li>
 </ul></div>
 </div>
-<div class="lab" data-lab="jvm-3.3">
-<div class="lab-head"><span class="lab-num">Лаба 3.3</span><b>Что javac делает со switch, try/finally и autoboxing</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab" data-lab="jvm-3.4">
+<div class="lab-head"><span class="lab-num">Лаба 3.4</span><b>Что javac делает со switch, try/finally и autoboxing</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
 <div class="lab-goal"><p>Проверить на своём коде каждое преобразование из таблицы «Java → байткод».</p></div>
 <ol class="lab-steps">
 <li class="lab-step"><div class="lab-text">Создайте файл <code>Sugar.java</code>:</div>
@@ -461,8 +651,8 @@ javap -c Sugar.class</code></pre>
 <li><details><summary>Вызовите <code>byString(null)</code>. Что будет и почему видно из байткода?</summary><div><code>NullPointerException</code>: первым делом вызывается <code>m.hashCode()</code>. С Java 21 можно написать <code>case null -&gt;</code> — тогда javac сгенерирует отдельную проверку на null до вызова hashCode.</div></details></li>
 </ul></div>
 </div>
-<div class="lab" data-lab="jvm-3.4">
-<div class="lab-head"><span class="lab-num">Лаба 3.4</span><b>Интерпретатор против JIT: почувствуйте разницу</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab" data-lab="jvm-3.5">
+<div class="lab-head"><span class="lab-num">Лаба 3.5</span><b>Интерпретатор против JIT: почувствуйте разницу</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
 <div class="lab-goal"><p>Увидеть цену интерпретации тех же самых инструкций.</p></div>
 <ol class="lab-steps">
 <li class="lab-step"><div class="lab-text">Создайте файл <code>Speed.java</code>:</div>
@@ -483,20 +673,20 @@ javap -c Sugar.class</code></pre>
 }</code></pre>
 <pre class="cmd" data-title="терминал"><code class="txt">javac Speed.java
 java Speed</code></pre>
-<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 1:   42 мс (r=149999998)
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 1:   41 мс (r=149999998)
 раунд 2:   44 мс (r=149999998)
-раунд 3:   33 мс (r=149999998)
-раунд 4:   31 мс (r=149999998)
-раунд 5:   32 мс (r=149999998)</code></pre></details>
+раунд 3:   31 мс (r=149999998)
+раунд 4:   32 мс (r=149999998)
+раунд 5:   33 мс (r=149999998)</code></pre></details>
 </li>
 <li class="lab-step predict"><div class="lab-text">Насколько медленнее будет только интерпретатор (<code>-Xint</code>)?</div>
 <p class="lab-ide"><span>IDEA</span>VM options: <code>-Xint</code></p>
 <pre class="cmd" data-title="терминал"><code class="txt">java -Xint Speed</code></pre>
 <details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 1:  227 мс (r=149999998)
-раунд 2:  225 мс (r=149999998)
-раунд 3:  225 мс (r=149999998)
-раунд 4:  226 мс (r=149999998)
-раунд 5:  229 мс (r=149999998)</code></pre></details>
+раунд 2:  233 мс (r=149999998)
+раунд 3:  226 мс (r=149999998)
+раунд 4:  225 мс (r=149999998)
+раунд 5:  230 мс (r=149999998)</code></pre></details>
 <div class="lab-ans" hidden><p>В разы: здесь примерно в 7 раз, на коде с вызовами методов и объектами разница доходит до 20–50 раз. Шаблонный интерпретатор выполняет каждую инструкцию <code>iload/irem/iadd/iinc/if_icmpgt</code> по отдельности с переходом через таблицу диспетчеризации, а C2 превращает цикл в несколько машинных инструкций в регистрах. Заметьте ещё, что в режиме по умолчанию время раундов «гуляет» — метод перекомпилируется по ходу работы (тема 16).</p></div>
 </li>
 </ol>
@@ -508,6 +698,8 @@ java Speed</code></pre>
 
 <h2 id="quiz"><span class="h-num">3.7</span>Самопроверка</h2>
 <div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Где хранится кадр метода в HotSpot?</p><ul><li>В куче, рядом с объектом <code>this</code></li><li>В стеке того потока, который вызвал метод</li><li>В metaspace вместе с байткодом метода</li><li>В code cache</li></ul><div class="why">У каждого потока свой стек (размер <code>-Xss</code>); вызов кладёт кадр на его вершину, return снимает. Объекты, на которые ссылаются слоты, — в куче.</div></div>
+<div class="mcq" data-ok="3"><p>Метод <code>static int f(int x) { return x + 1; }</code> рекурсивно вызывает сам себя из 3 потоков, в каждом на глубину 10. Сколько одновременно существует кадров <code>f</code> и сколько копий слота <code>x</code>?</p><ul><li>1 кадр, 1 слот — метод один</li><li>3 кадра — по одному на поток</li><li>10 кадров, общий слот x</li><li>30 кадров и 30 независимых слотов x</li></ul><div class="why">Кадр создаётся на каждый вызов: 3 потока × 10 уровней. Поэтому рекурсия и многопоточность не мешают локальным переменным друг друга.</div></div>
 <div class="mcq" data-ok="2"><p>Что лежит в слоте 0 локальных переменных экземплярного метода?</p><ul><li>Первый аргумент</li><li>Возвращаемое значение</li><li><code>this</code></li><li>Адрес возврата</li></ul><div class="why">У статических методов слот 0 — первый аргумент.</div></div>
 <div class="mcq" data-ok="0"><p>Почему после <code>new</code> почти всегда идёт <code>dup</code>?</p><ul><li>Одна ссылка уходит в вызов конструктора, вторая остаётся для дальнейшего использования</li><li>Чтобы удвоить память</li><li>Для синхронизации</li><li>Это ошибка javac</li></ul><div class="why">invokespecial &lt;init&gt; потребляет ссылку со стека.</div></div>
 <div class="mcq" data-ok="3"><p>Чему равен x после <code>int x = 5; x = x++;</code>?</p><ul><li>6</li><li>Ошибка компиляции</li><li>Не определено</li><li>5</li></ul><div class="why">iload (5) → iinc (слот 6) → istore (5).</div></div>

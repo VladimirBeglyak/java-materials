@@ -1,9 +1,57 @@
 @chapter 03 | quiz
 @intro
-<p>Симулятор выше выполнял заранее подготовленный байткод. Теперь получите его сами из своего кода и научитесь читать <code>javap -c</code> так же свободно, как исходник. Модуль IDEA — <code>ch03</code>; в IDEA байткод открытого класса показывает View → Show Bytecode.</p>
+<p>Сначала посмотрим на кадры работающей программы, затем — на их содержимое в байткоде. Симулятор выше выполнял заранее подготовленный байткод. Теперь получите его сами из своего кода и научитесь читать <code>javap -c</code> так же свободно, как исходник. Модуль IDEA — <code>ch03</code>; в IDEA байткод открытого класса показывает View → Show Bytecode.</p>
 @end
 
-@lab 3.1 | Цикл, слоты и стек операндов из своего кода | 20 мин
+@lab 3.1 | Кадры своими глазами: StackWalker и отладчик | 20 мин
+@goal
+<p>Увидеть, что каждый вызов — отдельный кадр со своими слотами, а у каждого потока — свой стек кадров.</p>
+@end
+@file Frames.java
+public class Frames {
+    static void show(String where) {
+        System.out.println("— " + where + ":");
+        StackWalker.getInstance().forEach(f -> System.out.printf("    %s.%s  строка %d, bci %d%n",
+                f.getClassName(), f.getMethodName(), f.getLineNumber(), f.getByteCodeIndex()));
+    }
+
+    static int fact(int n) {
+        if (n == 1) {
+            show("fact(1) — дно рекурсии");
+            return 1;
+        }
+        return n * fact(n - 1);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        show("main");
+        System.out.println("fact(4) = " + fact(4));
+        Thread worker = new Thread(() -> show("поток worker"), "worker");
+        worker.start();
+        worker.join();
+    }
+}
+@end
+@predict Сколько кадров напечатает <code>show</code>, вызванный из <code>fact(1)</code>, и чем будет отличаться стек потока <code>worker</code>?
+@answer
+<p>Шесть: <code>show</code>, четыре кадра <code>fact</code> (для n = 1, 2, 3, 4 — у каждого свой слот <code>n</code> и своё место возврата, bci) и <code>main</code>. У потока worker стек начинается не с <code>main</code>, а с методов <code>Thread.run…</code> и лямбды — это <b>другой стек</b>: кадров main в нём нет. <code>bci</code> — смещение инструкции в байткоде, на которой «стоит» кадр: у вызывающих кадров это сама инструкция вызова (<code>invokestatic fact</code> на смещении 16 — проверьте по javap). После возврата выполнение продолжится со следующей инструкции, а номер строки JVM вычисляет из bci через LineNumberTable.</p>
+@end
+@run
+javac Frames.java
+java Frames
+@end
+@step Теперь посмотрите на те же кадры в отладчике и убедитесь, что у каждого вызова свои локальные переменные:
+@ide Поставьте брейкпоинт на строке <code>show("fact(1) — дно рекурсии");</code> и запустите Debug (Shift+F9). В окне Debug слева панель <b>Frames</b> — четыре строки <code>fact</code> и <code>main</code>; щёлкайте по ним: в панели <b>Variables</b> значение <code>n</code> будет 1, 2, 3, 4 — это слоты разных кадров. В выпадающем списке потоков над Frames видны все потоки процесса.
+@note Попробуйте в отладчике «Reset Frame» (стрелка назад на панели Frames, раньше «Drop Frame»): верхний кадр снимается, и метод выполняется заново — наглядная демонстрация того, что вызов метода — это просто кадр на стеке.
+@step Сравните размеры кадров, которые javac записал в class-файл:
+@run grep="^  (static|public|private)|stack="
+javap -v -p Frames.class
+@end
+@try
+Сделайте рекурсию бесконечной (уберите условие n == 1) и поймайте <code>StackOverflowError</code>: сколько строк <code>at Frames.fact</code> в стектрейсе? ::: Ровно 1024 — по умолчанию JVM сохраняет в исключении не больше 1024 кадров (<code>-XX:MaxJavaStackTraceDepth</code>), хотя реальная глубина — десятки тысяч.
+@end
+
+@lab 3.2 | Цикл, слоты и стек операндов из своего кода | 20 мин
 @goal
 <p>Скомпилировать методы из симулятора, прочитать их байткод и сопоставить каждую инструкцию со строкой Java.</p>
 @end
@@ -52,7 +100,7 @@ javap -c -l -p Loops.class ||| javap -c -l -p Loops.class | sed -n '/int addToFi
 Чем <code>s += i</code> отличается в байткоде от <code>i++</code>? ::: <code>i++</code> — одна инструкция <code>iinc 2, 1</code>, работающая прямо в слоте. <code>s += i</code> — четыре: <code>iload_1, iload_2, iadd, istore_1</code>. <code>iinc</code> есть только для int и константы от −32768 до 32767.
 @end
 
-@lab 3.2 | Классика собеседований в байткоде: x = x++ | 10 мин
+@lab 3.3 | Классика собеседований в байткоде: x = x++ | 10 мин
 @goal
 <p>Не запоминать ответ, а увидеть, почему он такой.</p>
 @end
@@ -82,7 +130,7 @@ javap -c Incr.class
 Найдите в выводе javap две инструкции, между которыми «теряется» инкремент в <code>x = x++</code>. ::: <code>iload_1</code> (на стек кладётся 5) → <code>iinc 1, 1</code> (слот = 6) → <code>istore_1</code> (в слот записывается 5 со стека). Увеличение произошло, но было перезаписано.
 @end
 
-@lab 3.3 | Что javac делает со switch, try/finally и autoboxing | 25 мин
+@lab 3.4 | Что javac делает со switch, try/finally и autoboxing | 25 мин
 @goal
 <p>Проверить на своём коде каждое преобразование из таблицы «Java → байткод».</p>
 @end
@@ -130,7 +178,7 @@ javap -c Sugar.class
 Вызовите <code>byString(null)</code>. Что будет и почему видно из байткода? ::: <code>NullPointerException</code>: первым делом вызывается <code>m.hashCode()</code>. С Java 21 можно написать <code>case null -&gt;</code> — тогда javac сгенерирует отдельную проверку на null до вызова hashCode.
 @end
 
-@lab 3.4 | Интерпретатор против JIT: почувствуйте разницу | 10 мин
+@lab 3.5 | Интерпретатор против JIT: почувствуйте разницу | 10 мин
 @goal
 <p>Увидеть цену интерпретации тех же самых инструкций.</p>
 @end
