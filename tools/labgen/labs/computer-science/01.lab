@@ -227,3 +227,57 @@ java Negative
 Поменяйте <code>% 10</code> на <code>% 16</code>. ::: Получится 0 — ловушка спряталась: −2³¹ делится на 16 нацело. Поэтому такая ошибка годами живёт в коде: она срабатывает только для одного значения хэша из четырёх миллиардов и только при «неудобном» делителе — то есть в продакшене, а не в тестах.
 Сколько будет <code>-Integer.MIN_VALUE</code>? ::: Снова <code>Integer.MIN_VALUE</code>: «переверни и прибавь 1» для <code>1000…0</code> даёт <code>0111…1 + 1 = 1000…0</code>. У самого маленького числа нет положительной пары.
 @end
+
+@lab 1.6 | Плавающая точка на практике | 20 мин
+@goal
+<p>Собрать число из трёх полей float руками, увидеть, где теряется точность, и проверить правила работы с дробями.</p>
+@end
+@file FloatPractice.java
+import java.math.BigDecimal;
+
+public class FloatPractice {
+    public static void main(String[] args) {
+        System.out.println("1) разбираем -6.25f на поля и собираем обратно:");
+        int bits = Float.floatToIntBits(-6.25f);
+        int sign = bits >>> 31, exp = (bits >>> 23) & 0xFF, mant = bits & 0x7FFFFF;
+        System.out.println("   знак=" + sign + " степень=" + exp + " (" + (exp - 127) + ") мантисса=" + Integer.toBinaryString(mant));
+        double value = (sign == 1 ? -1 : 1) * (1 + mant / Math.pow(2, 23)) * Math.pow(2, exp - 127);
+        System.out.println("   (-1)^знак × (1 + мантисса/2^23) × 2^(степень-127) = " + value);
+
+        System.out.println("2) что на самом деле хранится:");
+        System.out.println("   0.1  → " + new BigDecimal(0.1));
+        System.out.println("   0.5  → " + new BigDecimal(0.5) + "   (степень двойки — точно)");
+        System.out.println("   0.1 + 0.2 == 0.3 ? " + (0.1 + 0.2 == 0.3) + ", а с допуском: " + (Math.abs(0.1 + 0.2 - 0.3) < 1e-9));
+
+        System.out.println("3) деньги:");
+        double balance = 0;
+        for (int i = 0; i < 1000; i++) balance += 0.10;                 // тысяча платежей по 10 копеек
+        BigDecimal exact = BigDecimal.ZERO;
+        for (int i = 0; i < 1000; i++) exact = exact.add(new BigDecimal("0.10"));
+        System.out.println("   double: " + balance + ",  BigDecimal: " + exact + ",  long в копейках: " + 1000 * 10 / 100.0);
+
+        System.out.println("4) float-счётчик застревает:");
+        float counter = 16_777_000f;
+        for (int i = 0; i < 1000; i++) counter += 1;
+        System.out.println("   16 777 000 + 1000 раз по 1 = " + (long) counter + "  (должно быть 16 778 000)");
+
+        System.out.println("5) порядок сложения:");
+        double big = 1e16;
+        System.out.println("   (1e16 + 1) + 1 = " + ((big + 1) + 1) + ",  1e16 + (1 + 1) = " + (big + (1 + 1)));
+
+        System.out.println("6) особые значения: " + (1.0 / 0) + ", " + (0.0 / 0) + ", NaN == NaN: " + (Double.NaN == Double.NaN)
+                + ", isNaN: " + Double.isNaN(0.0 / 0) + ", 1/-0.0 = " + (1 / -0.0));
+    }
+}
+@end
+@predict До запуска: на каком числе застрянет float-счётчик? Каким получится баланс в <code>double</code> после тысячи платежей по 0,10? Одинаковы ли два варианта сложения в пункте 5?
+@answer
+<p>Поля −6,25: знак 1, степень 129 (то есть 2²), мантисса <code>1001</code> и нули — формула собирает обратно −6.25. 0,1 хранится как 0,1000000000000000055511…, а 0,5 — ровно. Баланс в <code>double</code> — <code>99.9999999999986</code> вместо 100: тысяча мелких ошибок накопилась. <code>BigDecimal</code> даёт ровно 100.00. Float-счётчик застрянет на <b>16777216</b> (2²⁴): дальше шаг между соседними float равен 2, и <code>+1</code> округляется обратно. В пункте 5: <code>(1e16 + 1) + 1</code> = 1.0E16 — каждая единица по отдельности теряется (шаг double около 10¹⁶ равен 2), а <code>1e16 + 2</code> = 1.0000000000000002E16 — сумма разная от порядка сложения.</p>
+@end
+@run
+javac FloatPractice.java
+java FloatPractice
+@end
+@try
+Замените в пункте 4 <code>float</code> на <code>double</code>. ::: Получится ровно 16 778 000: у double 53 значащих бита, целые точны до 2⁵³ ≈ 9·10¹⁵.
+@end
