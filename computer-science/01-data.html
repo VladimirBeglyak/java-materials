@@ -306,6 +306,25 @@
 </div>
 
 <h2 id="endian"><span class="h-num">1.5</span>Порядок байт: little-endian и big-endian</h2>
+<h3>С нуля: в каком порядке класть байты</h3>
+<p>Память — длинный ряд ячеек по одному байту, у каждой свой номер (адрес). Число <code>int</code> занимает 4 байта — 4 соседние ячейки. Вопрос: какой из четырёх байт положить в первую ячейку?</p>
+<p>Это тот же вопрос, что с датами. Одну и ту же дату пишут двумя способами:</p>
+<pre><code class="txt">2026-10-25   ← сначала самая «старшая» часть (год)    — как big-endian
+25.10.2026   ← сначала самая «младшая» часть (день)   — как little-endian</code></pre>
+<p>Обе записи правильные, просто договорённости разные. С байтами так же:</p>
+<pre data-title="число 0x12345678 в четырёх ячейках"><code class="txt">адрес:            100  101  102  103
+big-endian:        12   34   56   78    ← старший байт первым, как мы пишем числа
+little-endian:     78   56   34   12    ← младший байт первым (так делают x86 и ARM)</code></pre>
+<ul>
+  <li><b>Почему процессоры выбрали «задом наперёд».</b> Little-endian удобен железу: по одному и тому же адресу лежит младшая часть числа, какой бы длины оно ни было (байт, short, int, long читаются с одного адреса), а сложение начинается как раз с младших байт — оттуда идут переносы.</li>
+  <li><b>Когда порядок важен.</b> Внутри одной программы — никогда: процессор читает число так же, как записал. Порядок становится важен, когда байты <b>покидают</b> программу: файл, сеть, другая машина. Читающий должен знать договорённость пишущего.</li>
+  <li><b>Кто как договорился.</b> Сетевые протоколы (TCP/IP) — big-endian, его так и называют «сетевым порядком»: порт 80 в заголовке — байты <code>00 50</code>. Java во всём своём вводе-выводе (<code>DataOutputStream</code>, сериализация, class-файлы, <code>ByteBuffer</code> по умолчанию) — тоже big-endian, на любом процессоре. А форматы, придуманные под x86 (BMP, WAV, ZIP, многие протоколы Windows), — little-endian.</li>
+</ul>
+<div class="callout bad"><span class="c-title">Типичная ошибка</span>
+Читаете заголовок WAV-файла через <code>DataInputStream.readInt()</code> — а частота дискретизации вместо 44100 получается 1 152 122 880. Байты <code>44 AC 00 00</code> лежат little-endian, а <code>DataInputStream</code> читает их big-endian. Решение — <code>ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getInt()</code> (лабораторная 1.7).
+</div>
+<p>И ещё: внутри одного байта никакого «порядка бит» для программиста нет — байт адресуется только целиком. Проблема возникает только с числами длиннее байта.</p>
+<h3>Строго</h3>
 <p>32-битное число <code>0x0A0B0C0D</code> занимает 4 байта памяти. В каком порядке их класть?</p>
 <figure class="diagram">
 <svg viewBox="0 0 760 170" role="img" aria-label="Число 0x0A0B0C0D в памяти: little-endian кладёт младший байт по младшему адресу, big-endian — старший">
@@ -331,6 +350,55 @@
 <p>Внутри одной машины порядок незаметен: процессор читает число так же, как записал. Он становится важен, когда байты <b>покидают</b> процесс: файл, сеть, общая память с другой архитектурой. Сетевые протоколы условились о big-endian («сетевой порядок»), поэтому порт 80 в заголовке TCP — это байты <code>00 50</code>. Java при этом скрывает процессорный порядок: <code>DataOutputStream</code>, сериализация и class-файлы — всегда big-endian (магическое число <code>CA FE BA BE</code> лежит в файле именно так), а <code>ByteBuffer</code> по умолчанию big-endian и переключается вызовом <code>order(ByteOrder.LITTLE_ENDIAN)</code>.</p>
 
 <h2 id="text"><span class="h-num">1.6</span>Текст: от ASCII до UTF-8</h2>
+<h3>С нуля: текст — это тоже числа</h3>
+<p>Компьютер не хранит буквы — только числа. Значит, нужна <b>таблица</b>: какой букве какое число. И, как с порядком байт, таблиц исторически было много.</p>
+<h4>Шаг 1. ASCII: 128 символов</h4>
+<p>В 1960-х договорились: <code>A</code> = 65, <code>B</code> = 66, <code>a</code> = 97, <code>0</code> = 48, пробел = 32, перевод строки = 10. Всего 128 кодов — английский алфавит, цифры, знаки. Помещается в 7 бит, то есть в один байт с запасом.</p>
+<h4>Шаг 2. Кодовые страницы — и хаос</h4>
+<p>Байт вмещает 256 значений, ASCII занял половину. Вторую половину каждая страна заняла по-своему. Байт <code>0xC0</code> в кодировке Windows-1251 — «А», в DOS-кодировке 866 — «└», в западноевропейской — «À». Файл без пометки, в какой он кодировке, превращается в лотерею. Отсюда «кракозябры».</p>
+<h4>Шаг 3. Юникод: один номер для каждого символа в мире</h4>
+<p><b>Юникод</b> — одна огромная таблица на все письменности: каждому символу — свой номер, <b>кодовая точка</b>. Пишут их как <code>U+</code> и шестнадцатеричный номер:</p>
+<pre><code class="txt">A  = U+0041 (65)       Я = U+042F (1071)       € = U+20AC (8364)       😀 = U+1F600 (128512)</code></pre>
+<p>Но номер — ещё не байты. Номеров больше миллиона, и вопрос «как записать номер в байты» решается отдельно. Это и есть <b>кодировка</b>: UTF-8, UTF-16, UTF-32 — три способа записать <i>одни и те же</i> номера Юникода.</p>
+<h4>Шаг 4. UTF-8: короткие номера — короче</h4>
+<p>Самый простой способ — каждый номер в 4 байта (UTF-32). Но тогда английский текст распухает вчетверо. UTF-8 делает умнее: <b>маленький номер — мало байт, большой — больше</b>, от 1 до 4. А чтобы читающий понимал, где кончается один символ и начинается следующий, <b>первый байт символа сообщает его длину</b>:</p>
+<pre data-title="шаблоны UTF-8: x — биты номера символа"><code class="txt">0xxxxxxx                              1 байт:  номера 0…127     — это просто ASCII
+110xxxxx 10xxxxxx                     2 байта: до 2047           — кириллица, греческий, иврит
+1110xxxx 10xxxxxx 10xxxxxx            3 байта: до 65535          — €, китайский, японский
+11110xxx 10xxxxxx 10xxxxxx 10xxxxxx   4 байта: остальное         — эмодзи
+
+Первый байт: сколько единиц в начале — столько байт в символе. Каждый следующий байт начинается с 10.</code></pre>
+<p><b>Кодируем «Я» руками.</b> Номер U+042F = 1071 = <code>100 0010 1111</code> в двоичной — 11 бит. В шаблон на 1 байт (7 бит) не влезает, в шаблон на 2 байта (5 + 6 = 11 бит) — как раз:</p>
+<pre><code class="txt">номер:     10000  101111          ← разрезали 11 бит на 5 и 6
+шаблон:    110xxxxx 10xxxxxx
+результат: 11010000 10101111  =  D0 AF   ← так «Я» лежит в UTF-8-файле</code></pre>
+<p>Поэтому любая русская буква в UTF-8 — 2 байта, и «Привет» — это 6 символов, но 12 байт.</p>
+<h4>Почему победил именно UTF-8</h4>
+<ul>
+  <li>английский текст и весь код — <b>байт в байт тот же ASCII</b>: старые программы его понимают;</li>
+  <li><b>нет проблемы порядка байт</b>: UTF-8 — поток отдельных байт, а не многобайтовых чисел;</li>
+  <li>по любому байту видно, начало это символа или середина (<code>10xxxxxx</code> — середина), поэтому испорченный кусок не ломает весь текст дальше;</li>
+  <li>сегодня это кодировка ~98% веб-страниц, исходников, JSON, YAML и кодировка по умолчанию в Java с версии 18.</li>
+</ul>
+<h4>Как это связано с Java</h4>
+<p>Внутри Java <code>String</code> хранит не UTF-8, а UTF-16: <code>char</code> — 2 байта, эмодзи — два <code>char</code> (поэтому <code>"😀".length() == 2</code>). Кодировка нужна <b>на границе</b>, когда текст становится байтами и обратно:</p>
+<pre><code class="java">byte[] bytes = text.getBytes(StandardCharsets.UTF_8);            // текст → байты
+String text  = new String(bytes, StandardCharsets.UTF_8);        // байты → текст
+Files.readString(path, StandardCharsets.UTF_8);                  // файл
+new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8);  // сеть</code></pre>
+<h4>Откуда кракозябры</h4>
+<p>Всегда одна и та же причина: <b>байты записали в одной кодировке, а прочитали в другой</b>.</p>
+<pre><code class="txt">«Привет» в UTF-8:               D0 9F D1 80 D0 B8 D0 B2 D0 B5 D1 82
+прочитали как Windows-1251:     Р  џ  С  Ђ  Р  ё  Р  І  Р  µ  С  ‚   → «РџСЂРёРІРµС‚»</code></pre>
+<p>Каждая русская буква — два байта, и каждый байт стал отдельной буквой. Первые байты <code>D0</code>/<code>D1</code> в Windows-1251 — это «Р» и «С», отсюда узнаваемое «РџСЂ…». Обратная ошибка (байты Windows-1251 прочитаны как UTF-8) даёт знаки <code>�</code>, и исходный текст уже не восстановить.</p>
+<h4>Правила</h4>
+<ol class="steps">
+  <li>Всегда указывайте кодировку явно там, где байты становятся текстом: файлы, сеть, БД, заголовок <code>Content-Type: …; charset=UTF-8</code>.</li>
+  <li>Длина в символах ≠ длина в байтах: поле «не больше 100 байт» и «не больше 100 символов» — разные проверки.</li>
+  <li>Не режьте массив байт UTF-8 посередине: из половинки «Я» получится <code>�</code> (лабораторная 1.7).</li>
+  <li>Исправлять кракозябры нужно чтением с правильной кодировкой, а не «перекодированием» уже испорченной строки.</li>
+</ol>
+<h3>Строго</h3>
 <p>Текст — это последовательность <b>символов</b>, а символ компьютеру не нужен — нужен его номер. Кодировка — это две таблицы: «символ ↔ номер» (набор символов) и «номер ↔ байты» (схема кодирования).</p>
 <ul>
   <li><b>ASCII</b> (1963): 128 символов, 7 бит. <code>'A'</code> = 65 = 0x41, <code>'a'</code> = 97 = 0x61 (разница ровно в один бит 0x20 — так устроены «регистр» и быстрое сравнение без учёта регистра), <code>'0'</code> = 48. Коды 0–31 — управляющие: <code>\n</code> = 10, <code>\r</code> = 13, <code>\t</code> = 9.</li>
@@ -399,6 +467,7 @@
 <tr><td>адрес в памяти</td><td>беззнаковое 64-битное число (используются 48 или 57 младших бит)</td><td>тема 08</td></tr>
 </table></div>
 <p>Одни и те же 4 байта <code>41 42 43 44</code> — это строка «ABCD», целое 1 094 861 636 при чтении big-endian и 1 145 258 561 при little-endian, а как <code>float</code> — 12,141422 (big-endian) или 781,0352 (little-endian). <b>Тип — это не свойство байтов, а договорённость о том, как их читать.</b> Языки с типизацией (Java) следят за этой договорённостью за вас; уязвимости вроде переполнения буфера в C — это случаи, когда программа прочла байты не по той договорённости.</p>
+
 
 
 
@@ -763,6 +832,89 @@ java FloatPractice</code></pre>
 </ol>
 <div class="lab-try"><b>Поэкспериментируйте</b><ul>
 <li><details><summary>Замените в пункте 4 <code>float</code> на <code>double</code>.</summary><div>Получится ровно 16 778 000: у double 53 значащих бита, целые точны до 2⁵³ ≈ 9·10¹⁵.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-1.7">
+<div class="lab-head"><span class="lab-num">Лаба 1.7</span><b>Порядок байт и UTF-8 руками</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Прочитать «чужой» little-endian формат, закодировать букву в UTF-8 вручную по шаблону и воспроизвести три типичные поломки текста.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>BytesAndText.java</code>:</div>
+<pre data-title="BytesAndText.java"><code class="java">import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.HexFormat;
+
+public class BytesAndText {
+    public static void main(String[] args) throws Exception {
+        HexFormat hex = HexFormat.ofDelimiter(" ");
+
+        System.out.println("1) частота 44100 Гц из заголовка WAV (little-endian):");
+        byte[] header = {0x44, (byte) 0xAC, 0x00, 0x00};           // так 44100 лежит в WAV-файле
+        int wrong = new DataInputStream(new ByteArrayInputStream(header)).readInt();
+        int right = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        System.out.println("   байты " + hex.formatHex(header) + ": DataInputStream → " + wrong + ", ByteBuffer LITTLE_ENDIAN → " + right);
+
+        System.out.println("2) «Я» в UTF-8 руками:");
+        int cp = 'Я';                                                 // кодовая точка U+042F
+        int first = 0b110_00000 | (cp &gt;&gt; 6);                          // старшие 5 бит в шаблон 110xxxxx
+        int second = 0b10_000000 | (cp &amp; 0b111111);                   // младшие 6 бит в шаблон 10xxxxxx
+        System.out.printf("   U+%04X = %s → руками: %02X %02X, Java: %s%n", cp, Integer.toBinaryString(cp),
+                first, second, hex.formatHex("Я".getBytes(StandardCharsets.UTF_8)));
+
+        System.out.println("3) сколько байт занимают символы:");
+        for (String s : new String[] {"A", "Я", "€", "😀"})
+            System.out.printf("   %s  U+%04X  UTF-8: %-12s UTF-16: %s%n", s, s.codePointAt(0),
+                    hex.formatHex(s.getBytes(StandardCharsets.UTF_8)), hex.formatHex(s.getBytes(StandardCharsets.UTF_16BE)));
+        System.out.println("   \"Привет\".length() = " + "Привет".length() + ", байт UTF-8 = " + "Привет".getBytes(StandardCharsets.UTF_8).length);
+
+        System.out.println("4) поломка 1 — записали UTF-8, прочитали Windows-1251:");
+        byte[] utf8 = "Привет".getBytes(StandardCharsets.UTF_8);
+        System.out.println("   " + new String(utf8, Charset.forName("windows-1251")));
+
+        System.out.println("5) поломка 2 — разрезали байты посередине буквы:");
+        byte[] cut = Arrays.copyOf(utf8, 5);                          // 2 буквы и половинка третьей
+        System.out.println("   первые 5 байт → \"" + new String(cut, StandardCharsets.UTF_8) + "\"");
+
+        System.out.println("6) поломка 3 — Windows-1251 прочитали как UTF-8:");
+        byte[] cp1251 = "Привет".getBytes(Charset.forName("windows-1251"));
+        System.out.println("   " + hex.formatHex(cp1251) + " → \"" + new String(cp1251, StandardCharsets.UTF_8) + "\"");
+
+        System.out.println("7) UTF-16 зависит от порядка байт, UTF-8 — нет:");
+        System.out.println("   \"A\" в UTF-16 (с меткой порядка BOM): " + hex.formatHex("A".getBytes(StandardCharsets.UTF_16))
+                + ", UTF-16LE: " + hex.formatHex("A".getBytes(StandardCharsets.UTF_16LE)) + ", UTF-8: " + hex.formatHex("A".getBytes(StandardCharsets.UTF_8)));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">До запуска: что вернёт <code>readInt()</code> от байт <code>44 AC 00 00</code>? Какие байты получатся у «Я» вручную? Что будет после разрезания на 5 байт?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac BytesAndText.java
+java BytesAndText</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1) частота 44100 Гц из заголовка WAV (little-endian):
+   байты 44 ac 00 00: DataInputStream → 1152122880, ByteBuffer LITTLE_ENDIAN → 44100
+2) «Я» в UTF-8 руками:
+   U+042F = 10000101111 → руками: D0 AF, Java: d0 af
+3) сколько байт занимают символы:
+   A  U+0041  UTF-8: 41           UTF-16: 00 41
+   Я  U+042F  UTF-8: d0 af        UTF-16: 04 2f
+   €  U+20AC  UTF-8: e2 82 ac     UTF-16: 20 ac
+   😀  U+1F600  UTF-8: f0 9f 98 80  UTF-16: d8 3d de 00
+   "Привет".length() = 6, байт UTF-8 = 12
+4) поломка 1 — записали UTF-8, прочитали Windows-1251:
+   РџСЂРёРІРµС‚
+5) поломка 2 — разрезали байты посередине буквы:
+   первые 5 байт → "Пр�"
+6) поломка 3 — Windows-1251 прочитали как UTF-8:
+   cf f0 e8 e2 e5 f2 → "������"
+7) UTF-16 зависит от порядка байт, UTF-8 — нет:
+   "A" в UTF-16 (с меткой порядка BOM): fe ff 00 41, UTF-16LE: 41 00, UTF-8: 41</code></pre></details>
+<div class="lab-ans" hidden><p><code>DataInputStream</code> читает big-endian и получает 1152122880, а little-endian чтение — правильные 44100. «Я» = U+042F = <code>10000101111</code>: старшие 5 бит в <code>110xxxxx</code> дают <code>D0</code>, младшие 6 бит в <code>10xxxxxx</code> — <code>AF</code>; ровно то же возвращает <code>getBytes</code>. Длины: A — 1 байт, Я — 2, € — 3, 😀 — 4 (в UTF-16 — 2, 2, 2 и 4: эмодзи — суррогатная пара). «Привет» — 6 <code>char</code> и 12 байт. Поломка 1 — «РџСЂРёРІРµС‚». Поломка 2 — «Пр�»: половинка буквы «и» заменилась знаком <code>�</code>. Поломка 3 — шесть знаков <code>�</code>: байты Windows-1251 не складываются в корректные последовательности UTF-8, и текст потерян. В UTF-16 «A» — это <code>fe ff 00 41</code> (метка порядка + big-endian) или <code>41 00</code> в LE, а в UTF-8 — просто <code>41</code>, без всякого порядка.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Закодируйте руками «€» (U+20AC) по трёхбайтовому шаблону <code>1110xxxx 10xxxxxx 10xxxxxx</code>.</summary><div><code>0x20AC</code> = <code>0010 000010 101100</code> (4 + 6 + 6 бит) → <code>1110 0010</code>, <code>10 000010</code>, <code>10 101100</code> = <code>E2 82 AC</code> — сверьте со строкой «€» в выводе.</div></details></li>
 </ul></div>
 </div>
 <!-- hands-on:end -->

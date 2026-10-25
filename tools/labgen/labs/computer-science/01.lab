@@ -281,3 +281,70 @@ java FloatPractice
 @try
 Замените в пункте 4 <code>float</code> на <code>double</code>. ::: Получится ровно 16 778 000: у double 53 значащих бита, целые точны до 2⁵³ ≈ 9·10¹⁵.
 @end
+
+@lab 1.7 | Порядок байт и UTF-8 руками | 25 мин
+@goal
+<p>Прочитать «чужой» little-endian формат, закодировать букву в UTF-8 вручную по шаблону и воспроизвести три типичные поломки текста.</p>
+@end
+@file BytesAndText.java
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.HexFormat;
+
+public class BytesAndText {
+    public static void main(String[] args) throws Exception {
+        HexFormat hex = HexFormat.ofDelimiter(" ");
+
+        System.out.println("1) частота 44100 Гц из заголовка WAV (little-endian):");
+        byte[] header = {0x44, (byte) 0xAC, 0x00, 0x00};           // так 44100 лежит в WAV-файле
+        int wrong = new DataInputStream(new ByteArrayInputStream(header)).readInt();
+        int right = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        System.out.println("   байты " + hex.formatHex(header) + ": DataInputStream → " + wrong + ", ByteBuffer LITTLE_ENDIAN → " + right);
+
+        System.out.println("2) «Я» в UTF-8 руками:");
+        int cp = 'Я';                                                 // кодовая точка U+042F
+        int first = 0b110_00000 | (cp >> 6);                          // старшие 5 бит в шаблон 110xxxxx
+        int second = 0b10_000000 | (cp & 0b111111);                   // младшие 6 бит в шаблон 10xxxxxx
+        System.out.printf("   U+%04X = %s → руками: %02X %02X, Java: %s%n", cp, Integer.toBinaryString(cp),
+                first, second, hex.formatHex("Я".getBytes(StandardCharsets.UTF_8)));
+
+        System.out.println("3) сколько байт занимают символы:");
+        for (String s : new String[] {"A", "Я", "€", "😀"})
+            System.out.printf("   %s  U+%04X  UTF-8: %-12s UTF-16: %s%n", s, s.codePointAt(0),
+                    hex.formatHex(s.getBytes(StandardCharsets.UTF_8)), hex.formatHex(s.getBytes(StandardCharsets.UTF_16BE)));
+        System.out.println("   \"Привет\".length() = " + "Привет".length() + ", байт UTF-8 = " + "Привет".getBytes(StandardCharsets.UTF_8).length);
+
+        System.out.println("4) поломка 1 — записали UTF-8, прочитали Windows-1251:");
+        byte[] utf8 = "Привет".getBytes(StandardCharsets.UTF_8);
+        System.out.println("   " + new String(utf8, Charset.forName("windows-1251")));
+
+        System.out.println("5) поломка 2 — разрезали байты посередине буквы:");
+        byte[] cut = Arrays.copyOf(utf8, 5);                          // 2 буквы и половинка третьей
+        System.out.println("   первые 5 байт → \"" + new String(cut, StandardCharsets.UTF_8) + "\"");
+
+        System.out.println("6) поломка 3 — Windows-1251 прочитали как UTF-8:");
+        byte[] cp1251 = "Привет".getBytes(Charset.forName("windows-1251"));
+        System.out.println("   " + hex.formatHex(cp1251) + " → \"" + new String(cp1251, StandardCharsets.UTF_8) + "\"");
+
+        System.out.println("7) UTF-16 зависит от порядка байт, UTF-8 — нет:");
+        System.out.println("   \"A\" в UTF-16 (с меткой порядка BOM): " + hex.formatHex("A".getBytes(StandardCharsets.UTF_16))
+                + ", UTF-16LE: " + hex.formatHex("A".getBytes(StandardCharsets.UTF_16LE)) + ", UTF-8: " + hex.formatHex("A".getBytes(StandardCharsets.UTF_8)));
+    }
+}
+@end
+@predict До запуска: что вернёт <code>readInt()</code> от байт <code>44 AC 00 00</code>? Какие байты получатся у «Я» вручную? Что будет после разрезания на 5 байт?
+@answer
+<p><code>DataInputStream</code> читает big-endian и получает 1152122880, а little-endian чтение — правильные 44100. «Я» = U+042F = <code>10000101111</code>: старшие 5 бит в <code>110xxxxx</code> дают <code>D0</code>, младшие 6 бит в <code>10xxxxxx</code> — <code>AF</code>; ровно то же возвращает <code>getBytes</code>. Длины: A — 1 байт, Я — 2, € — 3, 😀 — 4 (в UTF-16 — 2, 2, 2 и 4: эмодзи — суррогатная пара). «Привет» — 6 <code>char</code> и 12 байт. Поломка 1 — «РџСЂРёРІРµС‚». Поломка 2 — «Пр�»: половинка буквы «и» заменилась знаком <code>�</code>. Поломка 3 — шесть знаков <code>�</code>: байты Windows-1251 не складываются в корректные последовательности UTF-8, и текст потерян. В UTF-16 «A» — это <code>fe ff 00 41</code> (метка порядка + big-endian) или <code>41 00</code> в LE, а в UTF-8 — просто <code>41</code>, без всякого порядка.</p>
+@end
+@run
+javac BytesAndText.java
+java BytesAndText
+@end
+@try
+Закодируйте руками «€» (U+20AC) по трёхбайтовому шаблону <code>1110xxxx 10xxxxxx 10xxxxxx</code>. ::: <code>0x20AC</code> = <code>0010 000010 101100</code> (4 + 6 + 6 бит) → <code>1110 0010</code>, <code>10 000010</code>, <code>10 101100</code> = <code>E2 82 AC</code> — сверьте со строкой «€» в выводе.
+@end
