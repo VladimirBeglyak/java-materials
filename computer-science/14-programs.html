@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · От исходника до процесса: компиляция, линковка, загрузка</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · ПРОГРАММЫ И СРЕДА</div>
+  <h1>От исходника до процесса: компиляция, линковка, загрузка</h1>
+  <p class="lead">Исходный текст становится процессом через несколько преобразований: компилятор превращает его в машинный код с «дырами» на месте внешних функций, компоновщик связывает куски и библиотеки в исполняемый файл, загрузчик ядра и динамический загрузчик раскладывают его по адресному пространству и подключают разделяемые библиотеки. Разберём эту цепочку на C, заглянем внутрь ELF — и увидим, что команда <code>java</code> сама проходит её, прежде чем начнётся мир байткода.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">препроцессор, компилятор, ассемблер</span><span class="tag">объектные файлы</span><span class="tag">символы и релокации</span><span class="tag">ELF и PE</span><span class="tag">статические и динамические библиотеки</span><span class="tag">PLT/GOT</span><span class="tag">execve и ld.so</span><span class="tag">AOT, интерпретатор, JIT</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pipeline"><span class="h-num">14.1</span>Цепочка сборки C</h2>
+<div class="table-wrap"><table>
+<tr><th>Шаг</th><th>Команда</th><th>Вход → выход</th><th>Что делает</th></tr>
+<tr><td>препроцессор</td><td><code>gcc -E</code></td><td><code>.c</code> → <code>.i</code></td><td>подставляет <code>#include</code> (текст заголовков), раскрывает <code>#define</code>, условная компиляция <code>#ifdef</code></td></tr>
+<tr><td>компилятор</td><td><code>gcc -S</code></td><td><code>.i</code> → <code>.s</code></td><td>разбор, типы, оптимизация (тема 03), генерация ассемблера под целевую ISA</td></tr>
+<tr><td>ассемблер</td><td><code>as</code> / <code>gcc -c</code></td><td><code>.s</code> → <code>.o</code></td><td>кодирует команды в байты, создаёт <b>объектный файл</b>: секции кода и данных, таблица символов, релокации</td></tr>
+<tr><td>компоновщик</td><td><code>ld</code> / <code>gcc</code></td><td><code>.o</code> + библиотеки → исполняемый файл</td><td>собирает секции, назначает адреса, разрешает символы, исправляет адреса по релокациям</td></tr>
+</table></div>
+<p><b>Объектный файл</b> — машинный код одного файла исходника, который ещё нельзя запустить: вызов <code>printf</code> в нём — команда <code>call</code> с нулевым адресом и запись в таблице <b>релокаций</b>: «по смещению 0x1a вставь адрес символа <code>printf</code>». В <b>таблице символов</b> — что файл определяет (<code>T main</code>) и что ему нужно извне (<code>U printf</code>). Компоновщик сводит эти таблицы: ошибка «undefined reference to <code>foo</code>» — символ нужен, но никто его не определил; «multiple definition» — определён дважды.</p>
+<div class="callout info"><span class="c-title">Сравните с Java</span>
+<code>javac</code> делает только первые два шага, и то частично: class-файл — не машинный код, а байткод, а ссылки на другие классы — не адреса, а <b>символические имена</b> в пуле констант (<a href="../jvm/02-class-file.html">JVM, тема 02</a>). Компоновки как отдельного шага нет: разрешение ссылок — часть загрузки класса в JVM и происходит лениво, при первом использовании (<a href="../jvm/06-linking-init.html">JVM, тема 06</a>). Ошибка «undefined reference» в Java проявляется как <code>NoClassDefFoundError</code> или <code>NoSuchMethodError</code> — во время работы, а не сборки.
+</div>
+
+<h2 id="elf"><span class="h-num">14.2</span>Исполняемый файл: ELF и PE</h2>
+<p>Linux использует формат <b>ELF</b> (Executable and Linkable Format), Windows — <b>PE</b> (<code>.exe</code>, <code>.dll</code>), macOS — <b>Mach-O</b>. Устроены они похоже:</p>
+<ul>
+  <li><b>заголовок</b>: магическое число (<code>7F 45 4C 46</code> — «\x7FELF»; у PE — «MZ»), архитектура, точка входа;</li>
+  <li><b>секции</b> — для компоновщика и отладчика: <code>.text</code> (код), <code>.rodata</code> (константы, строковые литералы), <code>.data</code> (инициализированные глобальные переменные), <code>.bss</code> (нулевые глобальные — в файле не занимают места), <code>.symtab</code>, отладочная информация <code>.debug_*</code>, таблицы раскрутки <code>.eh_frame</code> (тема 04);</li>
+  <li><b>сегменты</b> (program headers) — для загрузчика: «отобрази этот кусок файла по такому адресу с такими правами» — <code>R-X</code> для кода, <code>RW-</code> для данных, <code>INTERP</code> — путь к динамическому загрузчику, <code>DYNAMIC</code> — список нужных библиотек.</li>
+</ul>
+<p>Секции и сегменты — две точки зрения на один файл: компоновщику важна логическая разбивка, загрузчику — что и с какими правами отобразить в память (тема 08). Именно поэтому в <code>/proc/&lt;pid&gt;/maps</code> программа видна тремя-четырьмя областями с разными правами.</p>
+
+<h2 id="libs"><span class="h-num">14.3</span>Библиотеки: статические и динамические</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>Статическая (<code>.a</code>, <code>.lib</code>)</th><th>Динамическая (<code>.so</code>, <code>.dll</code>, <code>.dylib</code>)</th></tr>
+<tr><td>когда подключается</td><td>при компоновке: нужный код копируется в исполняемый файл</td><td>при запуске или по <code>dlopen</code>: загружается динамическим загрузчиком</td></tr>
+<tr><td>размер файла</td><td>больше</td><td>меньше</td></tr>
+<tr><td>память</td><td>своя копия в каждом процессе</td><td>одна копия кода в RAM на все процессы (тема 08)</td></tr>
+<tr><td>обновление</td><td>пересобрать программу</td><td>заменить файл библиотеки — исправление безопасности сразу для всех</td></tr>
+<tr><td>переносимость</td><td>файл самодостаточен (удобно в контейнерах <code>scratch</code>, Go)</td><td>«DLL hell»: нужна совместимая версия библиотеки в системе</td></tr>
+</table></div>
+<p><b>Как работает вызов функции из .so.</b> Адрес библиотеки неизвестен до запуска (ASLR кладёт её в случайное место), а код программы — только для чтения и общий. Поэтому вызов <code>printf</code> идёт через трамплин в <b>PLT</b> (procedure linkage table), а тот прыгает по адресу из таблицы <b>GOT</b> (global offset table) в области данных. Динамический загрузчик заполняет GOT адресами — сразу при запуске или лениво при первом вызове. Код при этом не меняется — только данные.</p>
+<p><b>Кто находит библиотеки.</b> В сегменте <code>INTERP</code> указан динамический загрузчик <code>/lib64/ld-linux-x86-64.so.2</code>. Ядро запускает <i>его</i>, а он читает список <code>NEEDED</code>, ищет библиотеки по <code>RUNPATH</code>, <code>LD_LIBRARY_PATH</code>, кэшу <code>/etc/ld.so.cache</code> и стандартным каталогам, отображает их, выполняет релокации и конструкторы, и только потом передаёт управление программе. Ошибка «error while loading shared libraries: libX.so: cannot open shared object file» — это он.</p>
+
+<h2 id="exec"><span class="h-num">14.4</span>Загрузка: что делает execve</h2>
+<div class="widget stepper">
+  <div class="widget-title">execve("/usr/bin/java", argv, envp)</div>
+  <div class="st-stage"><pre class="out" style="min-height:130px"><span data-from="1" data-to="2">ядро открывает файл, читает первые байты: 7F 45 4C 46 — это ELF
+(для «#!/bin/sh» в начале запустит интерпретатор скрипта)
+проверяет права на исполнение</span><span data-from="2" data-to="3">старое адресное пространство процесса уничтожается
+(PID, открытые файлы без close-on-exec, текущий каталог — сохраняются)
+создаётся новое, пустое</span><span data-from="3" data-to="4">по program headers отображаются сегменты:
+код R-X, данные RW-, .bss — нулевыми страницами
+адрес выбирается случайно, если файл PIE (ASLR)</span><span data-from="4" data-to="5">есть сегмент INTERP → отображается ld-linux-x86-64.so.2
+создаётся стек главного потока: argc, argv, envp, auxv
+(auxv: где заголовки программы, точка входа, размер страницы, адрес vDSO)</span><span data-from="5" data-to="6">RIP = точка входа ld.so: загрузить NEEDED-библиотеки
+(для java: libjli.so, libc.so.6…), релокации, GOT, конструкторы
+затем прыжок на _start программы → __libc_start_main → main</span><span data-from="6">main лаунчера java: разбор аргументов, поиск JRE,
+dlopen("…/lib/server/libjvm.so"), JNI_CreateJavaVM,
+новый поток с большим стеком для Java-метода main (тема 04, JVM тема 01)</span></pre></div>
+  <section class="st-step" data-t="Формат файла"><p>По магическому числу ядро понимает, как запускать файл.</p></section>
+  <section class="st-step" data-t="Новое адресное пространство"><p>exec заменяет программу, но не процесс.</p></section>
+  <section class="st-step" data-t="Сегменты"><p>Файл не читается целиком — отображается, страницы подгрузятся при обращении (тема 08).</p></section>
+  <section class="st-step" data-t="Загрузчик и стек"><p>Ядро готовит стек с аргументами и передаёт управление динамическому загрузчику.</p></section>
+  <section class="st-step" data-t="Динамическая компоновка"><p>Библиотеки и адреса функций — в момент запуска.</p></section>
+  <section class="st-step" data-t="Дальше — JVM"><p>Для java всё это — только начало: лаунчер загружает libjvm.so и запускает виртуальную машину.</p></section>
+</div>
+<p><b>PIE и ASLR</b>: современные исполняемые файлы собираются позиционно-независимыми — их можно загрузить по любому адресу, и ядро выбирает случайный. Атакующему, перезаписавшему адрес возврата (тема 04), неизвестно, куда прыгать. В лабах главы 04 мы отключали это (<code>-no-pie</code>), чтобы адреса не менялись.</p>
+
+<h2 id="runtimes"><span class="h-num">14.5</span>Компиляторы, интерпретаторы, JIT</h2>
+<div class="table-wrap"><table>
+<tr><th>Подход</th><th>Примеры</th><th>Плюсы</th><th>Минусы</th></tr>
+<tr><td><b>AOT в машинный код</b></td><td>C, C++, Rust, Go, GraalVM Native Image</td><td>мгновенный старт, предсказуемость, мало памяти</td><td>код под конкретную ISA и ОС; оптимизация без знания реальной нагрузки</td></tr>
+<tr><td><b>интерпретатор байткода</b></td><td>CPython, ранние JVM</td><td>переносимость, простота</td><td>в 10–100 раз медленнее машинного кода</td></tr>
+<tr><td><b>байткод + JIT</b></td><td>HotSpot JVM, .NET CLR, V8 (JavaScript)</td><td>переносимость и скорость; оптимизация по реальному профилю (встраивание виртуальных вызовов, тема 05)</td><td>прогрев, память под компилятор и code cache, долгий старт</td></tr>
+</table></div>
+<p>JVM совмещает всё: шаблонный интерпретатор (сам — машинный код, сгенерированный при старте, тема 09), два JIT-компилятора (C1 и C2) и возможность AOT — архив AOT cache проекта Leyden или Native Image (<a href="../jvm/16-interpreter-jit.html">JVM, тема 16</a>, <a href="../jvm/20-startup.html">тема 20</a>). JIT-компилятор — это компоновщик и загрузчик в одном: он кладёт машинный код в code cache и сам «исправляет адреса» (патчит вызовы) при деоптимизации и перекомпиляции.</p>
+<p><b>Нативный код из Java</b>: JNI требует написать C-обёртку и собрать <code>.so</code>/<code>.dll</code>; Foreign Function &amp; Memory API (Java 22) находит функцию в загруженной библиотеке по имени (как <code>dlsym</code>) и вызывает её по ABI платформы (тема 04) без единой строки C — лаба 14.4.</p>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">14.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Проходим цепочку сборки руками: препроцессор, ассемблер, объектный файл с неразрешёнными символами, компоновка, ELF изнутри, статическая и динамическая версии одной программы, загрузка библиотек JVM и вызов функции libc из Java без единой строки C. Все лабы — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs14</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-14.1">
+<div class="lab-head"><span class="lab-num">Лаба 14.1</span><b>Объектный файл: символы и релокации</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть промежуточные результаты каждого шага сборки и «дыры» в объектном файле.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>greet.c</code>:</div>
+<pre data-title="greet.c"><code class="txt">#include &lt;stdio.h&gt;
+
+#define TIMES 3
+
+extern int helper(int x);           // определена в другом файле
+static const char *message = "привет";
+
+int main(void) {
+    for (int i = 0; i &lt; TIMES; i++)
+        printf("%s %d\n", message, helper(i));
+    return 0;
+}</code></pre>
+<pre data-title="helper.c"><code class="txt">int helper(int x) { return x * 10; }</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Препроцессор: сколько строк получилось из 11?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -E greet.c | wc -l; gcc -E greet.c | tail -6"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">850
+
+int main(void) {
+    for (int i = 0; i &lt; 3; i++)
+        printf("%s %d\n", message, helper(i));
+    return 0;
+}</code></pre></details>
+</li>
+<li class="lab-step"><div class="lab-text">Компиляция без компоновки и таблица символов:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O1 -c greet.c helper.c &amp;&amp; nm greet.o &amp;&amp; echo --- &amp;&amp; nm helper.o &amp;&amp; echo --- &amp;&amp; readelf -r greet.o | grep -E 'Offset|helper|printf|rodata'"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">                 U helper
+0000000000000000 r .LC0
+000000000000000d r .LC1
+0000000000000000 T main
+                 U __printf_chk
+---
+0000000000000000 T helper
+---
+  Offset          Info           Type           Sym. Value    Sym. Name + Addend
+00000000001e  000600000004 R_X86_64_PLT32    0000000000000000 helper - 4
+000000000035  000700000004 R_X86_64_PLT32    0000000000000000 __printf_chk - 4
+  Offset          Info           Type           Sym. Value    Sym. Name + Addend</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие символы <code>greet.o</code> определяет (T), а какие требует (U)? Что значат строки релокаций?</div>
+<div class="lab-ans" hidden><p>Препроцессор превратил 11 строк в ~800: в начало вставлено содержимое <code>stdio.h</code> и всего, что он включает; в конце — ваш код, где <code>TIMES</code> уже заменено на 3. В <code>greet.o</code>: <code>T main</code> — определена; <code>U helper</code> и <code>U printf</code> — нужны извне (вместо <code>printf</code> компилятор мог подставить <code>U __printf_chk</code> или <code>puts</code> — оптимизация). Символа <code>message</code> нет: оптимизатор подставил вместо указателя саму строку, она лежит под локальной меткой <code>r .LC0</code> (строчная буква — локальный символ, <code>r</code> — секция только для чтения), строка формата — <code>.LC1</code>. <code>helper.o</code> определяет <code>T helper</code>. Релокации <code>R_X86_64_PLT32 helper</code> и <code>printf</code> — «в это место кода вставить адрес функции», Ссылки на <code>.LC0</code>/<code>.LC1</code> компилятор закодировал относительно RIP внутри секции — без внешних символов. Второй заголовок «Offset» — таблица релокаций для <code>.eh_frame</code> (тема 04).</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Без <code>helper.o</code> компоновка не удастся:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc greet.o -o greet
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc greet.o helper.o -o greet &amp;&amp; ./greet"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">/usr/bin/x86_64-linux-gnu-ld.bfd: greet.o: in function `main':
+greet.c:(.text+0x1e): undefined reference to `helper'
+collect2: error: ld returned 1 exit status
+привет 0
+привет 10
+привет 20</code></pre></details>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-14.2">
+<div class="lab-head"><span class="lab-num">Лаба 14.2</span><b>ELF изнутри и статическая компоновка</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть заголовок, сегменты и зависимости исполняемого файла и сравнить динамическую и статическую сборку.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "od -A x -t x1z -N 16 greet &amp;&amp; readelf -h greet | grep -E 'Type|Machine|Entry' &amp;&amp; readelf -lW greet | grep -E 'LOAD|INTERP|interpreter|DYNAMIC' &amp;&amp; readelf -d greet | grep NEEDED"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">000000 7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00  &gt;.ELF............&lt;
+000010
+  Type:                              DYN (Position-Independent Executable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Entry point address:               0x1060
+  INTERP         0x000374 0x0000000000000374 0x0000000000000374 0x00001c 0x00001c R   0x1
+      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]
+  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x000628 0x000628 R   0x1000
+  LOAD           0x001000 0x0000000000001000 0x0000000000001000 0x0001ad 0x0001ad R E 0x1000
+  LOAD           0x002000 0x0000000000002000 0x0000000000002000 0x000178 0x000178 R   0x1000
+  LOAD           0x002db8 0x0000000000003db8 0x0000000000003db8 0x000258 0x000260 RW  0x1000
+  DYNAMIC        0x002dc8 0x0000000000003dc8 0x0000000000003dc8 0x0001f0 0x0001f0 RW  0x8
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какое магическое число в начале файла? Сколько сегментов LOAD и с какими правами? Какие библиотеки нужны программе?</div>
+<div class="lab-ans" hidden><p>Первые байты <code>7f 45 4c 46</code> — «.ELF». Тип <code>DYN</code> (позиционно-независимый исполняемый файл, PIE — его можно загрузить по любому адресу), машина — x86-64, точка входа — адрес <code>_start</code>. Сегментов LOAD четыре: заголовки (<code>R</code>), код (<code>R E</code>), константы (<code>R</code>), данные (<code>RW</code>). <code>INTERP</code> — <code>/lib64/ld-linux-x86-64.so.2</code>. Нужна одна библиотека: <code>libc.so.6</code>.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Та же программа, скомпонованная статически:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -static greet.c helper.c -o greet-static &amp;&amp; ls -l greet greet-static &amp;&amp; file greet greet-static"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">16024 greet
+816976 greet-static
+greet:        ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x
+greet-static: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, BuildID[sha1]=b89e42e2a617dcf</code></pre></details>
+<p class="lab-note">Статическая версия в десятки раз больше (внутри — нужная часть libc) и помечена <code>statically linked</code>: ей не нужен ни <code>ld-linux</code>, ни <code>libc.so.6</code> — она запустится даже в пустом контейнере <code>FROM scratch</code>.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-14.3">
+<div class="lab-head"><span class="lab-num">Лаба 14.3</span><b>Как java загружает свои библиотеки</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что команда <code>java</code> — маленький C-лаунчер, а виртуальная машина подгружается как библиотека.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "ls -l /opt/java/openjdk/bin/java /opt/java/openjdk/lib/server/libjvm.so; readelf -d /opt/java/openjdk/bin/java | grep -E 'NEEDED|RPATH'"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">16264 /opt/java/openjdk/bin/java
+ 0x0000000000000001 (NEEDED)             Shared library: [libjli.so]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+ 0x000000000000000f (RPATH)              Library rpath: [$ORIGIN:$ORIGIN/../lib]
+29875592 /opt/java/openjdk/lib/server/libjvm.so</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Каков размер файла <code>java</code> и <code>libjvm.so</code>? Есть ли <code>libjvm.so</code> в списке NEEDED лаунчера?</div>
+<div class="lab-ans" hidden><p><code>java</code> — около 16 КБ, <code>libjvm.so</code> — около 30 МБ. В NEEDED лаунчера — только <code>libjli.so</code> (Java Launcher Infrastructure) и <code>libc.so.6</code>, а <code>RPATH</code> — <code>$ORIGIN:$ORIGIN/../lib</code>: искать библиотеки относительно каталога самого файла, поэтому JDK работает из любого места без установки. <code>libjvm.so</code> в NEEDED <b>нет</b>: лаунчер сам выбирает вариант VM (server, client) и загружает её во время работы через <code>dlopen</code> — следующий шаг это покажет.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Журнал динамического загрузчика: какие библиотеки и в каком порядке подгружаются:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "LD_DEBUG=libs java -version 2&gt;&amp;1 | grep 'calling init'"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">	calling init: /lib64/ld-linux-x86-64.so.2
+	calling init: /usr/lib/x86_64-linux-gnu/libc.so.6
+	calling init: /usr/lib/x86_64-linux-gnu/libpthread.so.0
+	calling init: /usr/lib/x86_64-linux-gnu/libdl.so.2
+	calling init: /opt/java/openjdk/bin/../lib/libjli.so
+	calling init: /usr/lib/x86_64-linux-gnu/libm.so.6
+	calling init: /usr/lib/x86_64-linux-gnu/librt.so.1
+	calling init: /opt/java/openjdk/lib/server/libjvm.so
+	calling init: /opt/java/openjdk/lib/libjimage.so
+	calling init: /opt/java/openjdk/lib/libjava.so
+	calling init: /opt/java/openjdk/lib/libsimdsort.so</code></pre></details>
+<p class="lab-note"><code>LD_DEBUG=libs</code> заставляет <code>ld-linux</code> рассказывать о своей работе. Порядок строк «calling init» — порядок загрузки: сначала <code>libc</code> и <code>libjli.so</code> (по NEEDED при старте), затем <code>libjvm.so</code> (это уже <code>dlopen</code> из лаунчера), затем <code>libjimage.so</code> (чтение <code>lib/modules</code>), <code>libjava.so</code> (нативные методы <code>java.base</code>) и <code>libsimdsort.so</code> — векторная сортировка AVX для <code>Arrays.sort</code> (тема 05): JVM подгружает её, увидев подходящий процессор. Переменная <code>LD_DEBUG</code> задана внутри <code>sh -c</code> только для <code>java</code>: иначе журнал засорили бы утилиты стартового скрипта образа.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-14.4">
+<div class="lab-head"><span class="lab-num">Лаба 14.4</span><b>Вызов libc из Java через FFM API</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти функцию в загруженной библиотеке по имени и вызвать её по ABI платформы — без JNI и без C-кода.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Ffm.java</code>:</div>
+<pre data-title="Ffm.java"><code class="java">import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
+
+public class Ffm {
+    public static void main(String[] args) throws Throwable {
+        Linker linker = Linker.nativeLinker();                       // знает ABI текущей платформы (тема 04)
+        SymbolLookup libc = linker.defaultLookup();                  // как dlsym по уже загруженным библиотекам
+
+        MethodHandle getpid = linker.downcallHandle(libc.find("getpid").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        MethodHandle strlen = linker.downcallHandle(libc.find("strlen").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+        System.out.println("адрес функции getpid в памяти: " + libc.find("getpid").orElseThrow());
+        System.out.println("getpid() из libc = " + (int) getpid.invokeExact()
+                + ", ProcessHandle.pid() = " + ProcessHandle.current().pid());
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment s = arena.allocateFrom("привет");          // строка C в нативной памяти, UTF-8 + '\0'
+            System.out.println("strlen(\"привет\") = " + (long) strlen.invokeExact(s) + " байт");
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab java --enable-native-access=ALL-UNNAMED Ffm.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">адрес функции getpid в памяти: MemorySegment{ kind: native, address: 0x7490a40da700, byteSize: 0 }
+getpid() из libc = 1, ProcessHandle.pid() = 1
+strlen("привет") = 12 байт</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Совпадут ли PID от libc и от Java? Что вернёт <code>strlen("привет")</code>?</div>
+<div class="lab-ans" hidden><p>PID совпадут — это один и тот же процесс; адрес <code>getpid</code> — где-то в области <code>libc.so.6</code> (тема 08, карта памяти). <code>strlen</code> вернёт 12: C-функция считает байты до нуля, а «привет» в UTF-8 — 12 байт (тема 01). Флаг <code>--enable-native-access</code> разрешает «ограниченные» операции FFM без предупреждения: вызов нативного кода может обрушить JVM, и это явный выбор приложения.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">14.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что значит ошибка компоновщика «undefined reference to <code>foo</code>»?</p><ul><li>синтаксическая ошибка в foo</li><li>foo объявлена дважды</li><li>какой-то объектный файл использует символ foo, но ни один из компонуемых файлов и библиотек его не определяет</li><li>библиотека не найдена при запуске</li></ul><div class="why">Ошибка при запуске — уже от динамического загрузчика: «cannot open shared object file» или «symbol lookup error».</div></div>
+<div class="mcq" data-ok="0"><p>Почему код разделяемой библиотеки можно держать в памяти одной копией на все процессы, хотя адреса у всех разные?</p><ul><li>код позиционно-независимый, а адреса внешних функций и данных лежат в таблице GOT в собственной (записываемой) памяти каждого процесса</li><li>все процессы загружают её по одному адресу</li><li>ядро патчит код при переключении процессов</li><li>это не так, у каждого своя копия</li></ul><div class="why">Меняются только данные (GOT), код остаётся неизменным и общим.</div></div>
+<div class="mcq" data-ok="3"><p>Что ядро делает при <code>execve</code> с уже открытыми дескрипторами процесса?</p><ul><li>закрывает все</li><li>копирует в новый процесс</li><li>передаёт ld.so</li><li>оставляет открытыми, кроме помеченных close-on-exec</li></ul><div class="why">Так перенаправления shell (stdin/stdout) достаются новой программе. Поэтому Java открывает свои файлы с O_CLOEXEC — чтобы они не утекали в запускаемые процессы.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что внутри объектного файла и что делает компоновщик?</summary><div class="a"><p>Объектный файл содержит секции машинного кода и данных одного модуля, таблицу символов (что определено и что требуется) и релокации — места, куда нужно подставить адреса внешних символов. Компоновщик объединяет секции всех модулей, назначает им адреса, находит определение каждого требуемого символа (в объектных файлах и библиотеках) и исправляет адреса по релокациям, создавая исполняемый файл или разделяемую библиотеку.</p></div></details>
+<details class="q"><summary>Как запускается динамически скомпонованная программа?</summary><div class="a"><p>execve: ядро проверяет формат, создаёт новое адресное пространство, отображает сегменты программы и динамического загрузчика из INTERP, строит стек с argv, envp и auxv и передаёт управление ld.so. Загрузчик находит и отображает библиотеки из NEEDED, выполняет релокации, заполняет GOT, вызывает конструкторы и прыгает на точку входа программы, откуда libc вызывает main.</p></div></details>
+<details class="q"><summary>Чем модель Java отличается от C с точки зрения сборки и связывания?</summary><div class="a"><p>javac порождает переносимый байткод с символическими ссылками; отдельного компоновщика нет. Загрузка, проверка и связывание классов происходят во время работы, лениво, по первому обращению; машинный код создаёт JIT по профилю. Это даёт переносимость и динамические возможности (загрузка классов, прокси, агенты), но переносит часть ошибок связывания со сборки на время выполнения и добавляет прогрев.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,146 @@
+@chapter 17 | quiz
+@intro
+<p>Ломаем и защищаем: переполнение буфера в C с канарейкой стека и без неё, атака по времени на сравнение секретов в Java, статус защит процессора от Spectre-подобных атак и источники случайности. Лабы 17.1 и 17.3 — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs17</code>.</p>
+@end
+
+@lab 17.1 | Переполнение буфера и канарейка стека | 20 мин
+@goal
+<p>Перезаписать соседнюю переменную и адрес возврата через <code>strcpy</code> и посмотреть, как срабатывает защита.</p>
+@end
+@file bof.c
+#include <stdio.h>
+#include <string.h>
+
+struct account { char name[8]; int is_admin; };
+
+void login(const char *input) {
+    struct account acc = {"", 0};
+    strcpy(acc.name, input);                         // длина не проверяется!
+    printf("login: name='%s' is_admin=%d\n", acc.name, acc.is_admin);
+}
+
+void smash(const char *input) {
+    char buf[8];
+    strcpy(buf, input);                              // 40 байт в буфер на 8 — портим кадр и адрес возврата
+    printf("smash: buf='%.8s…'\n", buf);
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);                // без буфера: иначе вывод пропадёт при аварии
+    login("bob");
+    login("AAAAAAAA\x01");                           // 8 букв + байт 0x01 залезает в is_admin
+    smash(argv[1]);
+    puts("вернулись из smash");
+    return 0;
+}
+@end
+@step Без защиты стека:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -w -fno-stack-protector -o bof1 bof.c && ./bof1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo код завершения \$?" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c 'gcc -O0 -w -fno-stack-protector -o bof1 bof.c && ./bof1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo код завершения $?'
+@end
+@predict Что напечатает второй <code>login</code>? Что произойдёт после <code>smash</code> — напечатается ли «вернулись из smash»?
+@answer
+<p>Второй вызов: <code>is_admin=1</code> — девятый байт строки лёг в соседнее поле структуры, и «обычный пользователь» стал администратором, хотя код нигде не присваивает <code>is_admin</code>. <code>smash</code> печатает строку, а затем <code>ret</code> берёт из стека «адрес возврата» <code>0x4141414141414141</code> (байты 'A'), процессор прыгает в никуда — <code>Segmentation fault</code>, код 139 = 128 + 11 (SIGSEGV). «вернулись из smash» не печатается. Атакующий на месте 'A' положил бы нужный ему адрес.</p>
+@end
+@step С канарейкой стека:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -w -fstack-protector-all -o bof2 bof.c && ./bof2 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo код завершения \$?" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c 'gcc -O0 -w -fstack-protector-all -o bof2 bof.c && ./bof2 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo код завершения $?'
+@end
+@note Эпилог <code>smash</code> обнаружил испорченную канарейку и вызвал <code>__stack_chk_fail</code>: «*** stack smashing detected ***», процесс завершён SIGABRT (код 134 = 128 + 6) <b>до</b> <code>ret</code> по поддельному адресу. Подмену <code>is_admin</code> внутри структуры канарейка не ловит — она стоит только перед адресом возврата. В Java аналог <code>strcpy</code> за границу — <code>ArrayIndexOutOfBoundsException</code> ещё до записи.
+
+@lab 17.2 | Атака по времени на сравнение | 15 мин
+@goal
+<p>Измерить, зависит ли время сравнения массивов от длины совпавшего префикса.</p>
+@end
+@file Timing.java
+import java.security.MessageDigest;
+import java.util.Arrays;
+
+public class Timing {
+    public static void main(String[] args) {
+        int n = 1 << 20;                                  // большие массивы, чтобы разница была видна
+        byte[] secret = new byte[n];
+        for (int i = 0; i < n; i++) secret[i] = (byte) i;
+        int[] prefixes = {0, n / 4, n / 2, n - 1};
+        long sink = 0;
+        for (int round = 0; round < 3; round++) {
+            StringBuilder line = new StringBuilder("совпадает префикс:");
+            for (int p : prefixes) {
+                byte[] guess = secret.clone();
+                guess[p] ^= 1;                            // первое расхождение — на позиции p
+                long t0 = System.nanoTime();
+                for (int k = 0; k < 200; k++) sink += Arrays.equals(secret, guess) ? 1 : 0;
+                long t1 = System.nanoTime();
+                for (int k = 0; k < 200; k++) sink += MessageDigest.isEqual(secret, guess) ? 1 : 0;
+                long t2 = System.nanoTime();
+                line.append(String.format("  %4d КБ: equals %5.1f мкс, isEqual %5.1f мкс |", p / 1024, (t1 - t0) / 200e3, (t2 - t1) / 200e3));
+            }
+            if (round == 2) System.out.println(line);
+        }
+        System.out.println("(" + sink + ")");
+    }
+}
+@end
+@predict Как меняется время <code>Arrays.equals</code> и <code>MessageDigest.isEqual</code> в зависимости от позиции первого расхождения?
+@answer
+<p><code>Arrays.equals</code> растёт почти линейно с длиной совпавшего префикса: при расхождении в первом байте — доли микросекунды, в последнем — десятки микросекунд (сравнение векторизовано, но выходит на первом отличии). <code>MessageDigest.isEqual</code> тратит одно и то же время независимо от позиции (здесь ~0,7 мс на мегабайт — он ещё и не векторизован: проходит весь массив байт за байтом, накапливая XOR различий). Безопасность здесь важнее скорости, а секреты на практике короткие — 32–64 байта. Для коротких HMAC разница — наносекунды, но по сети её вытягивают статистикой из тысяч запросов.</p>
+@end
+@run
+javac Timing.java
+java Timing
+@end
+
+@lab 17.3 | Защиты процессора в ядре | 10 мин
+@goal
+<p>Посмотреть, от каких аппаратных уязвимостей и каким способом защищается ядро на вашем процессоре.</p>
+@end
+@run
+docker run --rm cs-lab sh -c "grep -r . /sys/devices/system/cpu/vulnerabilities/ | sed 's|.*/||' | sort" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "grep -r . /sys/devices/system/cpu/vulnerabilities/" | sed 's|/sys/devices/system/cpu/vulnerabilities/||' | sort
+@end
+@predict Уязвим ли ваш процессор к Meltdown? Какими средствами ядро защищается от Spectre v1 и v2?
+@answer
+<p>На Intel Core Ultra (2023): <code>meltdown: Not affected</code> — исправлено в железе, KPTI не нужен. <code>spectre_v1: Mitigation: usercopy/swapgs barriers and __user pointer sanitization</code> — барьеры и маскирование указателей в ядре. <code>spectre_v2: Mitigation: Enhanced / Automatic IBRS…</code> — аппаратное ограничение спекуляции косвенных переходов. <code>spec_store_bypass: … via prctl</code> — защиту включает сам процесс, если попросит. Большинство остальных — Not affected. На процессорах 2015–2018 годов список «Mitigation» длиннее, а системные вызовы заметно дороже.</p>
+@end
+
+@lab 17.4 | Случайные числа: Random против SecureRandom | 10 мин
+@goal
+<p>Увидеть, почему <code>java.util.Random</code> предсказуем, и откуда берёт энтропию <code>SecureRandom</code>.</p>
+@end
+@file Rng.java
+import java.security.SecureRandom;
+import java.util.Random;
+
+public class Rng {
+    public static void main(String[] args) throws Exception {
+        Random r1 = new Random(42), r2 = new Random(42);
+        System.out.println("Random(42):   " + r1.nextInt() + " " + r1.nextInt() + " " + r1.nextInt());
+        System.out.println("ещё Random(42): " + r2.nextInt() + " " + r2.nextInt() + " " + r2.nextInt());
+
+        // восстановление состояния по одному выходу nextInt(): перебор 2^16 младших бит
+        Random victim = new Random(System.nanoTime());
+        int out1 = victim.nextInt(), out2 = victim.nextInt();
+        long mult = 0x5DEECE66DL, add = 0xBL, mask = (1L << 48) - 1;
+        for (long low = 0; low < (1 << 16); low++) {
+            long state = ((long) out1 << 16) + low & mask;
+            long next = (state * mult + add) & mask;
+            if ((int) (next >>> 16) == out2) {
+                long predicted = (next * mult + add) & mask;
+                System.out.println("по двум выходам предсказано следующее: " + (int) (predicted >>> 16)
+                        + ", настоящее: " + victim.nextInt());
+                break;
+            }
+        }
+        SecureRandom sr = new SecureRandom();
+        System.out.println("SecureRandom по умолчанию: " + sr.getAlgorithm() + ", провайдер " + sr.getProvider().getName());
+        System.out.println("getInstanceStrong(): " + SecureRandom.getInstanceStrong().getAlgorithm());
+    }
+}
+@end
+@predict Одинаковы ли последовательности у двух <code>Random(42)</code>? Удастся ли предсказать следующее число по двум выходам?
+@answer
+<p>Последовательности одинаковые: <code>Random</code> — детерминированный генератор, семя полностью задаёт выход. По двум значениям <code>nextInt()</code> перебором 65 536 вариантов недостающих младших битов состояние восстанавливается за миллисекунды, и следующее число предсказывается точно. <code>SecureRandom</code> на Windows по умолчанию — <code>DRBG</code> (криптографический генератор по NIST SP 800-90A) с энтропией из ОС (<code>Windows-PRNG</code> для «сильного»); на Linux — <code>NativePRNG</code> поверх <code>/dev/urandom</code> и <code>getrandom</code>.</p>
+@end
+@run
+javac Rng.java
+java Rng
+@end

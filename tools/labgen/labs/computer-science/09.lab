@@ -1,0 +1,75 @@
+@chapter 09 | quiz
+@intro
+<p>Перезагружать компьютер ради лабы не будем — посмотрим на следы загрузки: что прошивка сообщила ОС, какую командную строку получило ядро, что оно писало в журнал при старте, кто PID 1 в контейнере, — и как по шагам «загружается» сама JVM. Модуль IDEA — <code>cs09</code>.</p>
+@end
+
+@lab 9.1 | Прошивка вашего компьютера | 10 мин
+@goal
+<p>Узнать тип прошивки и данные SMBIOS, которые она передала операционной системе.</p>
+@end
+@step В PowerShell (Windows):
+@run title=PowerShell
+$env:firmware_type ||| powershell.exe -NoProfile -Command '$env:firmware_type'
+Get-CimInstance Win32_BIOS | Format-List Manufacturer, SMBIOSBIOSVersion, ReleaseDate ||| powershell.exe -NoProfile -Command 'Get-CimInstance Win32_BIOS | Format-List Manufacturer, SMBIOSBIOSVersion, ReleaseDate' | sed '/^\s*$/d'
+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime ||| powershell.exe -NoProfile -Command '(Get-CimInstance Win32_OperatingSystem).LastBootUpTime' | sed '/^\s*$/d'
+@end
+@note <code>firmware_type</code> — <code>UEFI</code> или <code>Legacy</code> (BIOS). Производитель и версия — из таблицы SMBIOS. Проверка Secure Boot — <code>Confirm-SecureBootUEFI</code> в PowerShell от имени администратора (иначе «Access was denied»). На Linux то же самое: <code>ls /sys/firmware/efi</code> (каталог есть — UEFI), <code>sudo dmidecode -t bios</code>, <code>mokutil --sb-state</code>.
+
+@lab 9.2 | Командная строка и журнал ядра | 15 мин
+@goal
+<p>Посмотреть, с какими параметрами загрузчик запустил ядро Linux и что ядро писало о себе при старте. На Windows Docker работает внутри лёгкой виртуальной машины WSL 2 — это её ядро.</p>
+@end
+@run
+docker run --rm cs-lab cat /proc/cmdline ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab cat /proc/cmdline
+docker run --rm cs-lab uname -sr ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab uname -sr
+@end
+@step Сколько ядер процессора ядро ОС «подняло» при старте (раздел 9.5, INIT/SIPI) и сколько оно уже работает:
+@run
+docker run --rm cs-lab sh -c "cat /sys/devices/system/cpu/online; nproc; cut -d' ' -f1 /proc/uptime" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "cat /sys/devices/system/cpu/online; nproc; cut -d' ' -f1 /proc/uptime"
+@end
+@note Журнал загрузки ядра читается командой <code>dmesg</code> (в контейнере — только с <code>--privileged</code>). Это кольцевой буфер: на долго работающей машине самые ранние строки уже вытеснены, поэтому смотреть журнал загрузки лучше сразу после старта — или в сохранённом журнале <code>journalctl -k -b</code> на обычном Linux.
+@predict Что из командной строки ядра передал загрузчик? Сколько процессоров ядро разбудило при старте?
+@answer
+<p>В командной строке WSL: <code>initrd=\initrd.img</code> — путь к initramfs (обратная косая черта — путь Windows: ядро грузит загрузчик Hyper-V), <code>nr_cpus=18</code> — сколько процессоров разрешено поднять, <code>console=hvc0</code> — консоль через гипервизор, <code>panic=-1</code> — немедленная перезагрузка при панике ядра. Онлайн процессоры <code>0-17</code> — все 18 логических процессоров разбужены. <code>/proc/uptime</code> — секунды с момента старта ядра (у WSL это время с первого запуска Docker или WSL, а не с включения компьютера).</p>
+@end
+
+@lab 9.3 | Кто PID 1 | 10 мин
+@goal
+<p>Увидеть, что в контейнере первым процессом становится точка входа, и почему это важно для сигналов.</p>
+@end
+@run
+docker run --rm cs-lab ps -o pid,ppid,comm ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab ps -o pid,ppid,comm
+docker run --rm cs-lab sh -c "sleep 1 & ps -o pid,ppid,comm" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "sleep 1 & ps -o pid,ppid,comm"
+docker run --rm --init cs-lab ps -o pid,ppid,comm ||| MSYS_NO_PATHCONV=1 docker run --rm --init cs-lab ps -o pid,ppid,comm
+@end
+@predict Кто будет PID 1 в каждом из трёх запусков?
+@answer
+<p>В первом — сам <code>ps</code>: точка входа контейнера и есть PID 1, родитель — 0 (его создало ядро/рантайм, а не fork внутри контейнера). Во втором PID 1 — <code>sh</code>, а <code>sleep</code> и <code>ps</code> — его дети. В третьем с <code>--init</code> PID 1 — маленький init (<code>docker-init</code>, это tini), он пересылает сигналы и собирает зомби, а ваша программа — PID 2. Для Java: exec-форма <code>ENTRYPOINT ["java", …]</code> делает JVM PID 1, и она сама корректно обрабатывает SIGTERM.</p>
+@end
+
+@lab 9.4 | Как загружается JVM | 15 мин
+@goal
+<p>Увидеть фазы старта виртуальной машины и сравнить старт с архивом CDS и без него.</p>
+@end
+@file Hello.java
+public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Привет, мир!");
+    }
+}
+@end
+@run
+javac Hello.java
+java -Xlog:startuptime Hello
+@end
+@predict Какие фазы займут больше всего времени? Что означает строка «Interpreter generation»?
+@answer
+<p>«Genesis» (создание базовых структур VM, кучи и metaspace) и «Initialize java.lang classes» — самые долгие, вся «Create VM» укладывается в 40–60 мс. «Interpreter generation» — JVM при старте <b>генерирует машинный код</b> своего шаблонного интерпретатора под конкретный процессор (с учётом его расширений), подобно тому как ядро строит свои таблицы под железо. Затем запускается VM Thread, инициализируется система модулей, и только потом — ваш <code>main</code>.</p>
+@end
+@step Сравните время запуска с архивом CDS (по умолчанию) и без него:
+@run
+#!for i in 1 2 3; do java Hello >/dev/null; done
+java -Xshare:auto -Xlog:startuptime Hello ||| java -Xshare:auto -Xlog:startuptime Hello | grep "Create VM"
+java -Xshare:off -Xlog:startuptime Hello ||| java -Xshare:off -Xlog:startuptime Hello | grep "Create VM"
+@end
+@note Без CDS JVM должна найти, разобрать и проверить сотни классов <code>java.base</code> из <code>lib/modules</code>; с CDS они отображаются из готового архива (<code>mmap</code>, тема 08) уже в разобранном виде. Здесь «Create VM» без архива — примерно втрое дольше. Это аналог «быстрой загрузки» Windows, которая не загружается с нуля, а восстанавливает ядро из гибернации.

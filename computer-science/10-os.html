@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Ядро ОС: системные вызовы и прерывания</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ОПЕРАЦИОННАЯ СИСТЕМА</div>
+  <h1>Ядро ОС: системные вызовы и прерывания</h1>
+  <p class="lead">Программа не может сама прочитать файл, отправить пакет в сеть или даже узнать время с точностью до наносекунд без помощи ядра. Процессор разделяет код на привилегированный и непривилегированный, а переход между ними возможен только через строго определённые двери: системные вызовы, прерывания и исключения. Разберём, как устроены эти двери, сколько стоит пройти через них, что такое сигналы — и куда в ядро ходит JVM, когда вы читаете файл, спите в <code>Thread.sleep</code> или берёте блокировку.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">кольца защиты</span><span class="tag">syscall</span><span class="tag">vDSO</span><span class="tag">прерывания и IDT</span><span class="tag">исключения</span><span class="tag">таймер</span><span class="tag">сигналы</span><span class="tag">JVM и ядро</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="modes"><span class="h-num">10.1</span>Режим ядра и режим пользователя</h2>
+<p>Процессор x86 различает уровни привилегий — <b>кольца</b>: код ядра выполняется в кольце 0, программы — в кольце 3 (ARM: уровни исключений EL1 и EL0). В пользовательском режиме запрещены команды, которые могли бы нарушить изоляцию:</p>
+<ul>
+  <li>менять таблицы страниц и регистр <code>CR3</code> — иначе процесс отобразил бы себе чужую память;</li>
+  <li>работать с портами ввода-вывода и регистрами устройств — иначе любой процесс читал бы диск в обход прав доступа;</li>
+  <li>запрещать прерывания (<code>cli</code>) — иначе процесс мог бы не отдавать процессор;</li>
+  <li>обращаться к страницам ядра (бит user = 0 в записи таблицы страниц).</li>
+</ul>
+<p>Попытка выполнить такую команду — аппаратное исключение «общая ошибка защиты», и ядро завершает процесс. Поэтому <b>всё, что касается железа и других процессов, программа может сделать только попросив ядро</b>.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" role="img" aria-label="Пользовательский режим и ядро; три пути в ядро: системный вызов, прерывание от устройства, исключение процессора">
+  <defs><marker id="k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <rect x="20" y="14" width="780" height="70" rx="9" class="box-info"/>
+  <text x="40" y="38" font-weight="700">Пользовательский режим (кольцо 3)</text>
+  <text x="40" y="62" font-size="12.5">java, nginx, postgres — каждый в своём адресном пространстве · только свои страницы, без привилегированных команд</text>
+  <rect x="20" y="146" width="780" height="70" rx="9" class="box-warn"/>
+  <text x="40" y="170" font-weight="700">Ядро (кольцо 0)</text>
+  <text x="40" y="194" font-size="12.5">обработчики системных вызовов · планировщик · виртуальная память · файловые системы · сетевой стек · драйверы</text>
+  <g font-size="12.5">
+    <path d="M150 84 L150 144" class="ln-acc" marker-end="url(#k)"/><text x="160" y="110">syscall — по запросу программы</text><text x="160" y="126" class="muted" font-size="11.5">read, write, mmap, futex…</text>
+    <path d="M420 84 L420 144" class="ln-acc" marker-end="url(#k)"/><text x="430" y="110">исключение — из-за команды</text><text x="430" y="126" class="muted" font-size="11.5">page fault, деление на 0, int3</text>
+    <path d="M660 214 L660 150" class="ln-dash"/><path d="M660 144 L660 88" class="ln-dash" marker-end="url(#k)"/><text x="670" y="110">прерывание — от устройства</text><text x="670" y="126" class="muted" font-size="11.5">таймер, сеть, диск, IPI</text>
+  </g>
+</svg>
+<figcaption>Три двери в ядро. Системный вызов — синхронный и запрошенный. Исключение — синхронное, но незапрошенное (ошибка или особая ситуация в текущей команде). Прерывание — асинхронное: приходит от устройства в любой момент, между любыми двумя командами.</figcaption>
+</figure>
+
+<h2 id="syscall"><span class="h-num">10.2</span>Системный вызов изнутри</h2>
+<ol class="steps">
+  <li><b>Обёртка libc.</b> Программа вызывает <code>read(fd, buf, n)</code> — обычную функцию glibc. Она кладёт <b>номер системного вызова</b> в <code>RAX</code> (у <code>read</code> на x86-64 Linux — 0, <code>write</code> — 1, <code>mmap</code> — 9, <code>futex</code> — 202), аргументы — в <code>RDI, RSI, RDX, R10, R8, R9</code>.</li>
+  <li><b>Команда <code>syscall</code>.</b> Процессор сохраняет адрес возврата в <code>RCX</code> и флаги в <code>R11</code>, переключается в кольцо 0 и прыгает по адресу, который ядро заранее записало в регистр <code>MSR_LSTAR</code>. Программа не может выбрать, <i>куда</i> войти в ядро, — только номер вызова.</li>
+  <li><b>Вход в ядро.</b> Обработчик переключает стек на <b>стек ядра</b> этого потока (у каждого потока он свой, ~16 КБ), сохраняет регистры пользователя, при включённых защитах от Meltdown переключает таблицы страниц (KPTI), проверяет номер и вызывает функцию из таблицы <code>sys_call_table</code>.</li>
+  <li><b>Работа.</b> <code>sys_read</code> проверяет дескриптор и права, что буфер лежит в памяти пользователя, копирует данные из page cache (тема 12) или ставит поток ждать данных с диска или сети (тогда процессор достаётся другому потоку, тема 11).</li>
+  <li><b>Возврат.</b> Результат (число байт или отрицательный код ошибки) — в <code>RAX</code>; <code>sysret</code> возвращает кольцо 3 и <code>RIP</code>. glibc превращает отрицательный код в <code>-1</code> и <code>errno</code>.</li>
+</ol>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Порядок цены (лаба 10.2)</th></tr>
+<tr><td>вызов обычной функции</td><td>~1 нс</td></tr>
+<tr><td><code>clock_gettime</code> через vDSO — без входа в ядро</td><td>~20 нс</td></tr>
+<tr><td>простейший системный вызов (<code>getppid</code>)</td><td>~100–150 нс (больше с защитами от Spectre/Meltdown и под виртуализацией)</td></tr>
+<tr><td><code>read</code> из page cache</td><td>сотни нс + копирование</td></tr>
+<tr><td>системный вызов с блокировкой и переключением потока</td><td>микросекунды</td></tr>
+</table></div>
+<p><b>vDSO</b> (virtual dynamic shared object) — страница кода, которую ядро отображает в каждый процесс (видна в <code>/proc/self/maps</code> как <code>[vdso]</code>). Часто нужные «только для чтения» вызовы — время (<code>clock_gettime</code>, <code>gettimeofday</code>), номер процессора — выполняются там прямо в пользовательском режиме, читая страницу данных, которую ядро обновляет. Поэтому <code>System.nanoTime()</code> и <code>System.currentTimeMillis()</code> в Linux не делают системного вызова.</p>
+<p><b>Windows</b> устроена так же, но публичного интерфейса системных вызовов нет: программы вызывают функции <code>kernel32.dll</code> / <code>ntdll.dll</code> (<code>NtReadFile</code>…), а номера вызовов меняются от версии к версии.</p>
+
+<h2 id="interrupts"><span class="h-num">10.3</span>Прерывания и исключения</h2>
+<p>Устройство, у которого что-то произошло (пришёл пакет, диск закончил чтение, сработал таймер), посылает процессору <b>прерывание</b> — через контроллер (локальный APIC каждого ядра) или, в современных PCIe-устройствах, сообщением в память (MSI-X, у сетевой карты — по прерыванию на очередь и ядро). Процессор доделывает текущую команду, сохраняет <code>RIP</code>, флаги и стек, переключается в ядро и прыгает на обработчик из <b>таблицы дескрипторов прерываний</b> (IDT, 256 записей), которую ядро заполнило при загрузке (тема 09).</p>
+<ul>
+  <li><b>Верхняя и нижняя половины.</b> Обработчик прерывания должен быть очень коротким: подтвердить устройству, забрать минимум данных, запланировать остальную работу. Основная обработка (разбор сетевого пакета по стеку TCP/IP) идёт позже — в softirq или в потоках ядра. Отсюда в <code>top</code> строки <code>si</code> (softirq) и <code>hi</code>.</li>
+  <li><b>Межпроцессорные прерывания</b> (IPI): ядра посылают их друг другу — разбудить спящее ядро, сбросить TLB после изменения таблиц страниц (тема 08), остановить всех при панике.</li>
+  <li><b>Исключения</b> — те же записи IDT, но порождённые текущей командой: <code>#PF</code> (page fault, 14), <code>#DE</code> (деление на ноль, 0), <code>#UD</code> (неизвестная команда), <code>#GP</code> (нарушение защиты), <code>#BP</code> — ловушка <code>int3</code>.</li>
+</ul>
+<div class="callout info"><span class="c-title">Как работает точка останова отладчика</span>
+Отладчик (gdb, отладчик IDEA для нативного кода) заменяет первый байт команды по адресу точки останова на <code>0xCC</code> — однобайтовую команду <code>int3</code>. Процессор доходит до неё, генерирует исключение <code>#BP</code>, ядро останавливает поток и сообщает отладчику (через <code>ptrace</code>). Тот показывает переменные, а при продолжении возвращает исходный байт, делает один шаг и снова ставит <code>0xCC</code>. Отладка Java устроена иначе: JVM сама реализует точки останова в интерпретаторе по протоколу JDWP/JVMTI, деоптимизируя скомпилированный код (<a href="../jvm/21-diagnostics.html">JVM, тема 21</a>).
+</div>
+
+<h2 id="timer"><span class="h-num">10.4</span>Таймер и вытеснение</h2>
+<p>Если поток никогда не делает системных вызовов (крутит бесконечный цикл), как ядро отберёт у него процессор? С помощью <b>прерывания таймера</b>: локальный APIC каждого ядра настраивается так, чтобы прерывать его через заданное время. Обработчик таймера вызывает планировщик, и тот может решить, что поток исчерпал свой квант, и переключить ядро на другой (тема 11). Это и есть <b>вытесняющая многозадачность</b>. Современные ядра «безтиковые» (tickless): не будят простаивающее ядро периодически, а программируют таймер ровно на ближайшее событие — экономия энергии.</p>
+
+<h2 id="signals"><span class="h-num">10.5</span>Сигналы: прерывания для процессов</h2>
+<p><b>Сигнал</b> — уведомление процессу от ядра или другого процесса. Когда поток в следующий раз возвращается из ядра в пользовательский режим, ядро подменяет его контекст: на стеке строится кадр, и управление уходит в <b>обработчик сигнала</b>; по его завершении — обратно, будто ничего не было. Если обработчика нет — действие по умолчанию.</p>
+<div class="table-wrap"><table>
+<tr><th>Сигнал</th><th>Откуда</th><th>По умолчанию</th><th>Что делает JVM</th></tr>
+<tr><td><code>SIGTERM</code> (15)</td><td><code>kill</code>, <code>docker stop</code>, systemd, Kubernetes</td><td>завершить</td><td>запускает shutdown hooks и корректно выходит</td></tr>
+<tr><td><code>SIGINT</code> (2)</td><td>Ctrl+C в терминале</td><td>завершить</td><td>как SIGTERM</td></tr>
+<tr><td><code>SIGKILL</code> (9)</td><td><code>kill -9</code>, OOM killer</td><td>убить — перехватить нельзя</td><td>ничего не успевает</td></tr>
+<tr><td><code>SIGQUIT</code> (3)</td><td><code>kill -3</code>, Ctrl+\</td><td>завершить с дампом ядра</td><td>печатает <b>дамп потоков</b> в stdout и продолжает работу</td></tr>
+<tr><td><code>SIGSEGV</code>, <code>SIGBUS</code></td><td>исключение процессора (тема 08)</td><td>завершить с дампом</td><td>NPE, StackOverflowError, safepoint; иначе — авария и <code>hs_err_pid.log</code></td></tr>
+<tr><td><code>SIGCHLD</code></td><td>завершился дочерний процесс</td><td>игнорировать</td><td>используется <code>Process.waitFor</code></td></tr>
+</table></div>
+<p>Java-приложение может обработать сигнал только через shutdown hook (и нестандартный <code>sun.misc.Signal</code>). На Windows сигналов в POSIX-смысле нет: Ctrl+C и закрытие консоли приходят как console control events, а <code>Ctrl+Break</code> печатает дамп потоков, как SIGQUIT.</p>
+
+<h2 id="jvm"><span class="h-num">10.6</span>Куда JVM ходит в ядро</h2>
+<div class="table-wrap"><table>
+<tr><th>Java</th><th>Linux</th><th>Замечание</th></tr>
+<tr><td><code>FileInputStream.read()</code> по одному байту</td><td><code>read(fd, buf, 1)</code> на <b>каждый</b> вызов</td><td>сотни нс на байт — поэтому <code>BufferedInputStream</code> (лаба 10.3)</td></tr>
+<tr><td><code>Files.readAllBytes</code></td><td><code>openat</code>, <code>fstat</code>, несколько больших <code>read</code></td><td></td></tr>
+<tr><td><code>System.nanoTime()</code>, <code>currentTimeMillis()</code></td><td><code>clock_gettime</code> через vDSO</td><td>без системного вызова</td></tr>
+<tr><td><code>Thread.sleep</code>, <code>LockSupport.parkNanos</code></td><td><code>futex</code> с таймаутом (через <code>pthread_cond_timedwait</code>)</td><td>поток снимается с процессора</td></tr>
+<tr><td><code>synchronized</code>, <code>ReentrantLock</code> под конкуренцией</td><td><code>futex(FUTEX_WAIT / FUTEX_WAKE)</code></td><td>без конкуренции — только CAS в пользовательском режиме (тема 07)</td></tr>
+<tr><td><code>new Thread().start()</code></td><td><code>mmap</code> стека, <code>clone</code></td><td>тема 04</td></tr>
+<tr><td>рост кучи, выделение metaspace</td><td><code>mmap</code>, <code>mprotect</code>, <code>madvise</code></td><td>тема 08</td></tr>
+<tr><td>сокеты, NIO <code>Selector</code></td><td><code>socket</code>, <code>connect</code>, <code>epoll_wait</code>, <code>sendto</code>/<code>recvfrom</code></td><td>тема 13</td></tr>
+<tr><td><code>ProcessBuilder.start()</code></td><td><code>posix_spawn</code> → <code>clone</code> + <code>execve</code></td><td>тема 14</td></tr>
+</table></div>
+<p>Слово <b>futex</b> (fast userspace mutex) стоит запомнить: это механизм, на котором стоят все блокировки и ожидания в Linux. Пока блокировка свободна, её берут одной атомарной командой без ядра; только если надо ждать, поток делает <code>futex(WAIT)</code> и засыпает в ядре, а освобождающий — <code>futex(WAKE)</code>.</p>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">10.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Смотрим на границу между программой и ядром: сколько системных вызовов делает JVM при старте, сколько стоит один вызов, почему небуферизованный ввод-вывод медленный и как JVM реагирует на сигналы. Лабы 10.1, 10.2 и 10.4 — в Docker-образе <code>cs-lab</code>, 10.3 — на вашей машине. Модуль IDEA — <code>cs10</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-10.1">
+<div class="lab-head"><span class="lab-num">Лаба 10.1</span><b>Системные вызовы JVM</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посчитать, какие системные вызовы и сколько раз делает JVM, чтобы напечатать одну строку.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Hello.java</code>:</div>
+<pre data-title="Hello.java"><code class="java">public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Привет из Java");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac Hello.java &amp;&amp; strace -f -c -o /tmp/s.txt java Hello; head -22 /tmp/s.txt"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Привет из Java
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ------------------
+ 88.45    0.478548        1914       250        25 futex
+  2.41    0.013041         621        21           clone
+  2.22    0.012016          60       200           mprotect
+  1.38    0.007481          43       172           mmap
+  1.09    0.005893          39       150           rt_sigprocmask
+  0.75    0.004055          52        77        20 openat
+  0.51    0.002754         196        14         3 stat
+  0.36    0.001947          33        58           close
+  0.36    0.001945          32        59           read
+  0.29    0.001565          68        23           madvise
+  0.24    0.001322         330         4           getrusage
+  0.23    0.001242          62        20           prctl
+  0.22    0.001184          20        58           fstat
+  0.20    0.001109          29        37           lseek
+  0.18    0.000962          43        22           rseq
+  0.16    0.000880          40        22           set_robust_list
+  0.14    0.000768          48        16           munmap
+  0.12    0.000662          25        26           sched_getaffinity
+  0.09    0.000472          19        24           rt_sigaction
+  0.08    0.000451          19        23           gettid</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько всего системных вызовов понадобится? Какие окажутся самыми частыми?</div>
+<div class="lab-ans" hidden><p>Около полутора тысяч вызовов ради одной строки. По числу лидируют <code>futex</code> (синхронизация служебных потоков JVM; по времени он «съедает» почти всё, потому что в нём потоки <i>ждут</i>), <code>mprotect</code>/<code>mmap</code>/<code>munmap</code> (резервирование кучи, metaspace, code cache, стеков, загрузка библиотек), <code>rt_sigprocmask</code> (маски сигналов в каждом потоке), <code>openat</code>/<code>read</code>/<code>fstat</code> (файлы JDK, <code>/proc</code> и <code>/sys</code> для эргономики — сколько процессоров и памяти, тема 15). <code>clone</code> — около двадцати: столько служебных потоков создаёт JVM (GC, JIT-компиляторы, VM Thread, Reference Handler…). Сама печать — один <code>write(1, …)</code>.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>-e trace=write</code> вместо <code>-c</code> и найдите вашу строку.</summary><div><code>write(1, "\320\237\321\200…", 23)</code> — 23 байта: строка в UTF-8 плюс перевод строки, одним вызовом. stdout в JVM буферизуется построчно — <code>println</code> сбрасывает буфер.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-10.2">
+<div class="lab-head"><span class="lab-num">Лаба 10.2</span><b>Цена системного вызова и vDSO</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить обычный вызов функции, чтение времени через vDSO и настоящий системный вызов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>syscost.c</code>:</div>
+<pre data-title="syscost.c"><code class="txt">#define _GNU_SOURCE
+#include &lt;stdio.h&gt;
+#include &lt;sys/syscall.h&gt;
+#include &lt;time.h&gt;
+#include &lt;unistd.h&gt;
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &amp;t); return t.tv_sec * 1e9 + t.tv_nsec; }
+__attribute__((noinline)) long f(long x) { return x + 1; }
+
+int main(void) {
+    const int n = 2000000;
+    struct timespec ts;
+    long s = 0;
+    double t0, t1;
+    t0 = now(); for (int i = 0; i &lt; n; i++) s += f(i); t1 = now();
+    printf("вызов функции:               %6.1f нс\n", (t1 - t0) / n);
+    t0 = now(); for (int i = 0; i &lt; n; i++) { clock_gettime(CLOCK_MONOTONIC, &amp;ts); s += ts.tv_nsec; } t1 = now();
+    printf("clock_gettime через vDSO:    %6.1f нс\n", (t1 - t0) / n);
+    t0 = now(); for (int i = 0; i &lt; n; i++) { syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &amp;ts); s += ts.tv_nsec; } t1 = now();
+    printf("clock_gettime через syscall: %6.1f нс\n", (t1 - t0) / n);
+    t0 = now(); for (int i = 0; i &lt; n; i++) s += syscall(SYS_getppid); t1 = now();
+    printf("getppid (syscall):           %6.1f нс\n", (t1 - t0) / n);
+    return s == 42;
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O2 -o syscost syscost.c &amp;&amp; ./syscost &amp;&amp; grep vdso /proc/self/maps"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">вызов функции:                  1.5 нс
+clock_gettime через vDSO:      25.5 нс
+clock_gettime через syscall:  168.1 нс
+getppid (syscall):            122.9 нс
+7a7064cd9000-7a7064cdb000 r-xp 00000000 00:00 0                          [vdso]</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз системный вызов дороже вызова функции? Насколько vDSO дешевле системного вызова за то же самое время?</div>
+<div class="lab-ans" hidden><p>Вызов функции — доли наносекунды, системный вызов — 100–150 нс: в сотни раз дороже (переключение режима, стека, сохранение регистров, защиты от Spectre/Meltdown, плюс виртуальная машина WSL). <code>clock_gettime</code> через vDSO — 20–30 нс: тот же результат без входа в ядро, впятеро дешевле. Последняя строка — область <code>[vdso]</code> с правами <code>r-xp</code> в адресном пространстве процесса.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-10.3">
+<div class="lab-head"><span class="lab-num">Лаба 10.3</span><b>Буферизация против системных вызовов</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть цену системного вызова в обычном Java-коде: побайтовое чтение файла без буфера и с буфером.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Buffering.java</code>:</div>
+<pre data-title="Buffering.java"><code class="java">import java.io.*;
+import java.nio.file.*;
+
+public class Buffering {
+    public static void main(String[] args) throws IOException {
+        Path f = Files.createTempFile("data", ".bin");
+        Files.write(f, new byte[4 * 1024 * 1024]);           // 4 МБ
+        for (int r = 0; r &lt; 3; r++) {
+            long t0 = System.nanoTime(), n1 = 0;
+            try (InputStream in = new FileInputStream(f.toFile())) {
+                while (in.read() != -1) n1++;                  // read() → системный вызов на каждый байт
+            }
+            long t1 = System.nanoTime(), n2 = 0;
+            try (InputStream in = new BufferedInputStream(new FileInputStream(f.toFile()))) {
+                while (in.read() != -1) n2++;                  // read() → чтение из массива, системный вызов раз в 8 КБ
+            }
+            long t2 = System.nanoTime();
+            System.out.printf("без буфера: %5d мс (%.0f нс/байт) | с буфером: %3d мс (%.1f нс/байт)%n",
+                    (t1 - t0) / 1_000_000, (t1 - t0) / (double) n1, (t2 - t1) / 1_000_000, (t2 - t1) / (double) n2);
+        }
+        Files.delete(f);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз буферизованное чтение быстрее? Сколько системных вызовов в каждом случае на 4 МБ?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Buffering.java
+java Buffering</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">без буфера:  4712 мс (1124 нс/байт) | с буфером:  84 мс (20.2 нс/байт)
+без буфера:  4025 мс (960 нс/байт) | с буфером:  68 мс (16.4 нс/байт)
+без буфера:  3507 мс (836 нс/байт) | с буфером:  66 мс (15.8 нс/байт)</code></pre></details>
+<div class="lab-ans" hidden><p>Без буфера — 4 194 304 системных вызова, по одному на байт: сотни миллисекунд – секунды и сотни наносекунд на байт (на Windows вызов <code>ReadFile</code> ещё дороже). С буфером — 512 вызовов по 8 КБ, а каждый <code>read()</code> — просто чтение из массива в пользовательском режиме: здесь в 50–60 раз быстрее (около микросекунды против 16–23 нс на байт). Отсюда правило: любой поток байтов — через буфер, а лучше <code>Files.readAllBytes</code> или <code>InputStream.transferTo</code> большими блоками.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-10.4">
+<div class="lab-head"><span class="lab-num">Лаба 10.4</span><b>Сигналы и JVM</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Отправить JVM сигналы SIGQUIT, SIGTERM и SIGKILL и посмотреть на реакцию.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Signals.java</code>:</div>
+<pre data-title="Signals.java"><code class="java">public class Signals {
+    public static void main(String[] args) throws Exception {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -&gt; System.out.println("shutdown hook: корректное завершение")));
+        System.out.println("работаю, pid " + ProcessHandle.current().pid());
+        Thread.sleep(60_000);
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">SIGQUIT (дамп потоков), затем SIGTERM:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c 'javac Signals.java; java Signals &amp; P=$!; sleep 1.5; kill -QUIT $P; sleep 0.5; kill -TERM $P; wait $P; echo "код завершения $?"'</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">работаю, pid 40
+Full thread dump OpenJDK 64-Bit Server VM (25.0.4.1+1-LTS mixed mode, sharing):
+"main" #3 [42] prio=5 os_prio=0 cpu=73.39ms elapsed=1.50s tid=0x0000799b5002a660 nid=42 waiting on condition  [0x0000799b56c32000]
+   java.lang.Thread.State: TIMED_WAITING (sleeping)
+	at Signals.main(Signals.java:5)
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+shutdown hook: корректное завершение
+код завершения 143</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатает JVM на SIGQUIT? Выполнится ли shutdown hook на SIGTERM, и какой будет код завершения?</div>
+<div class="lab-ans" hidden><p>На SIGQUIT — «Full thread dump…» со стеками всех потоков (здесь показан только поток <code>main</code>: <code>TIMED_WAITING (sleeping)</code> в <code>Signals.main</code>), и программа продолжает работать. На SIGTERM — shutdown hook выполняется, код завершения 143 = 128 + 15 (номер сигнала). Это ровно то, что происходит при <code>docker stop</code> или удалении пода в Kubernetes.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Теперь SIGKILL:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c 'java Signals &amp; P=$!; sleep 1.5; kill -KILL $P; wait $P; echo "код завершения $?"'</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">работаю, pid 7
+код завершения 137
+Killed</code></pre></details>
+<p class="lab-note">Код 137 = 128 + 9, и никакого «shutdown hook»: SIGKILL перехватить нельзя, процесс уничтожает ядро. Так же выглядит смерть от OOM killer (тема 08) — если под в Kubernetes «упал» с кодом 137, первым делом смотрите на лимит памяти.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">10.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему программа не может сама прочитать сектор диска, минуя ядро?</p><ul><li>диск слишком медленный</li><li>это запрещено лицензией</li><li>команды доступа к устройствам и их регистрам привилегированные, а память устройств не отображена в адресное пространство процесса</li><li>у программы нет драйвера</li></ul><div class="why">Изоляцию обеспечивает железо: кольца привилегий и таблицы страниц.</div></div>
+<div class="mcq" data-ok="0"><p>Почему <code>System.nanoTime()</code> в Linux дешевле, чем <code>getppid()</code>?</p><ul><li>время читается в пользовательском режиме через vDSO, без перехода в ядро</li><li>JVM кэширует время</li><li>getppid медленный из-за поиска процесса</li><li>nanoTime не обращается к часам</li></ul><div class="why">vDSO — код и данные ядра, отображённые в процесс только для чтения.</div></div>
+<div class="mcq" data-ok="3"><p>Как ядро отбирает процессор у потока, который крутит бесконечный цикл без системных вызовов?</p><ul><li>никак — поток работает вечно</li><li>JVM вставляет проверки в цикл</li><li>поток сам отдаёт процессор</li><li>по прерыванию таймера ядро получает управление и планировщик переключает поток</li></ul><div class="why">Вытесняющая многозадачность. (А вот JVM-у, чтобы остановить такой поток для GC, нужны свои проверки — safepoint polls.)</div></div>
+<div class="mcq" data-ok="1"><p>Что сделает JVM при получении <code>SIGQUIT</code> (<code>kill -3</code>)?</p><ul><li>завершится с дампом ядра</li><li>напечатает дамп всех потоков и продолжит работу</li><li>запустит GC</li><li>проигнорирует</li></ul><div class="why">Классический способ снять стек-трейсы с работающего сервиса без jstack.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что происходит при системном вызове?</summary><div class="a"><p>Обёртка libc кладёт номер вызова и аргументы в регистры и выполняет syscall. Процессор переключается в кольцо 0 и переходит на точку входа ядра, заданную в MSR; ядро переключает стек на стек ядра потока, сохраняет регистры, вызывает обработчик по номеру из таблицы. Результат — в RAX, sysret возвращает в пользовательский режим. Стоимость — порядка сотни наносекунд без блокировки.</p></div></details>
+<details class="q"><summary>Чем прерывание отличается от исключения и от системного вызова?</summary><div class="a"><p>Системный вызов — синхронный и намеренный запрос программы. Исключение — синхронное, вызвано выполняемой командой (page fault, деление на 0, int3). Прерывание — асинхронное, от устройства или другого ядра, приходит между любыми командами. Все три попадают в ядро через таблицу обработчиков (IDT или точку входа syscall) с сохранением состояния прерванного кода.</p></div></details>
+<details class="q"><summary>Почему побайтовое чтение через FileInputStream медленное?</summary><div class="a"><p>Каждый вызов read() без буфера — отдельный системный вызов с переходом в ядро (~сотни наносекунд), проверками и копированием. BufferedInputStream читает блоками по 8 КБ и отдаёт байты из массива в пользовательском режиме: на 8192 байта — один системный вызов.</p></div></details>
+<details class="q"><summary>Что такое futex и при чём тут synchronized?</summary><div class="a"><p>Futex — механизм ядра Linux для ожидания на адресе в памяти. Блокировки реализуются как атомарная переменная в пользовательском режиме: без конкуренции её берут CAS-ом, не входя в ядро. Если блокировка занята, поток вызывает futex(WAIT) и засыпает; освобождающий поток делает futex(WAKE). synchronized и ReentrantLock под конкуренцией в итоге сводятся к этому.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

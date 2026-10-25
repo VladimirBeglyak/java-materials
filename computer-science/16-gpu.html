@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · GPU и ускорители</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ПРОГРАММЫ И СРЕДА</div>
+  <h1>GPU и ускорители</h1>
+  <p class="lead">Центральный процессор оптимизирован под задержку: выполнить один поток команд как можно быстрее, со всеми хитростями конвейера, предсказания и кэшей. Графический процессор оптимизирован под пропускную способность: тысячи простых ядер выполняют одну и ту же программу над разными данными. Рядом — ещё целый зоопарк специализированных блоков: тензорные ядра, NPU, шифрование, сжатие, сетевые сопроцессоры. Разберём, как они устроены, когда выгодны, как картинка попадает на экран и как до них дотягивается Java.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">задержка против пропускной способности</span><span class="tag">SIMT и варпы</span><span class="tag">память GPU</span><span class="tag">передача по PCIe</span><span class="tag">путь пикселя</span><span class="tag">тензорные ядра и NPU</span><span class="tag">AES-NI</span><span class="tag">Java и GPU</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">16.1</span>Два способа потратить транзисторы</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>CPU</th><th>GPU</th></tr>
+<tr><td>ядер</td><td>единицы – сотни, каждое сложное</td><td>тысячи – десятки тысяч простых «ALU-дорожек»</td></tr>
+<tr><td>на что уходят транзисторы</td><td>кэши, предсказатель переходов, внеочередное исполнение (тема 05)</td><td>арифметика и огромный регистровый файл</td></tr>
+<tr><td>как прячется задержка памяти</td><td>кэшами и предвыборкой</td><td>переключением на другую группу потоков: пока одни ждут память, считают другие</td></tr>
+<tr><td>память</td><td>DDR5, ~100 ГБ/с, большие объёмы</td><td>GDDR/HBM, 1–8 ТБ/с, но меньше объём</td></tr>
+<tr><td>хорош для</td><td>ветвистой логики, последовательных зависимостей, малых задач</td><td>одинаковой работы над миллионами элементов: графика, матрицы, нейросети, симуляции</td></tr>
+</table></div>
+<p>Пиковая производительность современных GPU — десятки – сотни терафлопс (а с тензорными ядрами в низкой точности — петафлопсы) против единиц терафлопс у многоядерного CPU с AVX-512. Но достаётся она только задачам, где параллелизм огромный, а ветвлений и обмена с CPU мало.</p>
+
+<h2 id="simt"><span class="h-num">16.2</span>SIMT: потоки, варпы, расхождение</h2>
+<p>Программа для GPU — <b>ядро</b> (kernel): функция, которую запускают сразу на сетке из миллионов потоков; каждый знает свой индекс и обрабатывает свой элемент. Аппаратно потоки объединены в <b>варпы</b> (warp, 32 потока у NVIDIA; wavefront, 32–64 у AMD): все потоки варпа выполняют <b>одну и ту же команду одновременно</b> — это SIMD, только с удобной моделью «у каждого потока свой код» (SIMT, single instruction, multiple threads).</p>
+<ul>
+  <li><b>Расхождение</b> (divergence): если часть потоков варпа идёт в <code>if</code>, а часть — в <code>else</code>, варп выполняет <b>обе</b> ветки по очереди, отключая (маскируя) неактивные дорожки. Ветвистый код на GPU теряет производительность пропорционально.</li>
+  <li><b>Объединение обращений</b> (coalescing): если 32 потока варпа читают 32 соседних слова, это одна транзакция с памятью; если вразнобой — 32 транзакции. Раскладка данных важна так же, как на CPU (тема 06), только сильнее.</li>
+  <li><b>Занятость</b> (occupancy): на мультипроцессоре одновременно живут десятки варпов; пока одни ждут память (сотни тактов), исполняются другие. Если программе нужно много регистров на поток, варпов помещается меньше — и прятать задержку нечем.</li>
+  <li><b>Разделяемая память</b> (shared memory) — программно управляемый «кэш» блока потоков на кристалле; основа быстрых алгоритмов вроде умножения матриц блоками.</li>
+</ul>
+<div class="widget" id="warpW">
+  <div class="widget-title">Расхождение в варпе (8 дорожек для наглядности)</div>
+  <p class="hint">Каждая дорожка обрабатывает элемент <code>x[i]</code>: <code>if (условие) { 4 команды } else { 6 команд }</code>. Выберите, как распределены данные.</p>
+  <div class="controls"><label>условие выполняется у<select id="wPat"><option value="all">всех дорожек</option><option value="half">чётных дорожек (половина)</option><option value="one">одной дорожки</option><option value="sorted">первых четырёх (данные отсортированы)</option></select></label></div>
+  <div class="out" id="wOut"></div>
+</div>
+<script>
+(function () {
+  var p = document.getElementById("wPat"), o = document.getElementById("wOut");
+  function run() {
+    var m = [];
+    for (var i = 0; i < 8; i++) m.push(p.value === "all" ? 1 : p.value === "half" ? (i % 2 === 0 ? 1 : 0) : p.value === "one" ? (i === 3 ? 1 : 0) : (i < 4 ? 1 : 0));
+    var anyT = m.indexOf(1) >= 0, anyF = m.indexOf(0) >= 0, L = [], cycles = 0, useful = 0;
+    L.push("дорожка:      0 1 2 3 4 5 6 7");
+    if (anyT) { for (var k = 0; k < 4; k++) { L.push("then, ком." + (k + 1) + ":  " + m.map(function (v) { return v ? "█" : "·"; }).join(" ")); cycles++; useful += m.filter(Boolean).length; } }
+    if (anyF) { for (var j = 0; j < 6; j++) { L.push("else, ком." + (j + 1) + ":  " + m.map(function (v) { return v ? "·" : "█"; }).join(" ")); cycles++; useful += m.filter(function (v) { return !v; }).length; } }
+    L.push("\nтактов варпа: " + cycles + ", полезной работы: " + useful + " из " + cycles * 8 + " дорожко-тактов → эффективность " + Math.round(useful / (cycles * 8) * 100) + "%");
+    L.push(anyT && anyF ? "Ветки выполнились последовательно с маской: · — дорожка простаивает. Если же расхождение совпадает с границами варпов (как у отсортированных данных на реальном GPU из 32-дорожечных варпов), целые варпы идут по одной ветке без потерь." : "Все дорожки идут по одной ветке — расхождения нет, эффективность 100%.");
+    o.textContent = L.join("\n");
+  }
+  p.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="transfer"><span class="h-num">16.3</span>Цена передачи данных</h2>
+<p>У дискретной видеокарты своя память. Данные нужно скопировать туда по PCIe (16 линий PCIe 4.0 — ~25 ГБ/с на практике), посчитать, скопировать результат обратно. Если вычислений на байт мало, копирование съедает весь выигрыш:</p>
+<ul>
+  <li>сложить два массива по 1 ГБ: копирование 3 ГБ туда-обратно — ~120 мс, само сложение на GPU — ~2 мс, на CPU — ~150 мс. Выигрыш почти нулевой;</li>
+  <li>умножить две матрицы 8192×8192: 1 трлн умножений-сложений на 0,8 ГБ данных — GPU выигрывает в десятки раз.</li>
+</ul>
+<p>Мера — <b>арифметическая интенсивность</b> (операций на байт). Поэтому на GPU переносят крупные куски работы целиком (обучение нейросети держит веса в памяти GPU всё время), а встроенные GPU (Intel Arc в процессоре машины из лаб, Apple M) делят оперативную память с CPU и копирования не требуют.</p>
+
+<h2 id="display"><span class="h-num">16.4</span>Как пиксель попадает на экран</h2>
+<ol class="steps">
+  <li><b>Приложение</b> (браузер, IDE) рисует окно: через графический API (Direct3D, Vulkan, Metal, OpenGL) отправляет GPU списки команд — треугольники, текстуры, шейдеры. Java Swing/JavaFX делают это через Java2D/Prism поверх Direct3D, OpenGL или Metal.</li>
+  <li><b>Конвейер GPU</b>: вершинные шейдеры преобразуют координаты, растеризатор превращает треугольники в фрагменты-пиксели, пиксельные шейдеры считают цвет — миллионы пикселей параллельно, по SIMT.</li>
+  <li><b>Композитор</b> окон (DWM в Windows, Mutter/KWin в Linux) собирает окна всех приложений в один кадр — тоже на GPU.</li>
+  <li><b>Буфер кадра</b> (framebuffer) — область памяти: 1920×1080×4 байта ≈ 8 МБ (тема 01). Используется двойная буферизация: пока один кадр показывается, рисуется следующий.</li>
+  <li><b>Вывод</b> (scanout): контроллер дисплея построчно читает буфер и передаёт по HDMI/DisplayPort; смена буферов синхронизируется с обновлением экрана (VSync, 60–240 раз в секунду) — иначе видны «разрывы» кадра.</li>
+</ol>
+
+<h2 id="accel"><span class="h-num">16.5</span>Специализированные ускорители</h2>
+<div class="table-wrap"><table>
+<tr><th>Ускоритель</th><th>Что делает</th><th>Где</th></tr>
+<tr><td><b>тензорные ядра</b>, матричные блоки (AMX в Intel Xeon, SME в ARM)</td><td>умножение небольших матриц за команду в низкой точности (FP16, BF16, FP8, INT8)</td><td>GPU NVIDIA/AMD, серверные CPU</td></tr>
+<tr><td><b>TPU</b></td><td>систолический массив: тысячи умножителей, по которым данные «текут» волной — без обращений к памяти в середине</td><td>Google Cloud</td></tr>
+<tr><td><b>NPU</b></td><td>энергоэффективный вывод нейросетей</td><td>телефоны, Apple M, Intel Core Ultra (есть и в машине из лаб)</td></tr>
+<tr><td><b>криптографические инструкции</b> (AES-NI, SHA-NI, PCLMULQDQ)</td><td>раунд AES — одна команда; GCM-аутентификация — умножение без переносов</td><td>все современные x86 и ARM</td></tr>
+<tr><td><b>QAT, DPU/SmartNIC</b></td><td>сжатие, шифрование, обработка сети и хранения в отдельном чипе</td><td>серверы, облака (AWS Nitro)</td></tr>
+<tr><td><b>FPGA</b></td><td>перепрограммируемая логика: своя схема под задачу</td><td>биржи, телеком, прототипирование чипов</td></tr>
+</table></div>
+<p>Тренд ясен из темы 02: когда транзисторов много, а частоту не поднять, выгоднее построить <b>специализированную схему</b>, чем исполнять ту же работу общими командами. Даже внутри CPU JVM пользуется этим постоянно: <code>Cipher</code> с AES-GCM на <a href="#hands-on">лабе 16.2</a> в 50 раз быстрее с аппаратными инструкциями, чем без них; <code>CRC32C</code>, <code>Base64</code>, <code>String.indexOf</code>, <code>Arrays.sort</code> (библиотека <code>libsimdsort</code>, тема 14) — интринсики на специальных и векторных командах.</p>
+
+<h2 id="java"><span class="h-num">16.6</span>Java и GPU</h2>
+<ul>
+  <li><b>Через библиотеки</b> — основной путь сегодня: обучение и вывод моделей через DJL, ONNX Runtime, TensorFlow Java, которые внутри вызывают CUDA или другие бэкенды через JNI (или FFM API).</li>
+  <li><b>FFM API</b> (тема 14) позволяет вызывать CUDA Driver API или OpenCL напрямую, без JNI-обёрток, а <code>MemorySegment</code> — работать с памятью вне кучи, которую понимает драйвер.</li>
+  <li><b>TornadoVM</b> — надстройка над OpenJDK/GraalVM, которая компилирует Java-методы в ядра для GPU и FPGA (OpenCL, PTX, SPIR-V).</li>
+  <li><b>Проект Babylon</b> (OpenJDK, экспериментальный) — «отражение кода» (code reflection): доступ к модели Java-метода во время работы, чтобы библиотеки могли транслировать его, например, в ядро GPU (прототип HAT — Heterogeneous Accelerator Toolkit). В стандартный JDK пока не входит.</li>
+  <li><b>Vector API</b> (тема 05) — SIMD на CPU, ближайший к GPU-стилю способ писать на чистой Java.</li>
+</ul>
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">16.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Дискретного GPU в Docker-контейнере у нас нет, поэтому смотрим на ускорители с доступной стороны: какой графический процессор у вас стоит, как модель SIMT выглядит в коде, во сколько раз аппаратные инструкции AES ускоряют шифрование в JVM и как арифметическая интенсивность и раскладка данных определяют скорость умножения матриц. Модуль IDEA — <code>cs16</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-16.1">
+<div class="lab-head"><span class="lab-num">Лаба 16.1</span><b>Ваш графический процессор</b><span class="lab-time">5 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Узнать, какой GPU стоит в машине и как его видит Windows.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="PowerShell"><code class="txt">Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion, VideoProcessor</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Name           : Intel(R) Arc(TM) Graphics
+DriverVersion  : 31.0.101.5333
+VideoProcessor : Intel(R) Arc(TM) Graphics     Family</code></pre></details>
+<p class="lab-note">На машине из лаб — встроенный Intel Arc: он делит оперативную память с CPU (копирование по PCIe не нужно, тема 16.3). На Linux — <code>lspci | grep -i vga</code>, для NVIDIA — <code>nvidia-smi</code>. Чтобы контейнер получил доступ к GPU NVIDIA, нужен NVIDIA Container Toolkit и <code>docker run --gpus all</code>: контейнер, как и любой процесс, работает с GPU через драйвер ядра хоста.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-16.2">
+<div class="lab-head"><span class="lab-num">Лаба 16.2</span><b>AES-NI: специализированные команды в JVM</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить скорость шифрования AES-GCM с интринсиками JIT на аппаратных командах и без них.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Aes.java</code>:</div>
+<pre data-title="Aes.java"><code class="java">import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+public class Aes {
+    public static void main(String[] args) throws Exception {
+        SecretKey key = new SecretKeySpec(new byte[16], "AES");
+        byte[] block = new byte[16 * 1024], out = new byte[block.length + 16];
+        for (int round = 0; round &lt; 5; round++) {
+            long bytes = 0, t0 = System.nanoTime();
+            for (int m = 0; m &lt; 4000; m++) {
+                Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                byte[] iv = {(byte) round, (byte) m, (byte) (m &gt;&gt; 8), 0, 0, 0, 0, 0, 0, 0, 0, 0};   // nonce не повторяется
+                c.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+                c.doFinal(block, 0, block.length, out, 0);
+                bytes += block.length;
+            }
+            System.out.printf("раунд %d: AES-GCM %,6.0f МБ/с%n", round, bytes / 1048576.0 / ((System.nanoTime() - t0) / 1e9));
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Насколько быстрее шифрование с аппаратными командами? Почему первый раунд медленнее остальных?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Aes.java
+java Aes
+java -XX:+UnlockDiagnosticVMOptions -XX:-UseAESIntrinsics -XX:-UseAESCTRIntrinsics -XX:-UseGHASHIntrinsics Aes</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 0: AES-GCM    140 МБ/с
+раунд 1: AES-GCM  1,891 МБ/с
+раунд 2: AES-GCM  1,665 МБ/с
+раунд 3: AES-GCM  3,858 МБ/с
+раунд 4: AES-GCM  3,804 МБ/с
+раунд 0: AES-GCM     65 МБ/с
+раунд 1: AES-GCM     70 МБ/с
+раунд 2: AES-GCM     68 МБ/с
+раунд 3: AES-GCM     69 МБ/с
+раунд 4: AES-GCM     69 МБ/с</code></pre></details>
+<div class="lab-ans" hidden><p>С интринсиками — 2–4,5 ГБ/с: C2 заменяет код раундов AES командами <code>aesenc</code> (раунд шифрования — одна команда) и вычисление GHASH — командой умножения без переносов <code>pclmulqdq</code>, обрабатывая сразу несколько блоков векторно. Без них — ~70 МБ/с: те же вычисления таблицами и сдвигами на Java, в 30–60 раз медленнее. Первый раунд медленный, потому что методы шифрования ещё интерпретируются: интринсик срабатывает только в JIT-коде.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Посмотрите, какие возможности процессора JVM обнаружила: <code>java -Xlog:os+cpu -version</code>.</summary><div>Список флагов CPU (avx2, aes, clmul, sha, bmi2…) — по нему JIT решает, какие интринсики включать. На процессоре без AES-NI флаг <code>UseAESIntrinsics</code> выключен сам.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-16.3">
+<div class="lab-head"><span class="lab-num">Лаба 16.3</span><b>Умножение матриц: интенсивность и раскладка</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, как одна и та же арифметика (2n³ операций) работает в разы быстрее при другом порядке циклов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>MatMul.java</code>:</div>
+<pre data-title="MatMul.java"><code class="java">public class MatMul {
+    static final int N = 768;
+
+    static void ijk(double[] a, double[] b, double[] c) {           // внутренний цикл идёт по столбцу b — шаг N
+        for (int i = 0; i &lt; N; i++)
+            for (int j = 0; j &lt; N; j++) {
+                double s = 0;
+                for (int k = 0; k &lt; N; k++) s += a[i * N + k] * b[k * N + j];
+                c[i * N + j] = s;
+            }
+    }
+
+    static void ikj(double[] a, double[] b, double[] c) {           // внутренний цикл идёт по строкам b и c подряд
+        java.util.Arrays.fill(c, 0);
+        for (int i = 0; i &lt; N; i++)
+            for (int k = 0; k &lt; N; k++) {
+                double aik = a[i * N + k];
+                for (int j = 0; j &lt; N; j++) c[i * N + j] += aik * b[k * N + j];
+            }
+    }
+
+    public static void main(String[] args) {
+        double[] a = new double[N * N], b = new double[N * N], c = new double[N * N];
+        for (int i = 0; i &lt; a.length; i++) { a[i] = i % 7; b[i] = i % 5; }
+        double flops = 2.0 * N * N * N;
+        for (int r = 0; r &lt; 3; r++) {
+            long t0 = System.nanoTime(); ijk(a, b, c); double s1 = c[N + 1];
+            long t1 = System.nanoTime(); ikj(a, b, c); double s2 = c[N + 1];
+            long t2 = System.nanoTime();
+            System.out.printf("ijk: %4d мс (%5.2f GFLOPS) | ikj: %4d мс (%5.2f GFLOPS)  %b%n",
+                    (t1 - t0) / 1_000_000, flops / (t1 - t0), (t2 - t1) / 1_000_000, flops / (t2 - t1), s1 == s2);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Порядок операций сложения в двух вариантах одинаков для каждой ячейки — результат совпадёт. Во сколько раз будет различаться скорость и почему?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac MatMul.java
+java MatMul</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">ijk:  436 мс ( 2.08 GFLOPS) | ikj:  192 мс ( 4.70 GFLOPS)  true
+ijk:  445 мс ( 2.03 GFLOPS) | ikj:  159 мс ( 5.70 GFLOPS)  true
+ijk:  428 мс ( 2.12 GFLOPS) | ikj:  176 мс ( 5.13 GFLOPS)  true</code></pre></details>
+<div class="lab-ans" hidden><p><code>ikj</code> быстрее в 2–3 раза. В <code>ijk</code> внутренний цикл читает <code>b</code> по столбцу с шагом 768 × 8 байт — каждое обращение в новую кэш-линию (тема 06), плюс одна длинная цепочка зависимых сложений <code>s +=</code> (тема 05). В <code>ikj</code> внутренний цикл идёт по строкам <code>b</code> и <code>c</code> подряд и его итерации независимы — C2 векторизует его (AVX2: 4 double за команду). На одном ядре CPU это единицы гигафлопс; GPU с тензорными ядрами делает то же на два-три порядка быстрее — но только если матрицы уже в его памяти. Библиотеки (BLAS) добавляют ещё блочное разбиение под кэши и многопоточность.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Увеличьте <code>N</code> до 1536.</summary><div>Разрыв вырастет: матрицы перестанут помещаться в L2/L3, и «столбцовый» доступ <code>ijk</code> упрётся в память, тогда как <code>ikj</code> по-прежнему читает подряд с предвыборкой.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">16.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Как GPU справляется с задержкой памяти в сотни тактов?</p><ul><li>огромным кэшем и предсказанием переходов</li><li>не справляется — поэтому GPU медленнее</li><li>держит много варпов одновременно и переключается на те, чьи данные готовы</li><li>копирует данные в регистры заранее</li></ul><div class="why">Параллелизм вместо кэшей. Нужна высокая занятость — много независимой работы.</div></div>
+<div class="mcq" data-ok="0"><p>Что происходит, когда потоки одного варпа идут в разные ветки <code>if</code>?</p><ul><li>варп выполняет обе ветки по очереди с маской неактивных потоков</li><li>варп делится на два независимых</li><li>GPU выдаёт ошибку</li><li>выполняется только одна ветка</li></ul><div class="why">Расхождение снижает эффективность; на GPU стараются обходиться без ветвлений, зависящих от данных.</div></div>
+<div class="mcq" data-ok="3"><p>Когда перенос вычисления на дискретный GPU невыгоден?</p><ul><li>когда данных больше гигабайта</li><li>когда используется double</li><li>никогда</li><li>когда операций на байт мало, и передача данных по PCIe туда и обратно дольше, чем расчёт на CPU</li></ul><div class="why">Арифметическая интенсивность решает. Сложение векторов — плохой кандидат, умножение больших матриц — отличный.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем архитектура GPU отличается от CPU?</summary><div class="a"><p>CPU тратит транзисторы на ускорение одного потока: внеочередное исполнение, предсказание, большие кэши. GPU — на количество простых вычислительных дорожек, объединённых в варпы, которые выполняют одну команду над разными данными, и прячет задержку памяти переключением между множеством варпов. CPU выигрывает на ветвистом последовательном коде, GPU — на массово-параллельной однородной работе.</p></div></details>
+<details class="q"><summary>Что такое арифметическая интенсивность и почему она важна для ускорителей?</summary><div class="a"><p>Отношение числа вычислительных операций к объёму перемещаемых данных. Если она низкая, производительность ограничена пропускной способностью памяти и передачей по шине, а не вычислениями; ускоритель не успевает получать данные. Для дискретного GPU добавляется ещё и копирование по PCIe.</p></div></details>
+<details class="q"><summary>Какие «ускорители» использует обычная JVM без всяких GPU?</summary><div class="a"><p>Интринсики на специальных командах процессора: AES-NI и PCLMULQDQ для AES-GCM, SHA-NI, CRC32/CRC32C, векторные команды для Arrays.equals/fill/sort, String.indexOf, кодирования UTF-8 и Base64, Vector API, атомарные команды для CAS. JIT подставляет их вместо обычного кода, если процессор их поддерживает.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

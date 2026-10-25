@@ -1,0 +1,134 @@
+@chapter 08 | quiz
+@intro
+<p>Смотрим на виртуальную память процесса Linux изнутри: зарезервированное против резидентного у JVM, цена первого касания страниц, copy-on-write после <code>fork</code> и карта адресного пространства Java-процесса. Лабы — в Docker-образе <code>cs-lab</code>, там есть <code>/proc</code>. Модуль IDEA — <code>cs08</code>.</p>
+@end
+
+@lab 8.1 | VmSize против VmRSS у JVM | 15 мин
+@goal
+<p>Увидеть, что JVM резервирует гигабайты адресов, а физическая память появляется по мере касания.</p>
+@end
+@file Rss.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Rss {
+    static String mem() throws Exception {
+        StringBuilder b = new StringBuilder();
+        for (String line : Files.readAllLines(Path.of("/proc/self/status")))
+            if (line.startsWith("VmSize") || line.startsWith("VmRSS"))
+                b.append(String.format("%-8s %,10d КБ   ", line.substring(0, line.indexOf(':') + 1),
+                        Long.parseLong(line.replaceAll("[^0-9]", ""))));
+        return b.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("старт:                    " + mem());
+        long[] big = new long[128 * 1024 * 1024];          // 1 ГБ
+        System.out.println("после new long[] на 1 ГБ: " + mem());
+        big = null;
+        System.gc();
+        System.out.println("после GC:                 " + mem());
+    }
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab java -Xmx4g Rss.java ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab java -Xmx4g Rss.java
+@end
+@predict Насколько VmSize больше 4 ГБ кучи? Вырастет ли VmRSS сразу после <code>new long[]</code> или только после записи в массив? Уменьшится ли RSS после GC?
+@answer
+<p>VmSize на старте ~7 ГБ: 4 ГБ резерва под кучу плюс class space (1 ГБ), code cache (240 МБ), стеки, библиотеки. VmRSS — около 100 МБ. После <code>new long[]</code> RSS сразу растёт на гигабайт: JVM обязана заполнить массив нулями и тем самым касается каждой страницы — хотя мы ещё ничего не записали. После GC RSS здесь не уменьшился, а VmSize даже вырос (GC выделил служебные структуры): G1 умеет возвращать ОС свободные регионы (uncommit), но делает это не всегда и не сразу — память процесса Java редко «отдаётся» мгновенно.</p>
+@end
+@step Теперь с предварительным касанием всей кучи:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab java -Xmx4g -Xms4g -XX:+AlwaysPreTouch Rss.java ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab java -Xmx4g -Xms4g -XX:+AlwaysPreTouch Rss.java
+@end
+@note С <code>AlwaysPreTouch</code> RSS на старте — все 4 ГБ: JVM коснулась каждой страницы кучи при запуске. Запуск дольше, зато в работе нет page faults на первом касании, а нехватка памяти обнаружится сразу, а не через час под нагрузкой.
+
+@lab 8.2 | Page faults и copy-on-write | 20 мин
+@goal
+<p>Посчитать page faults при первом касании памяти и увидеть copy-on-write после <code>fork</code>.</p>
+@end
+@file cow.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+long faults(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); return u.ru_minflt; }
+
+int main(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    size_t n = 64UL << 20;                                       // 64 МБ
+    long f0 = faults();
+    char *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long f1 = faults();
+    for (size_t i = 0; i < n; i += page) p[i] = 1;               // касаемся каждой страницы
+    long f2 = faults();
+    for (size_t i = 0; i < n; i += page) p[i] = 2;               // второй проход
+    long f3 = faults();
+    printf("страница %ld байт\nmmap 64 МБ:           +%ld page faults\nпервая запись:        +%ld\nвторая запись:        +%ld\n",
+           page, f1 - f0, f2 - f1, f3 - f2);
+
+    int x = 42;
+    fflush(stdout);                                              // иначе буфер stdio скопируется в потомка
+    pid_t pid = fork();
+    if (pid == 0) {
+        long a = faults();
+        for (size_t i = 0; i < n; i += page) p[i] = 3;           // пишем во все страницы — каждая копируется
+        x = 100;
+        printf("потомок:  &x=%p x=%d, page faults при записи в 64 МБ: +%ld (copy-on-write)\n", (void *)&x, x, faults() - a);
+        exit(0);
+    }
+    wait(NULL);
+    printf("родитель: &x=%p x=%d, p[0]=%d — адреса те же, данные свои\n", (void *)&x, x, p[0]);
+    return 0;
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -o cow cow.c && ./cow" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -O0 -o cow cow.c && ./cow"
+@end
+@predict Сколько page faults даст <code>mmap</code> 64 МБ, первая запись и вторая? Сколько — запись потомка в те же 64 МБ после <code>fork</code>?
+@answer
+<p><code>mmap</code> — ноль: только резервирование. Первая запись — 16384 (64 МБ / 4 КБ): по minor fault на страницу. Вторая — ноль: страницы уже есть. Потомок после <code>fork</code> снова получает около 16384 faults: все страницы общие и только для чтения, каждая запись — копия страницы (плюс пара страниц стека). Адрес <code>&amp;x</code> у родителя и потомка одинаковый, а значения разные: одинаковые виртуальные адреса отображены на разные физические кадры.</p>
+@end
+@try
+Уберите <code>fflush(stdout)</code> и запустите с выводом в канал: <code>./cow | cat</code>. ::: Первые строки напечатаются дважды: при выводе в канал stdio буферизует целиком, буфер с ещё не выведенным текстом копируется в потомка вместе с памятью, и оба процесса выводят его при завершении. Copy-on-write копирует всё — даже то, о чём вы забыли.
+Добавьте флаг <code>MAP_POPULATE</code> в <code>mmap</code>. ::: Page faults переедут из «первой записи» в сам вызов <code>mmap</code> (ядро заполнит таблицы сразу) — аналог <code>AlwaysPreTouch</code>.
+@end
+
+@lab 8.3 | Карта памяти Java-процесса | 15 мин
+@goal
+<p>Найти в адресном пространстве JVM кучу, code cache, библиотеки и стеки потоков.</p>
+@end
+@file Maps.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+public class Maps {
+    public static void main(String[] args) throws Exception {
+        List<String> maps = Files.readAllLines(Path.of("/proc/self/maps"));
+        System.out.println("всего областей: " + maps.size());
+        long total = 0;
+        for (String l : maps) {
+            String[] f = l.split("\\s+", 6);
+            String[] ab = f[0].split("-");
+            long size = Long.parseUnsignedLong(ab[1], 16) - Long.parseUnsignedLong(ab[0], 16);
+            total += size;
+            String name = f.length > 5 ? f[5].trim() : "";
+            if (size >= 64L << 20 || name.contains("libjvm") || name.contains("[stack]") || name.endsWith("modules") || name.endsWith(".jsa"))
+                System.out.printf("%12s  %s  %,9d КБ  %s%n", ab[0], f[1], size / 1024, name.isEmpty() ? "(анонимная)" : name);
+        }
+        System.out.printf("сумма областей: %,d МБ%n", total >> 20);
+    }
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab java -Xmx1g -XX:+UseG1GC Maps.java ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab java -Xmx1g -XX:+UseG1GC Maps.java
+@end
+@predict Найдите в выводе кучу (1 ГБ), class space, code cache, <code>libjvm.so</code> и архив CDS. Какие у них права?
+@answer
+<p><b>Куча</b> — две соседние анонимные области с адреса <code>0xc0000000</code> (3 ГБ): ~246 МБ <code>rw-p</code> (commit, <code>-Xms</code> по умолчанию) и ~776 МБ <code>---p</code> (резерв до <code>-Xmx1g</code>). Она заканчивается ровно на 4 ГБ — JVM специально положила кучу ниже 4 ГБ, чтобы сжатые ссылки работали без базы и сдвига (zero-based compressed oops). <b>Class space</b> — ~1 ГБ <code>---p</code> сразу за архивом CDS <code>classes.jsa</code> (их адрес меняется от запуска к запуску — рандомизация адресного пространства, ASLR). <b>Code cache</b> — две области по ~114 МБ <code>---p</code>: сегменты для профилируемого и оптимизированного кода, пока почти целиком только зарезервированы. <b><code>lib/modules</code></b> — <code>r--s</code>: файл модулей JDK отображён только на чтение и <i>общий</i> (s — shared) для всех процессов. <b><code>libjvm.so</code></b> — несколько областей: код <code>r-xp</code> (17 МБ), константы <code>r--p</code>, данные <code>rw-p</code>. Сумма — около 4 ГБ адресов при RSS ~100 МБ.</p>
+@end

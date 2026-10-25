@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Сеть внутри машины: сокеты и epoll</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · ВВОД-ВЫВОД</div>
+  <h1>Сеть внутри машины: сокеты и epoll</h1>
+  <p class="lead">Сетевые протоколы — тема <a href="../computer-networks/index.html">отдельного пособия</a>. Здесь — что происходит внутри одного компьютера: как пакет из провода попадает в сетевую карту, потом в ядро и в <code>read()</code> вашего потока, что такое сокет для ОС, почему модель «поток на соединение» упирается в тысячи соединений, как <code>epoll</code> позволяет одному потоку обслуживать сотни тысяч, и как этим пользуются Java NIO, Netty, WebFlux и виртуальные потоки.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">сетевая карта и DMA</span><span class="tag">стек TCP/IP в ядре</span><span class="tag">сокет = дескриптор</span><span class="tag">буферы</span><span class="tag">блокирующий ввод-вывод</span><span class="tag">epoll</span><span class="tag">io_uring и IOCP</span><span class="tag">zero-copy</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="rx"><span class="h-num">13.1</span>Путь пакета: от провода до read()</h2>
+<div class="widget stepper">
+  <div class="widget-title">Приём пакета</div>
+  <div class="st-stage"><pre class="out" style="min-height:120px"><span data-from="1" data-to="2">сетевая карта (NIC) принимает кадр Ethernet, проверяет контрольную сумму
+и по DMA кладёт его в заранее выделенный драйвером буфер
+в кольцевой очереди приёма (RX ring) в оперативной памяти</span><span data-from="2" data-to="3">NIC посылает прерывание (MSI-X) ядру процессора, к которому привязана эта очередь
+(RSS: хэш от адресов и портов распределяет соединения по очередям и ядрам)
+обработчик лишь отключает дальнейшие прерывания и планирует опрос (NAPI)</span><span data-from="3" data-to="4">softirq NET_RX: драйвер забирает пачку пакетов из кольца,
+стек ядра разбирает заголовки: Ethernet → IP (маршрут, фильтры netfilter/iptables)
+→ TCP: какой сокет? номер последовательности, подтверждение (ACK) отправителю</span><span data-from="4" data-to="5">данные дописываются в буфер приёма сокета (socket receive buffer, SO_RCVBUF)
+если поток ждёт в read() или в epoll_wait — ядро его будит</span><span data-from="5">поток возвращается из read(): данные скопированы из буфера сокета
+в byte[] / ByteBuffer программы. Между проводом и вашим кодом —
+DMA, прерывание, softirq, разбор протоколов, копирование, переключение потока</span></pre></div>
+  <section class="st-step" data-t="DMA в кольцо"><p>Сетевая карта сама пишет пакеты в память — процессор не копирует ни байта.</p></section>
+  <section class="st-step" data-t="Прерывание"><p>Под нагрузкой прерывания «склеиваются»: ядро переходит в режим опроса и забирает пакеты пачками.</p></section>
+  <section class="st-step" data-t="Стек TCP/IP"><p>Протоколы разбираются в ядре, в контексте softirq — время видно в top как si.</p></section>
+  <section class="st-step" data-t="Буфер сокета"><p>Пока программа не прочитала, данные лежат в ядре. Буфер полон — TCP уменьшает окно, и отправитель притормаживает.</p></section>
+  <section class="st-step" data-t="read() возвращается"><p>Последнее копирование — из ядра в память процесса.</p></section>
+</div>
+<p><b>Отправка</b> — зеркально: <code>write()</code> копирует данные в <b>буфер отправки</b> сокета и обычно возвращается сразу; ядро нарезает их на сегменты, строит заголовки и ставит в очередь передачи карты. Возврат <code>write</code> не означает, что данные дошли до получателя, — только что ядро их приняло. Аппаратные разгрузки (TSO, GRO, контрольные суммы) переносят нарезку и склейку сегментов в сетевую карту.</p>
+
+<h2 id="socket"><span class="h-num">13.2</span>Сокет — это файловый дескриптор</h2>
+<p>Для программы сокет — небольшое целое число, дескриптор, как у открытого файла: <code>read</code>, <code>write</code>, <code>close</code> работают так же. За ним в ядре — структура с состоянием TCP-соединения, буферами приёма и отправки, очередью ожидающих потоков.</p>
+<div class="table-wrap"><table>
+<tr><th>Системный вызов</th><th>Сервер</th><th>Клиент</th><th>Java</th></tr>
+<tr><td><code>socket</code></td><td>создать</td><td>создать</td><td><code>new ServerSocket</code>, <code>new Socket</code>, <code>SocketChannel.open</code></td></tr>
+<tr><td><code>bind</code></td><td>занять адрес и порт</td><td>(обычно автоматически — эфемерный порт)</td><td>конструктор / <code>bind</code></td></tr>
+<tr><td><code>listen(backlog)</code></td><td>начать принимать; ядро само проводит рукопожатие и кладёт готовые соединения в очередь</td><td>—</td><td>параметр backlog</td></tr>
+<tr><td><code>accept</code></td><td>забрать соединение из очереди — новый дескриптор</td><td>—</td><td><code>serverSocket.accept()</code></td></tr>
+<tr><td><code>connect</code></td><td>—</td><td>тройное рукопожатие TCP</td><td><code>new Socket(host, port)</code></td></tr>
+<tr><td><code>read</code>/<code>recvfrom</code>, <code>write</code>/<code>sendto</code></td><td colspan="2">обмен данными через буферы ядра</td><td>потоки сокета, <code>channel.read/write</code></td></tr>
+</table></div>
+<ul>
+  <li><b>Лимит дескрипторов</b> (<code>ulimit -n</code>, часто 1024 по умолчанию для сессии, в контейнерах — больше): каждое соединение — дескриптор. «Too many open files» под нагрузкой — классическая авария.</li>
+  <li><b>Эфемерные порты</b> клиента: исходящих соединений к одному адресу и порту не больше ~28 тысяч (диапазон 32768–60999) — причина ошибок «Cannot assign requested address» у клиентов без пула соединений. После закрытия соединение ещё ~60 секунд в состоянии <b>TIME_WAIT</b>.</li>
+  <li><b>Loopback</b> (127.0.0.1): пакеты не доходят до карты, но проходят весь стек TCP/IP в ядре. Unix-сокеты (тема 11) — быстрее, без TCP.</li>
+</ul>
+
+<h2 id="models"><span class="h-num">13.3</span>Модели ввода-вывода</h2>
+<h3>Блокирующий: поток на соединение</h3>
+<p><code>read()</code> на сокете без данных усыпляет поток в ядре (состояние S, хотя в Java — <code>RUNNABLE</code>, тема 11). Код простой и линейный: принял соединение — отдал его потоку, поток читает запрос, ходит в базу, пишет ответ. Цена — <b>поток ОС на каждое одновременное соединение</b>: стек (резерв 1 МБ и реально занятые десятки КБ), структура в ядре, переключения контекста. Тысячи потоков — терпимо, десятки и сотни тысяч — нет. Так работали сервлет-контейнеры (Tomcat с пулом 200 потоков).</p>
+<h3>Неблокирующий с мультиплексированием: epoll</h3>
+<p>Сокет переводят в неблокирующий режим: <code>read</code> без данных сразу возвращает <code>EAGAIN</code>. А чтобы не опрашивать тысячи сокетов вхолостую, ядро предоставляет <b>мультиплексор</b>: «вот мои сокеты — разбуди меня, когда хотя бы на одном что-то случится».</p>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>ОС</th><th>Особенность</th></tr>
+<tr><td><code>select</code>, <code>poll</code></td><td>POSIX</td><td>на каждый вызов передаётся весь список сокетов — O(n) на вызов</td></tr>
+<tr><td><b><code>epoll</code></b></td><td>Linux</td><td>список регистрируется в ядре один раз (<code>epoll_ctl</code>), <code>epoll_wait</code> возвращает только готовые — O(готовых)</td></tr>
+<tr><td><code>kqueue</code></td><td>macOS, BSD</td><td>то же, плюс события файлов, процессов, таймеров</td></tr>
+<tr><td><b>IOCP</b></td><td>Windows</td><td>модель завершения: «прочитай в этот буфер и сообщи, когда готово»</td></tr>
+<tr><td><b><code>io_uring</code></b></td><td>Linux 5.1+</td><td>общие с ядром кольца запросов и ответов в памяти: пачки операций (сеть, файлы) почти без системных вызовов</td></tr>
+</table></div>
+<p><b>Цикл событий</b> (event loop): один поток вызывает <code>epoll_wait</code>, получает список готовых сокетов, для каждого читает доступные данные, продвигает обработку и снова ждёт. Пока он не возвращается в цикл, все остальные соединения ждут — поэтому в обработчиках событий нельзя блокироваться (запросом в БД через JDBC, <code>Thread.sleep</code>). Так устроены nginx, Node.js, Netty, Vert.x, Spring WebFlux (<a href="../webflux/index.html">пособие WebFlux</a>).</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 220" role="img" aria-label="Поток на соединение против одного потока цикла событий с epoll">
+  <g font-size="12.5">
+    <text x="20" y="22" font-weight="700">поток на соединение</text>
+    <g id="tpc"></g>
+    <text x="20" y="200" class="muted">10 000 соединений → 10 000 потоков ОС, почти все спят в read()</text>
+    <text x="440" y="22" font-weight="700">цикл событий (epoll)</text>
+    <rect x="440" y="40" width="120" height="44" rx="6" class="box-acc"/><text x="500" y="67" text-anchor="middle">поток цикла</text>
+    <rect x="600" y="40" width="200" height="44" rx="6" class="box-warn"/><text x="700" y="60" text-anchor="middle">epoll (в ядре)</text><text x="700" y="76" text-anchor="middle" class="muted" font-size="11">набор 10 000 сокетов</text>
+    <path d="M560 62 L598 62" class="ln-acc"/>
+    <g id="evs"></g>
+    <text x="440" y="200" class="muted">10 000 соединений → 1–N потоков (обычно по числу ядер)</text>
+  </g>
+</svg>
+<script>
+(function () {
+  var h = ""; for (var i = 0; i < 18; i++) { var x = 20 + (i % 6) * 64, y = 40 + Math.floor(i / 6) * 48; h += '<rect x="' + x + '" y="' + y + '" width="58" height="40" rx="5" class="box-info"/><text x="' + (x + 29) + '" y="' + (y + 18) + '" text-anchor="middle" font-size="10.5">поток</text><text x="' + (x + 29) + '" y="' + (y + 32) + '" text-anchor="middle" font-size="10" class="muted">read() 💤</text>'; }
+  document.getElementById("tpc").innerHTML = h;
+  var e = ""; for (var j = 0; j < 24; j++) { var cx = 610 + (j % 12) * 16, cy = 110 + Math.floor(j / 12) * 22; e += '<rect x="' + cx + '" y="' + cy + '" width="12" height="16" rx="2" class="' + (j % 7 === 2 ? "box-ok" : "box") + '"/>'; }
+  e += '<text x="610" y="172" font-size="11" class="muted">зелёные — готовы к чтению: только их вернёт epoll_wait</text>';
+  document.getElementById("evs").innerHTML = e;
+})();
+</script>
+</figure>
+<h3>Виртуальные потоки: блокирующий код поверх epoll</h3>
+<p>Виртуальные потоки Java объединяют обе модели: код пишется блокирующим (<code>socket.read()</code>), но JVM внутри делает сокет неблокирующим. Если данных нет (<code>EAGAIN</code>), виртуальный поток регистрирует сокет в системном poller (epoll на Linux, kqueue на macOS, IOCP-подобный механизм на Windows) и <b>паркуется</b>, освобождая поток-носитель; когда poller сообщает о готовности, виртуальный поток снова ставится в очередь. Лаба 13.3 показывает это по системным вызовам.</p>
+
+<div class="widget" id="c10kW">
+  <div class="widget-title">Сколько стоят одновременные соединения</div>
+  <div class="controls"><label>одновременных соединений<input type="text" id="cN" value="10000"></label><label>реально занятый стек потока, КБ<input type="text" id="cStack" value="64"></label></div>
+  <div class="out" id="cOut"></div>
+</div>
+<script>
+(function () {
+  var n = document.getElementById("cN"), st = document.getElementById("cStack"), o = document.getElementById("cOut");
+  function mb(x) { return x >= 1024 ? (x / 1024).toFixed(1) + " ГБ" : Math.round(x) + " МБ"; }
+  function run() {
+    var N = Math.max(1, parseInt(n.value, 10) || 1), S = Math.max(4, parseFloat(st.value) || 64);
+    var sock = N * 10 / 1024;                    // ~10 КБ ядра на сокет с буферами в покое (очень грубо)
+    var L = [];
+    L.push("Поток на соединение (платформенные потоки):");
+    L.push("  потоков ОС:           " + N.toLocaleString("ru-RU"));
+    L.push("  резерв адресов стеков: " + mb(N * 1) + "  (при -Xss1m)");
+    L.push("  реально под стеки:     " + mb(N * S / 1024));
+    L.push("  ядро на сокеты:        ~" + mb(sock));
+    L.push("  переключения: каждый пришедший запрос будит свой поток через планировщик ОС");
+    L.push("\nЦикл событий / виртуальные потоки:");
+    L.push("  потоков ОС:           " + (navigator.hardwareConcurrency || 8) + " (по числу ядер)");
+    L.push("  виртуальные потоки: стеки в куче по реальной глубине, ~1–10 КБ на ожидающий");
+    L.push("  память под стеки:     ~" + mb(N * 4 / 1024) + ", ядро на сокеты — те же ~" + mb(sock));
+    L.push("\nПредел сместился: теперь упираемся в лимит дескрипторов (ulimit -n), буферы сокетов, пулы к БД и в сам процессор.");
+    o.textContent = L.join("\n");
+  }
+  n.addEventListener("input", run); st.addEventListener("input", run); run();
+})();
+</script>
+
+<h2 id="zerocopy"><span class="h-num">13.4</span>Копирования и zero-copy</h2>
+<p>Отдача файла по сети «в лоб» — <code>read(file)</code> в буфер программы, затем <code>write(socket)</code>: данные копируются из page cache в память процесса и обратно в ядро, плюс два системных вызова на каждый кусок. <b><code>sendfile</code></b> отправляет данные из page cache прямо в сокет, не поднимая их в пользовательское пространство; с поддержкой карты (scatter-gather DMA) копирований в процессоре нет совсем. В Java это <code>FileChannel.transferTo(…, socketChannel)</code> — так Kafka отдаёт сообщения потребителям и так веб-серверы отдают статику. Дальше по шкале — обход ядра (DPDK, RDMA) для бирж и хранилищ, где важны единицы микросекунд.</p>
+
+<h2 id="java"><span class="h-num">13.5</span>Java и сеть: сводка</h2>
+<div class="table-wrap"><table>
+<tr><th>API</th><th>Модель</th><th>Под капотом (Linux)</th></tr>
+<tr><td><code>Socket</code>, <code>ServerSocket</code> на платформенных потоках</td><td>блокирующая, поток на соединение</td><td><code>accept</code>, <code>read</code>, <code>write</code>, поток спит в ядре</td></tr>
+<tr><td>те же на виртуальных потоках</td><td>блокирующий код, неблокирующая реализация</td><td>неблокирующий сокет + системный poller на <code>epoll</code></td></tr>
+<tr><td>NIO <code>Selector</code></td><td>мультиплексирование</td><td><code>epoll_create</code>, <code>epoll_ctl</code>, <code>epoll_wait</code></td></tr>
+<tr><td>Netty, WebFlux / Reactor Netty</td><td>цикл событий на N потоках</td><td>NIO или нативный транспорт epoll / io_uring</td></tr>
+<tr><td><code>AsynchronousSocketChannel</code></td><td>завершение (completion)</td><td>на Windows — IOCP, на Linux — epoll и пул потоков</td></tr>
+<tr><td><code>HttpClient</code> (JDK 11+)</td><td>асинхронный</td><td>NIO <code>Selector</code></td></tr>
+<tr><td><code>FileChannel.transferTo</code> в сокет</td><td>zero-copy</td><td><code>sendfile</code></td></tr>
+</table></div>
+
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">13.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Смотрим на сетевой ввод-вывод Java по системным вызовам: блокирующий сервер, NIO <code>Selector</code> на <code>epoll</code>, виртуальный поток, который паркуется на сокете, и zero-copy через <code>sendfile</code>. Все лабы — в Docker-образе <code>cs-lab</code> под <code>strace</code>. Модуль IDEA — <code>cs13</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-13.1">
+<div class="lab-head"><span class="lab-num">Лаба 13.1</span><b>Блокирующий сервер</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти <code>socket</code>, <code>bind</code>, <code>listen</code>, <code>accept</code>, <code>read</code> и <code>write</code> в работе простейшего эхо-сервера.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>BlockingEcho.java</code>:</div>
+<pre data-title="BlockingEcho.java"><code class="java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class BlockingEcho {
+    public static void main(String[] args) throws Exception {
+        InetAddress lo = InetAddress.getLoopbackAddress();
+        try (ServerSocket server = new ServerSocket(9000, 50, lo)) {          // socket + bind + listen
+            Thread client = new Thread(() -&gt; {
+                try (Socket s = new Socket(lo, 9000)) {                          // connect
+                    s.getOutputStream().write("ping\n".getBytes());
+                    s.getInputStream().read();
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            });
+            client.start();
+            try (Socket conn = server.accept()) {                                // accept — новый дескриптор
+                byte[] buf = new byte[16];
+                int n = conn.getInputStream().read(buf);                         // read — спим, пока нет данных
+                conn.getOutputStream().write(buf, 0, n);                         // write — в буфер отправки
+            }
+            client.join();
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp BlockingEcho.java &amp;&amp; strace -f -e trace=socket,bind,listen,accept,connect,read,write java -cp /tmp BlockingEcho 2&gt;&amp;1 | grep -E 'AF_INET.*SOCK_STREAM|bind\(|listen\(|accept\(|connect\(.*9000|ping'"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[pid    45] socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 4
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_IP) = 4
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_IP) = 4
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP) = 5
+[pid    45] socket(AF_INET6, SOCK_STREAM, IPPROTO_IP) = 5
+[pid    45] bind(5, {sa_family=AF_INET6, sin6_port=htons(9000), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:127.0.0.1", &amp;sin6_addr), sin6_scope_id=0}, 28) = 0
+[pid    45] listen(5, 50)               = 0
+[pid    45] accept(5 &lt;unfinished ...&gt;
+[pid    66] socket(AF_INET6, SOCK_STREAM, IPPROTO_IP) = 7
+[pid    66] connect(7, {sa_family=AF_INET6, sin6_port=htons(9000), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:127.0.0.1", &amp;sin6_addr), sin6_scope_id=0}, 28) = 0
+[pid    66] write(7, "ping\n", 5 &lt;unfinished ...&gt;
+[pid    45] &lt;... read resumed&gt;, "ping\n", 16) = 5
+[pid    45] write(6, "ping\n", 5 &lt;unfinished ...&gt;</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">В каком порядке и от каких потоков ([pid N]) появятся вызовы? Что вернёт <code>accept</code>?</div>
+<div class="lab-ans" hidden><p>Несколько первых <code>socket</code> — JDK при старте проверяет, поддерживает ли система IPv6 (и сразу закрывает пробные сокеты). Затем поток <code>main</code>: <code>socket(AF_INET6, SOCK_STREAM)</code> → <code>bind(… port 9000)</code> → <code>listen(…, 50)</code> → <code>accept(…</code> — и засыпает (у strace — <code>&lt;unfinished …&gt;</code>). Поток клиента: свой <code>socket</code> и <code>connect</code> к порту 9000, затем <code>write(…, "ping\n", 5)</code>. <code>accept</code> возвращает <b>новый</b> дескриптор — соединение с клиентом (и адрес клиента с его эфемерным портом). Дальше <code>read(…, "ping\n")</code> на этом дескрипторе и <code>write</code> обратно; клиент читает ответ. Адреса — IPv6 (<code>::1</code> или <code>::ffff:127.0.0.1</code>): Java по умолчанию использует двойной стек.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-13.2">
+<div class="lab-head"><span class="lab-num">Лаба 13.2</span><b>NIO Selector — это epoll</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что <code>Selector</code> на Linux реализован через <code>epoll</code>, и увидеть цикл событий.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>NioEcho.java</code>:</div>
+<pre data-title="NioEcho.java"><code class="java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+
+public class NioEcho {
+    public static void main(String[] args) throws Exception {
+        InetSocketAddress addr = new InetSocketAddress(InetAddress.getLoopbackAddress(), 9001);
+        Selector selector = Selector.open();                                     // epoll_create
+        ServerSocketChannel server = ServerSocketChannel.open().bind(addr);
+        server.configureBlocking(false);
+        server.register(selector, SelectionKey.OP_ACCEPT);                       // epoll_ctl(ADD, слушающий сокет)
+
+        Thread client = new Thread(() -&gt; {
+            try (SocketChannel s = SocketChannel.open(addr)) {
+                s.write(ByteBuffer.wrap("ping".getBytes()));
+                s.read(ByteBuffer.allocate(8));
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+        });
+        client.start();
+
+        boolean done = false;
+        while (!done) {
+            selector.select();                                                   // epoll_wait — ждём любого события
+            for (SelectionKey key : selector.selectedKeys()) {
+                if (key.isAcceptable()) {
+                    SocketChannel ch = server.accept();
+                    ch.configureBlocking(false);
+                    ch.register(selector, SelectionKey.OP_READ);                 // epoll_ctl(ADD, новое соединение)
+                } else if (key.isReadable()) {
+                    SocketChannel ch = (SocketChannel) key.channel();
+                    ByteBuffer buf = ByteBuffer.allocate(8);
+                    ch.read(buf);
+                    buf.flip();
+                    ch.write(buf);
+                    ch.close();
+                    done = true;
+                }
+            }
+            selector.selectedKeys().clear();
+        }
+        client.join();
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp NioEcho.java &amp;&amp; strace -f -e trace=epoll_create1,epoll_ctl,epoll_wait,accept,read,write java -cp /tmp NioEcho 2&gt;&amp;1 | grep -E 'epoll|accept\(|ping' | grep -v resumed"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[pid    46] epoll_create1(EPOLL_CLOEXEC) = 4
+[pid    46] epoll_ctl(4, EPOLL_CTL_ADD, 5, {events=EPOLLIN, data=0x7e0f00000005}) = 0
+[pid    46] epoll_ctl(4, EPOLL_CTL_ADD, 7, {events=EPOLLIN, data=0x7e0f00000007}) = 0
+[pid    46] epoll_wait(4, [{events=EPOLLIN, data=0x7e0f00000007}], 1024, -1) = 1
+[pid    46] accept(7, {sa_family=AF_INET6, sin6_port=htons(49744), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "::ffff:127.0.0.1", &amp;sin6_addr), sin6_scope_id=0}, [28]) = 9
+[pid    67] write(8, "ping", 4)         = 4
+[pid    46] epoll_ctl(4, EPOLL_CTL_ADD, 9, {events=EPOLLIN, data=0x9}) = 0
+[pid    46] epoll_wait(4, [{events=EPOLLIN, data=0x9}], 1024, -1) = 1
+[pid    46] read(9, "ping", 8)          = 4
+[pid    46] write(9, "ping", 4 &lt;unfinished ...&gt;</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько раз поток сервера вызовет <code>epoll_wait</code> и что будет между вызовами?</div>
+<div class="lab-ans" hidden><p><code>epoll_create1</code> — создание селектора; <code>epoll_ctl(…, EPOLL_CTL_ADD, fd, {events=EPOLLIN…})</code> — регистрация слушающего сокета. Затем цикл: <code>epoll_wait</code> (ждём) → событие на слушающем сокете → <code>accept</code> → <code>epoll_ctl(ADD)</code> нового соединения → снова <code>epoll_wait</code> → событие чтения → <code>read(…, "ping")</code> и <code>write</code>. Один поток обслуживает любое число соединений: между ожиданиями он занят только теми сокетами, где что-то произошло.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-13.3">
+<div class="lab-head"><span class="lab-num">Лаба 13.3</span><b>Виртуальный поток паркуется на сокете</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что блокирующий <code>read()</code> в виртуальном потоке на самом деле неблокирующий: <code>EAGAIN</code>, регистрация в poller и пробуждение.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>VirtualRead.java</code>:</div>
+<pre data-title="VirtualRead.java"><code class="java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class VirtualRead {
+    public static void main(String[] args) throws Exception {
+        InetAddress lo = InetAddress.getLoopbackAddress();
+        try (ServerSocket server = new ServerSocket(9002, 50, lo)) {
+            Thread client = new Thread(() -&gt; {
+                try (Socket s = new Socket(lo, 9002)) {
+                    Thread.sleep(300);                                           // данные придут не сразу
+                    s.getOutputStream().write("ping\n".getBytes());
+                    s.getInputStream().read();
+                } catch (Exception e) { throw new RuntimeException(e); }
+            });
+            client.start();
+            Socket conn = server.accept();
+            Thread vt = Thread.ofVirtual().start(() -&gt; {
+                try {
+                    byte[] buf = new byte[16];
+                    int n = conn.getInputStream().read(buf);                     // обычный блокирующий код
+                    conn.getOutputStream().write(buf, 0, n);
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            });
+            vt.join();
+            client.join();
+            conn.close();
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp VirtualRead.java &amp;&amp; strace -f -e trace=read,epoll_ctl,epoll_wait java -cp /tmp VirtualRead 2&gt;&amp;1 | grep -E 'EAGAIN|CTL_ADD|ping' | grep -v unfinished"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[pid    70] read(6, 0x72a0d80024b0, 16) = -1 EAGAIN (Resource temporarily unavailable)
+[pid    70] epoll_ctl(15, EPOLL_CTL_ADD, 6, {events=EPOLLIN|EPOLLONESHOT, data=0x6}) = 0
+[pid    72] epoll_ctl(8, EPOLL_CTL_ADD, 9, {events=EPOLLIN|EPOLLONESHOT, data=0x9}) = 0
+[pid    73] epoll_ctl(8, EPOLL_CTL_ADD, 17, {events=EPOLLIN|EPOLLONESHOT, data=0x11}) = 0
+[pid    73] epoll_ctl(8, EPOLL_CTL_ADD, 18, {events=EPOLLIN|EPOLLONESHOT, data=0x12}) = 0
+[pid    73] epoll_ctl(8, EPOLL_CTL_ADD, 22, {events=EPOLLIN|EPOLLONESHOT, data=0x16}) = 0
+[pid    73] epoll_ctl(8, EPOLL_CTL_ADD, 24, {events=EPOLLIN|EPOLLONESHOT, data=0x18}) = 0
+[pid    73] epoll_ctl(8, EPOLL_CTL_ADD, 25, {events=EPOLLIN|EPOLLONESHOT, data=0x19}) = 0
+[pid    70] epoll_ctl(8, EPOLL_CTL_ADD, 11, {events=EPOLLIN|EPOLLONESHOT, data=0xb}strace: Process 76 attached
+[pid    74] epoll_ctl(8, EPOLL_CTL_ADD, 15, {events=EPOLLIN|EPOLLONESHOT, data=0xf}) = 0
+[pid    76] read(6, "ping\n", 16)       = 5</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой результат вернёт первый <code>read</code> виртуального потока? Как он потом получит данные?</div>
+<div class="lab-ans" hidden><p>Остальные строки <code>EPOLL_CTL_ADD</code> с другими номерами дескрипторов — служебные: потоки-poller JVM регистрируют свои внутренние каналы пробуждения. Нас интересует дескриптор соединения из строки с <code>EAGAIN</code>. Первый <code>read(fd, …)</code> возвращает <code>-1 EAGAIN (Resource temporarily unavailable)</code>: JVM перевела сокет в неблокирующий режим. Затем <code>epoll_ctl(…, EPOLL_CTL_ADD, fd, {events=EPOLLIN|EPOLLONESHOT…})</code> — сокет регистрируется в системном poller, а виртуальный поток паркуется: его носитель свободен для других. Когда клиент через 300 мс присылает данные, поток-poller в <code>epoll_wait</code> получает событие и снимает виртуальный поток с парковки; повторный <code>read</code> возвращает «ping». Посмотрите на номер в <code>[pid N]</code>: второй <code>read</code> часто выполняет <b>другой</b> поток ОС — виртуальный поток продолжил работу на другом носителе. Код при этом выглядит как обычный блокирующий.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-13.4">
+<div class="lab-head"><span class="lab-num">Лаба 13.4</span><b>Zero-copy: transferTo превращается в sendfile</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить, что отдача файла в сокет через <code>transferTo</code> не копирует данные через память Java.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ZeroCopy.java</code>:</div>
+<pre data-title="ZeroCopy.java"><code class="java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class ZeroCopy {
+    public static void main(String[] args) throws Exception {
+        Path file = Files.write(Path.of("/tmp/payload.bin"), new byte[1 &lt;&lt; 20]);   // 1 МБ
+        InetSocketAddress addr = new InetSocketAddress(InetAddress.getLoopbackAddress(), 9003);
+        try (ServerSocketChannel server = ServerSocketChannel.open().bind(addr)) {
+            Thread client = new Thread(() -&gt; {
+                try (SocketChannel s = SocketChannel.open(addr)) {
+                    ByteBuffer b = ByteBuffer.allocate(1 &lt;&lt; 16);
+                    long total = 0;
+                    for (int n; (n = s.read(b)) &gt; 0; b.clear()) total += n;
+                    System.out.println("клиент получил " + total + " байт");
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            });
+            client.start();
+            try (SocketChannel conn = server.accept(); FileChannel fc = FileChannel.open(file)) {
+                System.out.println("отправлено " + fc.transferTo(0, fc.size(), conn) + " байт");
+            }
+            client.join();
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp ZeroCopy.java &amp;&amp; strace -f -e trace=sendfile,copy_file_range,splice java -cp /tmp ZeroCopy 2&gt;&amp;1 | grep -E 'sendfile|copy_file_range|splice|байт' | grep -v resumed"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[pid    45] copy_file_range(8, [0], 6, NULL, 1048576, 0) = -1 EINVAL (Invalid argument)
+[pid    45] sendfile(6, 8, [0] =&gt; [1048576], 1048576) = 1048576
+отправлено 1048576 байт
+клиент получил 1048576 байт</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Каким системным вызовом JDK отправит файл? Сколько вызовов понадобится на мегабайт?</div>
+<div class="lab-ans" hidden><p>Сначала JDK пробует <code>copy_file_range</code> (он годится для «файл → файл», для сокета ядро отвечает <code>EINVAL</code>), затем — <code>sendfile(сокет, файл, [0], 1048576)</code>: данные идут из page cache в сокет внутри ядра. Один-два вызова на весь мегабайт (если буфер сокета заполнился, <code>sendfile</code> отправит часть, и JDK повторит). Через <code>read</code>/<code>write</code> было бы десятки вызовов и двойное копирование через память JVM.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">13.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что гарантирует успешный <code>write()</code> в TCP-сокет?</p><ul><li>что получатель прочитал данные</li><li>что ядро скопировало данные в буфер отправки; доставка — позже</li><li>что пакет ушёл в сеть</li><li>что пришёл ACK</li></ul><div class="why">Подтверждение доставки в приложение даёт только протокол уровня приложения (ответ сервера).</div></div>
+<div class="mcq" data-ok="3"><p>Чем <code>epoll</code> лучше <code>select</code> для 100 000 соединений?</p><ul><li>epoll работает в пользовательском режиме</li><li>select не поддерживает TCP</li><li>epoll читает данные за программу</li><li>набор сокетов хранится в ядре, и epoll_wait возвращает только готовые — не нужно передавать и проверять весь список на каждом вызове</li></ul><div class="why">Цена вызова пропорциональна числу готовых, а не всех сокетов.</div></div>
+<div class="mcq" data-ok="0"><p>Почему в обработчике цикла событий (Netty, WebFlux) нельзя делать блокирующий JDBC-запрос?</p><ul><li>пока поток цикла ждёт базу, он не обслуживает все остальные соединения, привязанные к нему</li><li>JDBC не работает в Netty</li><li>это вызовет утечку памяти</li><li>epoll отключится</li></ul><div class="why">Блокирующие вызовы — на отдельный пул (Schedulers.boundedElastic) или переход на реактивный драйвер / виртуальные потоки.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает виртуальный поток, если при <code>socket.read()</code> данных нет?</p><ul><li>блокирует поток-носитель в ядре</li><li>крутится в цикле опроса</li><li>регистрирует сокет в poller (epoll), паркуется и освобождает носитель; продолжит, когда данные придут</li><li>бросает исключение</li></ul><div class="why">Код блокирующий, реализация — неблокирующая.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите путь входящего пакета до read() в программе.</summary><div class="a"><p>Сетевая карта по DMA кладёт кадр в кольцо приёма и посылает прерывание; драйвер в softirq (NAPI) забирает пачку пакетов; стек ядра разбирает Ethernet, IP, TCP, находит сокет, кладёт данные в его буфер приёма и отправляет ACK; ожидающий в read или epoll_wait поток просыпается, read копирует данные из буфера сокета в память программы.</p></div></details>
+<details class="q"><summary>Почему модель «поток на соединение» плохо масштабируется и что делать?</summary><div class="a"><p>Каждое соединение держит поток ОС: стек, структуру в ядре, переключения контекста при каждом событии. На десятках тысяч соединений это память и время планировщика. Решения: мультиплексирование (epoll, цикл событий: Netty, WebFlux) или виртуальные потоки, которые сохраняют блокирующий стиль кода, но паркуются вместо блокировки потока ОС.</p></div></details>
+<details class="q"><summary>Что такое zero-copy и где он используется в Java?</summary><div class="a"><p>Передача данных из файла в сокет без копирования через память процесса: системный вызов sendfile отправляет страницы page cache прямо в сетевой стек (и при поддержке карты — без копирования процессором). В Java — FileChannel.transferTo в SocketChannel. Использует Kafka для отдачи сообщений и веб-серверы для статики.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

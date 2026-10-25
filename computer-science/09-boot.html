@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Загрузка: от кнопки питания до ядра</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ОПЕРАЦИОННАЯ СИСТЕМА</div>
+  <h1>Загрузка: от кнопки питания до ядра</h1>
+  <p class="lead">Когда вы нажимаете кнопку питания, в памяти нет ни операционной системы, ни драйверов, ни даже настроенной оперативной памяти. Процессор начинает с одного фиксированного адреса, и дальше каждая ступень загружает и проверяет следующую: прошивка инициализирует железо, загрузчик находит ядро, ядро настраивает процессор, память и устройства и запускает первый процесс, от которого происходят все остальные. Разберём эту цепочку — в том числе потому, что JVM при запуске проходит похожий путь в миниатюре.</p>
+  <div class="meta"><span class="tag">~1,5 часа</span><span class="tag">вектор сброса</span><span class="tag">UEFI и ACPI</span><span class="tag">Secure Boot</span><span class="tag">загрузчик</span><span class="tag">старт ядра</span><span class="tag">PID 1</span><span class="tag">старт JVM</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="reset"><span class="h-num">9.1</span>Питание и вектор сброса</h2>
+<ol class="steps">
+  <li><b>Питание.</b> Блок питания выводит напряжения на рабочий уровень и выставляет сигнал «питание в норме» (Power Good). До этого процессор удерживается в состоянии сброса.</li>
+  <li><b>Служебные процессоры.</b> Ещё до основного процессора стартуют встроенные контроллеры со своей прошивкой: Intel Management Engine / AMD Platform Security Processor, контроллер встраиваемых функций (EC) в ноутбуке, BMC в сервере. Они проверяют подпись прошивки и выпускают основной процессор из сброса.</li>
+  <li><b>Вектор сброса.</b> Одно ядро (bootstrap processor, BSP) начинает исполнять команды с фиксированного адреса <code>0xFFFFFFF0</code> — 16 байт ниже 4 ГБ. Этот адрес аппаратно отображён не на оперативную память, а на микросхему флеш-памяти с прошивкой. Остальные ядра (application processors) спят до явной команды.</li>
+  <li><b>Наследие 8086.</b> x86-процессор по-прежнему просыпается в <b>реальном режиме</b> — 16-битном, без защиты памяти, как в 1978 году. Первые же команды прошивки переводят его в защищённый (32-бит) и длинный (64-бит) режимы. С 2020-х Intel предлагает убрать это наследие (архитектура x86S), а ARM-машины такого груза не несут вовсе.</li>
+</ol>
+<div class="callout info"><span class="c-title">Оперативной памяти пока нет</span>
+Контроллер DRAM не настроен: прошивка не знает, какие модули стоят и на каких таймингах они работают. Первый код исполняется прямо из флеш-памяти, а в качестве памяти использует <b>кэш процессора</b> в специальном режиме (cache-as-RAM). Один из первых больших шагов прошивки — <b>тренировка памяти</b>: подбор задержек и уровней сигналов для каждой линии данных. Поэтому первый запуск после замены модулей длится десятки секунд, а потом результат кэшируется.
+</div>
+
+<h2 id="uefi"><span class="h-num">9.2</span>Прошивка: UEFI</h2>
+<p>Старый <b>BIOS</b> (1981) уступил место <b>UEFI</b> (Unified Extensible Firmware Interface) — по сути маленькой операционной системе со своими драйверами, файловой системой FAT, сетью и командной оболочкой. Её фазы:</p>
+<div class="table-wrap"><table>
+<tr><th>Фаза</th><th>Что происходит</th></tr>
+<tr><td><b>SEC</b> (security)</td><td>первый код после сброса: проверка целостности, кэш как временная память</td></tr>
+<tr><td><b>PEI</b> (pre-EFI initialization)</td><td>инициализация процессора, чипсета, <b>оперативной памяти</b>; после этого — переход в полноценную память</td></tr>
+<tr><td><b>DXE</b> (driver execution environment)</td><td>загрузка драйверов: PCIe, USB, дисков, видео, сети; построение таблиц, описывающих железо для ОС</td></tr>
+<tr><td><b>BDS</b> (boot device selection)</td><td>выбор, откуда загружаться, по списку в энергонезависимой памяти (переменные <code>BootOrder</code>, <code>Boot0001</code>…)</td></tr>
+<tr><td><b>Runtime</b></td><td>после передачи управления ОС часть прошивки остаётся резидентной: время, переменные UEFI, перезагрузка</td></tr>
+</table></div>
+<p><b>Как ОС узнаёт о железе.</b> Прошивка оставляет в памяти таблицы <b>ACPI</b> (сколько ядер и как они связаны, NUMA-узлы, таймеры, контроллеры прерываний, управление питанием, байткод AML для специальных устройств) и <b>SMBIOS</b> (производитель, модель, версия прошивки, модули памяти). Именно отсюда <code>lscpu</code>, «Сведения о системе» Windows и JVM узнают топологию процессора. Карта памяти — какие физические адреса заняты прошивкой, какие свободны — передаётся загрузчику вызовом <code>GetMemoryMap</code>.</p>
+
+<h2 id="secureboot"><span class="h-num">9.3</span>Цепочка доверия: Secure Boot и TPM</h2>
+<p>Если злоумышленник подменит загрузчик или ядро, никакой антивирус внутри ОС этого не увидит: вредоносный код запустится раньше. Поэтому каждая ступень проверяет следующую:</p>
+<ul>
+  <li><b>Secure Boot</b>: прошивка запускает только загрузчики, подписанные ключами из своей базы (обычно ключ Microsoft; Linux-дистрибутивы используют подписанный Microsoft промежуточный загрузчик <code>shim</code>, который проверяет GRUB и ядро ключом дистрибутива). Ядро, в свою очередь, проверяет подписи модулей.</li>
+  <li><b>TPM</b> (Trusted Platform Module) и <b>измеряемая загрузка</b>: каждая ступень вычисляет хэш следующей и «добавляет» его в регистры PCR чипа TPM. Изменить значение назад нельзя — только продолжить цепочку. Ключи шифрования диска (BitLocker, LUKS с TPM) «запечатаны» на определённые значения PCR: изменённый загрузчик — другие хэши — диск не расшифруется.</li>
+</ul>
+
+<h2 id="bootloader"><span class="h-num">9.4</span>Загрузчик</h2>
+<p>На диске с таблицей разделов GPT есть <b>системный раздел EFI</b> (ESP) с файловой системой FAT32. Прошивка читает с него программу-загрузчик — обычный исполняемый файл формата PE: <code>\EFI\BOOT\BOOTX64.EFI</code>, <code>\EFI\Microsoft\Boot\bootmgfw.efi</code> (Windows), <code>\EFI\ubuntu\shimx64.efi</code> → <code>grubx64.efi</code> (Linux).</p>
+<p>Загрузчик (GRUB, systemd-boot, Windows Boot Manager) показывает меню, затем загружает в память:</p>
+<ul>
+  <li><b>ядро</b> — Linux: сжатый образ <code>vmlinuz</code>; Windows: <code>winload.efi</code> → <code>ntoskrnl.exe</code>;</li>
+  <li><b>initramfs</b> (initial RAM filesystem) — маленькую файловую систему в памяти с драйверами и программами, нужными, чтобы найти и смонтировать настоящий корневой диск (который может быть на RAID, зашифрован, по сети);</li>
+  <li><b>командную строку ядра</b>: какой диск корневой, параметры отладки, ограничения (в лабе 9.2 видно, что WSL передаёт ядру <code>nr_cpus=18</code> и путь к <code>initrd</code>).</li>
+</ul>
+<p>Затем загрузчик вызывает <code>ExitBootServices</code> — прошивка «уходит» и больше не управляет железом — и передаёт управление точке входа ядра.</p>
+
+<h2 id="kernel"><span class="h-num">9.5</span>Старт ядра</h2>
+<ol class="steps">
+  <li><b>Распаковка и ранняя настройка.</b> Ядро распаковывает себя, строит свои таблицы страниц (тема 08) и включает виртуальную память: с этого момента ядро живёт в верхней половине адресного пространства.</li>
+  <li><b><code>start_kernel</code></b> — общая инициализация: учёт физической памяти по карте от прошивки, распределители памяти ядра, таблица обработчиков прерываний (IDT, тема 10), таймеры и источник времени (TSC, HPET), планировщик, модель устройств.</li>
+  <li><b>Запуск остальных ядер.</b> BSP посылает каждому спящему ядру межпроцессорные прерывания INIT и SIPI с адресом стартового кода. Каждое ядро проходит свою короткую инициализацию и сообщает о готовности — в журнале ядра Linux это строки <i>smp: Brought up 1 node, 18 CPUs</i>.</li>
+  <li><b>Драйверы.</b> Перебор шин (PCIe, USB), сопоставление устройств с драйверами, загрузка модулей.</li>
+  <li><b>Корневая файловая система.</b> Ядро распаковывает initramfs и запускает из неё <code>/init</code>, тот находит настоящий корневой диск, монтирует его и передаёт управление (switch_root).</li>
+  <li><b>PID 1.</b> Ядро запускает первую программу пользовательского режима — <code>/sbin/init</code> (в современных дистрибутивах это <b>systemd</b>). Это единственный процесс, созданный не через <code>fork</code>; все остальные — его потомки.</li>
+</ol>
+
+<h2 id="userspace"><span class="h-num">9.6</span>Пользовательское пространство и PID 1</h2>
+<p><b>systemd</b> читает описания юнитов и параллельно запускает службы с учётом зависимостей: монтирование дисков, сеть, журнал, SSH, Docker, базы данных, ваше Java-приложение как <code>.service</code>. Особые обязанности PID 1:</p>
+<ul>
+  <li><b>Усыновление сирот</b>: если процесс завершился раньше детей, они становятся детьми PID 1; он обязан забирать их статус завершения (<code>wait</code>), иначе они остаются «зомби».</li>
+  <li><b>Сигналы</b>: ядро не доставляет PID 1 сигналы, для которых он не установил обработчик (даже SIGTERM), — защита от случайного убийства init.</li>
+</ul>
+<div class="callout bad"><span class="c-title">Java как PID 1 в контейнере</span>
+В контейнере (тема 15) первым процессом своего пространства PID становится то, что указано в <code>ENTRYPOINT</code>. Если это <code>java</code> — она PID 1: JVM устанавливает обработчик SIGTERM, поэтому <code>docker stop</code> корректно запускает shutdown hooks. Но если запустить через shell (<code>ENTRYPOINT java -jar app.jar</code> в shell-форме), PID 1 — это <code>sh</code>, который сигнал не перешлёт: через 10 секунд придёт SIGKILL, и приложение умрёт без корректного завершения (<a href="../jvm/22-containers.html">JVM, тема 22</a>). Решения — exec-форма <code>ENTRYPOINT ["java", …]</code>, <code>exec java</code> в скрипте или маленький init (<code>tini</code>, <code>docker run --init</code>).
+</div>
+<p><b>Windows</b> проходит похожий путь: <code>winload</code> загружает ядро <code>ntoskrnl.exe</code> и драйверы загрузки, ядро запускает диспетчер сеансов <code>smss.exe</code>, тот — <code>wininit.exe</code> (службы через <code>services.exe</code>, проверка подлинности через <code>lsass.exe</code>) и <code>winlogon.exe</code> (вход пользователя, затем <code>explorer.exe</code>).</p>
+
+<div class="widget stepper">
+  <div class="widget-title">Хронология загрузки</div>
+  <div class="st-stage"><pre class="out" style="min-height:130px"><span data-from="1" data-to="2">0 мс        Power Good → служебный процессор проверил прошивку
+            основное ядро BSP: RIP = 0xFFFFFFF0 (флеш-память), реальный режим</span><span data-from="2" data-to="3">~0,1–1 с    SEC/PEI: кэш вместо памяти, тренировка DRAM
+            → 64-битный режим, появилась оперативная память</span><span data-from="3" data-to="4">~1–3 с      DXE: драйверы PCIe, NVMe, USB, видео
+            таблицы ACPI и SMBIOS, карта памяти; логотип производителя</span><span data-from="4" data-to="5">~3 с        BDS: BootOrder → ESP → \EFI\…\shimx64.efi (проверка подписи)
+            GRUB: меню, загрузка vmlinuz + initramfs, ExitBootServices</span><span data-from="5" data-to="6">+0 с ядра   распаковка, таблицы страниц, start_kernel
+            IDT, таймеры, планировщик; INIT/SIPI → «Brought up 18 CPUs»</span><span data-from="6" data-to="7">+0,3 с      драйверы, initramfs: /init находит корневой диск
+            switch_root → exec /sbin/init (systemd) — PID 1</span><span data-from="7">+1–5 с      systemd: юниты параллельно, сеть, журнал, docker.service
+            ваш app.service: exec java -jar app.jar → старт JVM (раздел 9.7)</span></pre></div>
+  <section class="st-step" data-t="Сброс"><p>Процессор просыпается в режиме совместимости с 8086 и исполняет код прямо из флеш-памяти прошивки.</p></section>
+  <section class="st-step" data-t="Память"><p>Пока DRAM не настроена, временной памятью служит кэш. Тренировка памяти — одна из самых долгих фаз.</p></section>
+  <section class="st-step" data-t="Драйверы прошивки"><p>UEFI находит устройства и описывает их для ОС в таблицах ACPI.</p></section>
+  <section class="st-step" data-t="Загрузчик"><p>Проверка подписи (Secure Boot), загрузка ядра и initramfs, прошивка уходит со сцены.</p></section>
+  <section class="st-step" data-t="Ядро"><p>Ядро включает свою виртуальную память, прерывания и планировщик, будит остальные ядра процессора.</p></section>
+  <section class="st-step" data-t="Корень и PID 1"><p>Временная файловая система в памяти помогает найти настоящий корневой диск, затем стартует первый процесс.</p></section>
+  <section class="st-step" data-t="Службы и приложение"><p>Init запускает службы; ваше приложение — одна из них, и его запуск — уже следующий слой загрузки.</p></section>
+</div>
+
+<h2 id="jvmboot"><span class="h-num">9.7</span>Загрузка JVM — та же идея в миниатюре</h2>
+<p>Запуск Java-программы повторяет схему «каждая ступень готовит следующую» (подробно — <a href="../jvm/01-architecture.html#startup">JVM, тема 01</a>):</p>
+<div class="table-wrap"><table>
+<tr><th>Компьютер</th><th>JVM</th></tr>
+<tr><td>прошивка находит загрузчик по <code>BootOrder</code></td><td>лаунчер <code>java</code> разбирает аргументы, находит и загружает <code>libjvm.so</code></td></tr>
+<tr><td>ядро размечает память и включает виртуальную память</td><td>JVM резервирует кучу, metaspace, code cache (тема 08)</td></tr>
+<tr><td>ядро генерирует таблицы и инициализирует подсистемы</td><td>JVM <b>генерирует машинный код интерпретатора</b> и заглушки («Interpreter generation» в логе <code>-Xlog:startuptime</code>), запускает служебные потоки</td></tr>
+<tr><td>initramfs с минимумом драйверов</td><td>базовые классы <code>java.base</code> из архива CDS или <code>lib/modules</code></td></tr>
+<tr><td>PID 1 запускает службы</td><td><code>System.initPhase1–3</code>, система модулей, загрузчик приложения, затем <code>main</code></td></tr>
+</table></div>
+<p>И проблема та же: старт — это работа, которую хочется сделать один раз. Компьютеры для этого засыпают и просыпаются (сохраняя состояние в памяти или на диске), JVM — использует CDS, AOT cache (проект Leyden) или снимки CRaC (<a href="../jvm/20-startup.html">JVM, тема 20</a>).</p>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">9.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Перезагружать компьютер ради лабы не будем — посмотрим на следы загрузки: что прошивка сообщила ОС, какую командную строку получило ядро, что оно писало в журнал при старте, кто PID 1 в контейнере, — и как по шагам «загружается» сама JVM. Модуль IDEA — <code>cs09</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-9.1">
+<div class="lab-head"><span class="lab-num">Лаба 9.1</span><b>Прошивка вашего компьютера</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Узнать тип прошивки и данные SMBIOS, которые она передала операционной системе.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">В PowerShell (Windows):</div>
+<pre class="cmd" data-title="PowerShell"><code class="txt">$env:firmware_type
+Get-CimInstance Win32_BIOS | Format-List Manufacturer, SMBIOSBIOSVersion, ReleaseDate
+(Get-CimInstance Win32_OperatingSystem).LastBootUpTime</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">UEFI
+Manufacturer      : XIAOMI
+SMBIOSBIOSVersion : RMAMT6B0P0A0A
+ReleaseDate       : 6/4/2024 3:00:00 AM
+Thursday, October 15, 2026 7:20:28 AM</code></pre></details>
+<p class="lab-note"><code>firmware_type</code> — <code>UEFI</code> или <code>Legacy</code> (BIOS). Производитель и версия — из таблицы SMBIOS. Проверка Secure Boot — <code>Confirm-SecureBootUEFI</code> в PowerShell от имени администратора (иначе «Access was denied»). На Linux то же самое: <code>ls /sys/firmware/efi</code> (каталог есть — UEFI), <code>sudo dmidecode -t bios</code>, <code>mokutil --sb-state</code>.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-9.2">
+<div class="lab-head"><span class="lab-num">Лаба 9.2</span><b>Командная строка и журнал ядра</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть, с какими параметрами загрузчик запустил ядро Linux и что ядро писало о себе при старте. На Windows Docker работает внутри лёгкой виртуальной машины WSL 2 — это её ядро.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab cat /proc/cmdline
+docker run --rm cs-lab uname -sr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">initrd=\initrd.img WSL_ROOT_INIT=1 panic=-1 nr_cpus=18 hv_utils.timesync_implicit=1 console=hvc0 debug pty.legacy_count=0 WSL_ENABLE_CRASH_DUMP=1
+Linux 6.18.33.2-microsoft-standard-WSL2</code></pre></details>
+</li>
+<li class="lab-step"><div class="lab-text">Сколько ядер процессора ядро ОС «подняло» при старте (раздел 9.5, INIT/SIPI) и сколько оно уже работает:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "cat /sys/devices/system/cpu/online; nproc; cut -d' ' -f1 /proc/uptime"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">0-17
+18
+421267.90</code></pre></details>
+<p class="lab-note">Журнал загрузки ядра читается командой <code>dmesg</code> (в контейнере — только с <code>--privileged</code>). Это кольцевой буфер: на долго работающей машине самые ранние строки уже вытеснены, поэтому смотреть журнал загрузки лучше сразу после старта — или в сохранённом журнале <code>journalctl -k -b</code> на обычном Linux.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что из командной строки ядра передал загрузчик? Сколько процессоров ядро разбудило при старте?</div>
+<div class="lab-ans" hidden><p>В командной строке WSL: <code>initrd=\initrd.img</code> — путь к initramfs (обратная косая черта — путь Windows: ядро грузит загрузчик Hyper-V), <code>nr_cpus=18</code> — сколько процессоров разрешено поднять, <code>console=hvc0</code> — консоль через гипервизор, <code>panic=-1</code> — немедленная перезагрузка при панике ядра. Онлайн процессоры <code>0-17</code> — все 18 логических процессоров разбужены. <code>/proc/uptime</code> — секунды с момента старта ядра (у WSL это время с первого запуска Docker или WSL, а не с включения компьютера).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-9.3">
+<div class="lab-head"><span class="lab-num">Лаба 9.3</span><b>Кто PID 1</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что в контейнере первым процессом становится точка входа, и почему это важно для сигналов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab ps -o pid,ppid,comm
+docker run --rm cs-lab sh -c "sleep 1 &amp; ps -o pid,ppid,comm"
+docker run --rm --init cs-lab ps -o pid,ppid,comm</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">    PID    PPID COMMAND
+      1       0 ps
+    PID    PPID COMMAND
+      1       0 sh
+      7       1 sleep
+      8       1 ps
+    PID    PPID COMMAND
+      1       0 docker-init
+      7       1 ps</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Кто будет PID 1 в каждом из трёх запусков?</div>
+<div class="lab-ans" hidden><p>В первом — сам <code>ps</code>: точка входа контейнера и есть PID 1, родитель — 0 (его создало ядро/рантайм, а не fork внутри контейнера). Во втором PID 1 — <code>sh</code>, а <code>sleep</code> и <code>ps</code> — его дети. В третьем с <code>--init</code> PID 1 — маленький init (<code>docker-init</code>, это tini), он пересылает сигналы и собирает зомби, а ваша программа — PID 2. Для Java: exec-форма <code>ENTRYPOINT ["java", …]</code> делает JVM PID 1, и она сама корректно обрабатывает SIGTERM.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-9.4">
+<div class="lab-head"><span class="lab-num">Лаба 9.4</span><b>Как загружается JVM</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть фазы старта виртуальной машины и сравнить старт с архивом CDS и без него.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Hello.java</code>:</div>
+<pre data-title="Hello.java"><code class="java">public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Привет, мир!");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Hello.java
+java -Xlog:startuptime Hello</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.015s][info][startuptime] StubRoutines generation initial stubs, 0.0004078 secs
+[0.015s][info][startuptime] SharedRuntime generate_throw_exception, 0.0000524 secs
+[0.032s][info][startuptime] Genesis, 0.0164731 secs
+[0.032s][info][startuptime] StubRoutines generation continuation stubs, 0.0000389 secs
+[0.032s][info][startuptime] SharedRuntime generate_jfr_stubs, 0.0000438 secs
+[0.032s][info][startuptime] SharedRuntime generate_throw_exception, 0.0000032 secs
+[0.032s][info][startuptime] SharedRuntime generate_throw_exception, 0.0000032 secs
+[0.032s][info][startuptime] SharedRuntime generate_throw_exception, 0.0000025 secs
+[0.032s][info][startuptime] SharedRuntime generate_throw_exception, 0.0000023 secs
+[0.035s][info][startuptime] Interpreter generation, 0.0010693 secs
+[0.036s][info][startuptime] StubRoutines generation final stubs, 0.0001598 secs
+[0.036s][info][startuptime] MethodHandles adapters generation, 0.0000435 secs
+[0.036s][info][startuptime] Start VMThread, 0.0003051 secs
+[0.046s][info][startuptime] Initialize java.lang classes, 0.0097466 secs
+[0.047s][info][startuptime] Initialize java.lang.invoke classes, 0.0004227 secs
+[0.048s][info][startuptime] StubRoutines generation compiler stubs, 0.0005984 secs
+[0.051s][info][startuptime] Initialize module system, 0.0035674 secs
+[0.051s][info][startuptime] Create VM, 0.0451189 secs
+Привет, мир!</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие фазы займут больше всего времени? Что означает строка «Interpreter generation»?</div>
+<div class="lab-ans" hidden><p>«Genesis» (создание базовых структур VM, кучи и metaspace) и «Initialize java.lang classes» — самые долгие, вся «Create VM» укладывается в 40–60 мс. «Interpreter generation» — JVM при старте <b>генерирует машинный код</b> своего шаблонного интерпретатора под конкретный процессор (с учётом его расширений), подобно тому как ядро строит свои таблицы под железо. Затем запускается VM Thread, инициализируется система модулей, и только потом — ваш <code>main</code>.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сравните время запуска с архивом CDS (по умолчанию) и без него:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">java -Xshare:auto -Xlog:startuptime Hello
+java -Xshare:off -Xlog:startuptime Hello</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[0.050s][info][startuptime] Create VM, 0.0446356 secs
+[0.109s][info][startuptime] Create VM, 0.1036229 secs</code></pre></details>
+<p class="lab-note">Без CDS JVM должна найти, разобрать и проверить сотни классов <code>java.base</code> из <code>lib/modules</code>; с CDS они отображаются из готового архива (<code>mmap</code>, тема 08) уже в разобранном виде. Здесь «Create VM» без архива — примерно втрое дольше. Это аналог «быстрой загрузки» Windows, которая не загружается с нуля, а восстанавливает ядро из гибернации.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">9.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Откуда процессор x86 берёт первую команду после сброса?</p><ul><li>с начала диска</li><li>с фиксированного адреса 0xFFFFFFF0, отображённого на флеш-память прошивки</li><li>из оперативной памяти по адресу 0</li><li>от загрузчика по сети</li></ul><div class="why">Вектор сброса. Оперативная память в этот момент ещё даже не настроена.</div></div>
+<div class="mcq" data-ok="3"><p>Как ОС узнаёт, сколько у компьютера ядер, какие NUMA-узлы и устройства?</p><ul><li>перебирает адреса памяти</li><li>из реестра</li><li>спрашивает пользователя</li><li>из таблиц ACPI и SMBIOS, которые прошивка оставляет в памяти</li></ul><div class="why">Плюс перебор шин PCIe и USB при инициализации драйверов.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужен initramfs?</p><ul><li>чтобы иметь драйверы и утилиты для поиска и монтирования настоящего корневого диска</li><li>для хранения логов загрузки</li><li>это swap-раздел</li><li>для Secure Boot</li></ul><div class="why">Корень может быть на RAID, LVM, зашифрованном разделе или в сети — ядру нужны модули и логика, которых нет внутри него самого.</div></div>
+<div class="mcq" data-ok="2"><p>Java-приложение в контейнере запущено как <code>ENTRYPOINT java -jar app.jar</code> (shell-форма). Что будет при <code>docker stop</code>?</p><ul><li>JVM корректно завершится</li><li>контейнер не остановится</li><li>SIGTERM получит sh (PID 1) и не перешлёт его; через таймаут придёт SIGKILL, shutdown hooks не выполнятся</li><li>JVM сделает дамп памяти</li></ul><div class="why">Exec-форма ENTRYPOINT ["java", …] делает java PID 1, и SIGTERM доходит до JVM.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Перечислите ступени загрузки компьютера.</summary><div class="a"><p>Питание и служебные контроллеры → вектор сброса, код прошивки из флеш-памяти → инициализация процессора и тренировка памяти → драйверы UEFI и таблицы ACPI → выбор устройства и проверка подписи загрузчика → загрузчик грузит ядро, initramfs и командную строку → ядро включает свою виртуальную память, прерывания, планировщик, будит ядра процессора, инициализирует драйверы → initramfs монтирует корень → PID 1 (systemd) → службы и приложения.</p></div></details>
+<details class="q"><summary>Что такое Secure Boot и чем он отличается от измеряемой загрузки с TPM?</summary><div class="a"><p>Secure Boot — проверка подписи каждой следующей ступени до её запуска: неподписанный загрузчик не запустится. Измеряемая загрузка ничего не запрещает, а записывает хэши всех ступеней в регистры TPM; секреты (ключи шифрования диска) выдаются только при ожидаемых значениях. Вместе они защищают от подмены кода, исполняемого раньше ОС.</p></div></details>
+<details class="q"><summary>Почему PID 1 особенный и как это касается Java в контейнерах?</summary><div class="a"><p>PID 1 усыновляет осиротевшие процессы и должен собирать их статус, а ядро не доставляет ему сигналы без явного обработчика. В контейнере PID 1 — точка входа. Если это shell без exec, SIGTERM не дойдёт до JVM, и при остановке процесс убьют SIGKILL без shutdown hooks. Нужна exec-форма ENTRYPOINT или init-процесс (tini, --init).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

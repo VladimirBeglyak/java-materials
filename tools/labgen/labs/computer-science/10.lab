@@ -1,0 +1,129 @@
+@chapter 10 | quiz
+@intro
+<p>Смотрим на границу между программой и ядром: сколько системных вызовов делает JVM при старте, сколько стоит один вызов, почему небуферизованный ввод-вывод медленный и как JVM реагирует на сигналы. Лабы 10.1, 10.2 и 10.4 — в Docker-образе <code>cs-lab</code>, 10.3 — на вашей машине. Модуль IDEA — <code>cs10</code>.</p>
+@end
+
+@lab 10.1 | Системные вызовы JVM | 15 мин
+@goal
+<p>Посчитать, какие системные вызовы и сколько раз делает JVM, чтобы напечатать одну строку.</p>
+@end
+@file Hello.java
+public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Привет из Java");
+    }
+}
+@end
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac Hello.java && strace -f -c -o /tmp/s.txt java Hello; head -22 /tmp/s.txt" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac Hello.java && strace -f -c -o /tmp/s.txt java Hello; head -22 /tmp/s.txt"
+@end
+@predict Сколько всего системных вызовов понадобится? Какие окажутся самыми частыми?
+@answer
+<p>Около полутора тысяч вызовов ради одной строки. По числу лидируют <code>futex</code> (синхронизация служебных потоков JVM; по времени он «съедает» почти всё, потому что в нём потоки <i>ждут</i>), <code>mprotect</code>/<code>mmap</code>/<code>munmap</code> (резервирование кучи, metaspace, code cache, стеков, загрузка библиотек), <code>rt_sigprocmask</code> (маски сигналов в каждом потоке), <code>openat</code>/<code>read</code>/<code>fstat</code> (файлы JDK, <code>/proc</code> и <code>/sys</code> для эргономики — сколько процессоров и памяти, тема 15). <code>clone</code> — около двадцати: столько служебных потоков создаёт JVM (GC, JIT-компиляторы, VM Thread, Reference Handler…). Сама печать — один <code>write(1, …)</code>.</p>
+@end
+@try
+Добавьте <code>-e trace=write</code> вместо <code>-c</code> и найдите вашу строку. ::: <code>write(1, "\320\237\321\200…", 23)</code> — 23 байта: строка в UTF-8 плюс перевод строки, одним вызовом. stdout в JVM буферизуется построчно — <code>println</code> сбрасывает буфер.
+@end
+
+@lab 10.2 | Цена системного вызова и vDSO | 15 мин
+@goal
+<p>Сравнить обычный вызов функции, чтение времени через vDSO и настоящий системный вызов.</p>
+@end
+@file syscost.c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
+
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e9 + t.tv_nsec; }
+__attribute__((noinline)) long f(long x) { return x + 1; }
+
+int main(void) {
+    const int n = 2000000;
+    struct timespec ts;
+    long s = 0;
+    double t0, t1;
+    t0 = now(); for (int i = 0; i < n; i++) s += f(i); t1 = now();
+    printf("вызов функции:               %6.1f нс\n", (t1 - t0) / n);
+    t0 = now(); for (int i = 0; i < n; i++) { clock_gettime(CLOCK_MONOTONIC, &ts); s += ts.tv_nsec; } t1 = now();
+    printf("clock_gettime через vDSO:    %6.1f нс\n", (t1 - t0) / n);
+    t0 = now(); for (int i = 0; i < n; i++) { syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts); s += ts.tv_nsec; } t1 = now();
+    printf("clock_gettime через syscall: %6.1f нс\n", (t1 - t0) / n);
+    t0 = now(); for (int i = 0; i < n; i++) s += syscall(SYS_getppid); t1 = now();
+    printf("getppid (syscall):           %6.1f нс\n", (t1 - t0) / n);
+    return s == 42;
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O2 -o syscost syscost.c && ./syscost && grep vdso /proc/self/maps" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -O2 -o syscost syscost.c && ./syscost && grep vdso /proc/self/maps"
+@end
+@predict Во сколько раз системный вызов дороже вызова функции? Насколько vDSO дешевле системного вызова за то же самое время?
+@answer
+<p>Вызов функции — доли наносекунды, системный вызов — 100–150 нс: в сотни раз дороже (переключение режима, стека, сохранение регистров, защиты от Spectre/Meltdown, плюс виртуальная машина WSL). <code>clock_gettime</code> через vDSO — 20–30 нс: тот же результат без входа в ядро, впятеро дешевле. Последняя строка — область <code>[vdso]</code> с правами <code>r-xp</code> в адресном пространстве процесса.</p>
+@end
+
+@lab 10.3 | Буферизация против системных вызовов | 15 мин
+@goal
+<p>Увидеть цену системного вызова в обычном Java-коде: побайтовое чтение файла без буфера и с буфером.</p>
+@end
+@file Buffering.java
+import java.io.*;
+import java.nio.file.*;
+
+public class Buffering {
+    public static void main(String[] args) throws IOException {
+        Path f = Files.createTempFile("data", ".bin");
+        Files.write(f, new byte[4 * 1024 * 1024]);           // 4 МБ
+        for (int r = 0; r < 3; r++) {
+            long t0 = System.nanoTime(), n1 = 0;
+            try (InputStream in = new FileInputStream(f.toFile())) {
+                while (in.read() != -1) n1++;                  // read() → системный вызов на каждый байт
+            }
+            long t1 = System.nanoTime(), n2 = 0;
+            try (InputStream in = new BufferedInputStream(new FileInputStream(f.toFile()))) {
+                while (in.read() != -1) n2++;                  // read() → чтение из массива, системный вызов раз в 8 КБ
+            }
+            long t2 = System.nanoTime();
+            System.out.printf("без буфера: %5d мс (%.0f нс/байт) | с буфером: %3d мс (%.1f нс/байт)%n",
+                    (t1 - t0) / 1_000_000, (t1 - t0) / (double) n1, (t2 - t1) / 1_000_000, (t2 - t1) / (double) n2);
+        }
+        Files.delete(f);
+    }
+}
+@end
+@predict Во сколько раз буферизованное чтение быстрее? Сколько системных вызовов в каждом случае на 4 МБ?
+@answer
+<p>Без буфера — 4 194 304 системных вызова, по одному на байт: сотни миллисекунд – секунды и сотни наносекунд на байт (на Windows вызов <code>ReadFile</code> ещё дороже). С буфером — 512 вызовов по 8 КБ, а каждый <code>read()</code> — просто чтение из массива в пользовательском режиме: здесь в 50–60 раз быстрее (около микросекунды против 16–23 нс на байт). Отсюда правило: любой поток байтов — через буфер, а лучше <code>Files.readAllBytes</code> или <code>InputStream.transferTo</code> большими блоками.</p>
+@end
+@run
+javac Buffering.java
+java Buffering
+@end
+
+@lab 10.4 | Сигналы и JVM | 15 мин
+@goal
+<p>Отправить JVM сигналы SIGQUIT, SIGTERM и SIGKILL и посмотреть на реакцию.</p>
+@end
+@file Signals.java
+public class Signals {
+    public static void main(String[] args) throws Exception {
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> System.out.println("shutdown hook: корректное завершение")));
+        System.out.println("работаю, pid " + ProcessHandle.current().pid());
+        Thread.sleep(60_000);
+    }
+}
+@end
+@step SIGQUIT (дамп потоков), затем SIGTERM:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c 'javac Signals.java; java Signals & P=$!; sleep 1.5; kill -QUIT $P; sleep 0.5; kill -TERM $P; wait $P; echo "код завершения $?"' ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c 'javac Signals.java; java Signals & P=$!; sleep 1.5; kill -QUIT $P; sleep 0.5; kill -TERM $P; wait $P; echo "код завершения $?"' | grep -E 'работаю|Full thread dump|^"main"|State: TIMED|at Signals|shutdown|код'
+@end
+@predict Что напечатает JVM на SIGQUIT? Выполнится ли shutdown hook на SIGTERM, и какой будет код завершения?
+@answer
+<p>На SIGQUIT — «Full thread dump…» со стеками всех потоков (здесь показан только поток <code>main</code>: <code>TIMED_WAITING (sleeping)</code> в <code>Signals.main</code>), и программа продолжает работать. На SIGTERM — shutdown hook выполняется, код завершения 143 = 128 + 15 (номер сигнала). Это ровно то, что происходит при <code>docker stop</code> или удалении пода в Kubernetes.</p>
+@end
+@step Теперь SIGKILL:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c 'java Signals & P=$!; sleep 1.5; kill -KILL $P; wait $P; echo "код завершения $?"' ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c 'java Signals & P=$!; sleep 1.5; kill -KILL $P; wait $P; echo "код завершения $?"'
+@end
+@note Код 137 = 128 + 9, и никакого «shutdown hook»: SIGKILL перехватить нельзя, процесс уничтожает ядро. Так же выглядит смерть от OOM killer (тема 08) — если под в Kubernetes «упал» с кодом 137, первым делом смотрите на лимит памяти.

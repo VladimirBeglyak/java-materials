@@ -1,0 +1,67 @@
+@chapter 18 | quiz
+@intro
+<p>Проходим трассу запуска Java-программы по настоящим системным вызовам с отметками времени и проверяем главный факт главы: Java-метод <code>main</code> исполняется не в изначальном потоке процесса. Лабы — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs18</code>.</p>
+@end
+
+@lab 18.1 | Хронология запуска java Hello | 25 мин
+@goal
+<p>Увидеть по времени ключевые вехи: execve, загрузку libjli и libjvm, создание потока main, отображение модулей и CDS, служебные потоки, загрузку Hello.class, write и exit_group.</p>
+@end
+@file Hello.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Hello {
+    public static void main(String[] args) throws Exception {
+        long pid = ProcessHandle.current().pid();
+        long tid = Long.parseLong(Files.readSymbolicLink(Path.of("/proc/thread-self")).getFileName().toString());
+        try (var tasks = Files.list(Path.of("/proc/self/task"))) {
+            System.out.println("PID процесса " + pid + ", поток main — TID " + tid + ", потоков ОС: " + tasks.count());
+        }
+        System.out.println("Привет!");
+    }
+}
+@end
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp Hello.java && strace -f -tt -e trace=execve,openat,clone,write,exit_group java -cp /tmp Hello 2>&1 | grep -E 'execve|libjli|libjvm|classes.jsa|lib/modules|Hello.class|clone|write.1|exit_group' | grep -v ENOENT" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac -d /tmp Hello.java && strace -f -tt -e trace=execve,openat,clone,write,exit_group java -cp /tmp Hello 2>&1 | grep -E 'execve|libjli|libjvm|classes.jsa|lib/modules|Hello.class|clone|write.1|exit_group' | grep -v ENOENT" | sed -E 's/, flags=CLONE_VM.*//; s/strace: Process ([0-9]+) attached/  → поток \1/'
+@end
+@predict Найдите в выводе: (1) какой поток загружает <code>libjvm.so</code> и создаёт следующий поток; (2) какой поток открывает <code>lib/modules</code>, <code>Hello.class</code> и выполняет <code>write(1, …)</code>; (3) кто вызывает <code>exit_group</code>. Сколько времени прошло от execve до первого write?
+@answer
+<p>(1) Изначальный поток процесса (строки без <code>[pid N]</code> — это PID процесса): <code>execve</code>, <code>libjli.so</code>, <code>libjvm.so</code> и первый <code>clone</code> — создание потока, который станет Java-потоком <code>main</code>. (2) Всё остальное делает именно этот новый поток: отображает <code>lib/modules</code> и <code>classes.jsa</code>, создаёт полтора десятка служебных потоков (GC, JIT, VM Thread…), читает <code>Hello.class</code> и выполняет оба <code>write(1, …)</code> — в первом видно, что TID потока main не равен PID. (3) <code>exit_group(0)</code> вызывает снова изначальный поток: он всё это время ждал в <code>pthread_join</code>. От execve до первого write — порядка 200–300 мс под strace (без трассировки — 50–80 мс): трассировка каждого вызова замедляет запуск.</p>
+@end
+@try
+Добавьте <code>-Xss4m</code> в команду запуска java и найдите первый <code>clone</code> с <code>mmap</code> перед ним (добавьте <code>mmap</code> в <code>-e trace=</code>). ::: Перед первым <code>clone</code> — <code>mmap(NULL, 4198400, …, MAP_STACK)</code> или похожий размер: стек потока main берётся из <code>-Xss</code>, а не из <code>ulimit -s</code>.
+@end
+
+@lab 18.2 | Потоки JVM глазами ядра | 10 мин
+@goal
+<p>Сопоставить потоки ОС процесса Java с их ролями.</p>
+@end
+@file Threads.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+public class Threads {
+    public static void main(String[] args) throws Exception {
+        try (Stream<Path> tasks = Files.list(Path.of("/proc/self/task"))) {
+            tasks.sorted((a, b) -> Integer.compare(Integer.parseInt(a.getFileName().toString()), Integer.parseInt(b.getFileName().toString())))
+                 .forEach(t -> {
+                     try {
+                         String name = Files.readString(t.resolve("comm")).trim();       // имя потока в ядре (до 15 символов)
+                         String stat = Files.readString(t.resolve("stat"));
+                         String state = stat.substring(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
+                         System.out.printf("TID %-4s %-16s состояние %s%n", t.getFileName(), name, state);
+                     } catch (Exception e) { throw new RuntimeException(e); }
+                 });
+        }
+    }
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab java Threads.java ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab java Threads.java
+@end
+@predict Какой поток имеет TID, равный PID? Найдите поток, который сейчас выполняет этот код, и потоки GC и JIT.
+@answer
+<p>TID = PID (здесь 1, java — PID 1 в контейнере) — изначальный поток с именем <code>java</code>, он в состоянии S: ждёт в <code>pthread_join</code>. Следующий — тоже <code>java</code>, но в состоянии R: это поток main, выполняющий наш код (ядро называет его по имени программы; имя «main» видно только внутри JVM). Дальше — <code>GC Thread#0</code> и другие потоки сборщика, <code>G1 Main Marker</code>, <code>G1 Conc#0</code>, <code>G1 Refine#0</code>, <code>G1 Service</code>, <code>VM Periodic Tas</code>, <code>VM Thread</code>, <code>Reference Handl</code>, <code>Finalizer</code>, <code>Signal Dispatch</code>, <code>Service Thread</code>, <code>Monitor Deflati</code>, <code>C2 CompilerThre</code>, <code>C1 CompilerThre</code>, <code>Common-Cleaner</code>, <code>Notification Th</code> — имена обрезаны ядром до 15 символов. Почти все спят (S): они ждут работы.</p>
+@end

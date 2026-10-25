@@ -1,0 +1,80 @@
+@chapter 12 | quiz
+@intro
+<p>Измеряем цену надёжности (запись с <code>force</code> и без), эффект page cache и устройство файловой системы: inode, жёсткие и символические ссылки, удалённый, но открытый файл. Лабы 12.2 и 12.3 — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs12</code>.</p>
+@end
+
+@lab 12.1 | Цена fsync | 15 мин
+@goal
+<p>Сравнить запись маленьких записей «как журнал» с принудительным сбросом на диск и без него.</p>
+@end
+@file Journal.java
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.*;
+
+public class Journal {
+    public static void main(String[] args) throws Exception {
+        Path f = Path.of("journal.log");
+        ByteBuffer record = ByteBuffer.allocate(100);
+        for (int round = 0; round < 2; round++) {
+            for (boolean sync : new boolean[] {false, true}) {
+                try (FileChannel ch = FileChannel.open(f, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                        StandardOpenOption.TRUNCATE_EXISTING)) {
+                    int n = 1000;
+                    long t0 = System.nanoTime();
+                    for (int i = 0; i < n; i++) {
+                        record.clear();
+                        ch.write(record);
+                        if (sync) ch.force(false);                 // fdatasync / FlushFileBuffers
+                    }
+                    double us = (System.nanoTime() - t0) / 1000.0 / n;
+                    System.out.printf("%s %8.1f мкс на запись → %,9.0f записей в секунду%n",
+                            sync ? "write + force:" : "только write: ", us, 1e6 / us);
+                }
+            }
+        }
+        Files.delete(f);
+    }
+}
+@end
+@predict Во сколько раз <code>force</code> замедлит запись? Сколько «коммитов» в секунду выдержит такой журнал?
+@answer
+<p>Простой <code>write</code> — единицы микросекунд: копирование в page cache. С <code>force</code> — около 1,5 мс на Windows (в WSL 2 — около 3,5 мс через виртуальный диск): в сотни и тысячи раз медленнее, всего несколько сотен сохранённых записей в секунду. Поэтому базы данных группируют коммиты (group commit): один <code>fsync</code> на пачку транзакций разных клиентов, а брокеры вроде Kafka вместо <code>fsync</code> полагаются на репликацию.</p>
+@end
+@run
+javac Journal.java
+java Journal
+@end
+@try
+Откройте файл с <code>StandardOpenOption.DSYNC</code> и уберите <code>force</code>. ::: Скорость будет как у варианта с <code>force</code>: каждый <code>write</code> теперь сам ждёт диска (флаг <code>O_DSYNC</code> / <code>FILE_FLAG_WRITE_THROUGH</code>).
+@end
+
+@lab 12.2 | Page cache: холодное и тёплое чтение | 10 мин
+@goal
+<p>Сбросить кэш страниц и увидеть разницу между чтением с диска и из памяти.</p>
+@end
+@run
+docker run --rm --privileged cs-lab sh -c "dd if=/dev/urandom of=/tmp/big bs=1M count=512 status=none; sync; echo 3 > /proc/sys/vm/drop_caches; dd if=/tmp/big of=/dev/null bs=1M 2>&1 | tail -1; dd if=/tmp/big of=/dev/null bs=1M 2>&1 | tail -1; grep -E '^(MemFree|Cached|Dirty)' /proc/meminfo" ||| MSYS_NO_PATHCONV=1 docker run --rm --privileged cs-lab sh -c "dd if=/dev/urandom of=/tmp/big bs=1M count=512 status=none; sync; echo 3 > /proc/sys/vm/drop_caches; dd if=/tmp/big of=/dev/null bs=1M 2>&1 | tail -1; dd if=/tmp/big of=/dev/null bs=1M 2>&1 | tail -1; grep -E '^(MemFree|Cached|Dirty)' /proc/meminfo"
+@end
+@note <code>echo 3 &gt; /proc/sys/vm/drop_caches</code> выбрасывает чистые страницы page cache (и кэши метаданных) — нужен привилегированный контейнер, и действует это на всю виртуальную машину WSL. Перед этим <code>sync</code> сбрасывает грязные страницы, иначе их нельзя выбросить.
+@predict Во сколько раз второе чтение того же файла быстрее первого?
+@answer
+<p>Первое чтение идёт с диска (здесь NVMe через виртуальный диск WSL — около 2–2,5 ГБ/с), второе — из page cache: 10+ ГБ/с, примерно в пять раз быстрее, и упирается уже в копирование памяти. На HDD разница была бы в десятки раз. <code>Cached</code> в <code>/proc/meminfo</code> вырос на прочитанный файл — память «занята» кэшем, но будет отдана по первому требованию.</p>
+@end
+
+@lab 12.3 | inode, ссылки и удалённый открытый файл | 15 мин
+@goal
+<p>Увидеть, что имя файла — запись в каталоге, а файл — это inode.</p>
+@end
+@run
+docker run --rm cs-lab sh -c "cd /tmp && echo hello > a.txt && ln a.txt hard.txt && ln -s a.txt soft.txt && ls -li a.txt hard.txt soft.txt && stat -c '%n: inode %i, ссылок %h, размер %s' a.txt && mv a.txt b.txt && cat hard.txt && cat soft.txt; ls -l soft.txt" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "cd /tmp && echo hello > a.txt && ln a.txt hard.txt && ln -s a.txt soft.txt && ls -li a.txt hard.txt soft.txt && stat -c '%n: inode %i, ссылок %h, размер %s' a.txt && mv a.txt b.txt && cat hard.txt && cat soft.txt; ls -l soft.txt"
+@end
+@predict Какие номера inode будут у <code>a.txt</code>, <code>hard.txt</code> и <code>soft.txt</code>? Что выведут <code>cat hard.txt</code> и <code>cat soft.txt</code> после переименования <code>a.txt</code>?
+@answer
+<p><code>a.txt</code> и <code>hard.txt</code> — один номер inode, «ссылок 2»: это два имени одного файла. У <code>soft.txt</code> — свой inode, тип <code>l</code>, внутри — строка «a.txt». После <code>mv a.txt b.txt</code> жёсткая ссылка работает (inode тот же), а символическая указывает на несуществующее имя: «No such file or directory».</p>
+@end
+@step Удалённый, но открытый файл:
+@run
+docker run --rm cs-lab sh -c "cd /tmp && dd if=/dev/zero of=log bs=1M count=200 status=none && df -m /tmp | tail -1 && (sleep 3 < log &) && sleep 0.5 && rm log && df -m /tmp | tail -1 && ls -l /proc/*/fd 2>/dev/null | grep deleted; sleep 3; df -m /tmp | tail -1" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "cd /tmp && dd if=/dev/zero of=log bs=1M count=200 status=none && df -m /tmp | tail -1 && (sleep 3 < log &) && sleep 0.5 && rm log && df -m /tmp | tail -1 && ls -l /proc/*/fd 2>/dev/null | grep deleted; sleep 3; df -m /tmp | tail -1"
+@end
+@note Первый <code>df</code> — с файлом, второй — после <code>rm</code>: занятое место не уменьшилось, потому что <code>sleep</code> держит файл открытым (его дескриптор указывает на <code>/tmp/log (deleted)</code>). Третий — после завершения <code>sleep</code>: место освободилось. Тот же эффект у Java-приложения, которое пишет в удалённый лог: смотрите <code>ls -l /proc/&lt;pid&gt;/fd</code> или <code>lsof</code>.

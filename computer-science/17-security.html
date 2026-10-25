@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Аппаратная безопасность: кольца, Spectre, шифрование</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ПРОГРАММЫ И СРЕДА</div>
+  <h1>Аппаратная безопасность: кольца, Spectre, шифрование</h1>
+  <p class="lead">Всё, что делает компьютер безопасным, опирается на механизмы из предыдущих глав: кольца привилегий, виртуальную память, проверку подписей при загрузке. И почти всё, что его ломает, — это способы обойти эти механизмы: переполнение буфера, которое перезаписывает адрес возврата, побочные каналы, по времени выдающие секреты, спекулятивное исполнение, которое заглядывает туда, куда нельзя. Разберём атаки и защиты на уровне железа и ОС — и почему Java по построению избавлена от целого класса уязвимостей, но не от всех.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">границы изоляции</span><span class="tag">переполнение буфера</span><span class="tag">NX, ASLR, канарейки, CET</span><span class="tag">безопасность памяти Java</span><span class="tag">атаки по времени</span><span class="tag">Spectre и Meltdown</span><span class="tag">TPM и анклавы</span><span class="tag">случайные числа</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="boundaries"><span class="h-num">17.1</span>Границы изоляции</h2>
+<div class="table-wrap"><table>
+<tr><th>Граница</th><th>Механизм</th><th>Тема</th></tr>
+<tr><td>процесс ↔ процесс</td><td>отдельные таблицы страниц: чужая память не отображена</td><td>08</td></tr>
+<tr><td>программа ↔ ядро</td><td>кольца привилегий, бит user в записях таблиц страниц, вход в ядро только через syscall</td><td>10</td></tr>
+<tr><td>контейнер ↔ хост</td><td>пространства имён, cgroups, seccomp, capabilities — программно, на общем ядре</td><td>15</td></tr>
+<tr><td>ВМ ↔ гипервизор</td><td>VT-x, EPT — аппаратно</td><td>15</td></tr>
+<tr><td>устройство ↔ память</td><td>IOMMU</td><td>12</td></tr>
+<tr><td>прошивка и ОС ↔ подмена</td><td>Secure Boot, TPM, измеряемая загрузка</td><td>09</td></tr>
+</table></div>
+<p>Атакующий всегда ищет способ пересечь одну из этих границ: выполнить свой код в чужом процессе, поднять привилегии до ядра, выйти из контейнера, прочитать память, к которой нет доступа.</p>
+
+<h2 id="overflow"><span class="h-num">17.2</span>Переполнение буфера и защиты от него</h2>
+<p>В C массив — это просто адрес; запись за его конец портит то, что лежит рядом. На стеке рядом — другие переменные и <b>адрес возврата</b> (тема 04). Классическая атака: передать программе строку длиннее буфера так, чтобы <code>strcpy</code> перезаписал адрес возврата адресом кода атакующего. При <code>ret</code> управление уйдёт туда.</p>
+<div class="table-wrap"><table>
+<tr><th>Защита</th><th>Идея</th><th>Как обходят</th></tr>
+<tr><td><b>NX / DEP</b> (бит запрета исполнения в записи таблицы страниц)</td><td>стек и куча не исполняемы — нельзя прыгнуть в принесённый код</td><td><b>ROP</b>: собрать программу из «гаджетов» — кусочков существующего кода перед <code>ret</code></td></tr>
+<tr><td><b>ASLR</b> + PIE</td><td>код, стек, куча, библиотеки по случайным адресам (тема 14) — неизвестно, куда прыгать</td><td>утечка любого адреса раскрывает раскладку</td></tr>
+<tr><td><b>канарейка стека</b> (<code>-fstack-protector</code>)</td><td>перед адресом возврата — случайное число; эпилог проверяет его и завершает процесс при порче («stack smashing detected»)</td><td>утечка значения канарейки, перезапись мимо неё</td></tr>
+<tr><td><b>CET</b>: теневой стек и IBT (Intel), PAC и BTI (ARM)</td><td>аппаратная копия адресов возврата, которую нельзя изменить обычной записью; косвенные переходы допустимы только на команды <code>endbr64</code> (их мы видели в выводе gcc в теме 03)</td><td>сильно сужает ROP и JOP</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Почему Java избавлена от этого класса уязвимостей</span>
+В Java нет арифметики указателей, каждый доступ к массиву проверяет границы (<code>ArrayIndexOutOfBoundsException</code> вместо порчи памяти), каждое приведение типа проверяется, память не освобождается вручную (нет «использования после освобождения»), стек нельзя адресовать. Эта <b>безопасность памяти</b> — главная причина, почему Microsoft и Google сообщают, что ~70% их уязвимостей — ошибки памяти в C/C++, а Java-сервисы страдают от другого: инъекций, десериализации, ошибок логики. Но граница прорывается там, где Java касается нативного: JNI, <code>sun.misc.Unsafe</code>, FFM API с <code>--enable-native-access</code>, нативные библиотеки (парсеры изображений, драйверы) — и сама JVM, написанная на C++.
+</div>
+
+<h2 id="timing"><span class="h-num">17.3</span>Побочные каналы: секреты утекают по времени</h2>
+<p>Даже корректная программа может выдать секрет не через данные, а через <b>время работы</b>, потребление энергии или состояние кэша. Простейший пример — сравнение строк, которое выходит на первом несовпадающем символе: сравнение с почти правильным токеном работает чуть дольше, и атакующий подбирает его посимвольно.</p>
+<div class="widget" id="tmW">
+  <div class="widget-title">Атака по времени на сравнение секрета</div>
+  <p class="hint">Секрет — 6 символов из алфавита <code>a…h</code>. «Сервер» сравнивает посимвольно и выходит при первом несовпадении; каждый совпавший символ добавляет 1 условную единицу времени (плюс шум). Атакующий для каждой позиции пробует все символы и берёт самый «медленный».</p>
+  <div class="controls">
+    <label>сравнение<select id="tmMode"><option value="early">ранний выход (как Arrays.equals)</option><option value="ct">постоянное время (как MessageDigest.isEqual)</option></select></label>
+    <label>шум, %<input type="text" id="tmNoise" value="30"></label>
+    <button class="btn primary" type="button" id="tmGo">Атаковать</button>
+  </div>
+  <div class="out" id="tmOut"></div>
+</div>
+<script>
+(function () {
+  var A = "abcdefgh", mode = document.getElementById("tmMode"), noise = document.getElementById("tmNoise"), out = document.getElementById("tmOut");
+  function secret() { var s = ""; for (var i = 0; i < 6; i++) s += A[Math.floor(Math.random() * 8)]; return s; }
+  function cost(sec, guess) {
+    var n = parseFloat(noise.value) / 100 || 0, t = 0;
+    if (mode.value === "early") { for (var i = 0; i < sec.length; i++) { t += 1; if (sec[i] !== guess[i]) break; } }
+    else t = sec.length;
+    return t + (Math.random() * 2 - 1) * n * 2;
+  }
+  function attack() {
+    var sec = secret(), known = "", L = ["секрет (сервер знает): " + sec, ""];
+    for (var pos = 0; pos < 6; pos++) {
+      var best = null, bestT = -1, row = [];
+      for (var k = 0; k < 8; k++) {
+        var g = known + A[k] + "a".repeat(5 - pos), t = 0;
+        for (var r = 0; r < 25; r++) t += cost(sec, g);       // 25 замеров на попытку
+        t /= 25; row.push(A[k] + ":" + t.toFixed(2));
+        if (t > bestT) { bestT = t; best = A[k]; }
+      }
+      known += best;
+      L.push("позиция " + (pos + 1) + "  " + row.join(" ") + "  → берём «" + best + "»");
+    }
+    L.push("\nугадано: " + known + (known === sec ? "  ✓ секрет раскрыт за " + 6 * 8 * 25 + " запросов вместо 8⁶ = 262 144 переборов" : "  ✗ не совпало: время не зависит от данных (или шум слишком велик)"));
+    out.textContent = L.join("\n");
+  }
+  document.getElementById("tmGo").addEventListener("click", attack); attack();
+})();
+</script>
+<ul>
+  <li><b>В Java</b>: сравнивать секреты (HMAC, токены, хэши паролей) только через <code>MessageDigest.isEqual</code> — он проверяет все байты независимо от первого расхождения. <code>String.equals</code> и <code>Arrays.equals</code> выходят рано (лаба 17.2).</li>
+  <li><b>Кэш как канал</b>: атакующий в соседнем процессе или ВМ на том же ядре может определить, к каким линиям кэша обращалась жертва (Flush+Reload, Prime+Probe) — по времени своих обращений. Так извлекали ключи AES из табличных реализаций; аппаратный AES-NI (тема 16) не использует таблиц и защищён от этого.</li>
+  <li><b>Rowhammer</b>: частое чтение одной строки DRAM вызывает переворот битов в соседних строках (тема 06) — так получали права ядра, меняя биты в таблицах страниц. Защита — ECC, обновление «соседей» в контроллерах памяти.</li>
+</ul>
+
+<h2 id="spectre"><span class="h-num">17.4</span>Spectre и Meltdown: спекуляция против изоляции</h2>
+<p>Внеочередное ядро выполняет команды по предсказанному пути до того, как известно, нужны ли они (тема 05). Неверно предсказанные результаты отбрасываются из регистров — но <b>не из кэша</b>. Это превращает спекуляцию в способ читать запрещённое:</p>
+<pre data-title="Spectre v1 — обход проверки границ (схема)"><code class="c">if (x &lt; array1_size) {              // предсказатель «натренирован» на x в пределах
+    y = array2[array1[x] * 4096];   // спекулятивно: x за границей → читается секретный байт,
+}                                   // и он определяет, какая линия array2 попадёт в кэш
+// затем атакующий измеряет время доступа к array2[0], array2[4096], … — быстрая линия раскрывает байт</code></pre>
+<ul>
+  <li><b>Meltdown</b> (2018, Intel): спекулятивное чтение памяти ядра из пользовательского режима — проверка прав происходила позже чтения. Защита — <b>KPTI</b>: при работе программы таблицы страниц ядра почти не отображены, а каждый вход в ядро переключает таблицы (поэтому системные вызовы подорожали, тема 10). Новые процессоры не уязвимы — в лабе 17.3 ядро сообщает «meltdown: Not affected».</li>
+  <li><b>Spectre v2</b>: отравление предсказателя косвенных переходов, чтобы жертва спекулятивно прыгнула на нужный атакующему «гаджет». Защиты — retpoline, IBRS/eIBRS, IBPB при переключении контекста.</li>
+  <li><b>Что это значит для JVM</b>: JIT вставляет барьеры против Spectre в критичных местах (маскирование индекса), браузеры изолировали сайты по процессам и огрубили таймеры (тот же класс атак из JavaScript). Для обычного серверного Java-кода главное следствие — более дорогие переходы в ядро и переключения контекста на уязвимых процессорах.</li>
+</ul>
+
+<h2 id="hw"><span class="h-num">17.5</span>Аппаратные средства доверия</h2>
+<ul>
+  <li><b>TPM</b> — хранение ключей и измерения загрузки (тема 09); на нём основано шифрование диска без ввода пароля.</li>
+  <li><b>Анклавы и конфиденциальные вычисления</b>: Intel SGX (изолированная область памяти внутри процесса), AMD SEV-SNP и Intel TDX (шифрование всей памяти ВМ ключом, неизвестным гипервизору), ARM TrustZone и CCA. Облачный провайдер не может прочитать память вашей ВМ, а внешняя сторона — проверить, какой именно код в ней запущен (аттестация).</li>
+  <li><b>Шифрование памяти</b> (Intel TME, AMD SME) — защищает от физического извлечения модулей DRAM.</li>
+  <li><b>Аппаратный генератор случайных чисел</b> (<code>RDRAND</code>/<code>RDSEED</code>) — источник энтропии для ядра. Пользовательским программам надо брать случайность из ядра (<code>getrandom</code>, <code>/dev/urandom</code>, <code>BCryptGenRandom</code>): <code>SecureRandom</code> в Java делает именно это. <code>java.util.Random</code> — предсказуемый генератор: по нескольким выходам восстанавливается его состояние, для токенов и ключей он недопустим.</li>
+</ul>
+
+<h2 id="java"><span class="h-num">17.6</span>Памятка Java-разработчику</h2>
+<div class="table-wrap"><table>
+<tr><th>Угроза</th><th>Что делать</th></tr>
+<tr><td>нативный код (JNI, FFM, Unsafe)</td><td>минимизировать, изолировать, держать библиотеки обновлёнными; помнить, что ошибка в нативном коде — авария всей JVM</td></tr>
+<tr><td>сравнение секретов</td><td><code>MessageDigest.isEqual</code>, а не <code>equals</code></td></tr>
+<tr><td>случайность для безопасности</td><td><code>SecureRandom</code>, а не <code>Random</code>/<code>ThreadLocalRandom</code>/<code>Math.random</code></td></tr>
+<tr><td>секреты в памяти</td><td>хранить в <code>char[]</code>/<code>byte[]</code> и затирать после использования; <code>String</code> неизменяем и может жить в куче и дампах долго (дамп кучи содержит пароли!)</td></tr>
+<tr><td>контейнер</td><td>не запускать от root, без <code>--privileged</code>, минимальные capabilities, read-only файловая система</td></tr>
+<tr><td>обновления</td><td>патчи JDK закрывают уязвимости и в самой JVM; патчи микрокода и ядра — от Spectre-подобных атак</td></tr>
+</table></div>
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">17.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Ломаем и защищаем: переполнение буфера в C с канарейкой стека и без неё, атака по времени на сравнение секретов в Java, статус защит процессора от Spectre-подобных атак и источники случайности. Лабы 17.1 и 17.3 — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs17</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-17.1">
+<div class="lab-head"><span class="lab-num">Лаба 17.1</span><b>Переполнение буфера и канарейка стека</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Перезаписать соседнюю переменную и адрес возврата через <code>strcpy</code> и посмотреть, как срабатывает защита.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>bof.c</code>:</div>
+<pre data-title="bof.c"><code class="txt">#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+struct account { char name[8]; int is_admin; };
+
+void login(const char *input) {
+    struct account acc = {"", 0};
+    strcpy(acc.name, input);                         // длина не проверяется!
+    printf("login: name='%s' is_admin=%d\n", acc.name, acc.is_admin);
+}
+
+void smash(const char *input) {
+    char buf[8];
+    strcpy(buf, input);                              // 40 байт в буфер на 8 — портим кадр и адрес возврата
+    printf("smash: buf='%.8s…'\n", buf);
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IONBF, 0);                // без буфера: иначе вывод пропадёт при аварии
+    login("bob");
+    login("AAAAAAAA\x01");                           // 8 букв + байт 0x01 залезает в is_admin
+    smash(argv[1]);
+    puts("вернулись из smash");
+    return 0;
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Без защиты стека:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -w -fno-stack-protector -o bof1 bof.c &amp;&amp; ./bof1 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo код завершения \$?"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">login: name='bob' is_admin=0
+login: name='AAAAAAAA' is_admin=1
+smash: buf='AAAAAAAA…'
+Segmentation fault (core dumped)
+код завершения 139</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатает второй <code>login</code>? Что произойдёт после <code>smash</code> — напечатается ли «вернулись из smash»?</div>
+<div class="lab-ans" hidden><p>Второй вызов: <code>is_admin=1</code> — девятый байт строки лёг в соседнее поле структуры, и «обычный пользователь» стал администратором, хотя код нигде не присваивает <code>is_admin</code>. <code>smash</code> печатает строку, а затем <code>ret</code> берёт из стека «адрес возврата» <code>0x4141414141414141</code> (байты 'A'), процессор прыгает в никуда — <code>Segmentation fault</code>, код 139 = 128 + 11 (SIGSEGV). «вернулись из smash» не печатается. Атакующий на месте 'A' положил бы нужный ему адрес.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">С канарейкой стека:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -w -fstack-protector-all -o bof2 bof.c &amp;&amp; ./bof2 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA; echo код завершения \$?"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">login: name='bob' is_admin=0
+login: name='AAAAAAAA' is_admin=1
+smash: buf='AAAAAAAA…'
+*** stack smashing detected ***: terminated
+код завершения 134
+Aborted (core dumped)</code></pre></details>
+<p class="lab-note">Эпилог <code>smash</code> обнаружил испорченную канарейку и вызвал <code>__stack_chk_fail</code>: «*** stack smashing detected ***», процесс завершён SIGABRT (код 134 = 128 + 6) <b>до</b> <code>ret</code> по поддельному адресу. Подмену <code>is_admin</code> внутри структуры канарейка не ловит — она стоит только перед адресом возврата. В Java аналог <code>strcpy</code> за границу — <code>ArrayIndexOutOfBoundsException</code> ещё до записи.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-17.2">
+<div class="lab-head"><span class="lab-num">Лаба 17.2</span><b>Атака по времени на сравнение</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, зависит ли время сравнения массивов от длины совпавшего префикса.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Timing.java</code>:</div>
+<pre data-title="Timing.java"><code class="java">import java.security.MessageDigest;
+import java.util.Arrays;
+
+public class Timing {
+    public static void main(String[] args) {
+        int n = 1 &lt;&lt; 20;                                  // большие массивы, чтобы разница была видна
+        byte[] secret = new byte[n];
+        for (int i = 0; i &lt; n; i++) secret[i] = (byte) i;
+        int[] prefixes = {0, n / 4, n / 2, n - 1};
+        long sink = 0;
+        for (int round = 0; round &lt; 3; round++) {
+            StringBuilder line = new StringBuilder("совпадает префикс:");
+            for (int p : prefixes) {
+                byte[] guess = secret.clone();
+                guess[p] ^= 1;                            // первое расхождение — на позиции p
+                long t0 = System.nanoTime();
+                for (int k = 0; k &lt; 200; k++) sink += Arrays.equals(secret, guess) ? 1 : 0;
+                long t1 = System.nanoTime();
+                for (int k = 0; k &lt; 200; k++) sink += MessageDigest.isEqual(secret, guess) ? 1 : 0;
+                long t2 = System.nanoTime();
+                line.append(String.format("  %4d КБ: equals %5.1f мкс, isEqual %5.1f мкс |", p / 1024, (t1 - t0) / 200e3, (t2 - t1) / 200e3));
+            }
+            if (round == 2) System.out.println(line);
+        }
+        System.out.println("(" + sink + ")");
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Как меняется время <code>Arrays.equals</code> и <code>MessageDigest.isEqual</code> в зависимости от позиции первого расхождения?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Timing.java
+java Timing</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">совпадает префикс:     0 КБ: equals   0.1 мкс, isEqual 746.2 мкс |   256 КБ: equals   6.2 мкс, isEqual 822.2 мкс |   512 КБ: equals  12.5 мкс, isEqual 885.4 мкс |  1023 КБ: equals  44.5 мкс, isEqual 753.9 мкс |
+(0)</code></pre></details>
+<div class="lab-ans" hidden><p><code>Arrays.equals</code> растёт почти линейно с длиной совпавшего префикса: при расхождении в первом байте — доли микросекунды, в последнем — десятки микросекунд (сравнение векторизовано, но выходит на первом отличии). <code>MessageDigest.isEqual</code> тратит одно и то же время независимо от позиции (здесь ~0,7 мс на мегабайт — он ещё и не векторизован: проходит весь массив байт за байтом, накапливая XOR различий). Безопасность здесь важнее скорости, а секреты на практике короткие — 32–64 байта. Для коротких HMAC разница — наносекунды, но по сети её вытягивают статистикой из тысяч запросов.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-17.3">
+<div class="lab-head"><span class="lab-num">Лаба 17.3</span><b>Защиты процессора в ядре</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть, от каких аппаратных уязвимостей и каким способом защищается ядро на вашем процессоре.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "grep -r . /sys/devices/system/cpu/vulnerabilities/ | sed 's|.*/||' | sort"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">gather_data_sampling:Not affected
+ghostwrite:Not affected
+indirect_target_selection:Not affected
+itlb_multihit:Not affected
+l1tf:Not affected
+mds:Not affected
+meltdown:Not affected
+mmio_stale_data:Not affected
+old_microcode:Not affected
+reg_file_data_sampling:Not affected
+retbleed:Mitigation: Enhanced IBRS
+spec_rstack_overflow:Not affected
+spec_store_bypass:Mitigation: Speculative Store Bypass disabled via prctl
+spectre_v1:Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+spectre_v2:Mitigation: Enhanced / Automatic IBRS; IBPB: conditional; PBRSB-eIBRS: SW sequence; BHI: BHI_DIS_S
+srbds:Not affected
+tsa:Not affected
+tsx_async_abort:Not affected
+vmscape:Not affected</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Уязвим ли ваш процессор к Meltdown? Какими средствами ядро защищается от Spectre v1 и v2?</div>
+<div class="lab-ans" hidden><p>На Intel Core Ultra (2023): <code>meltdown: Not affected</code> — исправлено в железе, KPTI не нужен. <code>spectre_v1: Mitigation: usercopy/swapgs barriers and __user pointer sanitization</code> — барьеры и маскирование указателей в ядре. <code>spectre_v2: Mitigation: Enhanced / Automatic IBRS…</code> — аппаратное ограничение спекуляции косвенных переходов. <code>spec_store_bypass: … via prctl</code> — защиту включает сам процесс, если попросит. Большинство остальных — Not affected. На процессорах 2015–2018 годов список «Mitigation» длиннее, а системные вызовы заметно дороже.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-17.4">
+<div class="lab-head"><span class="lab-num">Лаба 17.4</span><b>Случайные числа: Random против SecureRandom</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, почему <code>java.util.Random</code> предсказуем, и откуда берёт энтропию <code>SecureRandom</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Rng.java</code>:</div>
+<pre data-title="Rng.java"><code class="java">import java.security.SecureRandom;
+import java.util.Random;
+
+public class Rng {
+    public static void main(String[] args) throws Exception {
+        Random r1 = new Random(42), r2 = new Random(42);
+        System.out.println("Random(42):   " + r1.nextInt() + " " + r1.nextInt() + " " + r1.nextInt());
+        System.out.println("ещё Random(42): " + r2.nextInt() + " " + r2.nextInt() + " " + r2.nextInt());
+
+        // восстановление состояния по одному выходу nextInt(): перебор 2^16 младших бит
+        Random victim = new Random(System.nanoTime());
+        int out1 = victim.nextInt(), out2 = victim.nextInt();
+        long mult = 0x5DEECE66DL, add = 0xBL, mask = (1L &lt;&lt; 48) - 1;
+        for (long low = 0; low &lt; (1 &lt;&lt; 16); low++) {
+            long state = ((long) out1 &lt;&lt; 16) + low &amp; mask;
+            long next = (state * mult + add) &amp; mask;
+            if ((int) (next &gt;&gt;&gt; 16) == out2) {
+                long predicted = (next * mult + add) &amp; mask;
+                System.out.println("по двум выходам предсказано следующее: " + (int) (predicted &gt;&gt;&gt; 16)
+                        + ", настоящее: " + victim.nextInt());
+                break;
+            }
+        }
+        SecureRandom sr = new SecureRandom();
+        System.out.println("SecureRandom по умолчанию: " + sr.getAlgorithm() + ", провайдер " + sr.getProvider().getName());
+        System.out.println("getInstanceStrong(): " + SecureRandom.getInstanceStrong().getAlgorithm());
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Одинаковы ли последовательности у двух <code>Random(42)</code>? Удастся ли предсказать следующее число по двум выходам?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Rng.java
+java Rng</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Random(42):   -1170105035 234785527 -1360544799
+ещё Random(42): -1170105035 234785527 -1360544799
+по двум выходам предсказано следующее: 559249585, настоящее: 559249585
+SecureRandom по умолчанию: DRBG, провайдер SUN
+getInstanceStrong(): Windows-PRNG</code></pre></details>
+<div class="lab-ans" hidden><p>Последовательности одинаковые: <code>Random</code> — детерминированный генератор, семя полностью задаёт выход. По двум значениям <code>nextInt()</code> перебором 65 536 вариантов недостающих младших битов состояние восстанавливается за миллисекунды, и следующее число предсказывается точно. <code>SecureRandom</code> на Windows по умолчанию — <code>DRBG</code> (криптографический генератор по NIST SP 800-90A) с энтропией из ОС (<code>Windows-PRNG</code> для «сильного»); на Linux — <code>NativePRNG</code> поверх <code>/dev/urandom</code> и <code>getrandom</code>.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">17.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему бит NX (запрет исполнения) не останавливает атаки переполнения буфера полностью?</p><ul><li>его можно выключить из пользовательского режима</li><li>атакующий может не приносить свой код, а собрать нужное поведение из кусочков существующего кода (ROP)</li><li>он работает только на ARM</li><li>он защищает только кучу</li></ul><div class="why">Против ROP — ASLR, канарейки и аппаратные теневые стеки (CET).</div></div>
+<div class="mcq" data-ok="3"><p>Почему для сравнения HMAC в Java нужен <code>MessageDigest.isEqual</code>?</p><ul><li>он быстрее</li><li>equals не работает с byte[]</li><li>он сравнивает хэши, а не байты</li><li>он работает постоянное время, а Arrays.equals выходит при первом расхождении и выдаёт по времени длину совпавшего префикса</li></ul><div class="why">Классическая атака по времени: подбор подписи посимвольно.</div></div>
+<div class="mcq" data-ok="0"><p>Что общего у Spectre и Meltdown?</p><ul><li>спекулятивно выполненные команды оставляют следы в кэше, которые можно измерить по времени доступа</li><li>обе — ошибки в ОС</li><li>обе требуют физического доступа</li><li>обе исправлены в Java</li></ul><div class="why">Архитектурное состояние откатывается, микроархитектурное (кэш) — нет.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как работает атака переполнения буфера на стеке и какие защиты против неё есть?</summary><div class="a"><p>Запись за пределы локального массива перезаписывает соседние данные кадра и адрес возврата; при ret управление уходит на адрес атакующего. Защиты: NX (стек не исполняем), ASLR/PIE (адреса неизвестны), канарейка перед адресом возврата, аппаратные теневые стеки и проверка целей переходов (CET, PAC/BTI). Java недоступна для этой атаки, потому что проверяет границы массивов и не даёт адресовать стек.</p></div></details>
+<details class="q"><summary>Что такое побочный канал и как он связан с кэшем процессора?</summary><div class="a"><p>Утечка информации не через результат, а через наблюдаемые побочные эффекты: время, энергию, состояние кэша. Если обращения программы к памяти зависят от секрета, атакующий, разделяющий с ней кэш, по времени своих обращений узнаёт, какие линии она использовала. Защита — код с постоянным временем и без зависящих от секрета обращений к памяти, аппаратные инструкции шифрования.</p></div></details>
+<details class="q"><summary>Почему java.util.Random нельзя использовать для токенов?</summary><div class="a"><p>Это линейный конгруэнтный генератор с 48-битным состоянием: по паре выходов состояние восстанавливается, и все следующие значения предсказуемы. SecureRandom берёт энтропию из ядра ОС (а ядро — в том числе из аппаратного генератора) и использует криптографически стойкий алгоритм.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

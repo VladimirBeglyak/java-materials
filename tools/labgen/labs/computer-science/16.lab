@@ -1,0 +1,106 @@
+@chapter 16 | quiz
+@intro
+<p>Дискретного GPU в Docker-контейнере у нас нет, поэтому смотрим на ускорители с доступной стороны: какой графический процессор у вас стоит, как модель SIMT выглядит в коде, во сколько раз аппаратные инструкции AES ускоряют шифрование в JVM и как арифметическая интенсивность и раскладка данных определяют скорость умножения матриц. Модуль IDEA — <code>cs16</code>.</p>
+@end
+
+@lab 16.1 | Ваш графический процессор | 5 мин
+@goal
+<p>Узнать, какой GPU стоит в машине и как его видит Windows.</p>
+@end
+@run title=PowerShell
+Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion, VideoProcessor ||| powershell.exe -NoProfile -Command 'Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion, VideoProcessor' | sed '/^\s*$/d'
+@end
+@note На машине из лаб — встроенный Intel Arc: он делит оперативную память с CPU (копирование по PCIe не нужно, тема 16.3). На Linux — <code>lspci | grep -i vga</code>, для NVIDIA — <code>nvidia-smi</code>. Чтобы контейнер получил доступ к GPU NVIDIA, нужен NVIDIA Container Toolkit и <code>docker run --gpus all</code>: контейнер, как и любой процесс, работает с GPU через драйвер ядра хоста.
+
+@lab 16.2 | AES-NI: специализированные команды в JVM | 15 мин
+@goal
+<p>Измерить скорость шифрования AES-GCM с интринсиками JIT на аппаратных командах и без них.</p>
+@end
+@file Aes.java
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+public class Aes {
+    public static void main(String[] args) throws Exception {
+        SecretKey key = new SecretKeySpec(new byte[16], "AES");
+        byte[] block = new byte[16 * 1024], out = new byte[block.length + 16];
+        for (int round = 0; round < 5; round++) {
+            long bytes = 0, t0 = System.nanoTime();
+            for (int m = 0; m < 4000; m++) {
+                Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                byte[] iv = {(byte) round, (byte) m, (byte) (m >> 8), 0, 0, 0, 0, 0, 0, 0, 0, 0};   // nonce не повторяется
+                c.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+                c.doFinal(block, 0, block.length, out, 0);
+                bytes += block.length;
+            }
+            System.out.printf("раунд %d: AES-GCM %,6.0f МБ/с%n", round, bytes / 1048576.0 / ((System.nanoTime() - t0) / 1e9));
+        }
+    }
+}
+@end
+@predict Насколько быстрее шифрование с аппаратными командами? Почему первый раунд медленнее остальных?
+@answer
+<p>С интринсиками — 2–4,5 ГБ/с: C2 заменяет код раундов AES командами <code>aesenc</code> (раунд шифрования — одна команда) и вычисление GHASH — командой умножения без переносов <code>pclmulqdq</code>, обрабатывая сразу несколько блоков векторно. Без них — ~70 МБ/с: те же вычисления таблицами и сдвигами на Java, в 30–60 раз медленнее. Первый раунд медленный, потому что методы шифрования ещё интерпретируются: интринсик срабатывает только в JIT-коде.</p>
+@end
+@run
+javac Aes.java
+java Aes
+java -XX:+UnlockDiagnosticVMOptions -XX:-UseAESIntrinsics -XX:-UseAESCTRIntrinsics -XX:-UseGHASHIntrinsics Aes
+@end
+@try
+Посмотрите, какие возможности процессора JVM обнаружила: <code>java -Xlog:os+cpu -version</code>. ::: Список флагов CPU (avx2, aes, clmul, sha, bmi2…) — по нему JIT решает, какие интринсики включать. На процессоре без AES-NI флаг <code>UseAESIntrinsics</code> выключен сам.
+@end
+
+@lab 16.3 | Умножение матриц: интенсивность и раскладка | 20 мин
+@goal
+<p>Увидеть, как одна и та же арифметика (2n³ операций) работает в разы быстрее при другом порядке циклов.</p>
+@end
+@file MatMul.java
+public class MatMul {
+    static final int N = 768;
+
+    static void ijk(double[] a, double[] b, double[] c) {           // внутренний цикл идёт по столбцу b — шаг N
+        for (int i = 0; i < N; i++)
+            for (int j = 0; j < N; j++) {
+                double s = 0;
+                for (int k = 0; k < N; k++) s += a[i * N + k] * b[k * N + j];
+                c[i * N + j] = s;
+            }
+    }
+
+    static void ikj(double[] a, double[] b, double[] c) {           // внутренний цикл идёт по строкам b и c подряд
+        java.util.Arrays.fill(c, 0);
+        for (int i = 0; i < N; i++)
+            for (int k = 0; k < N; k++) {
+                double aik = a[i * N + k];
+                for (int j = 0; j < N; j++) c[i * N + j] += aik * b[k * N + j];
+            }
+    }
+
+    public static void main(String[] args) {
+        double[] a = new double[N * N], b = new double[N * N], c = new double[N * N];
+        for (int i = 0; i < a.length; i++) { a[i] = i % 7; b[i] = i % 5; }
+        double flops = 2.0 * N * N * N;
+        for (int r = 0; r < 3; r++) {
+            long t0 = System.nanoTime(); ijk(a, b, c); double s1 = c[N + 1];
+            long t1 = System.nanoTime(); ikj(a, b, c); double s2 = c[N + 1];
+            long t2 = System.nanoTime();
+            System.out.printf("ijk: %4d мс (%5.2f GFLOPS) | ikj: %4d мс (%5.2f GFLOPS)  %b%n",
+                    (t1 - t0) / 1_000_000, flops / (t1 - t0), (t2 - t1) / 1_000_000, flops / (t2 - t1), s1 == s2);
+        }
+    }
+}
+@end
+@predict Порядок операций сложения в двух вариантах одинаков для каждой ячейки — результат совпадёт. Во сколько раз будет различаться скорость и почему?
+@answer
+<p><code>ikj</code> быстрее в 2–3 раза. В <code>ijk</code> внутренний цикл читает <code>b</code> по столбцу с шагом 768 × 8 байт — каждое обращение в новую кэш-линию (тема 06), плюс одна длинная цепочка зависимых сложений <code>s +=</code> (тема 05). В <code>ikj</code> внутренний цикл идёт по строкам <code>b</code> и <code>c</code> подряд и его итерации независимы — C2 векторизует его (AVX2: 4 double за команду). На одном ядре CPU это единицы гигафлопс; GPU с тензорными ядрами делает то же на два-три порядка быстрее — но только если матрицы уже в его памяти. Библиотеки (BLAS) добавляют ещё блочное разбиение под кэши и многопоточность.</p>
+@end
+@run
+javac MatMul.java
+java MatMul
+@end
+@try
+Увеличьте <code>N</code> до 1536. ::: Разрыв вырастет: матрицы перестанут помещаться в L2/L3, и «столбцовый» доступ <code>ijk</code> упрётся в память, тогда как <code>ikj</code> по-прежнему читает подряд с предвыборкой.
+@end

@@ -1,0 +1,161 @@
+@chapter 03 | quiz
+@intro
+<p>Пишем эмулятор процессора на Java, смотрим настоящий машинный код, который gcc делает из C, и измеряем, сколько стоят разные команды. Модуль IDEA — <code>cs03</code>. Лабы 3.2 и 3.3 используют Docker-образ <code>cs-lab</code> с gcc и binutils — как его собрать, описано на <a href="index.html#lab-setup">странице курса</a> (одна команда <code>docker build</code>). В PowerShell <code>${PWD}</code> работает как есть; в cmd пишите <code>%cd%</code>.</p>
+@end
+
+@lab 3.1 | Эмулятор: программа — это данные | 25 мин
+@goal
+<p>Реализовать цикл fetch-decode-execute и убедиться, что команды и данные лежат в одной памяти.</p>
+@end
+@file ToyCpu.java
+import java.util.Arrays;
+
+public class ToyCpu {
+    // формат команды: код операции * 100 + аргумент; память общая для кода и данных
+    static final int HALT = 0, LOAD = 1, ADDM = 2, STORE = 3, DEC = 4, JZ = 5, JMP = 6;
+    static final String[] NAMES = {"HALT", "LOAD", "ADDM", "STORE", "DEC", "JZ", "JMP"};
+
+    public static void main(String[] args) {
+        int[] mem = new int[32];
+        // while (n != 0) { sum += n; n--; }     n — в ячейке [20], sum — в [21]
+        int[] code = {
+            1_20,   // 0: LOAD  [20]   acc = n
+            5_08,   // 1: JZ    8      n == 0 → на HALT
+            2_21,   // 2: ADDM  [21]   acc = acc + sum
+            3_21,   // 3: STORE [21]   sum = acc
+            1_20,   // 4: LOAD  [20]
+            4_00,   // 5: DEC          acc--
+            3_20,   // 6: STORE [20]   n = acc
+            6_00,   // 7: JMP   0      в начало цикла
+            0_00    // 8: HALT
+        };
+        System.arraycopy(code, 0, mem, 0, code.length);
+        mem[20] = args.length > 0 ? Integer.parseInt(args[0]) : 5;
+
+        int pc = 0, acc = 0, steps = 0;
+        while (true) {
+            int ir = mem[pc];                  // FETCH: команда — просто число из памяти
+            int op = ir / 100, arg = ir % 100; // DECODE
+            int next = pc + 1;
+            switch (op) {                      // EXECUTE
+                case LOAD -> acc = mem[arg];
+                case ADDM -> acc += mem[arg];
+                case STORE -> mem[arg] = acc;
+                case DEC -> acc--;
+                case JZ -> { if (acc == 0) next = arg; }
+                case JMP -> next = arg;
+                case HALT -> { }
+                default -> throw new IllegalStateException("неизвестная команда " + ir + " по адресу " + pc);
+            }
+            steps++;
+            if (steps <= 9 || op == HALT)
+                System.out.printf("шаг %2d  pc=%d  %-5s %2d   acc=%d  n=%d  sum=%d%n", steps, pc, NAMES[op], arg, acc, mem[20], mem[21]);
+            if (op == HALT) break;
+            pc = next;                         // обновление PC
+        }
+        System.out.println("выполнено команд: " + steps);
+        System.out.println("память: " + Arrays.toString(Arrays.copyOf(mem, 22)));
+    }
+}
+@end
+@predict Чему будет равна сумма в ячейке [21] и сколько команд выполнит эмулятор для n = 5? Где в дампе памяти программа, а где данные?
+@answer
+<p>Сумма 5 + 4 + 3 + 2 + 1 = 15. Тело цикла — 8 команд (адреса 0–7), 5 итераций = 40 команд, плюс финальные LOAD, JZ и HALT — 43. В дампе первые девять чисел (120, 508, 221…) — это программа, ячейка 20 — <code>n</code> (стала 0), 21 — сумма. Для процессора между ними нет разницы: если бы <code>STORE</code> записал в ячейку 0–8, программа изменила бы сама себя.</p>
+@end
+@run
+javac ToyCpu.java
+java ToyCpu
+@end
+@try
+Запустите <code>java ToyCpu 0</code>. ::: Три команды: LOAD, JZ (acc = 0 — переход на 8), HALT. Проверка условия в начале цикла — это <code>while</code>; если бы JZ стоял в конце, тело выполнилось бы хотя бы раз (<code>do-while</code>) и n ушло бы в −1, −2… почти навсегда.
+Сделайте так, чтобы программа сама заменила свой HALT: добавьте перед циклом запись числа 6_00 (JMP 0) в ячейку 8. ::: Программа станет самомодифицирующейся и никогда не остановится: на месте HALT окажется переход в начало. Именно поэтому ОС помечает страницы с кодом «только чтение и исполнение» (тема 08), а JIT JVM переключает права страниц code cache при записи нового кода.
+@end
+
+@lab 3.2 | Машинный код из C: gcc и objdump | 20 мин
+@goal
+<p>Посмотреть, во что gcc компилирует цикл, сравнить уровни оптимизации и увидеть байты команд.</p>
+@end
+@file sum.c
+long sum(long *a, long n) {
+    long s = 0;
+    for (long i = 0; i < n; i++)
+        s += a[i];
+    return s;
+}
+@end
+@step Без оптимизации (<code>-O0</code>) — переменные живут в памяти стека:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab gcc -O0 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - sum.c ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc -O0 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - sum.c | grep -v "^\s*\.\(file\|text\|globl\|type\|size\|ident\|section\|intel_syntax\)"
+@end
+@predict Теперь <code>-O1</code>. Что исчезнет из кода и где будут храниться <code>s</code> и <code>i</code>?
+@answer
+<p>Исчезнут все обращения <code>QWORD PTR [rbp-…]</code>: переменные переедут в регистры (<code>s</code> — RDX, указатель — RAX), а индекс <code>i</code> пропадёт совсем — оптимизатор заменит его указателем, бегущим до <code>end = a + n*8</code>, вычисленного одной <code>lea</code>. Тело цикла — 4 команды вместо ~10.</p>
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab gcc -O1 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - sum.c ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc -O1 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - sum.c | grep -v "^\s*\.\(file\|text\|globl\|type\|size\|ident\|section\|intel_syntax\)"
+@end
+@step Байты машинного кода: скомпилируйте в объектный файл и дизассемблируйте.
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O1 -fcf-protection=none -c sum.c && objdump -d -M intel sum.o" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -O1 -fcf-protection=none -c sum.c && objdump -d -M intel sum.o" | sed -n '/<sum>/,$p'
+@end
+@note Слева — смещение в функции, посередине — байты команды, справа — её запись. Длина команд разная: от 1 байта (<code>ret</code> = <code>c3</code>) до 5 и больше — это x86.
+@try
+Скомпилируйте с <code>-O3</code>. ::: Появятся векторные команды <code>paddq</code>/<code>movdqu</code> с регистрами XMM: компилятор складывает по два long за команду (SIMD, тема 05) и добавляет «хвост» для нечётного n.
+@end
+
+@lab 3.3 | Флаги, знак и деление на константу | 15 мин
+@goal
+<p>Увидеть разные команды для знакового и беззнакового сравнения и как компилятор избавляется от деления.</p>
+@end
+@file ops.c
+int lt_signed(long a, long b)                     { return a < b; }
+int lt_unsigned(unsigned long a, unsigned long b) { return a < b; }
+long div10(long x)                                { return x / 10; }
+long div_n(long x, long n)                        { return x / n; }
+long times5(long x)                               { return x * 5; }
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - ops.c ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - ops.c | grep -v "^\s*\.\(file\|text\|globl\|type\|size\|ident\|section\|intel_syntax\|p2align\)"
+@end
+@predict Найдите в выводе: какой командой записан результат знакового и беззнакового сравнения? Есть ли команда деления в <code>div10</code>? Как умножается на 5?
+@answer
+<p>Сравнение одно и то же — <code>cmp rdi, rsi</code>, а флаги читаются по-разному: <code>setl</code> (less — по SF и OF) и <code>setb</code> (below — по CF). В <code>div10</code> деления нет: умножение <code>imul</code> на магическую константу 7378697629483820647 (≈ 2⁶⁶/10), сдвиг <code>sar</code> и поправка на знак (вычитание <code>x &gt;&gt; 63</code>). В <code>div_n</code> делитель неизвестен — там настоящий <code>idiv</code> и подготовка <code>cqo</code> (знаковое расширение RAX в RDX:RAX). Умножение на 5 — <code>lea rax, [rdi+rdi*4]</code>.</p>
+@end
+
+@lab 3.4 | Стоимость операций в Java | 15 мин
+@goal
+<p>Измерить цепочки зависимых операций: сложение, деление на неизвестное число и деление на константу, которое JIT заменяет умножением.</p>
+@end
+@file Cost.java
+public class Cost {
+    static long add(long x, int n)          { for (int i = 0; i < n; i++) x = x + 7 ^ i; return x; }
+    static long divVar(long x, long d, int n) { for (int i = 0; i < n; i++) x = x / d + 1_000_003 ^ i; return x; }
+    static long divConst(long x, int n)     { for (int i = 0; i < n; i++) x = x / 7 + 1_000_003 ^ i; return x; }
+
+    public static void main(String[] args) {
+        long d = args.length > 0 ? Long.parseLong(args[0]) : 7;   // делитель неизвестен JIT
+        int n = 50_000_000;
+        long sink = 0;
+        for (int round = 0; round < 3; round++) {
+            long t0 = System.nanoTime(); sink += add(round, n);
+            long t1 = System.nanoTime(); sink += divVar(round + 1_000_000_000L, d, n);
+            long t2 = System.nanoTime(); sink += divConst(round + 1_000_000_000L, n);
+            long t3 = System.nanoTime();
+            System.out.printf("раунд %d: сложение %.2f нс/оп, деление на переменную %.2f нс/оп, деление на константу %.2f нс/оп%n",
+                    round, (t1 - t0) / (double) n, (t2 - t1) / (double) n, (t3 - t2) / (double) n);
+        }
+        System.out.println("(контрольная сумма " + (sink & 0xFF) + ")");
+    }
+}
+@end
+@predict Во сколько раз деление на переменную медленнее сложения? А деление на константу?
+@answer
+<p>Порядок чисел (у вас будут свои): сложение с XOR — доли наносекунды (≈ 1–2 такта на итерацию), деление на переменную — примерно на порядок медленнее (команда <code>idiv</code> с задержкой в десятки тактов на этом поколении меньше, но цепочка зависимостей не даёт её спрятать), деление на константу — заметно быстрее деления на переменную: C2, как и gcc, заменил его умножением. Первый раунд часто медленнее — код ещё интерпретируется или работает на C1 (прогрев, <a href="../jvm/16-interpreter-jit.html">JVM, тема 16</a>).</p>
+@end
+@run
+javac Cost.java
+java Cost 7
+@end
+@try
+Почему в цикле стоит <code>^ i</code>? ::: Без него JIT мог бы вычислить цикл быстрее, чем по шагам (или вынести инвариант), — зависимость от i делает каждую итерацию настоящей. Измерять микрооперации вручную вообще ненадёжно; для серьёзных замеров — JMH.
+@end

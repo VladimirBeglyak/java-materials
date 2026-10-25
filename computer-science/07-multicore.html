@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Многоядерность: когерентность и барьеры</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ПАМЯТЬ</div>
+  <h1>Многоядерность: когерентность и барьеры</h1>
+  <p class="lead">Несколько ядер с собственными кэшами работают с одной памятью. Железо поддерживает иллюзию единой памяти протоколом когерентности, но эта иллюзия неполная: записи стоят в буферах, видны другим ядрам с задержкой и не в том порядке. Отсюда ложное разделение кэш-линий, переупорядочивание операций, барьеры памяти и атомарные инструкции — фундамент, на котором стоят <code>volatile</code>, <code>synchronized</code>, <code>AtomicLong</code> и вся Java Memory Model.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">ядра, SMT, NUMA</span><span class="tag">MESI</span><span class="tag">false sharing</span><span class="tag">store buffer</span><span class="tag">TSO и слабые модели</span><span class="tag">барьеры</span><span class="tag">CAS</span><span class="tag">закон Амдала</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cores"><span class="h-num">7.1</span>Ядра, потоки железа, сокеты</h2>
+<ul>
+  <li><b>Ядро</b> — полноценный процессор: свой конвейер, регистры, L1 и (обычно) L2. Ядра одного кристалла делят L3 и контроллер памяти.</li>
+  <li><b>SMT / Hyper-Threading</b>: одно ядро держит два набора архитектурных регистров и исполняет два потока, перемешивая их команды по свободным блокам. Это не удваивает скорость (обычно +10–30%), зато прячет простои на промахах кэша. ОС видит два <b>логических процессора</b>: <code>Runtime.availableProcessors()</code> на машине из лаб возвращает 18 при 14 физических ядрах (4 P-ядра с SMT + 8 E-ядер + 2 LP E-ядра).</li>
+  <li><b>Гибридные процессоры</b>: быстрые P-ядра и экономичные E-ядра с разной производительностью — планировщик ОС решает, где запускать поток; для бенчмарков это ещё один источник разброса.</li>
+  <li><b>Сокеты и NUMA</b>: серверы с 2–8 процессорами. У каждого — своя память; обращение к «чужой» идёт через межпроцессорную шину и стоит дороже. Топология видна в <code>lscpu</code> и <code>numactl --hardware</code>.</li>
+</ul>
+
+<h2 id="coherence"><span class="h-num">7.2</span>Когерентность кэшей: протокол MESI</h2>
+<p>Пусть два ядра прочитали одну переменную — у каждого копия в L1. Первое ядро записывает новое значение в свою копию. Как второе узнает, что его копия устарела? Протокол <b>когерентности</b> гарантирует: в каждый момент у линии может быть <b>много читателей или один писатель</b>. Классический протокол — <b>MESI</b>, по состоянию линии в каждом кэше:</p>
+<div class="table-wrap"><table>
+<tr><th>Состояние</th><th>Смысл</th><th>Можно читать</th><th>Можно писать</th></tr>
+<tr><td><b>M</b> (Modified)</td><td>только у меня, изменена, в памяти устаревшая копия</td><td>да</td><td>да, без сообщений</td></tr>
+<tr><td><b>E</b> (Exclusive)</td><td>только у меня, совпадает с памятью</td><td>да</td><td>да, молча переходит в M</td></tr>
+<tr><td><b>S</b> (Shared)</td><td>копии могут быть и у других</td><td>да</td><td>только после рассылки «invalidate» всем остальным</td></tr>
+<tr><td><b>I</b> (Invalid)</td><td>копии нет или она недействительна</td><td>промах: запросить линию</td><td>промах: запросить линию на запись (RFO)</td></tr>
+</table></div>
+<p>Реальные протоколы сложнее (MESIF у Intel, MOESI у AMD), а вместо «подслушивания шины» используется <b>каталог</b> (directory) или фильтры в L3: кэш знает, у каких ядер может быть копия, и рассылает сообщения только им. Важно одно: <b>передача линии между ядрами стоит 40–100 нс</b> — столько же, сколько промах в память. Запись в линию, которую постоянно читают и пишут другие ядра, становится самой дорогой операцией в программе.</p>
+
+<div class="widget" id="mesiW">
+  <div class="widget-title">Симулятор MESI: одна кэш-линия, три ядра</div>
+  <p class="hint">Нажимайте операции чтения и записи от имени ядер и смотрите, как меняются состояния линии в их кэшах и какие сообщения идут по межъядерной сети.</p>
+  <div class="controls" id="mesiBtns"></div>
+  <div class="cells" id="mesiState" style="grid-template-columns:repeat(4,1fr)"></div>
+  <div class="out" id="mesiLog" style="max-height:220px;overflow:auto"></div>
+</div>
+<script>
+(function () {
+  var N = 3, st, mem, val, log = document.getElementById("mesiLog"), stEl = document.getElementById("mesiState"), btns = document.getElementById("mesiBtns"), cost;
+  function reset() { st = ["I", "I", "I"]; val = [null, null, null]; mem = 0; cost = 0; log.textContent = "Все копии недействительны (I). Значение в памяти: 0.\n"; draw(); }
+  function draw() {
+    stEl.innerHTML = st.map(function (s, i) { return '<div class="' + (s === "M" ? "miss" : s === "I" ? "" : "hit") + '"><small>ядро ' + i + '</small><b>' + s + '</b>' + (val[i] !== null && s !== "I" ? "<small>копия = " + val[i] + "</small>" : "<small>—</small>") + '</div>'; }).join("") +
+      '<div><small>память</small><b>' + mem + '</b><small>' + (st.indexOf("M") >= 0 ? "устарела" : "актуальна") + '</small></div>';
+  }
+  function L(s) { log.textContent += s + "\n"; log.scrollTop = log.scrollHeight; }
+  function read(c) {
+    var s = st[c];
+    if (s !== "I") { L("ядро " + c + " читает: попадание (" + s + "), без сообщений"); return; }
+    var owner = st.indexOf("M"), others = st.some(function (x, i) { return i !== c && x !== "I"; });
+    if (owner >= 0) { L("ядро " + c + " читает: промах. Запрос по сети → ядро " + owner + " владеет (M): отдаёт данные и пишет их в память, M → S"); mem = val[owner]; st[owner] = "S"; st[c] = "S"; val[c] = mem; cost += 80; }
+    else if (others) { L("ядро " + c + " читает: промах. Копия есть у других → получает данные, все копии в S"); st = st.map(function (x, i) { return x === "E" ? "S" : x; }); st[c] = "S"; val[c] = mem; cost += 60; }
+    else { L("ядро " + c + " читает: промах. Ни у кого нет → данные из памяти, состояние E (эксклюзивно)"); st[c] = "E"; val[c] = mem; cost += 100; }
+  }
+  function write(c) {
+    var s = st[c], owner = st.indexOf("M"), base = owner >= 0 ? val[owner] : (s !== "I" ? val[c] : mem), nv = base + 1;
+    if (s === "M") { L("ядро " + c + " пишет " + nv + ": уже M — молча, без сообщений"); }
+    else if (s === "E") { L("ядро " + c + " пишет " + nv + ": E → M молча — никто больше копию не держит"); }
+    else {
+      var inv = st.map(function (x, i) { return i !== c && x !== "I" ? i : -1; }).filter(function (i) { return i >= 0; });
+      if (s === "S") L("ядро " + c + " пишет " + nv + ": S → M, рассылает invalidate ядрам [" + inv.join(", ") + "], ждёт подтверждений");
+      else L("ядро " + c + " пишет " + nv + ": промах на запись (RFO): забрать линию" + (owner >= 0 ? " у ядра " + owner + " (было M, отдаёт свежие данные)" : inv.length ? " и аннулировать копии у ядер [" + inv.join(", ") + "]" : " из памяти"));
+      inv.forEach(function (i) { st[i] = "I"; }); cost += inv.length ? 80 : 100;
+    }
+    st[c] = "M"; val[c] = nv;
+  }
+  for (var c = 0; c < N; c++) (function (c) {
+    var r = document.createElement("button"); r.className = "btn"; r.type = "button"; r.textContent = "ядро " + c + ": читать"; r.onclick = function () { read(c); draw(); }; btns.appendChild(r);
+    var w = document.createElement("button"); w.className = "btn primary"; w.type = "button"; w.textContent = "ядро " + c + ": x++"; w.onclick = function () { write(c); draw(); }; btns.appendChild(w);
+  })(c);
+  var pp = document.createElement("button"); pp.className = "btn"; pp.type = "button"; pp.textContent = "пинг-понг ×10 (ядра 0 и 1 по очереди x++)";
+  pp.onclick = function () { var before = cost; for (var k = 0; k < 10; k++) { write(k % 2); } draw(); L("→ каждая запись перетаскивает линию к другому ядру: ~" + (cost - before) + " нс на 10 инкрементов вместо ~3 нс у одного ядра"); }; btns.appendChild(pp);
+  var rs = document.createElement("button"); rs.className = "btn"; rs.type = "button"; rs.textContent = "↺ сброс"; rs.onclick = reset; btns.appendChild(rs);
+  reset();
+})();
+</script>
+
+<h2 id="falsesharing"><span class="h-num">7.3</span>Ложное разделение (false sharing)</h2>
+<p>Когерентность работает с <b>линиями</b>, а не с переменными. Если два потока пишут в <b>разные</b> переменные, оказавшиеся в <b>одной</b> 64-байтной линии, линия всё равно будет летать между их ядрами, как будто они пишут одно и то же. Логически данные не разделяются — физически разделяются. Это <b>ложное разделение</b>: классический источник «многопоточный код медленнее однопоточного».</p>
+<pre data-title="типичная ситуация"><code class="java">class Stats {
+    volatile long requests;   // пишет поток A
+    volatile long errors;     // пишет поток B — те же 64 байта, что и requests!
+}
+long[] counters = new long[nThreads];   // counters[i] пишет поток i — соседние элементы в одной линии</code></pre>
+<ul>
+  <li><b>Лечение</b> — разнести горячие поля по разным линиям: «прокладка» (padding) из неиспользуемых полей, индексы с шагом 8–16 элементов, или аннотация <code>@jdk.internal.vm.annotation.Contended</code>: JVM добавляет вокруг поля 128 байт пустоты (на случай соседней предвыборки пар линий). Вне JDK аннотация действует только с <code>-XX:-RestrictContended</code>.</li>
+  <li><b>В JDK</b> <code>@Contended</code> стоит на ячейках <code>LongAdder</code> (<code>Striped64.Cell</code>), на полях <code>Thread</code> для <code>ThreadLocalRandom</code>, в <code>ForkJoinPool</code>, <code>Exchanger</code>, <code>ConcurrentHashMap.CounterCell</code>.</li>
+  <li><b>Найти</b> — по счётчикам производительности (<code>perf c2c</code> в Linux показывает линии с HITM — попаданиями в чужие изменённые линии) или по подозрительно плохому масштабированию.</li>
+</ul>
+
+<h2 id="reorder"><span class="h-num">7.4</span>Буфер записи и переупорядочивание</h2>
+<p>Ждать подтверждений протокола когерентности на каждую запись — дорого. Поэтому у каждого ядра есть <b>буфер записи</b> (store buffer): команда записи кладёт значение в буфер и идёт дальше, а в кэш (и тем самым в видимость другим ядрам) оно попадает позже. Своё ядро видит свои записи сразу (читает из буфера), другие — с задержкой.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 250" role="img" aria-label="Тест Деккера: оба ядра записали значения в свои буферы записи и прочитали из кэша старые нули">
+  <defs><marker id="sb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <g font-size="12.5">
+    <rect x="20" y="14" width="250" height="80" rx="8" class="box-acc"/><text x="145" y="36" text-anchor="middle" font-weight="700">ядро 0 (поток A)</text>
+    <text x="40" y="58" class="mono">x = 1;</text><text x="40" y="78" class="mono">r1 = y;   // прочитал 0</text>
+    <rect x="550" y="14" width="250" height="80" rx="8" class="box-acc"/><text x="675" y="36" text-anchor="middle" font-weight="700">ядро 1 (поток B)</text>
+    <text x="570" y="58" class="mono">y = 1;</text><text x="570" y="78" class="mono">r2 = x;   // прочитал 0</text>
+    <rect x="20" y="110" width="250" height="40" rx="6" class="box-warn"/><text x="145" y="135" text-anchor="middle" class="mono">буфер записи: x = 1 (ещё не виден)</text>
+    <rect x="550" y="110" width="250" height="40" rx="6" class="box-warn"/><text x="675" y="135" text-anchor="middle" class="mono">буфер записи: y = 1 (ещё не виден)</text>
+    <rect x="250" y="180" width="320" height="50" rx="8" class="box-info"/><text x="410" y="202" text-anchor="middle" font-weight="700">кэши / память</text><text x="410" y="221" text-anchor="middle" class="mono">x = 0, y = 0</text>
+    <path d="M145 150 L300 180" class="ln-dash" marker-end="url(#sb)"/><path d="M675 150 L520 180" class="ln-dash" marker-end="url(#sb)"/>
+    <path d="M250 80 C 330 120, 330 170, 330 178" class="ln-acc" marker-end="url(#sb)"/><path d="M570 80 C 490 120, 490 170, 490 178" class="ln-acc" marker-end="url(#sb)"/>
+  </g>
+</svg>
+<figcaption>Тест Деккера (store → load). При любом «чередовании» команд хотя бы одно чтение должно увидеть 1. Но обе записи ещё в буферах, обе загрузки читают из кэша нули: результат <code>r1 == 0 &amp;&amp; r2 == 0</code>. На x86 это единственный разрешённый вид переупорядочивания — в лабе 7.2 он случается в 10–25% попыток.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<tr><th>Переупорядочивание</th><th>x86-64 (TSO)</th><th>ARM64, RISC-V (слабые модели)</th></tr>
+<tr><td>load → load (два чтения меняются местами)</td><td>нет</td><td>да</td></tr>
+<tr><td>load → store</td><td>нет</td><td>да</td></tr>
+<tr><td>store → store (записи видны другим в другом порядке)</td><td>нет</td><td>да</td></tr>
+<tr><td>store → load (чтение «обгоняет» свою предыдущую запись в другую переменную)</td><td><b>да</b> — из-за буфера записи</td><td>да</td></tr>
+</table></div>
+<p>x86 называют <b>TSO</b> (total store order): записи всех ядер видны всем в одном порядке, и ломается только store → load. На ARM разрешено почти всё, поэтому код с гонкой данных, «работающий» на ноутбуке с x86, может ломаться на сервере Graviton или Apple M. Кроме процессора, переставлять обращения вправе и <b>компилятор</b> (javac почти нет, JIT — да): вынести чтение из цикла, объединить записи. Модель памяти языка ограничивает обоих.</p>
+
+<h2 id="barriers"><span class="h-num">7.5</span>Барьеры памяти и как их использует JVM</h2>
+<p><b>Барьер</b> (fence) — команда, запрещающая определённые переупорядочивания вокруг себя: <code>mfence</code> на x86 ждёт опустошения буфера записи; на ARM — <code>dmb ish</code> и, удобнее, команды с семантикой <b>acquire</b> (<code>ldar</code>: последующие обращения не уходят раньше этого чтения) и <b>release</b> (<code>stlr</code>: предыдущие обращения не уходят позже этой записи).</p>
+<div class="table-wrap"><table>
+<tr><th>Java</th><th>Гарантия JMM</th><th>x86-64 (HotSpot)</th><th>ARM64 (HotSpot)</th></tr>
+<tr><td>чтение <code>volatile</code></td><td>acquire</td><td>обычный <code>mov</code> — TSO и так не переставляет load → load/store</td><td><code>ldar</code></td></tr>
+<tr><td>запись <code>volatile</code></td><td>release + запрет store → load с последующим volatile-чтением</td><td><code>mov</code> + <code>lock addl [rsp], 0</code> (дешёвый аналог mfence) или <code>xchg</code></td><td><code>stlr</code></td></tr>
+<tr><td>вход/выход <code>synchronized</code></td><td>acquire / release</td><td><code>lock cmpxchg</code> на захват, обычная запись или CAS на освобождение</td><td>CAS с acquire, <code>stlr</code></td></tr>
+<tr><td><code>VarHandle.setRelease</code>, <code>getAcquire</code></td><td>только release / acquire</td><td>обычные <code>mov</code></td><td><code>stlr</code> / <code>ldar</code></td></tr>
+<tr><td><code>VarHandle.setOpaque</code></td><td>без порядка, но без «оптимизаций» компилятора</td><td><code>mov</code></td><td>обычные load/store</td></tr>
+</table></div>
+<p>Отсюда практические факты: на x86 чтение <code>volatile</code> почти бесплатно, а запись стоит ~20–40 тактов (опустошение буфера записи); на ARM обе операции заметнее, но дешевле полного барьера. Правила Java Memory Model (happens-before, безопасная публикация, final-поля) разобраны в <a href="../java-concurrency/02-jmm.html">Java Concurrency, тема 02</a> — эта глава объясняет, <i>почему</i> они такие.</p>
+
+<h2 id="atomics"><span class="h-num">7.6</span>Атомарные операции и CAS</h2>
+<p><code>count++</code> — три действия: прочитать, прибавить, записать. Два ядра могут прочитать одно значение и записать одинаковый результат — одно увеличение потеряется. Нужна <b>атомарная</b> операция «прочитать-изменить-записать», которую никто не может разорвать.</p>
+<ul>
+  <li><b>x86</b>: префикс <code>lock</code> (<code>lock xadd</code>, <code>lock cmpxchg</code>). Ядро получает линию в состояние M и держит её, не отвечая на запросы других, до конца операции. Заодно это полный барьер. Стоимость — ~20 тактов без конкуренции и сотни наносекунд, если линию тянут несколько ядер.</li>
+  <li><b>ARM64</b>: пара <b>LL/SC</b> (<code>ldxr</code>/<code>stxr</code>: «прочитать и пометить»; «записать, если никто не трогал, иначе вернуть ошибку») или команды LSE (<code>cas</code>, <code>ldadd</code>) с ARMv8.1.</li>
+  <li><b>CAS</b> (compare-and-swap): «если в ячейке ожидаемое значение — запиши новое, верни успех». На нём строятся <code>AtomicLong.incrementAndGet</code> (на x86 JIT использует сразу <code>lock xadd</code>), неблокирующие очереди, <code>ConcurrentHashMap</code>, AQS — основа <code>ReentrantLock</code> (<a href="../java-concurrency/05-atomics.html">Java Concurrency, тема 05</a>).</li>
+</ul>
+<pre data-title="CAS-цикл: так устроено большинство неблокирующих алгоритмов"><code class="java">long v;
+do {
+    v = counter.get();                         // прочитать
+} while (!counter.compareAndSet(v, v * 2));    // попытаться записать; если кто-то успел раньше — повторить</code></pre>
+<p><b>Конкуренция</b> — главный враг. 16 потоков, увеличивающих один <code>AtomicLong</code>, работают медленнее одного: линия всё время в пути между ядрами, а CAS-циклы ещё и проваливаются. <code>LongAdder</code> решает это разбиением: у каждого потока (точнее, у каждой группы) своя ячейка в своей линии (<code>@Contended</code>), а сумма считается только при чтении. Лаба 7.3.</p>
+
+<h2 id="scaling"><span class="h-num">7.7</span>Масштабирование: Амдал и стоимость общего</h2>
+<p><b>Закон Амдала</b>: если доля <i>p</i> работы параллелится идеально, а 1 − <i>p</i> — последовательна, ускорение на <i>N</i> ядрах не больше 1 / ((1 − p) + p / N). При p = 95% даже бесконечность ядер даст лишь ×20. «Последовательной» частью оказываются не только явные блокировки, но и любые общие изменяемые данные: счётчик, общий кэш, логгер, пул соединений.</p>
+<div class="widget" id="amdW">
+  <div class="widget-title">Закон Амдала</div>
+  <div class="controls"><label>параллельная доля p, %<input type="text" id="amdP" value="95"></label><label>ядер N<input type="text" id="amdN" value="16"></label></div>
+  <div class="out" id="amdOut"></div>
+</div>
+<script>
+(function () {
+  var p = document.getElementById("amdP"), n = document.getElementById("amdN"), o = document.getElementById("amdOut");
+  function run() {
+    var P = Math.min(100, Math.max(0, parseFloat(p.value) || 0)) / 100, N = Math.max(1, parseInt(n.value, 10) || 1), L = [];
+    [1, 2, 4, 8, 16, 32, 64, 128, N].filter(function (v, i, a) { return a.indexOf(v) === i; }).sort(function (a, b) { return a - b; }).forEach(function (k) {
+      var s = 1 / ((1 - P) + P / k); L.push(("N = " + k).padEnd(9) + " ускорение ×" + s.toFixed(2).padEnd(7) + " " + "█".repeat(Math.min(60, Math.round(s))) + (k === N ? "  ← ваше N" : ""));
+    });
+    L.push("\nпредел при N → ∞: ×" + (P < 1 ? (1 / (1 - P)).toFixed(1) : "∞") + ". Эффективность на N = " + N + ": " + Math.round(100 / ((1 - P) * N + P)) + "% ядер работает на задачу.");
+    o.textContent = L.join("\n");
+  }
+  p.addEventListener("input", run); n.addEventListener("input", run); run();
+})();
+</script>
+<p>Практические правила многоядерного кода: не делить изменяемое состояние без необходимости (данные на поток, неизменяемые объекты, передача сообщений); если делить — разбивать на независимые части (шардинг счётчиков, <code>ConcurrentHashMap</code> вместо общей блокировки); разносить горячие поля по линиям; помнить, что SMT-«ядра» не настоящие и что тысяча потоков на 16 ядрах тратит время на переключения (тема 11).</p>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">7.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Ловим эффекты многоядерности: ложное разделение кэш-линии, переупорядочивание store → load на x86, цену конкуренции за одну линию и машинные команды, в которые превращаются атомарные операции. Модуль IDEA — <code>cs07</code>. Лаба 7.4 — в Docker-образе <code>cs-lab</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-7.1">
+<div class="lab-head"><span class="lab-num">Лаба 7.1</span><b>Ложное разделение</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Два потока пишут каждый в свою ячейку. Измерить, во что обходится соседство ячеек в одной кэш-линии.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>FalseSharing.java</code>:</div>
+<pre data-title="FalseSharing.java"><code class="java">import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+
+public class FalseSharing {
+    static final VarHandle AH = MethodHandles.arrayElementVarHandle(long[].class);
+    static final int ITER = 20_000_000;
+
+    // threads потоков; поток t увеличивает свою ячейку cells[t * step]
+    static long run(long[] cells, int threads, int step, boolean vol) throws InterruptedException {
+        Thread[] ts = new Thread[threads];
+        for (int t = 0; t &lt; threads; t++) {
+            int idx = t * step;
+            ts[t] = new Thread(() -&gt; {
+                for (int k = 0; k &lt; ITER; k++) {
+                    if (vol) AH.setVolatile(cells, idx, (long) AH.getVolatile(cells, idx) + 1);
+                    else     AH.setOpaque(cells, idx, (long) AH.getOpaque(cells, idx) + 1);
+                }
+            });
+        }
+        long t0 = System.nanoTime();
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        long[] cells = new long[16 * 16];
+        run(cells, 2, 1, true); run(cells, 2, 16, false);        // прогрев
+        for (int threads : new int[] {2, 4, 8}) {
+            System.out.printf("потоков %d | volatile: соседние ячейки %5d мс, через 128 байт %4d мс | opaque: соседние %4d мс, через 128 байт %4d мс%n",
+                    threads, run(cells, threads, 1, true), run(cells, threads, 16, true),
+                    run(cells, threads, 1, false), run(cells, threads, 16, false));
+        }
+    }
+}</code></pre>
+<p class="lab-note">Каждый поток делает 20 млн увеличений <b>своей</b> ячейки — логически потоки ничего не делят. «Соседние» — ячейки 0, 1, 2… в одной кэш-линии; «через 128 байт» — индексы 0, 16, 32… <code>volatile</code>-запись на x86 ждёт опустошения буфера записи (тема 7.5), <code>opaque</code> — обычный <code>mov</code> без барьера.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз «соседние» медленнее «разнесённых» для volatile? Растёт ли разница с числом потоков? Будет ли такой же эффект у opaque?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac FalseSharing.java
+java FalseSharing</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">потоков 2 | volatile: соседние ячейки   572 мс, через 128 байт  155 мс | opaque: соседние   37 мс, через 128 байт   35 мс
+потоков 4 | volatile: соседние ячейки  1213 мс, через 128 байт  177 мс | opaque: соседние   64 мс, через 128 байт   34 мс
+потоков 8 | volatile: соседние ячейки  2100 мс, через 128 байт  182 мс | opaque: соседние   76 мс, через 128 байт   32 мс</code></pre></details>
+<div class="lab-ans" hidden><p>Для volatile — в 4–20 раз, и разница растёт с числом потоков: разнесённые ячейки идут за одно и то же время при 2, 4 и 8 потоках (каждое ядро держит свою линию в M), а соседние замедляются почти линейно — одна линия по очереди путешествует ко всем ядрам. Для opaque эффект есть, но в разы слабее: записи копятся в буфере записи, свои чтения ядро берёт прямо из него, и линия перетаскивается не на каждой итерации, а пачками. Ложное разделение больнее всего бьёт как раз по коду с барьерами и атомиками — счётчикам, флагам, блокировкам.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Поменяйте шаг 16 на 8 (64 байта).</summary><div>Обычно тоже быстро — ячейки в соседних линиях. Но на ряде процессоров Intel предвыборщик загружает линии парами (spatial prefetcher), и соседние 64-байтные линии мешают друг другу; поэтому <code>@Contended</code> по умолчанию отступает 128 байт.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-7.2">
+<div class="lab-head"><span class="lab-num">Лаба 7.2</span><b>Переупорядочивание store → load</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Поймать «невозможный» результат теста Деккера на x86 и убедиться, что <code>volatile</code> его запрещает.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Reorder.java</code>:</div>
+<pre data-title="Reorder.java"><code class="java">public class Reorder {
+    static int x, y, r1, r2;
+    static volatile int vx, vy;
+    static volatile int go1, go2, done1, done2;   // служебная синхронизация раундов
+
+    public static void main(String[] args) throws Exception {
+        boolean useVolatile = args.length &gt; 0 &amp;&amp; args[0].equals("volatile");
+        int n = 2_000_000;
+        Thread a = new Thread(() -&gt; {
+            for (int i = 1; i &lt;= n; i++) {
+                while (go1 != i) Thread.onSpinWait();
+                if (useVolatile) { vx = 1; r1 = vy; } else { x = 1; r1 = y; }
+                done1 = i;
+            }
+        });
+        Thread b = new Thread(() -&gt; {
+            for (int i = 1; i &lt;= n; i++) {
+                while (go2 != i) Thread.onSpinWait();
+                if (useVolatile) { vy = 1; r2 = vx; } else { y = 1; r2 = x; }
+                done2 = i;
+            }
+        });
+        a.start(); b.start();
+        int both0 = 0;
+        for (int i = 1; i &lt;= n; i++) {
+            x = 0; y = 0; vx = 0; vy = 0;
+            go1 = i; go2 = i;                                  // старт раунда для обоих потоков
+            while (done1 != i || done2 != i) Thread.onSpinWait();
+            if (r1 == 0 &amp;&amp; r2 == 0) both0++;
+        }
+        a.join(); b.join();
+        System.out.printf("%s: r1 == 0 &amp;&amp; r2 == 0 — %d раз из %d%n", useVolatile ? "volatile" : "обычные поля", both0, n);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">При любом чередовании команд двух потоков хотя бы одна из переменных r1, r2 должна быть 1. Сколько раз встретится r1 == 0 &amp;&amp; r2 == 0 с обычными полями и с volatile?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Reorder.java
+java Reorder
+java Reorder volatile</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">обычные поля: r1 == 0 &amp;&amp; r2 == 0 — 290460 раз из 2000000
+volatile: r1 == 0 &amp;&amp; r2 == 0 — 0 раз из 2000000</code></pre></details>
+<div class="lab-ans" hidden><p>С обычными полями — десятки или сотни тысяч раз (на этой машине от 10 до 25% раундов, от запуска к запуску по-разному): обе записи сидят в буферах записи своих ядер, а чтения уже прошли и получили старые нули. Переставить могли и процессор (store buffer), и JIT — JMM разрешает обоим. С <code>volatile</code> — ни разу: после volatile-записи JIT ставит <code>lock addl</code>, который ждёт опустошения буфера, прежде чем выполнится чтение.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Оставьте volatile только у <code>vx</code> и <code>vy</code> на запись, а читайте обычные поля.</summary><div>Так нельзя по смыслу JMM: гарантия «volatile-запись не переставляется с последующим volatile-чтением» требует volatile с обеих сторон. На x86 барьер после записи всё равно спасёт, на ARM — нет. Корректность нельзя проверять тестом на одной архитектуре — только рассуждением по модели памяти (и инструментами вроде jcstress).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-7.3">
+<div class="lab-head"><span class="lab-num">Лаба 7.3</span><b>Конкуренция за линию: AtomicLong, LongAdder, synchronized</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, как растёт стоимость одного общего счётчика с числом потоков.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Contention.java</code>:</div>
+<pre data-title="Contention.java"><code class="java">import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+
+public class Contention {
+    static final int TOTAL = 40_000_000;
+    static long syncCounter;
+    static synchronized void syncInc() { syncCounter++; }
+
+    static long time(int threads, Runnable inc) throws InterruptedException {
+        Thread[] ts = new Thread[threads];
+        int per = TOTAL / threads;
+        for (int i = 0; i &lt; threads; i++) ts[i] = new Thread(() -&gt; { for (int k = 0; k &lt; per; k++) inc.run(); });
+        long t0 = System.nanoTime();
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        AtomicLong atomic = new AtomicLong();
+        LongAdder adder = new LongAdder();
+        time(4, atomic::incrementAndGet); time(4, adder::increment); time(4, Contention::syncInc);   // прогрев
+        System.out.println("40 млн увеличений одного счётчика, мс:");
+        for (int t : new int[] {1, 2, 4, 8, 16}) {
+            System.out.printf("потоков %2d: AtomicLong %5d | LongAdder %5d | synchronized %5d%n",
+                    t, time(t, atomic::incrementAndGet), time(t, adder::increment), time(t, Contention::syncInc));
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Как изменится время <code>AtomicLong</code> при переходе от 1 к 16 потокам? А у <code>LongAdder</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Contention.java
+java Contention</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">40 млн увеличений одного счётчика, мс:
+потоков  1: AtomicLong   237 | LongAdder   300 | synchronized   468
+потоков  2: AtomicLong   436 | LongAdder   160 | synchronized  2517
+потоков  4: AtomicLong   604 | LongAdder    91 | synchronized  4765
+потоков  8: AtomicLong   654 | LongAdder    54 | synchronized  5178
+потоков 16: AtomicLong   766 | LongAdder    34 | synchronized  5175</code></pre></details>
+<div class="lab-ans" hidden><p><code>AtomicLong</code> с одним потоком — быстрый (линия всё время в своём L1, <code>lock xadd</code> ~ 20 тактов), а с 2+ потоками время <b>растёт</b>, хотя работы столько же: каждая операция ждёт, пока линия придёт от другого ядра. <code>LongAdder</code> с ростом числа потоков ускоряется или держится: у потоков свои ячейки в разных линиях. <code>synchronized</code> — медленнее всех под конкуренцией: при столкновениях потоки паркуются в ядре ОС, а это переключения контекста (тема 11).</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-7.4">
+<div class="lab-head"><span class="lab-num">Лаба 7.4</span><b>Атомики в машинном коде</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть, во что компилятор превращает атомарные операции и барьеры на x86-64.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>atomics.c</code>:</div>
+<pre data-title="atomics.c"><code class="txt">#include &lt;stdatomic.h&gt;
+
+atomic_long counter;
+atomic_int flag;
+
+void store_seq_cst(int v)  { atomic_store(&amp;flag, v); }                                   // как volatile-запись
+void store_release(int v)  { atomic_store_explicit(&amp;flag, v, memory_order_release); }    // VarHandle.setRelease
+int  load_acquire(void)    { return atomic_load_explicit(&amp;flag, memory_order_acquire); }  // volatile-чтение
+long fetch_add(void)       { return atomic_fetch_add(&amp;counter, 1); }                      // getAndIncrement
+int  cas(long expected)    { return atomic_compare_exchange_strong(&amp;counter, &amp;expected, 42); } // compareAndSet
+void fence(void)           { atomic_thread_fence(memory_order_seq_cst); }</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - atomics.c</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">store_seq_cst:
+	xchg	edi, DWORD PTR flag[rip]
+	ret
+store_release:
+	mov	DWORD PTR flag[rip], edi
+	ret
+load_acquire:
+	mov	eax, DWORD PTR flag[rip]
+	ret
+fetch_add:
+	mov	eax, 1
+	lock xadd	QWORD PTR counter[rip], rax
+	ret
+cas:
+	mov	rax, rdi
+	mov	edx, 42
+	lock cmpxchg	QWORD PTR counter[rip], rdx
+	sete	al
+	movzx	eax, al
+	ret
+fence:
+	lock or	QWORD PTR [rsp], 0
+	ret
+	.bss
+	.align 4
+flag:
+	.zero	4
+	.align 8
+counter:
+	.zero	8</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие функции превратятся в обычный <code>mov</code>, а где появятся <code>lock</code>, <code>xchg</code> или <code>mfence</code>?</div>
+<div class="lab-ans" hidden><p>Release-запись и acquire-чтение — обычные <code>mov</code>: на x86 (TSO) эти гарантии бесплатны. Seq-cst запись — <code>xchg</code> (неявно с <code>lock</code>: это и запись, и полный барьер). <code>fetch_add</code> — <code>lock xadd</code>, CAS — <code>lock cmpxchg</code>, полный барьер — <code>mfence</code> (или <code>lock or</code> на вершину стека). HotSpot генерирует для Java то же самое: <code>getAcquire</code>/volatile-чтение — <code>mov</code>, volatile-запись — <code>mov</code> + <code>lock addl</code>.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">7.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что гарантирует протокол когерентности кэшей?</p><ul><li>что все записи сразу видны всем ядрам в порядке программы</li><li>что для каждой отдельной линии в каждый момент либо много читателей, либо один писатель, и все видят одну последовательность её значений</li><li>что кэши не нужны</li><li>атомарность count++</li></ul><div class="why">Когерентность — про одну линию. Порядок записей в разные адреса — это уже модель памяти (буферы записи, переупорядочивание).</div></div>
+<div class="mcq" data-ok="3"><p>Два потока увеличивают <code>counters[0]</code> и <code>counters[1]</code> массива <code>long[]</code>. Почему это медленно, хотя данные разные?</p><ul><li>массивы синхронизированы</li><li>JIT вставляет блокировку</li><li>long не атомарен</li><li>элементы лежат в одной кэш-линии, и она перебрасывается между ядрами при каждой записи (ложное разделение)</li></ul><div class="why">Лечится разнесением на ≥ 64 байта (индексы 0 и 16 в long[]) или @Contended.</div></div>
+<div class="mcq" data-ok="0"><p>Какое переупорядочивание допускает x86?</p><ul><li>только чтение может обогнать предыдущую запись в другой адрес (store → load)</li><li>никакого</li><li>любое</li><li>только запись может обогнать запись</li></ul><div class="why">TSO: из-за буфера записи. Поэтому volatile-запись на x86 сопровождается lock-инструкцией, а volatile-чтение — обычное.</div></div>
+<div class="mcq" data-ok="2"><p>Почему <code>LongAdder</code> под высокой конкуренцией быстрее <code>AtomicLong</code>?</p><ul><li>он не атомарен</li><li>использует блокировку</li><li>потоки пишут в разные ячейки в разных кэш-линиях, и линия одного счётчика не перебрасывается между всеми ядрами</li><li>он хранит int вместо long</li></ul><div class="why">Цена — sum() не атомарен относительно параллельных add и дороже обычного чтения.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните протокол MESI и стоимость записи в разделяемую линию.</summary><div class="a"><p>Каждая линия в каждом кэше в состоянии Modified, Exclusive, Shared или Invalid. Чтение в I запрашивает линию (у владельца или из памяти); запись в S или I требует аннулировать все другие копии и получить линию эксклюзивно. Передача линии между ядрами — десятки наносекунд, поэтому частая запись в общую линию многими ядрами (счётчик, блокировка, ложное разделение) сводит параллелизм на нет.</p></div></details>
+<details class="q"><summary>Что такое буфер записи и к чему он приводит?</summary><div class="a"><p>Очередь записей ядра, ещё не ставших видимыми другим ядрам. Ядро не ждёт подтверждения когерентности и продолжает исполнять команды; свои записи видит сразу. Следствие — чтение может «обогнать» предыдущую запись в другой адрес (store → load), и в тесте Деккера оба потока читают старые значения. Барьер (mfence, lock-инструкция) ждёт опустошения буфера.</p></div></details>
+<details class="q"><summary>Во что HotSpot компилирует запись в volatile-поле на x86 и почему?</summary><div class="a"><p>В обычную запись mov плюс lock-инструкцию (lock addl к вершине стека) — полный барьер, опустошающий буфер записи. JMM требует, чтобы volatile-запись и последующее volatile-чтение не переставлялись (sequential consistency для volatile), а на x86 переупорядочивается именно store → load. Остальные гарантии (release) TSO даёт бесплатно.</p></div></details>
+<details class="q"><summary>Почему код с гонкой может работать на x86 и ломаться на ARM?</summary><div class="a"><p>x86 запрещает почти все переупорядочивания (кроме store → load), поэтому, например, публикация объекта через обычное поле обычно «случайно работает». ARM разрешает переставлять и записи, и чтения: другой поток может увидеть ссылку на объект раньше, чем его поля. Корректный код использует volatile, final, synchronized или VarHandle — тогда JIT ставит нужные барьеры на любой архитектуре.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

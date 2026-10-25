@@ -16,6 +16,9 @@ python setup.py                      # раздел «подготовка ра�
 ```
 
 Нужны JDK 25 в `PATH`, bash (на Windows — Git Bash; путь можно задать `LABGEN_BASH`), для главы jvm/22 — Docker.
+Для пособия `computer-science` нужен Docker-образ `cs-lab` (Temurin 25 + gcc, binutils, strace, procps) — Dockerfile приведён
+на странице `computer-science/index.html#lab-setup`; собрать: `docker build -t cs-lab .`. Раздел подготовки рабочего места
+этого пособия написан вручную в его `index.html` (не через `setup.py`).
 Вывод снят на JDK 25.0.2; строка с версией — константа `JDK` в `labgen.py`.
 
 - `run/<пособие>/<NN>/` — рабочий каталог главы (общий для всех лаб главы, пересоздаётся при каждом прогоне).

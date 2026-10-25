@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Устройства, диски и файловые системы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ВВОД-ВЫВОД</div>
+  <h1>Устройства, диски и файловые системы</h1>
+  <p class="lead">Как процессор разговаривает с устройствами, почему SSD быстрее HDD в тысячу раз на случайном чтении и при этом не любит перезапись, как файловая система превращает имя файла в блоки на диске, и что на самом деле происходит после <code>write()</code>. Главный практический урок: успешный <code>write</code> не означает, что данные на диске — это знает каждая база данных и должен знать каждый, кто пишет в файл что-то важное.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">PCIe, MMIO, DMA</span><span class="tag">HDD и SSD</span><span class="tag">NVMe</span><span class="tag">inode и каталоги</span><span class="tag">журналирование</span><span class="tag">page cache</span><span class="tag">fsync</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="devices"><span class="h-num">12.1</span>Как процессор работает с устройствами</h2>
+<ul>
+  <li><b>Шина PCI Express</b> соединяет процессор с видеокартой, NVMe-дисками, сетевыми картами. Это не общая шина, а набор последовательных линий «точка-точка»: PCIe 4.0 даёт ~2 ГБ/с на линию, NVMe-диск использует 4 линии (~8 ГБ/с), видеокарта — 16. PCIe 5.0 — вдвое больше.</li>
+  <li><b>Регистры устройства отображены в память</b> (MMIO): драйвер пишет в «адрес памяти», а на самом деле — в регистр контроллера диска. Эти адреса доступны только ядру (тема 10).</li>
+  <li><b>DMA</b> (прямой доступ к памяти): устройство само читает и пишет оперативную память, без участия процессора. Драйвер готовит в памяти описание операции («прочитай 8 блоков с адреса X диска в физические страницы Y, Z»), сообщает устройству и занимается другими делами. По завершении устройство посылает <b>прерывание</b>. Без DMA процессор копировал бы каждый байт сам.</li>
+  <li><b>IOMMU</b> — MMU для устройств: ограничивает, к какой памяти устройство имеет доступ (защита от вредоносных устройств, проброс устройств в виртуальные машины).</li>
+</ul>
+
+<h2 id="disks"><span class="h-num">12.2</span>HDD и SSD</h2>
+<div class="table-wrap"><table>
+<tr><th></th><th>HDD</th><th>SSD NVMe</th></tr>
+<tr><td>устройство</td><td>вращающиеся магнитные пластины (5400–15000 об/мин) и головки на рычаге</td><td>микросхемы флеш-памяти NAND и контроллер со своим процессором и DRAM</td></tr>
+<tr><td>случайное чтение 4 КБ</td><td>5–10 мс: подвести головку (seek) + дождаться оборота</td><td>20–100 мкс</td></tr>
+<tr><td>операций в секунду (IOPS)</td><td>~100–200</td><td>сотни тысяч – миллион+ (с глубокой очередью)</td></tr>
+<tr><td>последовательно</td><td>~150–250 МБ/с</td><td>3–14 ГБ/с</td></tr>
+<tr><td>особенности</td><td>последовательный доступ в сотни раз выгоднее случайного</td><td>стирание блоками, ограниченный ресурс записи, нужен TRIM</td></tr>
+</table></div>
+<h3>Почему SSD «не любит» перезапись</h3>
+<p>Флеш-память читается и пишется <b>страницами</b> (4–16 КБ), а стирается только <b>блоками</b> (сотни страниц, мегабайты), и записать можно только в стёртую страницу. Поэтому SSD никогда не перезаписывает данные на месте: новая версия пишется в свободную страницу, а старая помечается недействительной. Контроллер ведёт таблицу «логический адрес → физическая страница» (<b>FTL</b>, flash translation layer — та же идея, что виртуальная память) и в фоне собирает мусор: переносит живые страницы из полупустых блоков и стирает блоки целиком.</p>
+<ul>
+  <li><b>Усиление записи</b> (write amplification): ради записи 4 КБ контроллеру иногда приходится переписать больше — когда свободных блоков мало. Поэтому заполненный на 95% SSD медленнее на запись, чем на 50%.</li>
+  <li><b>TRIM</b>: ОС сообщает диску, какие блоки файловой системы освобождены, чтобы он не таскал «мёртвые» данные при сборке мусора.</li>
+  <li><b>Ресурс</b>: ячейка выдерживает от тысяч до десятков тысяч циклов стирания; контроллер равномерно распределяет износ (wear leveling).</li>
+  <li><b>NVMe</b> — протокол, спроектированный под флеш: до 64 тысяч очередей команд, у каждого ядра своя очередь, без общей блокировки. Старые протоколы (SATA/AHCI) — одна очередь на 32 команды.</li>
+</ul>
+
+<h2 id="fs"><span class="h-num">12.3</span>Файловая система</h2>
+<p>Диск — массив блоков (секторы 512 Б или 4 КБ). Файловая система превращает его в дерево каталогов с именами, правами и временем изменения.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" role="img" aria-label="Каталог сопоставляет имя номеру inode; inode хранит метаданные и список экстентов блоков данных">
+  <defs><marker id="fs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <g font-size="12.5">
+    <rect x="20" y="20" width="210" height="130" rx="8" class="box-info"/><text x="125" y="42" text-anchor="middle" font-weight="700">каталог /app</text>
+    <text x="36" y="68" class="mono">app.jar     → inode 1842</text><text x="36" y="90" class="mono">config.yml  → inode 1907</text><text x="36" y="112" class="mono">current.jar → inode 1842</text><text x="36" y="134" class="muted" font-size="11">(жёсткая ссылка: то же inode)</text>
+    <rect x="290" y="20" width="230" height="170" rx="8" class="box-acc"/><text x="405" y="42" text-anchor="middle" font-weight="700">inode 1842</text>
+    <text x="306" y="66">тип: файл, права rw-r--r--</text><text x="306" y="86">владелец: app, размер 48 МБ</text><text x="306" y="106">mtime, ctime, atime</text><text x="306" y="126">число ссылок: 2</text><text x="306" y="150" class="mono">экстенты: [5120..17407]</text><text x="306" y="172" class="muted" font-size="11">имени файла в inode нет!</text>
+    <rect x="580" y="20" width="220" height="170" rx="8" class="box-ok"/><text x="690" y="42" text-anchor="middle" font-weight="700">блоки данных на диске</text>
+    <g id="blk"></g>
+    <path d="M230 70 L288 70" class="ln-acc" marker-end="url(#fs)"/><path d="M230 114 C 260 114, 260 80, 288 76" class="ln-acc" marker-end="url(#fs)"/>
+    <path d="M520 150 L578 120" class="ln-acc" marker-end="url(#fs)"/>
+    <text x="20" y="214" class="muted">Удаление файла (rm, Files.delete) — это удаление записи из каталога. Блоки освобождаются, когда число ссылок станет 0 и файл никто не держит открытым.</text>
+  </g>
+</svg>
+<script>
+(function () { var h = ""; for (var r = 0; r < 4; r++) for (var c = 0; c < 8; c++) h += '<rect x="' + (596 + c * 24) + '" y="' + (58 + r * 30) + '" width="20" height="24" rx="3" class="' + (r > 0 && r < 3 ? "box-acc" : "box") + '"/>'; document.getElementById("blk").innerHTML = h; })();
+</script>
+</figure>
+<ul>
+  <li><b>inode</b> (индексный узел) — метаданные файла и где лежат его данные (в ext4 и XFS — <b>экстенты</b>: «блоки с N по M»). Имени в inode нет: имя — запись в каталоге, а каталог — особый файл со списком «имя → номер inode». Отсюда <b>жёсткие ссылки</b> (два имени одного inode) и то, что переименование внутри одной файловой системы атомарно и мгновенно — меняется только запись каталога.</li>
+  <li><b>Символическая ссылка</b> — отдельный маленький файл с путём внутри; может указывать в никуда.</li>
+  <li><b>Открытый удалённый файл</b> продолжает существовать, пока открыт: место на диске не освободится, хотя файла «нет» (классика: удалили гигантский лог, а диск по-прежнему полон — <code>lsof | grep deleted</code>).</li>
+  <li><b>Журналирование</b> (ext4, XFS, NTFS): изменения метаданных сначала пишутся в журнал, затем на место. После сбоя питания файловая система проигрывает журнал и остаётся согласованной — без многочасового <code>fsck</code>. Журналируются по умолчанию метаданные, а не ваши данные.</li>
+  <li><b>Copy-on-write</b> файловые системы (Btrfs, ZFS, APFS) никогда не перезаписывают блоки на месте — как SSD — и поэтому дешёво делают снимки (snapshots).</li>
+  <li><b>Windows NTFS</b> хранит метаданные в главной таблице файлов (MFT); маленькие файлы целиком помещаются прямо в запись MFT.</li>
+</ul>
+
+<h2 id="pagecache"><span class="h-num">12.4</span>Page cache: что на самом деле делает write()</h2>
+<p>Ядро держит в свободной оперативной памяти <b>кэш страниц файлов</b> (page cache) — именно поэтому <code>free</code> в Linux показывает почти всю память «занятой» в buff/cache: она занята полезным кэшем и отдаётся программам по первому требованию.</p>
+<div class="widget stepper">
+  <div class="widget-title">Путь write() до диска</div>
+  <div class="st-stage"><pre class="out" style="min-height:120px"><span data-from="1" data-to="2">ch.write(buf)  →  системный вызов write(fd, buf, 4096)
+ядро копирует 4 КБ в страницу page cache этого файла
+страница помечается «грязной» (dirty)
+write вернул 4096 — прошло ~1–10 мкс, ДИСК НЕ ТРОНУТ</span><span data-from="2" data-to="3">другой процесс читает этот файл →
+read берёт данные из той же страницы page cache —
+он видит новые данные, хотя на диске их нет</span><span data-from="3" data-to="4">через ~5–30 секунд (vm.dirty_expire_centisecs)
+или при нехватке памяти поток ядра writeback
+собирает грязные страницы и отправляет их на диск (DMA)</span><span data-from="4" data-to="5">ПИТАНИЕ ПРОПАЛО до writeback:
+данные, «успешно» записанные write(), потеряны.
+Журнал ФС сохранит согласованность метаданных — но не ваши байты.</span><span data-from="5">ch.force(false) → fdatasync(fd):
+ждать, пока грязные страницы файла уйдут на диск,
+и попросить диск сбросить его собственный кэш (FLUSH).
+Только после возврата данные переживут сбой. Цена — миллисекунды.</span></pre></div>
+  <section class="st-step" data-t="write возвращается сразу"><p>Запись — это копирование в память ядра. Быстро, но ещё не надёжно.</p></section>
+  <section class="st-step" data-t="Чтение видит новое"><p>Все процессы видят файл через один и тот же page cache.</p></section>
+  <section class="st-step" data-t="Отложенная запись"><p>Ядро сбрасывает грязные страницы позже, большими порциями — это выгодно диску.</p></section>
+  <section class="st-step" data-t="Сбой питания"><p>Всё, что не дошло до диска, теряется. Это нормальное поведение, а не ошибка ОС.</p></section>
+  <section class="st-step" data-t="fsync"><p>Явный сброс на диск — единственный способ гарантировать сохранность.</p></section>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Java</th><th>Linux</th><th>Гарантия</th></tr>
+<tr><td><code>FileChannel.write</code>, <code>OutputStream.write</code></td><td><code>write</code></td><td>данные в page cache</td></tr>
+<tr><td><code>OutputStream.flush()</code></td><td>сброс буфера Java в <code>write</code></td><td>всё ещё только page cache! (частая ошибка — считать flush сохранением на диск)</td></tr>
+<tr><td><code>FileChannel.force(false)</code>, <code>FileDescriptor.sync()</code></td><td><code>fdatasync</code> / <code>fsync</code></td><td>данные на диске (если диск честно выполняет FLUSH)</td></tr>
+<tr><td><code>StandardOpenOption.DSYNC</code> / <code>SYNC</code></td><td><code>O_DSYNC</code> / <code>O_SYNC</code></td><td>каждый write ждёт диска</td></tr>
+<tr><td>атомарная замена файла</td><td>запись во временный файл, <code>fsync</code>, <code>rename</code>, <code>fsync</code> каталога</td><td>читатели видят либо старую, либо новую версию целиком</td></tr>
+</table></div>
+<p>Именно так устроены базы данных: <b>журнал упреждающей записи</b> (WAL) — каждая транзакция дописывается в конец журнала и сбрасывается <code>fsync</code> перед ответом «закоммичено», а сами страницы таблиц пишутся позже (<a href="../relational-db/index.html">пособие «Реляционные БД»</a>). Kafka по умолчанию <code>fsync</code> не делает вовсе и полагается на репликацию: копия на трёх машинах надёжнее, чем сброс на одну.</p>
+<ul>
+  <li><b>Readahead</b>: при последовательном чтении ядро заранее читает следующие блоки — аналог предвыборки кэша процессора (тема 06).</li>
+  <li><b>O_DIRECT</b>: чтение и запись мимо page cache, прямо в буфер программы через DMA — для баз данных со своим кэшем. В Java — <code>ExtendedOpenOption.DIRECT</code>.</li>
+  <li><b>Zero-copy</b>: <code>FileChannel.transferTo</code> в сокет превращается в <code>sendfile</code> — данные идут из page cache в сетевую карту, не копируясь в память процесса (тема 13).</li>
+</ul>
+
+<h2 id="latency"><span class="h-num">12.5</span>Сколько стоит ввод-вывод</h2>
+<div class="widget" id="ioW">
+  <div class="widget-title">Калькулятор: сколько займёт чтение</div>
+  <div class="controls">
+    <label>объём, МБ<input type="text" id="ioSize" value="1024"></label>
+    <label>размер запроса, КБ<input type="text" id="ioReq" value="4"></label>
+    <label>доступ<select id="ioPat"><option value="rand">случайный</option><option value="seq">последовательный</option></select></label>
+  </div>
+  <div class="out" id="ioOut"></div>
+</div>
+<script>
+(function () {
+  var D = [["HDD 7200 об/мин", 8e-3, 200e6, 1], ["SATA SSD", 100e-6, 550e6, 32], ["NVMe SSD (PCIe 4)", 60e-6, 7000e6, 64], ["page cache (RAM)", 0.3e-6, 10000e6, 1e9], ["сетевой диск (облако)", 1e-3, 250e6, 16]];
+  var sz = document.getElementById("ioSize"), rq = document.getElementById("ioReq"), pat = document.getElementById("ioPat"), out = document.getElementById("ioOut");
+  function fmt(s) { return s < 1e-3 ? (s * 1e6).toFixed(0) + " мкс" : s < 1 ? (s * 1e3).toFixed(1) + " мс" : s < 120 ? s.toFixed(1) + " с" : (s / 60).toFixed(1) + " мин"; }
+  function run() {
+    var bytes = (parseFloat(sz.value) || 0) * 1048576, req = Math.max(0.5, parseFloat(rq.value) || 4) * 1024, n = Math.ceil(bytes / req), L = [];
+    L.push("запросов: " + n.toLocaleString("ru-RU") + " по " + (req / 1024) + " КБ\n");
+    D.forEach(function (d) {
+      var t;
+      if (pat.value === "seq") t = d[1] + bytes / d[2];
+      else { var qd = Math.min(d[3], 32); t = Math.max(n * d[1] / qd, bytes / d[2]); }
+      L.push(d[0].padEnd(24) + fmt(t).padStart(10));
+    });
+    L.push("\nМодель грубая: случайный доступ — задержка × число запросов с параллелизмом очереди (до 32 запросов одновременно), последовательный — объём / пропускную способность.");
+    L.push("Вывод: для HDD случайный доступ катастрофичен, для SSD — терпим, но всё равно на порядки медленнее памяти. Отсюда индексы, кэши и пакетная запись.");
+    out.textContent = L.join("\n");
+  }
+  [sz, rq].forEach(function (e) { e.addEventListener("input", run); }); pat.addEventListener("change", run); run();
+})();
+</script>
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">12.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Измеряем цену надёжности (запись с <code>force</code> и без), эффект page cache и устройство файловой системы: inode, жёсткие и символические ссылки, удалённый, но открытый файл. Лабы 12.2 и 12.3 — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs12</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-12.1">
+<div class="lab-head"><span class="lab-num">Лаба 12.1</span><b>Цена fsync</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить запись маленьких записей «как журнал» с принудительным сбросом на диск и без него.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Journal.java</code>:</div>
+<pre data-title="Journal.java"><code class="java">import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.*;
+
+public class Journal {
+    public static void main(String[] args) throws Exception {
+        Path f = Path.of("journal.log");
+        ByteBuffer record = ByteBuffer.allocate(100);
+        for (int round = 0; round &lt; 2; round++) {
+            for (boolean sync : new boolean[] {false, true}) {
+                try (FileChannel ch = FileChannel.open(f, StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                        StandardOpenOption.TRUNCATE_EXISTING)) {
+                    int n = 1000;
+                    long t0 = System.nanoTime();
+                    for (int i = 0; i &lt; n; i++) {
+                        record.clear();
+                        ch.write(record);
+                        if (sync) ch.force(false);                 // fdatasync / FlushFileBuffers
+                    }
+                    double us = (System.nanoTime() - t0) / 1000.0 / n;
+                    System.out.printf("%s %8.1f мкс на запись → %,9.0f записей в секунду%n",
+                            sync ? "write + force:" : "только write: ", us, 1e6 / us);
+                }
+            }
+        }
+        Files.delete(f);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз <code>force</code> замедлит запись? Сколько «коммитов» в секунду выдержит такой журнал?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Journal.java
+java Journal</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">только write:       6.1 мкс на запись →   163,313 записей в секунду
+write + force:   1585.1 мкс на запись →       631 записей в секунду
+только write:       1.5 мкс на запись →   647,836 записей в секунду
+write + force:   1843.9 мкс на запись →       542 записей в секунду</code></pre></details>
+<div class="lab-ans" hidden><p>Простой <code>write</code> — единицы микросекунд: копирование в page cache. С <code>force</code> — около 1,5 мс на Windows (в WSL 2 — около 3,5 мс через виртуальный диск): в сотни и тысячи раз медленнее, всего несколько сотен сохранённых записей в секунду. Поэтому базы данных группируют коммиты (group commit): один <code>fsync</code> на пачку транзакций разных клиентов, а брокеры вроде Kafka вместо <code>fsync</code> полагаются на репликацию.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Откройте файл с <code>StandardOpenOption.DSYNC</code> и уберите <code>force</code>.</summary><div>Скорость будет как у варианта с <code>force</code>: каждый <code>write</code> теперь сам ждёт диска (флаг <code>O_DSYNC</code> / <code>FILE_FLAG_WRITE_THROUGH</code>).</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-12.2">
+<div class="lab-head"><span class="lab-num">Лаба 12.2</span><b>Page cache: холодное и тёплое чтение</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сбросить кэш страниц и увидеть разницу между чтением с диска и из памяти.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --privileged cs-lab sh -c "dd if=/dev/urandom of=/tmp/big bs=1M count=512 status=none; sync; echo 3 &gt; /proc/sys/vm/drop_caches; dd if=/tmp/big of=/dev/null bs=1M 2&gt;&amp;1 | tail -1; dd if=/tmp/big of=/dev/null bs=1M 2&gt;&amp;1 | tail -1; grep -E '^(MemFree|Cached|Dirty)' /proc/meminfo"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">536870912 bytes (537 MB, 512 MiB) copied, 0.206885 s, 2.6 GB/s
+536870912 bytes (537 MB, 512 MiB) copied, 0.0503337 s, 11 GB/s
+MemFree:         8887080 kB
+Cached:          1081172 kB
+Dirty:                 4 kB</code></pre></details>
+<p class="lab-note"><code>echo 3 &gt; /proc/sys/vm/drop_caches</code> выбрасывает чистые страницы page cache (и кэши метаданных) — нужен привилегированный контейнер, и действует это на всю виртуальную машину WSL. Перед этим <code>sync</code> сбрасывает грязные страницы, иначе их нельзя выбросить.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз второе чтение того же файла быстрее первого?</div>
+<div class="lab-ans" hidden><p>Первое чтение идёт с диска (здесь NVMe через виртуальный диск WSL — около 2–2,5 ГБ/с), второе — из page cache: 10+ ГБ/с, примерно в пять раз быстрее, и упирается уже в копирование памяти. На HDD разница была бы в десятки раз. <code>Cached</code> в <code>/proc/meminfo</code> вырос на прочитанный файл — память «занята» кэшем, но будет отдана по первому требованию.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-12.3">
+<div class="lab-head"><span class="lab-num">Лаба 12.3</span><b>inode, ссылки и удалённый открытый файл</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что имя файла — запись в каталоге, а файл — это inode.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "cd /tmp &amp;&amp; echo hello &gt; a.txt &amp;&amp; ln a.txt hard.txt &amp;&amp; ln -s a.txt soft.txt &amp;&amp; ls -li a.txt hard.txt soft.txt &amp;&amp; stat -c '%n: inode %i, ссылок %h, размер %s' a.txt &amp;&amp; mv a.txt b.txt &amp;&amp; cat hard.txt &amp;&amp; cat soft.txt; ls -l soft.txt"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1482057 -rw-r--r-- 2 root root 6 Oct 25 12:42 a.txt
+1482057 -rw-r--r-- 2 root root 6 Oct 25 12:42 hard.txt
+1482065 lrwxrwxrwx 1 root root 5 Oct 25 12:42 soft.txt -&gt; a.txt
+a.txt: inode 1482057, ссылок 2, размер 6
+hello
+cat: soft.txt: No such file or directory
+lrwxrwxrwx 1 root root 5 Oct 25 12:42 soft.txt -&gt; a.txt</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие номера inode будут у <code>a.txt</code>, <code>hard.txt</code> и <code>soft.txt</code>? Что выведут <code>cat hard.txt</code> и <code>cat soft.txt</code> после переименования <code>a.txt</code>?</div>
+<div class="lab-ans" hidden><p><code>a.txt</code> и <code>hard.txt</code> — один номер inode, «ссылок 2»: это два имени одного файла. У <code>soft.txt</code> — свой inode, тип <code>l</code>, внутри — строка «a.txt». После <code>mv a.txt b.txt</code> жёсткая ссылка работает (inode тот же), а символическая указывает на несуществующее имя: «No such file or directory».</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Удалённый, но открытый файл:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "cd /tmp &amp;&amp; dd if=/dev/zero of=log bs=1M count=200 status=none &amp;&amp; df -m /tmp | tail -1 &amp;&amp; (sleep 3 &lt; log &amp;) &amp;&amp; sleep 0.5 &amp;&amp; rm log &amp;&amp; df -m /tmp | tail -1 &amp;&amp; ls -l /proc/*/fd 2&gt;/dev/null | grep deleted; sleep 3; df -m /tmp | tail -1"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">overlay          1031019 125756    852819  13% /
+overlay          1031019 125756    852819  13% /
+lr-x------ 1 root root 64 Oct 25 12:42 0 -&gt; /tmp/log (deleted)
+overlay          1031019 125556    853019  13% /</code></pre></details>
+<p class="lab-note">Первый <code>df</code> — с файлом, второй — после <code>rm</code>: занятое место не уменьшилось, потому что <code>sleep</code> держит файл открытым (его дескриптор указывает на <code>/tmp/log (deleted)</code>). Третий — после завершения <code>sleep</code>: место освободилось. Тот же эффект у Java-приложения, которое пишет в удалённый лог: смотрите <code>ls -l /proc/&lt;pid&gt;/fd</code> или <code>lsof</code>.</p>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">12.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что гарантирует успешный <code>write()</code> в файл в Linux?</p><ul><li>данные на диске</li><li>данные в кэше диска</li><li>данные в page cache ядра; на диск они попадут позже</li><li>ничего — запись может не выполниться</li></ul><div class="why">Для сохранности — fsync/fdatasync (в Java FileChannel.force). Другие процессы при этом уже видят новые данные.</div></div>
+<div class="mcq" data-ok="0"><p>Почему переименование файла внутри одной файловой системы атомарно и мгновенно даже для файла в 100 ГБ?</p><ul><li>меняется только запись каталога «имя → inode», данные не трогаются</li><li>ФС копирует файл в фоне</li><li>rename выполняет диск</li><li>это не так</li></ul><div class="why">На этом построен паттерн «записать во временный файл и переименовать».</div></div>
+<div class="mcq" data-ok="3"><p>Почему SSD не перезаписывает данные на месте?</p><ul><li>так быстрее читать</li><li>из-за шифрования</li><li>ОС запрещает</li><li>флеш-память пишется только в стёртые страницы, а стирается крупными блоками, поэтому новая версия пишется в свободное место, а таблица FTL переназначает адрес</li></ul><div class="why">Отсюда сборка мусора контроллера, усиление записи и TRIM.</div></div>
+<div class="mcq" data-ok="1"><p>Удалили лог-файл на 50 ГБ, а место на диске не освободилось. Почему?</p><ul><li>файл в корзине</li><li>файл всё ещё открыт процессом: inode живёт, пока на него есть ссылки и открытые дескрипторы</li><li>ФС не поддерживает удаление</li><li>нужен TRIM</li></ul><div class="why">lsof покажет его как (deleted). Освободится после закрытия или перезапуска процесса; либо обрезать через /proc/&lt;pid&gt;/fd.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как данные попадают с диска в память программы?</summary><div class="a"><p>read → ядро проверяет page cache. Если страницы нет — блочный слой формирует запрос, драйвер кладёт команду в очередь NVMe-контроллера; контроллер через DMA пишет данные в страницу page cache и посылает прерывание. Ядро будит ожидающий поток, копирует данные в буфер программы (или при mmap просто отображает страницу). Повторное чтение берётся из page cache без диска.</p></div></details>
+<details class="q"><summary>Как надёжно сохранить файл, чтобы после сбоя был либо старый, либо новый вариант?</summary><div class="a"><p>Записать содержимое во временный файл в том же каталоге, вызвать fsync (FileChannel.force), атомарно переименовать на место старого (Files.move с ATOMIC_MOVE), затем fsync каталога, чтобы сохранилась запись о переименовании. Прямая перезапись на месте может оставить после сбоя наполовину записанный файл.</p></div></details>
+<details class="q"><summary>Почему flush() не гарантирует сохранность данных?</summary><div class="a"><p>flush выталкивает данные из буфера Java (BufferedOutputStream и т. п.) в ядро системным вызовом write. Дальше они в page cache и будут записаны на диск позже. Для сохранности нужен sync/force — fsync в ядре.</p></div></details>
+<details class="q"><summary>Что такое page cache и почему «свободной памяти» в Linux всегда мало?</summary><div class="a"><p>Кэш содержимого файлов в оперативной памяти ядра. Ядро использует всю незанятую программами память под кэш, потому что пустая память бесполезна, а кэшированная ускоряет повторные чтения. При нехватке памяти кэш вытесняется. Смотреть надо на «available», а не на «free».</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

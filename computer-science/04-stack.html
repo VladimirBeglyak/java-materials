@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Поток, стек и кадр вызова</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ПРОЦЕССОР</div>
+  <h1>Поток, стек и кадр вызова</h1>
+  <p class="lead">Что такое поток для процессора и для операционной системы, откуда берётся стек, как устроен кадр (frame) функции и что в нём лежит, как команды <code>call</code> и <code>ret</code> делают возможными вложенные вызовы, кто и когда выделяет память под стек нового потока — и как всё это устроено в JVM: где лежат кадры Java-методов, что такое <code>-Xss</code>, откуда берётся <code>StackOverflowError</code>. Это одна из самых важных глав курса: на этих механизмах стоят рекурсия, исключения, стек-трейсы, отладчик, профилировщики и виртуальные потоки.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">поток = контекст исполнения</span><span class="tag">RSP, RBP, RIP</span><span class="tag">call / ret</span><span class="tag">кадр: что внутри</span><span class="tag">ABI</span><span class="tag">pthread и clone</span><span class="tag">guard pages</span><span class="tag">кадры JVM</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="thread"><span class="h-num">4.1</span>Что такое поток</h2>
+<p>Процессорное ядро в каждый момент делает одно: исполняет команду по адресу в <code>RIP</code>, используя значения в своих регистрах. Всё «состояние вычисления» в данный момент — это:</p>
+<ul>
+  <li><b>счётчик команд</b> <code>RIP</code> — где мы в программе;</li>
+  <li><b>указатель стека</b> <code>RSP</code> — где вершина стека (и, через него, вся цепочка незавершённых вызовов);</li>
+  <li><b>остальные регистры</b> — промежуточные значения, флаги, векторные регистры;</li>
+  <li><b>стек в памяти</b> — локальные переменные и адреса возврата всех незавершённых функций.</li>
+</ul>
+<p><b>Поток (thread) — это и есть такое состояние исполнения</b>: «куда смотрит» RIP, свой стек и свой набор значений регистров. Процессор о потоках ничего не знает — он просто исполняет команды. Потоки создаёт и переключает <b>ядро операционной системы</b>: когда ядро решает отдать процессор другому потоку, оно сохраняет все регистры текущего в свою структуру данных (в Linux — <code>task_struct</code> и область сохранения регистров на стеке ядра) и загружает регистры другого. Для потока это незаметно: он продолжает с той же команды, с теми же регистрами (переключение контекста — тема 11).</p>
+<div class="table-wrap"><table>
+<tr><th>У каждого потока своё</th><th>Общее для всех потоков процесса</th></tr>
+<tr><td>регистры, включая RIP и RSP (сохраняются ядром при переключении)</td><td>адресное пространство: код, глобальные переменные, куча</td></tr>
+<tr><td><b>стек</b> — отдельная область памяти</td><td>открытые файлы и сокеты (дескрипторы)</td></tr>
+<tr><td>локальная память потока (TLS): <code>errno</code>, <code>ThreadLocal</code> в Java</td><td>обработчики сигналов, текущий каталог, права</td></tr>
+<tr><td>состояние планирования: приоритет, маска процессоров, «спит / готов»</td><td>идентификатор процесса (PID)</td></tr>
+</table></div>
+<p><b>Процесс</b> — контейнер ресурсов (адресное пространство, дескрипторы, права) и один или больше потоков. Потоки одного процесса видят одну и ту же память — поэтому они быстро обмениваются данными и поэтому нужна синхронизация (тема 07 и <a href="../java-concurrency/02-jmm.html">Java Concurrency, тема 02</a>). Стеки при этом разные: локальная переменная одного потока недоступна другому, пока на неё не дали указатель.</p>
+
+<h2 id="stack"><span class="h-num">4.2</span>Стек: зачем он и как работает</h2>
+<p>Функции вызываются вложенно: <code>main</code> вызвала <code>f</code>, <code>f</code> — <code>g</code>; закончиться первой должна <code>g</code>, затем <code>f</code>, затем <code>main</code>. Последний вызванный завершается первым — это ровно дисциплина <b>LIFO</b> (last in, first out). Поэтому данные вызовов хранят в <b>стеке</b>: непрерывной области памяти, у которой есть вершина.</p>
+<ul>
+  <li><b>Стек растёт вниз</b> — к меньшим адресам (на x86-64, ARM64, RISC-V). Вершину хранит регистр <code>RSP</code>. «Положить» 8 байт — <code>push</code>: <code>RSP -= 8</code>, затем запись по адресу <code>RSP</code>. «Снять» — <code>pop</code>: чтение и <code>RSP += 8</code>.</li>
+  <li><b>Выделение памяти на стеке бесплатно</b>: одна команда <code>sub rsp, 48</code> резервирует 48 байт под локальные переменные функции. Освобождение — <code>add rsp, 48</code> или восстановление <code>RSP</code> при выходе. Никакого поиска свободного блока, никакой сборки мусора — сравните с выделением в куче (<a href="../jvm/11-allocation.html">JVM, тема 11</a>).</li>
+  <li><b>Время жизни данных на стеке = время вызова.</b> Когда функция вернулась, её область стека считается свободной и будет перезаписана следующим вызовом. Поэтому в C нельзя возвращать адрес локальной переменной, а в Java на стеке вообще нельзя разместить объект, на который может остаться ссылка (компилятор делает это только для «не убегающих» объектов — escape analysis).</li>
+  <li><b>Стек близко и «горячий»</b>: его вершина почти всегда в кэше L1 (тема 06), поэтому обращения к локальным переменным дешёвые даже без регистров.</li>
+</ul>
+
+<h2 id="callret"><span class="h-num">4.3</span>call и ret: как процессор вызывает функцию и возвращается</h2>
+<p>У процессора нет понятия «функция». Есть две команды:</p>
+<ul>
+  <li><b><code>call f</code></b> = положить в стек адрес следующей команды (<b>адрес возврата</b>) и перейти на <code>f</code>: <code>push rip_следующей; jmp f</code>.</li>
+  <li><b><code>ret</code></b> = снять адрес со стека и перейти по нему: <code>pop rip</code>.</li>
+</ul>
+<p>Этого достаточно для любой вложенности и рекурсии: каждый вызов кладёт свой адрес возврата, каждый возврат снимает свой. Если функция испортит стек (переполнение буфера в C перезаписало адрес возврата), <code>ret</code> «вернётся» куда угодно — классическая атака на программы без защиты памяти. В Java такое невозможно: нет арифметики указателей, а массивы проверяют границы.</p>
+
+<h2 id="frame"><span class="h-num">4.4</span>Кадр вызова: что в нём лежит</h2>
+<p><b>Кадр</b> (stack frame, activation record) — участок стека, принадлежащий одному <i>вызову</i> функции. Два одновременных вызова одной функции (рекурсия, два потока) — два разных кадра. Типичный кадр x86-64, скомпилированный без оптимизаций (с указателем кадра):</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 470" role="img" aria-label="Стек с кадрами main, sum_sq и square: адрес возврата, сохранённый RBP, локальные переменные; RSP и RBP указывают на текущий кадр">
+  <defs><marker id="sf" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="30" y="22" font-weight="700">старшие адреса (дно стека: кадры, вызванные раньше)</text>
+  <g font-size="12.5" class="mono">
+    <rect x="160" y="34" width="320" height="30" rx="4" class="box"/><text x="320" y="54" text-anchor="middle">… кадры libc: __libc_start_main …</text>
+    <rect x="160" y="70" width="320" height="30" rx="4" class="box-info"/><text x="320" y="90" text-anchor="middle">адрес возврата в libc</text>
+    <rect x="160" y="100" width="320" height="30" rx="4" class="box-info"/><text x="320" y="120" text-anchor="middle">сохранённый RBP (кадра libc)</text>
+    <rect x="160" y="130" width="320" height="30" rx="4" class="box-info"/><text x="320" y="150" text-anchor="middle">long m = 1;  long *heap</text>
+    <rect x="160" y="166" width="320" height="30" rx="4" class="box-warn"/><text x="320" y="186" text-anchor="middle">адрес возврата в main</text>
+    <rect x="160" y="196" width="320" height="30" rx="4" class="box-warn"/><text x="320" y="216" text-anchor="middle">сохранённый RBP (кадра main)</text>
+    <rect x="160" y="226" width="320" height="30" rx="4" class="box-warn"/><text x="320" y="246" text-anchor="middle">local_a, local_b</text>
+    <rect x="160" y="256" width="320" height="30" rx="4" class="box-warn"/><text x="320" y="276" text-anchor="middle">копии аргументов a, b (при -O0)</text>
+    <rect x="160" y="292" width="320" height="30" rx="4" class="box-acc"/><text x="320" y="312" text-anchor="middle">адрес возврата в sum_sq</text>
+    <rect x="160" y="322" width="320" height="30" rx="4" class="box-acc"/><text x="320" y="342" text-anchor="middle">сохранённый RBP (кадра sum_sq)</text>
+    <rect x="160" y="352" width="320" height="30" rx="4" class="box-acc"/><text x="320" y="372" text-anchor="middle">local_sq; копия x</text>
+    <rect x="160" y="382" width="320" height="30" rx="4" class="box-acc"/><text x="320" y="402" text-anchor="middle">выравнивание, место под вызовы</text>
+    <rect x="160" y="418" width="320" height="30" rx="4" class="box" stroke-dasharray="4 3"/><text x="320" y="438" text-anchor="middle">свободно (red zone 128 байт)</text>
+  </g>
+  <g font-size="12.5">
+    <path d="M150 70 L130 70 L130 160 L150 160" class="ln-acc" fill="none"/><text x="122" y="118" text-anchor="end">кадр main</text>
+    <path d="M150 166 L130 166 L130 286 L150 286" class="ln-acc" fill="none"/><text x="122" y="230" text-anchor="end">кадр sum_sq</text>
+    <path d="M150 292 L130 292 L130 412 L150 412" class="ln-acc" fill="none"/><text x="122" y="356" text-anchor="end">кадр square</text>
+    <line x1="560" y1="337" x2="484" y2="337" class="ln-acc" marker-end="url(#sf)"/><text x="566" y="341" font-weight="700" class="mono">RBP</text><text x="606" y="341" class="muted">— начало текущего кадра</text>
+    <line x1="560" y1="412" x2="484" y2="412" class="ln-acc" marker-end="url(#sf)"/><text x="566" y="416" font-weight="700" class="mono">RSP</text><text x="606" y="416" class="muted">— вершина стека</text>
+    <path d="M484 342 C 540 320, 540 230, 484 212" class="ln-dash" marker-end="url(#sf)" fill="none"/><text x="548" y="276" class="muted">цепочка сохранённых RBP:</text><text x="548" y="294" class="muted">по ней отладчик «раскручивает» стек</text>
+    <text x="566" y="460" class="muted">младшие адреса → стек растёт сюда</text>
+  </g>
+</svg>
+<figcaption>Вызов <code>square</code> из <code>sum_sq</code>: команда <code>call</code> положила адрес возврата, пролог функции сохранил <code>RBP</code> вызывающего и зарезервировал место под локальные переменные. Регистр <code>RBP</code> указывает на «якорь» текущего кадра, а значение по этому адресу — на якорь предыдущего: так получается связный список кадров.</figcaption>
+</figure>
+<div class="table-wrap"><table>
+<tr><th>Что</th><th>Кто кладёт</th><th>Зачем</th></tr>
+<tr><td><b>адрес возврата</b></td><td><code>call</code> вызывающего</td><td>куда перейти по <code>ret</code></td></tr>
+<tr><td><b>сохранённый RBP</b> (frame pointer)</td><td>пролог: <code>push rbp; mov rbp, rsp</code></td><td>восстановить кадр вызывающего; цепочка для стек-трейса</td></tr>
+<tr><td><b>сохранённые регистры</b> (RBX, R12–R15)</td><td>пролог, если функция их использует</td><td>соглашение: вызывающий рассчитывает, что они не изменятся</td></tr>
+<tr><td><b>локальные переменные</b></td><td><code>sub rsp, N</code></td><td>значения, которым не хватило регистров или чей адрес взят (<code>&amp;x</code>)</td></tr>
+<tr><td><b>«пролитые» значения</b> (spills)</td><td>компилятор</td><td>временные результаты, когда регистров не хватило</td></tr>
+<tr><td><b>аргументы сверх шести</b></td><td>вызывающий, перед <code>call</code></td><td>первые шесть целых передаются в регистрах</td></tr>
+<tr><td><b>выравнивание</b></td><td>компилятор</td><td>ABI требует RSP кратный 16 перед <code>call</code> (для SIMD-команд)</td></tr>
+</table></div>
+<pre data-title="пролог и эпилог (gcc -O0)"><code class="c">square:
+    push  rbp              ; сохранить указатель кадра вызывающего
+    mov   rbp, rsp         ; теперь RBP — якорь нашего кадра
+    sub   rsp, 32          ; место под локальные переменные
+    mov   QWORD PTR -24[rbp], rdi   ; аргумент x (пришёл в RDI) → в кадр
+    ...                    ; local_sq лежит по адресу [rbp-8]
+    leave                  ; = mov rsp, rbp; pop rbp — снести кадр
+    ret                    ; снять адрес возврата → RIP</code></pre>
+<p>С оптимизацией (<code>-O2</code>) кадр часто вырождается: переменные остаются в регистрах, <code>RBP</code> используется как обычный регистр (флаг <code>-fomit-frame-pointer</code> включён по умолчанию), а короткие функции вообще встраиваются (inline) и собственного кадра не имеют. Как отладчик тогда строит стек-трейс? По <b>таблицам раскрутки</b> <code>.eh_frame</code>, которые компилятор кладёт в исполняемый файл: для каждого адреса кода записано, где искать адрес возврата и сохранённые регистры. По ним же работает раскрутка исключений C++.</p>
+
+<div class="widget stepper">
+  <div class="widget-title">Пошагово: вызов, кадр, возврат</div>
+  <div class="st-stage"><pre class="out" style="min-height:230px"><span data-from="1" data-to="2">RIP → main:  long r = sum_sq(3, 4);
+RSP = …a60   RBP = …a90
+
+стек (адрес : содержимое)
+…a90 : сохр. RBP libc       ← RBP (кадр main)
+…a68 : m = 1
+…a60 :                       ← RSP</span><span data-from="2" data-to="3">mov edi, 3 ; mov esi, 4     аргументы — в регистры
+RDI = 3   RSI = 4
+call sum_sq:
+…a58 : адрес возврата в main  ← RSP (было …a60, стало −8)
+RIP = sum_sq</span><span data-from="3" data-to="4">пролог sum_sq:
+push rbp        …a50 : сохр. RBP main (…a90)
+mov rbp, rsp    RBP = …a50
+sub rsp, 32     RSP = …a30   — место под local_a, local_b
+кадр sum_sq: от …a58 (адрес возврата) до …a30</span><span data-from="4" data-to="5">mov rdi, a ; call square
+…a28 : адрес возврата в sum_sq ← RSP
+пролог square: push rbp → …a20 : сохр. RBP (…a50)
+RBP = …a20, RSP = …a00
+local_sq = 9 → [rbp-8] = …a18</span><span data-from="5" data-to="6">эпилог square:
+mov rax, [rbp-8]   RAX = 9  — результат в RAX
+leave              RSP = …a20, pop rbp → RBP = …a50
+ret                pop RIP = адрес в sum_sq, RSP = …a30
+кадр square «исчез»: память …a28…a00 свободна, но не стёрта</span><span data-from="6" data-to="7">sum_sq: local_a = RAX (9)
+второй вызов square(4) кладёт адрес возврата
+РОВНО в то же место …a28 — кадр переиспользован
+local_b = 16, результат 25 → RAX</span><span data-from="7">эпилог sum_sq: leave → RBP = …a90 (кадр main)
+ret → RIP = main, RSP = …a60
+main: r = RAX = 25
+стек вернулся в исходное состояние — ничего не надо «освобождать»</span></pre></div>
+  <section class="st-step" data-t="Перед вызовом"><p><code>main</code> выполняется, её кадр на стеке. RBP указывает на начало кадра, RSP — на вершину.</p></section>
+  <section class="st-step" data-t="Аргументы и call"><p>Аргументы кладутся в регистры RDI и RSI (соглашение System V). <code>call</code> кладёт в стек адрес возврата и переходит на функцию.</p></section>
+  <section class="st-step" data-t="Пролог: новый кадр"><p>Функция сохраняет RBP вызывающего, делает RBP своим якорем и опускает RSP — кадр готов.</p></section>
+  <section class="st-step" data-t="Вложенный вызов"><p>Тот же механизм для <code>square</code>: новый адрес возврата, новый кадр ниже предыдущего.</p></section>
+  <section class="st-step" data-t="Возврат"><p>Результат — в RAX. <code>leave</code> сносит кадр, <code>ret</code> снимает адрес возврата в RIP.</p></section>
+  <section class="st-step" data-t="Повторный вызов"><p>Следующий вызов занимает ту же память: стек — это постоянно переиспользуемая область.</p></section>
+  <section class="st-step" data-t="Возврат в main"><p>Стек вернулся к началу. Освобождение памяти вызова — просто восстановление RSP.</p></section>
+</div>
+
+<h2 id="abi"><span class="h-num">4.5</span>Соглашение о вызовах (ABI)</h2>
+<p>Чтобы функция из одной библиотеки могла вызвать функцию из другой, скомпилированной другим компилятором (или даже на другом языке), все должны одинаково договориться: где аргументы, где результат, какие регистры можно портить, как выровнен стек. Это <b>двоичный интерфейс приложений</b> (ABI) платформы.</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>System V AMD64 (Linux, macOS)</th><th>Microsoft x64 (Windows)</th><th>AArch64</th></tr>
+<tr><td>целые аргументы</td><td>RDI, RSI, RDX, RCX, R8, R9</td><td>RCX, RDX, R8, R9</td><td>X0…X7</td></tr>
+<tr><td>аргументы с плавающей точкой</td><td>XMM0…XMM7</td><td>XMM0…XMM3</td><td>V0…V7</td></tr>
+<tr><td>результат</td><td>RAX (RDX:RAX), XMM0</td><td>RAX, XMM0</td><td>X0, V0</td></tr>
+<tr><td>сохраняет вызываемый</td><td>RBX, RBP, R12–R15</td><td>RBX, RBP, RDI, RSI, R12–R15, XMM6–15</td><td>X19–X28, X29 (FP)</td></tr>
+<tr><td>особенности</td><td>red zone: 128 байт ниже RSP можно использовать без <code>sub rsp</code></td><td>shadow space: вызывающий резервирует 32 байта для 4 регистровых аргументов</td><td>адрес возврата в регистре X30 (LR), а не в стеке</td></tr>
+</table></div>
+<p><b>Как с этим живёт JVM.</b> Интерпретатор HotSpot и JIT-код используют <b>собственное внутреннее соглашение</b> для вызовов Java → Java (оно ближе к ABI платформы, но со своими правилами для регистров), а на границе с нативным кодом (JNI, FFM API) переходят на ABI ОС — это одна из причин, почему нативный вызов дороже обычного (<a href="../jvm/19-native.html">JVM, тема 19</a>). Foreign Function &amp; Memory API (Java 22) как раз описывает ABI платформы в коде: класс <code>Linker</code> знает, как разложить аргументы по регистрам для текущей ОС.</p>
+
+<h2 id="where"><span class="h-num">4.6</span>Что где лежит: регистры, стек, куча, сегменты</h2>
+<p>Адресное пространство процесса Linux x86-64 (подробно — тема 08):</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 300" role="img" aria-label="Адресное пространство процесса: код, данные, куча растёт вверх, области mmap и стеки потоков, стек main растёт вниз">
+  <g font-size="12.5">
+    <rect x="40" y="10" width="300" height="34" rx="5" class="box-bad"/><text x="190" y="32" text-anchor="middle">ядро (недоступно из программы)</text>
+    <rect x="40" y="50" width="300" height="40" rx="5" class="box-acc"/><text x="190" y="68" text-anchor="middle" font-weight="700">стек главного потока ↓</text><text x="190" y="84" text-anchor="middle" class="muted" font-size="11">argv, envp, auxv на самом верху · растёт до 8 МБ</text>
+    <rect x="40" y="96" width="300" height="70" rx="5" class="box-warn"/><text x="190" y="116" text-anchor="middle" font-weight="700">область mmap</text><text x="190" y="134" text-anchor="middle" font-size="11">стеки других потоков + guard-страницы</text><text x="190" y="150" text-anchor="middle" font-size="11">разделяемые библиотеки (libc, libjvm), куча Java</text>
+    <rect x="40" y="172" width="300" height="34" rx="5" class="box" stroke-dasharray="4 3"/><text x="190" y="194" text-anchor="middle" class="muted">свободно</text>
+    <rect x="40" y="212" width="300" height="30" rx="5" class="box-ok"/><text x="190" y="232" text-anchor="middle">куча malloc (brk) ↑</text>
+    <rect x="40" y="246" width="300" height="22" rx="5" class="box-info"/><text x="190" y="262" text-anchor="middle" font-size="11.5">.data / .bss — глобальные переменные</text>
+    <rect x="40" y="272" width="300" height="22" rx="5" class="box-info"/><text x="190" y="288" text-anchor="middle" font-size="11.5">.text — машинный код (только чтение + исполнение)</text>
+  </g>
+  <g font-size="12.5">
+    <text x="380" y="30" font-weight="700">C</text>
+    <text x="380" y="52">локальная переменная → регистр или кадр стека</text>
+    <text x="380" y="72">malloc → куча; глобальная → .data/.bss; функция → .text</text>
+    <text x="380" y="108" font-weight="700">Java</text>
+    <text x="380" y="130">локальная переменная примитивного типа → слот кадра / регистр</text>
+    <text x="380" y="150">локальная переменная-ссылка → слот кадра / регистр (сама ссылка),</text>
+    <text x="380" y="170">   объект, на который она указывает → куча Java (mmap)</text>
+    <text x="380" y="190">поле объекта, элемент массива → внутри объекта в куче</text>
+    <text x="380" y="210">static-поле → в объекте Class (куча), метаданные класса → metaspace</text>
+    <text x="380" y="230">байткод → metaspace; JIT-код → code cache (mmap, исполняемая)</text>
+    <text x="380" y="262" class="muted">Кадры Java-методов лежат на том же нативном стеке потока,</text>
+    <text x="380" y="280" class="muted">что и кадры C-функций самой JVM (раздел 4.8).</text>
+  </g>
+</svg>
+</figure>
+<div class="callout interview"><span class="c-title">«Примитивы в стеке, объекты в куче» — насколько это правда</span>
+Как модель — верно: локальные переменные (и примитивы, и ссылки) принадлежат кадру метода, объекты — куче. Но «в стеке» значит «в кадре или в регистре»: JIT держит горячие переменные в регистрах. Поле <code>int</code> объекта лежит в куче, хоть и примитив. А объект, который не покидает метод, JIT может вовсе не создавать, разложив его поля по регистрам (скалярная замена, <a href="../jvm/11-allocation.html">JVM, тема 11</a>).
+</div>
+
+<h2 id="create"><span class="h-num">4.7</span>Как операционная система создаёт поток и его стек</h2>
+<h3>Главный поток</h3>
+<p>При запуске программы (<code>execve</code>, тема 14) ядро создаёт процесс с одним потоком: строит адресное пространство, отображает в него исполняемый файл и загрузчик библиотек, <b>выделяет стек главного потока</b> у верхней границы пользовательской памяти и кладёт на него аргументы командной строки, переменные окружения и вспомогательный вектор (auxv). <code>RSP</code> указывает на <code>argc</code>, <code>RIP</code> — на точку входа. Размер стека главного потока ограничен <code>ulimit -s</code> (по умолчанию 8 МБ), и ядро <b>растит</b> его автоматически: при обращении ниже текущей границы происходит page fault, и ядро добавляет страницу.</p>
+<h3>Дополнительный поток</h3>
+<ol class="steps">
+  <li><b>Выделить память под стек.</b> Библиотека потоков (<code>pthread_create</code> в glibc) вызывает <code>mmap(NULL, размер, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK)</code> — заказывает <b>адресное пространство</b>. Физическая память не выделяется: страницы появятся при первом касании (ленивое выделение, тема 08). Поэтому 1000 потоков с «стеком 1 МБ» не занимают 1 ГБ RAM.</li>
+  <li><b>Поставить guard-страницу.</b> Нижнюю страницу (или несколько) делают недоступной: классически — <code>mprotect(PROT_NONE)</code>, в Linux 6.13+ с glibc 2.42+ — более лёгким <code>madvise(MADV_GUARD_INSTALL)</code>. Любое обращение к ней — аппаратное исключение, и вместо тихой порчи соседней памяти поток получает <code>SIGSEGV</code>. Так переполнение стека становится видимым.</li>
+  <li><b>Создать поток в ядре.</b> Системный вызов <code>clone</code> (или <code>clone3</code>) с флагами <code>CLONE_VM | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD …</code> — «новая задача, разделяющая с родителем память, файлы и сигналы», и параметром <code>child_stack</code> — начальным значением <code>RSP</code> нового потока. Для ядра Linux поток и процесс — одна и та же структура <code>task_struct</code>, разница только в том, что разделяется.</li>
+  <li><b>Начать исполнение.</b> Ядро ставит новый поток в очередь планировщика. Когда он впервые получает процессор, <code>RSP</code> указывает в его новый стек, а <code>RIP</code> — на стартовую функцию библиотеки потоков, которая вызывает вашу функцию потока.</li>
+  <li><b>Завершение.</b> Функция потока вернулась → библиотека вызывает <code>exit</code> для потока; стек освобождается (<code>munmap</code>) или кэшируется для следующего потока.</li>
+</ol>
+<p>На Windows аналог — <code>CreateThread</code>: стек резервируется (по умолчанию 1 МБ, значение из заголовка исполняемого файла), а физические страницы «коммитятся» постепенно через guard-страницу, которая сдвигается вниз при росте стека.</p>
+
+<h2 id="jvm"><span class="h-num">4.8</span>Потоки и кадры в JVM</h2>
+<p>Платформенный поток Java (<code>new Thread(...)</code>) — это <b>обычный поток ОС</b>, 1:1. <code>thread.start()</code> проходит путь: <code>Thread.start0</code> (native) → <code>JVM_StartThread</code> → создание C++-объекта <code>JavaThread</code> → <code>os::create_thread</code> → <code>pthread_create</code> с размером стека из <code>-Xss</code> (или параметра <code>stackSize</code> конструктора <code>Thread</code>). В новом потоке JVM инициализирует свои структуры (TLAB для выделения памяти, зоны защиты стека) и вызывает Java-метод <code>Thread.run()</code>. Это видно в лабораторной 4.4 прямо по системным вызовам.</p>
+<div class="table-wrap"><table>
+<tr><th>Вид кадра в стеке Java-потока</th><th>Что внутри</th></tr>
+<tr><td><b>интерпретируемый</b></td><td>слоты локальных переменных (параметры, <code>this</code>), стек операндов, указатель на метод (<code>Method*</code>), текущий байткод (bcp), кэш пула констант, мониторы <code>synchronized</code>-блоков, связь с предыдущим кадром. Логическая модель — <a href="../jvm/03-bytecode.html#frame">JVM, тема 03</a></td></tr>
+<tr><td><b>скомпилированный (C1/C2)</b></td><td>как кадр C-функции: фиксированный размер, большая часть значений в регистрах, «пролитые» значения и сохранённые регистры. Встроенные (inlined) методы своих кадров не имеют — но JIT хранит карты, чтобы показать их в стек-трейсе</td></tr>
+<tr><td><b>нативный</b></td><td>кадры C/C++-кода: JNI-методы, код самой JVM (например, при загрузке класса или в GC)</td></tr>
+<tr><td><b>служебные</b></td><td>«заглушки» перехода (call stubs) между интерпретатором, JIT-кодом и нативным кодом</td></tr>
+</table></div>
+<p>Все эти кадры лежат <b>в одном нативном стеке потока</b>, вперемешку: интерпретатор может вызвать JIT-метод, тот — нативный, тот — снова Java. Отдельного «стека JVM» в HotSpot нет: спецификация JVM описывает его абстрактно, а реализация совмещает со стеком ОС.</p>
+<h3>Откуда берётся StackOverflowError</h3>
+<p>В нижней части стека каждого Java-потока HotSpot размечает защитные зоны и делает их недоступными (<code>mprotect(PROT_NONE)</code>):</p>
+<div class="table-wrap"><table>
+<tr><th>Зона</th><th>Linux x64 (страниц по 4 КБ)</th><th>Что происходит при касании</th></tr>
+<tr><td><b>reserved</b></td><td>1</td><td>временно открывается для критических секций JDK (аннотация <code>@ReservedStackAccess</code>, JEP 270), чтобы, например, <code>ReentrantLock</code> не остался в сломанном состоянии</td></tr>
+<tr><td><b>yellow</b></td><td>2</td><td>обработчик сигнала понимает, что это переполнение стека Java-кода, временно открывает зону и бросает <code>StackOverflowError</code></td></tr>
+<tr><td><b>red</b></td><td>1</td><td>переполнение случилось в коде самой JVM — восстановиться нельзя, аварийное завершение с hs_err-файлом</td></tr>
+</table></div>
+<p>Кроме того, перед входом в метод JIT-код делает <b>stack banging</b> — пробное обращение на несколько страниц ниже (<code>StackShadowPages</code>), чтобы переполнение случилось в предсказуемом месте Java-кода, а не внутри нативной функции, вызванной из него. Поэтому <code>StackOverflowError</code> — обычное исключение, которое можно поймать (хотя продолжать работу после него рискованно).</p>
+<ul>
+  <li><b><code>-Xss</code></b> (<code>-XX:ThreadStackSize</code>) — размер стека платформенных потоков. По умолчанию 1 МБ на Linux x64 и macOS; на Windows — размер из заголовка <code>java.exe</code> (1 МБ). Главный поток Java тоже получает этот размер: лаунчер не исполняет <code>main</code> в изначальном потоке процесса, а создаёт для него новый поток (<a href="../jvm/01-architecture.html#startup">JVM, тема 01</a>).</li>
+  <li><b>Глубина рекурсии</b> = размер стека / размер кадра. Интерпретируемый кадр больше JIT-кадра, поэтому один и тот же код до прогрева «падает» раньше (<a href="../jvm/09-runtime-areas.html#stack">JVM, тема 09</a>).</li>
+  <li><b>Виртуальные потоки</b> (Java 21) своего стека ОС не имеют: работают на стеке потока-носителя, а при блокировке их кадры копируются в кучу (объекты <code>StackChunk</code>). Поэтому миллион виртуальных потоков возможен, а миллион платформенных — нет: каждому нужен <code>clone</code>, структура в ядре и резерв адресного пространства под стек.</li>
+</ul>
+
+<h2 id="unwind"><span class="h-num">4.9</span>Стек-трейс, исключения и раскрутка стека</h2>
+<p><b>Стек-трейс</b> — это просто проход по цепочке кадров от текущего к самому старому с переводом адресов возврата в имена функций и номера строк. Для Java: <code>new Throwable()</code> вызывает <code>fillInStackTrace</code>, и JVM обходит кадры потока (интерпретируемые, скомпилированные с учётом встроенных методов), записывая пары «метод + номер байткода», а номера строк берёт из атрибута <code>LineNumberTable</code> class-файла. Это дорого (сотни наносекунд – микросекунды на глубоком стеке), поэтому исключения не используют для обычного управления потоком, а HotSpot для часто бросаемых встроенных исключений (NPE, ArithmeticException) в горячем коде может отдавать заранее созданный объект без стек-трейса (<code>-XX:-OmitStackTraceInFastThrow</code> отключает).</p>
+<p><b>Бросок исключения</b> — тоже раскрутка: JVM ищет в таблице исключений текущего метода обработчик для этого адреса; если нет — снимает кадр (как <code>ret</code>, только без результата) и ищет в вызывающем, и так далее. Блоки <code>finally</code> исполняются по дороге (<a href="../jvm/03-bytecode.html#javac">JVM, тема 03</a>).</p>
+<p><b>Профилировщики</b> (async-profiler, JFR) сотни раз в секунду останавливают поток и записывают его стек — из миллионов таких снимков строится флеймграф (<a href="../jvm/21-diagnostics.html">JVM, тема 21</a>). <b>Отладчик</b> показывает переменные каждого кадра, потому что знает, в каком слоте или регистре лежит каждая переменная в каждой точке кода.</p>
+
+
+
+
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">4.10</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Видим стек и кадры своими глазами: адреса локальных переменных и адреса возврата в C, пролог и эпилог в ассемблере, стеки потоков в карте памяти процесса, системные вызовы, которыми JVM создаёт поток, и глубину рекурсии Java при разных <code>-Xss</code>. Лабы 4.1–4.4 — в Docker-образе <code>cs-lab</code> (Linux), 4.5–4.6 — на вашей машине. Модуль IDEA — <code>cs04</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-4.1">
+<div class="lab-head"><span class="lab-num">Лаба 4.1</span><b>Кадры в C: адреса и цепочка RBP</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что стек растёт вниз, что кадры связаны сохранёнными RBP, и что адрес возврата указывает на строку вызова.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>frames.c</code>:</div>
+<pre data-title="frames.c"><code class="txt">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+long global_counter = 42;
+
+void walk(void) {
+    void **fp = __builtin_frame_address(0);          // RBP текущего кадра
+    for (int depth = 0; depth &lt; 4; depth++) {
+        printf("  кадр %d: RBP=%p  [RBP]=сохранённый RBP=%p  [RBP+8]=адрес возврата=%p\n",
+               depth, (void *)fp, fp[0], fp[1]);
+        fp = (void **)fp[0];                          // переход к кадру вызывающего
+    }
+}
+
+long square(long x) {
+    long local_sq = x * x;
+    printf("square(%ld): &amp;x=%p  &amp;local_sq=%p\n", x, (void *)&amp;x, (void *)&amp;local_sq);
+    if (x == 3) walk();
+    return local_sq;
+}
+
+long sum_sq(long a, long b) {
+    long local_a = square(a);
+    long local_b = square(b);
+    printf("sum_sq:     &amp;local_a=%p &amp;local_b=%p\n", (void *)&amp;local_a, (void *)&amp;local_b);
+    return local_a + local_b;
+}
+
+int main(void) {
+    long m = 1;
+    long *heap = malloc(sizeof(long));
+    printf("main:       &amp;m=%p\n", (void *)&amp;m);
+    printf("куча:       %p\nглобальная: %p\nкод:        main=%p sum_sq=%p square=%p\n",
+           (void *)heap, (void *)&amp;global_counter, (void *)main, (void *)sum_sq, (void *)square);
+    printf("результат:  %ld\n\n", sum_sq(3, 4));
+
+    FILE *maps = fopen("/proc/self/maps", "r");       // карта памяти этого процесса
+    char line[512];
+    while (fgets(line, sizeof line, maps))
+        if (strstr(line, "[stack]") || strstr(line, "[heap]") || strstr(line, "/frames")) fputs(line, stdout);
+    return 0;
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Скомпилируйте без оптимизаций, с указателем кадра и отладочной информацией, и запустите:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -g -fno-omit-frame-pointer -no-pie -o frames frames.c &amp;&amp; ./frames"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">main:       &amp;m=0x7fffdf0be428
+куча:       0x36e2f010
+глобальная: 0x404048
+код:        main=0x401352 sum_sq=0x4012cf square=0x401257
+square(3): &amp;x=0x7fffdf0be3b8  &amp;local_sq=0x7fffdf0be3c0
+  кадр 0: RBP=0x7fffdf0be3a0  [RBP]=сохранённый RBP=0x7fffdf0be3d0  [RBP+8]=адрес возврата=0x4012b5
+  кадр 1: RBP=0x7fffdf0be3d0  [RBP]=сохранённый RBP=0x7fffdf0be410  [RBP+8]=адрес возврата=0x4012fe
+  кадр 2: RBP=0x7fffdf0be410  [RBP]=сохранённый RBP=0x7fffdf0be650  [RBP+8]=адрес возврата=0x4013f6
+  кадр 3: RBP=0x7fffdf0be650  [RBP]=сохранённый RBP=0x7fffdf0be700  [RBP+8]=адрес возврата=0x795d7219a601
+square(4): &amp;x=0x7fffdf0be3b8  &amp;local_sq=0x7fffdf0be3c0
+sum_sq:     &amp;local_a=0x7fffdf0be3f8 &amp;local_b=0x7fffdf0be400
+результат:  25
+
+00400000-00401000 r--p 00000000 00:4b 2814749767848755                   /lab/frames
+00401000-00402000 r-xp 00001000 00:4b 2814749767848755                   /lab/frames
+00402000-00403000 r--p 00002000 00:4b 2814749767848755                   /lab/frames
+00403000-00404000 r--p 00002000 00:4b 2814749767848755                   /lab/frames
+00404000-00405000 rw-p 00003000 00:4b 2814749767848755                   /lab/frames
+36e2f000-36e50000 rw-p 00000000 00:00 0                                  [heap]
+7fffdf09f000-7fffdf0c0000 rw-p 00000000 00:00 0                          [stack]</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сравните адреса <code>&amp;m</code> (main), <code>&amp;local_a</code> (sum_sq) и <code>&amp;local_sq</code> (square). В какую сторону растёт стек? Совпадут ли адреса <code>&amp;local_sq</code> у двух вызовов <code>square</code>? Как связаны соседние строки «кадр N»?</div>
+<div class="lab-ans" hidden><p>Адреса убывают: <code>main</code> &gt; <code>sum_sq</code> &gt; <code>square</code> — стек растёт вниз. Оба вызова <code>square</code> показывают <b>одинаковые</b> адреса: второй вызов занял ту же память, что и первый (он был снесён). В <code>walk</code> «сохранённый RBP» кадра N равен «RBP» кадра N+1 — это связный список кадров. Адреса возврата кадров 1–2 — внутри кода программы (рядом с адресами <code>square</code>/<code>sum_sq</code>/<code>main</code>), кадров 3+ — внутри libc (<code>__libc_start_main</code> вызвала <code>main</code>). Стек (<code>[stack]</code>) — у верхней границы адресов, куча и код программы — внизу.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Превратите адреса возврата кадров 0–2 в номера строк исходника (флаг <code>-no-pie</code> делает адреса кода одинаковыми от запуска к запуску; если у вас они другие — подставьте свои):</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "addr2line -f -e frames 0x4012b5 0x4012fe 0x4013f6"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">square
+/lab/frames.c:20
+sum_sq
+/lab/frames.c:24 (discriminator 1)
+main
+/lab/frames.c:36</code></pre></details>
+<p class="lab-note"><code>addr2line</code> по отладочной информации (DWARF) переводит адрес в функцию и строку. Каждый адрес возврата указывает на строку <b>после</b> вызова: в <code>square</code> (где вызвана <code>walk</code>), в <code>sum_sq</code> (где вызвана <code>square</code>) и в <code>main</code>. Именно так строится любой стек-трейс.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>-fno-omit-frame-pointer</code> и добавьте <code>-O2</code>.</summary><div>Цепочка развалится: RBP перестанет быть указателем кадра, <code>walk</code> напечатает мусор или упадёт, а <code>square</code> встроится в <code>sum_sq</code>. Поэтому профилировщики для продакшена либо требуют frame pointers (в последних версиях Fedora и Ubuntu их снова включили по умолчанию), либо разбирают таблицы <code>.eh_frame</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-4.2">
+<div class="lab-head"><span class="lab-num">Лаба 4.2</span><b>Пролог, эпилог и исчезающий кадр</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в ассемблере создание и снос кадра и увидеть, как оптимизатор от них избавляется.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>calls.c</code>:</div>
+<pre data-title="calls.c"><code class="txt">long square(long x) {
+    long local_sq = x * x;
+    return local_sq;
+}
+
+long sum_sq(long a, long b) {
+    return square(a) + square(b);
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc -O0 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - calls.c</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">square:
+	push	rbp
+	mov	rbp, rsp
+	mov	QWORD PTR -24[rbp], rdi
+	mov	rax, QWORD PTR -24[rbp]
+	imul	rax, rax
+	mov	QWORD PTR -8[rbp], rax
+	mov	rax, QWORD PTR -8[rbp]
+	pop	rbp
+	ret
+sum_sq:
+	push	rbp
+	mov	rbp, rsp
+	push	rbx
+	sub	rsp, 16
+	mov	QWORD PTR -16[rbp], rdi
+	mov	QWORD PTR -24[rbp], rsi
+	mov	rax, QWORD PTR -16[rbp]
+	mov	rdi, rax
+	call	square
+	mov	rbx, rax
+	mov	rax, QWORD PTR -24[rbp]
+	mov	rdi, rax
+	call	square
+	add	rax, rbx
+	mov	rbx, QWORD PTR -8[rbp]
+	leave
+	ret</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Найдите в <code>-O0</code> пролог и эпилог. Что останется от <code>sum_sq</code> при <code>-O2</code>? Будет ли там <code>call</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - calls.c</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">square:
+	imul	rdi, rdi
+	mov	rax, rdi
+	ret
+sum_sq:
+	imul	rdi, rdi
+	imul	rsi, rsi
+	lea	rax, [rdi+rsi]
+	ret</code></pre></details>
+<div class="lab-ans" hidden><p>Пролог: <code>push rbp</code>, <code>mov rbp, rsp</code>; аргументы сохраняются в кадр (<code>mov QWORD PTR -24[rbp], rdi</code>), эпилог: <code>pop rbp</code> / <code>leave</code> и <code>ret</code>. <code>square</code> — листовая функция (никого не вызывает), поэтому без <code>sub rsp</code>: ей хватает red zone. При <code>-O2</code> кадров нет совсем: <code>square</code> — <code>imul</code> и <code>ret</code>, а <code>sum_sq</code> встроила оба вызова — два умножения и сложение, <b>без call</b>. Встроенная функция не создаёт кадр — так же поступает JIT в JVM.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-4.3">
+<div class="lab-head"><span class="lab-num">Лаба 4.3</span><b>Стеки потоков в карте памяти</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Создать потоки pthread и найти их стеки и guard-страницы в <code>/proc/self/maps</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>threads.c</code>:</div>
+<pre data-title="threads.c"><code class="txt">#include &lt;pthread.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+pthread_barrier_t ready, done;
+void *locals[2];
+
+void *worker(void *arg) {
+    long local = (long)arg;
+    locals[local - 1] = &amp;local;
+    printf("поток %ld: &amp;local = %p\n", local, (void *)&amp;local);
+    pthread_barrier_wait(&amp;ready);   // сообщить main, что стек создан
+    pthread_barrier_wait(&amp;done);    // и жить, пока main читает карту памяти
+    return NULL;
+}
+
+int main(void) {
+    long local_main = 0;
+    printf("main:     &amp;local = %p\n", (void *)&amp;local_main);
+    pthread_attr_t attr;
+    pthread_attr_init(&amp;attr);
+    size_t sz, guard;
+    pthread_attr_getstacksize(&amp;attr, &amp;sz);
+    pthread_attr_getguardsize(&amp;attr, &amp;guard);
+    printf("стек нового потока по умолчанию: %zu КБ, guard: %zu КБ\n", sz / 1024, guard / 1024);
+
+    pthread_barrier_init(&amp;ready, NULL, 3);
+    pthread_barrier_init(&amp;done, NULL, 3);
+    pthread_t t[2];
+    for (long i = 0; i &lt; 2; i++) pthread_create(&amp;t[i], NULL, worker, (void *)(i + 1));
+    pthread_barrier_wait(&amp;ready);
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512], prev[512] = "";
+    puts("\nкарта памяти: области, в которых лежат стеки (и строка перед каждой):");
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long a, b;
+        sscanf(line, "%lx-%lx", &amp;a, &amp;b);
+        int hit = strstr(line, "[stack]") != NULL;
+        for (int i = 0; i &lt; 2; i++) hit |= (unsigned long)locals[i] &gt;= a &amp;&amp; (unsigned long)locals[i] &lt; b;
+        if (hit) printf("  %s\n  %.*s   &lt;- %lu KB\n", prev, (int)strcspn(line, "\n"), line, (b - a) / 1024);
+        strcpy(prev, line);
+        prev[strcspn(prev, "\n")] = 0;
+    }
+    pthread_barrier_wait(&amp;done);
+    for (int i = 0; i &lt; 2; i++) pthread_join(t[i], NULL);
+    return 0;
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -pthread -o threads threads.c &amp;&amp; ./threads"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">main:     &amp;local = 0x7ffd0cb74d88
+стек нового потока по умолчанию: 8192 КБ, guard: 4 КБ
+поток 1: &amp;local = 0x7d8226f63e80
+поток 2: &amp;local = 0x7d8226762e80
+
+карта памяти: области, в которых лежат стеки (и строка перед каждой):
+  60867eddf000-60867ee01000 rw-p 00000000 00:00 0                          [heap]
+  7d8225f63000-7d8226f65000 rw-p 00000000 00:00 0    &lt;- 16392 KB
+  7d82271d4000-7d82271d5000 rw-p 00000000 00:00 0 
+  7ffd0cb56000-7ffd0cb77000 rw-p 00000000 00:00 0                          [stack]   &lt;- 132 KB</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой размер стека по умолчанию у нового потока? Где стеки потоков относительно стека <code>main</code>? Сколько займут в карте памяти два стека потоков?</div>
+<div class="lab-ans" hidden><p>8192 КБ — glibc берёт размер из <code>ulimit -s</code>, guard — 4 КБ. Стеки потоков лежат в области mmap, далеко ниже стека главного потока <code>[stack]</code>, и соседствуют друг с другом. Здесь оба стека слились в <b>одну</b> область <code>rw-p</code> на 16392 КБ = 2 × (8192 + 4) КБ: guard-страниц как отдельных строк <code>---p</code> не видно. Почему — покажет следующий шаг. Стек <code>[stack]</code> главного потока маленький (132 КБ): ядро растит его по мере надобности до лимита.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите, какими системными вызовами glibc создаёт стек и guard:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "strace -f -e trace=mmap,mprotect,madvise,clone,clone3 ./threads 2&gt;&amp;1 | grep -E 'MAP_STACK|GUARD|clone'"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">mmap(NULL, 8392704, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7aeedaed0000
+madvise(0x7aeedaed0000, 4096, MADV_GUARD_INSTALL) = 0
+clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7aeedb6d0ce8, parent_tid=0x7aeedb6d0990, exit_signal=0, stack=0x7aeedaed0000, stack_size=0x7fff80, tls=0x7aeedb6d06c0}, 88) = -1 ENOSYS (Function not implemented)
+clone(child_stack=0x7aeedb6cff70, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTIDstrace: Process 11 attached
+[pid    10] mmap(NULL, 8392704, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7aeeda6cf000
+[pid    10] madvise(0x7aeeda6cf000, 4096, MADV_GUARD_INSTALL) = 0
+[pid    10] clone(child_stack=0x7aeedaecef70, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTIDstrace: Process 12 attached</code></pre></details>
+<p class="lab-note"><code>mmap(NULL, 8392704, …, MAP_STACK)</code> — 8 МБ + 4 КБ под стек и guard. <code>madvise(…, 4096, MADV_GUARD_INSTALL)</code> — новый (Linux 6.13, glibc 2.42+) способ поставить guard-страницу: она недоступна, но не создаёт отдельную область в таблице ядра, поэтому <code>/proc/self/maps</code> её не показывает. На старых системах здесь <code>mprotect(…, PROT_NONE)</code> и строка <code>---p</code> в карте. <code>clone3</code> вернул <code>ENOSYS</code>: фильтр системных вызовов Docker (seccomp) его не пропускает, и glibc откатывается на старый <code>clone</code> — та же операция, другой формат аргументов.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>ulimit -s 1024</code> перед <code>./threads</code> (внутри <code>sh -c</code>).</summary><div>Размер по умолчанию станет 1024 КБ, области в карте — около 1 МБ. JVM этим путём не пользуется: она передаёт размер явно из <code>-Xss</code>.</div></details></li>
+<li><details><summary>Создайте потоки по очереди с <code>pthread_join</code> сразу после <code>pthread_create</code> и напечатайте <code>&amp;local</code>.</summary><div>Адреса совпадут: glibc кэширует стек завершённого потока и отдаёт его следующему, не вызывая <code>munmap</code>/<code>mmap</code> заново.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-4.4">
+<div class="lab-head"><span class="lab-num">Лаба 4.4</span><b>Как JVM создаёт поток: системные вызовы</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проследить <code>Thread.start()</code> до системных вызовов: выделение стека, <code>clone</code>, защитные зоны HotSpot.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Spawn.java</code>:</div>
+<pre data-title="Spawn.java"><code class="java">public class Spawn {
+    public static void main(String[] args) throws Exception {
+        System.out.println("&gt;&gt;&gt; start");
+        Thread t = new Thread(null, () -&gt; System.out.println("в потоке " + Thread.currentThread().getName()),
+                "worker", 512 * 1024);           // стек 512 КБ
+        t.start();
+        t.join();
+        System.out.println("&lt;&lt;&lt; end");
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Запустите под <code>strace</code> (нужна возможность трассировки — флаг <code>--cap-add=SYS_PTRACE</code>), оставив только вызовы между маркерами:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac Spawn.java &amp;&amp; strace -f -e trace=write,mmap,mprotect,clone,clone3 java Spawn 2&gt;&amp;1 | sed -n '/&gt;&gt;&gt; start/,/&lt;&lt;&lt; end/p' | grep -E 'MAP_STACK|clone|PROT_NONE|write'"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">[pid    46] write(1, "&gt;&gt;&gt; start\n", 10&gt;&gt;&gt; start
+[pid    46] mmap(NULL, 524288, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK, -1, 0) = 0x7137e402d000
+[pid    46] clone(child_stack=0x7137e40abf70, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTIDstrace: Process 67 attached
+[pid    67] mmap(0x713798000000, 67108864, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x713798000000
+[pid    67] mprotect(0x7137e402d000, 16384, PROT_NONE) = 0
+[pid    67] write(1, "\320\262 \320\277\320\276\321\202\320\276\320\272\320\265 worker\n", 23в потоке worker
+[pid    67] mmap(0x7137e402d000, 16384, PROT_NONE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) = 0x7137e402d000
+[pid    46] write(1, "&lt;&lt;&lt; end\n", 8&lt;&lt;&lt; end</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Найдите в выводе: (1) выделение стека — какого размера? (2) создание потока — какие флаги и что такое <code>child_stack</code>? (3) что делает новый поток со своим стеком сразу после старта?</div>
+<div class="lab-ans" hidden><p>(1) <code>mmap(NULL, 524288, …, MAP_STACK)</code> — ровно 512 КБ, заказанные в конструкторе <code>Thread</code>. (2) <code>clone(child_stack=…, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|…)</code> — новая задача ядра, разделяющая с родителем память, файлы и обработчики сигналов; <code>child_stack</code> — начальное значение RSP, адрес у верхнего края только что выделенной области. Вызов в выводе разорван строкой «Process N attached» — strace подключился к новому потоку. (3) Уже от имени нового потока (<code>[pid N]</code>) — <code>mprotect(адрес начала области стека, 16384, PROT_NONE)</code>: HotSpot закрывает 16 КБ у дна стека — зоны reserved + yellow + red (1 + 2 + 1 страница). Строка <code>mmap(…, 67108864 или 134217728, PROT_NONE…)</code> — это не стек, а резерв адресного пространства под арену malloc glibc для нового потока (64–128 МБ, физически не занят). После печати поток снимает защиту (<code>MAP_NORESERVE</code>) перед завершением.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сравните с размерами защитных зон, которые печатает сама JVM:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab java -XX:+PrintFlagsFinal -version | grep -E " (StackRedPages|StackYellowPages|StackReservedPages|StackShadowPages|ThreadStackSize) "</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">     intx StackRedPages                            = 1                                      {pd product} {default}
+     intx StackReservedPages                       = 1                                      {pd product} {default}
+     intx StackShadowPages                         = 20                                     {pd product} {default}
+     intx StackYellowPages                         = 2                                      {pd product} {default}
+     intx ThreadStackSize                          = 1024                                   {pd product} {default}</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>512 * 1024</code> из конструктора. Какой размер будет у <code>mmap</code>?</summary><div>1 МБ (<code>ThreadStackSize = 1024</code> КБ) плюс выравнивание — значение <code>-Xss</code> по умолчанию на Linux x64. С <code>java -Xss4m</code> — 4 МБ.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-4.5">
+<div class="lab-head"><span class="lab-num">Лаба 4.5</span><b>Глубина рекурсии и StackOverflowError</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить, сколько кадров помещается в стек, и как это зависит от размера стека, размера кадра и режима исполнения.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Depth.java</code>:</div>
+<pre data-title="Depth.java"><code class="java">public class Depth {
+    static int depth;
+
+    static void small() { depth++; small(); }
+
+    static long big(long a, long b, long c, long d) {
+        depth++;
+        long x = a + 1, y = b + 2, z = c + 3, w = d + 4, v = x * y, u = z * w;
+        return big(x, y, z, w) + v + u;
+    }
+
+    static int measure(Runnable r, long stackSize) throws InterruptedException {
+        int[] res = new int[1];
+        Thread t = new Thread(null, () -&gt; {
+            depth = 0;
+            try { r.run(); } catch (StackOverflowError e) { res[0] = depth; }
+        }, "probe", stackSize);
+        t.start();
+        t.join();
+        return res[0];
+    }
+
+    public static void main(String[] args) throws Exception {
+        for (long kb : new long[] {256, 1024, 4096}) {
+            int s = measure(Depth::small, kb * 1024);
+            int b = measure(() -&gt; big(1, 2, 3, 4), kb * 1024);
+            System.out.printf("стек %4d КБ: small() — %7d кадров (~%d байт на кадр), big() — %6d кадров (~%d байт)%n",
+                    kb, s, kb * 1024 / s, b, kb * 1024 / b);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз вырастет глубина при стеке 4 МБ вместо 1 МБ? У какого метода кадр больше? Как изменится картина с <code>-Xint</code> (только интерпретатор)?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Depth.java
+java Depth
+java -Xint Depth</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">стек  256 КБ: small() —    3382 кадров (~77 байт на кадр), big() —    845 кадров (~310 байт)
+стек 1024 КБ: small() —   24906 кадров (~42 байт на кадр), big() —   8892 кадров (~117 байт)
+стек 4096 КБ: small() —  103532 кадров (~40 байт на кадр), big() — 129428 кадров (~32 байт)
+стек  256 КБ: small() —    2383 кадров (~110 байт на кадр), big() —    843 кадров (~310 байт)
+стек 1024 КБ: small() —   11317 кадров (~92 байт на кадр), big() —   4020 кадров (~260 байт)
+стек 4096 КБ: small() —   47058 кадров (~89 байт на кадр), big() —  16700 кадров (~251 байт)</code></pre></details>
+<div class="lab-ans" hidden><p>С <code>-Xint</code> картина «учебная»: глубина почти пропорциональна размеру стека, кадр <code>small</code> около 90 байт, <code>big</code> — около 250 (больше аргументов и локальных переменных). В обычном режиме числа «плавают»: первые вызовы идут в интерпретаторе (большие кадры), потом метод компилируется, и кадры уменьшаются. А C2 ещё и <b>встраивает рекурсию</b> на несколько уровней — один нативный кадр на несколько Java-вызовов, поэтому при стеке 4 МБ «байт на кадр» у <code>big()</code> может оказаться меньше, чем у <code>small()</code>. Глубина рекурсии до <code>StackOverflowError</code> — не константа программы.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему в <code>measure</code> рекурсия запускается в отдельном потоке, а не в <code>main</code>?</summary><div>Чтобы задать размер стека параметром <code>stackSize</code> конструктора <code>Thread</code>, не перезапуская JVM с другим <code>-Xss</code>. Спецификация разрешает JVM игнорировать этот параметр, но HotSpot его учитывает.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-4.6">
+<div class="lab-head"><span class="lab-num">Лаба 4.6</span><b>Стек Java-потока: StackWalker и служебные потоки</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Пройти по кадрам текущего потока средствами Java и увидеть, какие потоки JVM создаёт ещё до <code>main</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Walk.java</code>:</div>
+<pre data-title="Walk.java"><code class="java">import java.util.Map;
+
+public class Walk {
+    public static void main(String[] args) {
+        level1();
+        System.out.println("\nпотоки JVM при старте:");
+        Map&lt;Thread, StackTraceElement[]&gt; all = Thread.getAllStackTraces();
+        all.keySet().stream()
+                .sorted((a, b) -&gt; a.getName().compareTo(b.getName()))
+                .forEach(t -&gt; System.out.printf("  %-20s daemon=%-5s кадров в стеке: %d%n",
+                        t.getName(), t.isDaemon(), all.get(t).length));
+    }
+
+    static void level1() { level2(42); }
+
+    static void level2(int x) {
+        StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE)
+                .forEach(f -&gt; System.out.printf("  %s.%s строка %d (bci %d)%n",
+                        f.getDeclaringClass().getSimpleName(), f.getMethodName(), f.getLineNumber(), f.getByteCodeIndex()));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько кадров покажет <code>StackWalker</code> внутри <code>level2</code>? Какие потоки, кроме <code>main</code>, уже существуют?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Walk.java
+java Walk</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">  Walk.level2 строка 18 (bci 11)
+  Walk.level1 строка 14 (bci 2)
+  Walk.main строка 5 (bci 0)
+
+потоки JVM при старте:
+  Attach Listener      daemon=true  кадров в стеке: 0
+  Common-Cleaner       daemon=true  кадров в стеке: 8
+  Finalizer            daemon=true  кадров в стеке: 6
+  Notification Thread  daemon=true  кадров в стеке: 0
+  Reference Handler    daemon=true  кадров в стеке: 3
+  Signal Dispatcher    daemon=true  кадров в стеке: 0
+  main                 daemon=false кадров в стеке: 3</code></pre></details>
+<div class="lab-ans" hidden><p>Три кадра: <code>level2</code>, <code>level1</code>, <code>main</code> — с номерами строк и индексами байткода (bci), где произошёл вызов. Кадры самой JVM и лаунчера Java не показывает. Служебные потоки: <code>Reference Handler</code> и <code>Finalizer</code> (обработка ссылок, тема JVM 15), <code>Signal Dispatcher</code> (сигналы ОС, например Ctrl+Break для дампа потоков), <code>Common-Cleaner</code>, <code>Notification Thread</code>, а в IDEA — ещё потоки отладчика или агента. Потоков GC и JIT-компилятора здесь нет: это нативные потоки JVM без объекта <code>Thread</code>, их видно в <code>jcmd &lt;pid&gt; Thread.print</code>.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">4.11</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что из этого есть у каждого потока своё, а не общее с другими потоками процесса?</p><ul><li>куча</li><li>открытые файлы</li><li>стек и значения регистров, включая RIP и RSP</li><li>глобальные переменные</li></ul><div class="why">Потоки процесса разделяют адресное пространство и ресурсы; собственные у них только контекст исполнения (регистры), стек и TLS.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает команда <code>call f</code>?</p><ul><li>кладёт адрес следующей команды в стек и переходит на f</li><li>создаёт новый поток</li><li>выделяет кадр под локальные переменные</li><li>копирует аргументы в стек</li></ul><div class="why">Кадр строит уже сама функция в прологе; аргументы обычно в регистрах. call — только адрес возврата + переход.</div></div>
+<div class="mcq" data-ok="3"><p>Почему создание 10 000 платформенных потоков со стеком 1 МБ не требует 10 ГБ оперативной памяти сразу?</p><ul><li>JVM сжимает стеки</li><li>стек выделяется в куче</li><li>ОС ограничивает число потоков до 1000</li><li>mmap резервирует только адресное пространство, физические страницы появляются при первом касании</li></ul><div class="why">Ленивое выделение памяти. Занятым становится лишь реально использованный «верх» стека, обычно десятки килобайт.</div></div>
+<div class="mcq" data-ok="1"><p>Как HotSpot превращает переполнение стека в <code>StackOverflowError</code>, а не в падение процесса?</p><ul><li>проверяет глубину рекурсии счётчиком</li><li>ставит недоступные защитные страницы (yellow zone) в конце стека, ловит аппаратное исключение и бросает Java-исключение</li><li>увеличивает стек автоматически</li><li>никак: процесс всегда падает</li></ul><div class="why">Защитные зоны reserved/yellow/red и stack banging. Если переполнение случится в коде самой JVM (red zone) — процесс аварийно завершится.</div></div>
+<div class="mcq" data-ok="2"><p>Где лежит кадр Java-метода, исполняемого интерпретатором HotSpot?</p><ul><li>в куче</li><li>в metaspace</li><li>на нативном стеке потока ОС, рядом с кадрами C++-кода JVM</li><li>в отдельной области «стек JVM», не связанной со стеком ОС</li></ul><div class="why">Спецификация описывает стек JVM абстрактно; HotSpot использует для него стек потока ОС. Исключение — виртуальные потоки: их кадры при парковке переезжают в кучу.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое поток с точки зрения процессора и с точки зрения ОС?</summary><div class="a"><p>Для процессора есть только текущее состояние: регистры (RIP, RSP и другие) и память. Поток — абстракция ОС: сохранённый контекст исполнения (значения регистров), собственный стек и данные планировщика. Ядро переключает потоки, сохраняя регистры одного и загружая регистры другого; потоки одного процесса разделяют адресное пространство и ресурсы.</p></div></details>
+<details class="q"><summary>Что лежит в кадре вызова и что — в стеке целиком?</summary><div class="a"><p>Стек — область памяти потока, где друг под другом лежат кадры всех незавершённых вызовов. Кадр одного вызова: адрес возврата в вызывающего, сохранённый указатель кадра вызывающего, сохранённые регистры, локальные переменные и временные значения, не поместившиеся в регистры, аргументы для следующего вызова (если их больше, чем регистров). Для интерпретатора Java: слоты локальных переменных, стек операндов, ссылка на метод и текущий байткод, мониторы.</p></div></details>
+<details class="q"><summary>Как создаётся стек нового потока в Linux?</summary><div class="a"><p>Библиотека потоков резервирует область mmap нужного размера (физические страницы появятся при касании), делает нижнюю страницу недоступной (guard), затем вызывает clone с флагами разделения памяти и ресурсов и указателем на вершину нового стека. Ядро создаёт задачу, планировщик запускает её с RSP в новом стеке. HotSpot дополнительно размечает свои защитные зоны для StackOverflowError.</p></div></details>
+<details class="q"><summary>Почему выделение на стеке быстрее, чем в куче?</summary><div class="a"><p>Выделить место — одна команда (уменьшить RSP на размер кадра), освободить — восстановить RSP при выходе. Не нужно искать свободный блок, синхронизироваться между потоками и потом собирать мусор: время жизни данных совпадает со временем вызова. Цена — данные нельзя пережить вызов; поэтому объекты Java живут в куче, а на стеке — только локальные переменные и ссылки.</p></div></details>
+<details class="q"><summary>Как строится стек-трейс, если компилятор не сохраняет RBP?</summary><div class="a"><p>По таблицам раскрутки (.eh_frame / DWARF CFI), где для каждого адреса кода описано, на каком смещении от RSP лежат адрес возврата и сохранённые регистры. JVM для своего JIT-кода хранит собственные метаданные: размер кадра каждого скомпилированного метода и карты встраивания, поэтому показывает и встроенные методы.</p></div></details>
+<details class="q"><summary>Чем стек виртуального потока отличается от стека платформенного?</summary><div class="a"><p>У платформенного потока — стек ОС фиксированного резерва (-Xss), созданный при старте. Виртуальный поток исполняется на стеке потока-носителя; при блокировке его кадры копируются в кучу (StackChunk) и носитель освобождается, при продолжении — лениво копируются обратно на стек какого-либо носителя. Память — пропорционально реальной глубине, а не резерву.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

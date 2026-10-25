@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Виртуализация и контейнеры</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ПРОГРАММЫ И СРЕДА</div>
+  <h1>Виртуализация и контейнеры</h1>
+  <p class="lead">Почти любое Java-приложение в продакшене работает в контейнере, контейнер — в виртуальной машине облака, а та — на чужом физическом сервере. Это два принципиально разных механизма: виртуальная машина обманывает операционную систему, будто у неё есть своё железо; контейнер — это обычные процессы общего ядра, которым ограничили обзор и ресурсы. Разберём оба, и почему JVM должна понимать, где именно она запущена.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">гипервизор</span><span class="tag">VT-x и EPT</span><span class="tag">virtio</span><span class="tag">namespaces</span><span class="tag">cgroups v2</span><span class="tag">overlayfs</span><span class="tag">seccomp и capabilities</span><span class="tag">троттлинг CPU</span><span class="tag">JVM в контейнере</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="vm"><span class="h-num">15.1</span>Виртуальные машины</h2>
+<p><b>Гипервизор</b> запускает несколько гостевых операционных систем, каждая из которых думает, что владеет процессором, памятью и устройствами. Типы: <b>первого типа</b> работает прямо на железе (VMware ESXi, Xen, Hyper-V, KVM — модуль ядра Linux, превращающий его в гипервизор); <b>второго типа</b> — программа внутри обычной ОС (VirtualBox, VMware Workstation). WSL 2 и Docker Desktop на Windows, на которых сняты лабы этого курса, — это лёгкая виртуальная машина Hyper-V с ядром Linux (в лабе 9.2 видно ядро <code>…-microsoft-standard-WSL2</code>).</p>
+<ul>
+  <li><b>Процессор</b>: гостевое ядро хочет выполнять привилегированные команды (менять <code>CR3</code>, запрещать прерывания). Аппаратная виртуализация (Intel VT-x, AMD-V) добавляет режим «гостя»: гость работает в своём кольце 0, а «опасные» команды и события вызывают <b>VM exit</b> — переход в гипервизор, который их эмулирует. Каждый выход — сотни – тысячи тактов; хорошая виртуализация — это мало выходов.</li>
+  <li><b>Память</b>: у гостя свои таблицы страниц (виртуальный → «физический гостя»), а железо добавляет второй уровень — <b>EPT/NPT</b> («физический гостя» → настоящий физический). Промах TLB в ВМ обходит обе таблицы — до 24 обращений вместо 4; поэтому большие страницы в ВМ особенно полезны.</li>
+  <li><b>Устройства</b>: эмулировать настоящую сетевую карту медленно, поэтому гостю дают <b>паравиртуальные</b> устройства (<b>virtio</b>-net, virtio-blk): гостевой драйвер знает, что он в ВМ, и обменивается с гипервизором кольцами запросов в общей памяти. Ещё быстрее — пробросить кусок настоящей карты (SR-IOV) прямо в ВМ.</li>
+  <li><b>Время</b>: виртуальный процессор может быть приостановлен гипервизором («украденное время», <code>st</code> в <code>top</code>), если физических ядер на всех не хватает.</li>
+</ul>
+
+<h2 id="containers"><span class="h-num">15.2</span>Контейнеры: процессы с ограниченным обзором</h2>
+<p>Контейнер — <b>не виртуальная машина</b>. Своего ядра у него нет: процессы контейнера — обычные процессы ядра хоста (в Docker Desktop — ядра той самой ВМ). Иллюзию отдельной машины создают несколько механизмов ядра Linux:</p>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Что даёт</th></tr>
+<tr><td><b>пространства имён</b> (namespaces): <code>pid</code>, <code>mnt</code>, <code>net</code>, <code>uts</code>, <code>ipc</code>, <code>user</code>, <code>cgroup</code>, <code>time</code></td><td>свой список процессов (точка входа — PID 1, тема 09), своё дерево файловой системы, свой сетевой стек и адреса, своё имя хоста. Процессы контейнера просто не видят чужого</td></tr>
+<tr><td><b>cgroups v2</b> (control groups)</td><td>лимиты и учёт ресурсов группы процессов: <code>cpu.max</code> (квота процессорного времени), <code>cpu.weight</code>, <code>memory.max</code>, <code>pids.max</code>, <code>io.max</code></td></tr>
+<tr><td><b>слоистая файловая система</b> (overlayfs)</td><td>образ — стопка слоёв только для чтения, сверху — тонкий записываемый слой контейнера (copy-on-write на уровне файлов)</td></tr>
+<tr><td><b>seccomp</b></td><td>фильтр системных вызовов: опасные или новые (в лабе 4.3 <code>clone3</code> вернул ENOSYS) запрещены</td></tr>
+<tr><td><b>capabilities</b></td><td>права root разбиты на части; контейнеру по умолчанию даются не все (для <code>strace</code> мы добавляли <code>SYS_PTRACE</code>)</td></tr>
+</table></div>
+<p>Отсюда плюсы — старт за миллисекунды, нет накладных расходов на виртуализацию процессора и памяти, плотная упаковка — и минусы: общее ядро (уязвимость ядра — угроза всем контейнерам; поэтому многопользовательские облака запускают контейнеры внутри микро-ВМ: AWS Firecracker, gVisor, Kata Containers).</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>Виртуальная машина</th><th>Контейнер</th></tr>
+<tr><td>ядро</td><td>своё у каждой</td><td>общее у всех</td></tr>
+<tr><td>изоляция</td><td>аппаратная (VT-x, EPT)</td><td>программная (namespaces, cgroups, seccomp)</td></tr>
+<tr><td>старт</td><td>секунды – десятки секунд (загрузка ОС, тема 09)</td><td>миллисекунды (запуск процесса)</td></tr>
+<tr><td>накладные расходы</td><td>VM exits, двойная трансляция адресов</td><td>почти нулевые для CPU и памяти</td></tr>
+<tr><td>образ</td><td>диск с целой ОС</td><td>файлы приложения и библиотек</td></tr>
+</table></div>
+
+<h2 id="cgroups"><span class="h-num">15.3</span>Как работают лимиты cgroups</h2>
+<ul>
+  <li><b>Память</b>: <code>memory.max</code> — жёсткий предел для суммы памяти процессов группы (включая page cache, который ядро вытесняет первым). Превышение — <b>OOM killer внутри группы</b>: процесс получает SIGKILL, контейнер завершается с кодом 137 (тема 10). Для JVM лимит должен покрывать не только кучу, но и metaspace, стеки потоков, code cache, прямые буферы, GC-структуры (<a href="../jvm/09-runtime-areas.html">JVM, тема 09</a>).</li>
+  <li><b>Процессор</b>: <code>cpu.max = "квота период"</code>, например <code>50000 100000</code> — 50 мс процессорного времени на каждые 100 мс, то есть 0,5 CPU (<code>--cpus=0.5</code>, в Kubernetes <code>limits.cpu: 500m</code>). Квота считается по <b>сумме всех потоков</b>: если 4 потока выберут 50 мс за первые 12,5 мс периода, вся группа будет <b>заморожена</b> до конца периода — 87,5 мс никто не работает. Это <b>троттлинг</b>.</li>
+  <li><b>Вес</b> (<code>cpu.weight</code>, <code>requests.cpu</code> в Kubernetes) — не лимит, а доля при конкуренции за процессор: пока ядра свободны, группа может использовать больше.</li>
+</ul>
+<div class="widget" id="thW">
+  <div class="widget-title">Симулятор троттлинга CFS: квота на период 100 мс</div>
+  <div class="controls">
+    <label>лимит CPU (cpus)<input type="text" id="thQ" value="1"></label>
+    <label>потоков, которые хотят работать<input type="text" id="thN" value="4"></label>
+    <label>работы на запрос, мс CPU<input type="text" id="thW1" value="20"></label>
+  </div>
+  <div class="out" id="thOut"></div>
+</div>
+<script>
+(function () {
+  var q = document.getElementById("thQ"), n = document.getElementById("thN"), w = document.getElementById("thW1"), o = document.getElementById("thOut");
+  function run() {
+    var Q = Math.max(0.05, parseFloat(q.value) || 1) * 100, N = Math.max(1, Math.min(64, parseInt(n.value, 10) || 1)), W = Math.max(1, parseFloat(w.value) || 20);
+    var L = [], bar = "";
+    var runFor = Math.min(100, Q / N);               // все N потоков параллельно расходуют квоту
+    for (var ms = 0; ms < 100; ms += 2) bar += ms < runFor ? "█" : "░";
+    L.push("квота: " + Q.toFixed(0) + " мс CPU на период 100 мс; " + N + " потоков расходуют её параллельно");
+    L.push("период: " + bar);
+    L.push("        █ — потоки работают (" + runFor.toFixed(1) + " мс), ░ — группа заморожена (" + (100 - runFor).toFixed(1) + " мс)");
+    if (runFor >= 100) { L.push("\nКвоты хватает на весь период — троттлинга нет."); }
+    else {
+      // запрос, требующий W мс CPU одного потока: сколько периодов он растянется
+      var periods = Math.ceil(W / runFor), latency = (periods - 1) * 100 + (W - (periods - 1) * runFor);
+      L.push("\nЗапрос на " + W + " мс процессорного времени в одном потоке:");
+      L.push("  без лимита — " + W + " мс; под лимитом — до " + latency.toFixed(0) + " мс (" + periods + " период" + (periods > 1 ? "а" : "") + ")");
+      L.push("  средняя загрузка при этом может быть далека от лимита — троттлинг виден только по cpu.stat (nr_throttled) и хвостам задержек p99.");
+    }
+    L.push("\nJVM усугубляет: в момент сборки мусора или JIT-компиляции работают десятки служебных потоков сразу — квота выгорает за миллисекунды.");
+    o.textContent = L.join("\n");
+  }
+  [q, n, w].forEach(function (e) { e.addEventListener("input", run); }); run();
+})();
+</script>
+
+<h2 id="jvm"><span class="h-num">15.4</span>JVM в контейнере</h2>
+<p>JVM (с Java 10, перенесено в 8u191) <b>понимает контейнеры</b>: при старте читает файлы cgroups (<code>/sys/fs/cgroup/cpu.max</code>, <code>memory.max</code>) и считает их «железом» машины:</p>
+<ul>
+  <li><code>Runtime.availableProcessors()</code> = ⌈квота / период⌉ (или ограничение cpuset), а не число ядер хоста. От него зависят число потоков GC, JIT-компилятора, размер <code>ForkJoinPool.commonPool()</code>, параллельные стримы и выбор сборщика (при 1 CPU и &lt; 1792 МБ — Serial GC).</li>
+  <li>Максимальная куча по умолчанию — <code>MaxRAMPercentage</code> (25%) от <code>memory.max</code>, а не от памяти хоста. В контейнерах обычно ставят 60–75%.</li>
+  <li>Посмотреть, что JVM увидела: <code>java -XshowSettings:system -version</code> и <code>-Xlog:os+container=trace</code>.</li>
+</ul>
+<p>Подробности настройки — генератор флагов под лимиты пода, корректное завершение, образы — в <a href="../jvm/22-containers.html">JVM, тема 22</a>. Главное, что объясняет эта глава: лимиты контейнера — это не «маленький компьютер», а счётчики ядра, и троттлинг процессора — пауза для всей группы потоков, которая проявляется как необъяснимые задержки.</p>
+
+<h2 id="k8s"><span class="h-num">15.5</span>Kubernetes: что под капотом</h2>
+<ul>
+  <li><b>Под</b> — группа контейнеров, разделяющих пространство имён сети (один IP, общий <code>localhost</code>) и тома. Сайдкар (прокси, агент логов) — соседний процесс в том же сетевом пространстве.</li>
+  <li><b>requests</b> превращаются в <code>cpu.weight</code> и используются планировщиком Kubernetes для размещения; <b>limits</b> — в <code>cpu.max</code> и <code>memory.max</code>. Распространённая практика для JVM: <code>requests.cpu</code> есть, а <code>limits.cpu</code> не ставить (или ставить с запасом), чтобы не ловить троттлинг на GC и прогреве; память — <code>limits = requests</code>.</li>
+  <li><b>Удаление пода</b>: kubelet посылает SIGTERM точке входа (PID 1 контейнера), ждёт <code>terminationGracePeriodSeconds</code> (30 с), затем SIGKILL (темы 09, 10).</li>
+</ul>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">15.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Разбираем контейнер на механизмы ядра: пространства имён, файлы cgroups с лимитами, что из этого видит JVM, троттлинг процессора и урезанные права. Все лабы — в Docker. Модуль IDEA — <code>cs15</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-15.1">
+<div class="lab-head"><span class="lab-num">Лаба 15.1</span><b>Пространства имён</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что два одновременно работающих контейнера — процессы одного ядра, но в разных пространствах имён.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Запустите первый контейнер в фоне и посмотрите на оба одновременно:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run -d --name ns1 cs-lab sleep 60
+docker exec ns1 sh -c "uname -r; hostname; ls -l /proc/self/ns"
+docker run --rm cs-lab sh -c "uname -r; hostname; ls -l /proc/self/ns"
+docker rm -f ns1</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">запущен ns1
+6.18.33.2-microsoft-standard-WSL2
+eae8f4df8b7d
+mnt mnt:[4026532369]
+net net:[4026532383]
+pid pid:[4026532381]
+uts uts:[4026532370]
+6.18.33.2-microsoft-standard-WSL2
+8dd905c9f39c
+mnt mnt:[4026532636]
+net net:[4026532641]
+pid pid:[4026532639]
+uts uts:[4026532637]
+удалён ns1</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Совпадут ли версия ядра, имя хоста и идентификаторы пространств имён у двух контейнеров?</div>
+<div class="lab-ans" hidden><p>Версия ядра одинаковая — ядро одно на всех. Имя хоста разное (по умолчанию — короткий ID контейнера: пространство <code>uts</code>). Номера в <code>pid:[…]</code>, <code>net:[…]</code>, <code>mnt:[…]</code>, <code>uts:[…]</code> — разные: это идентификаторы объектов пространств имён в ядре. Процессы с одинаковым номером видят одно и то же; <code>docker run --pid=host</code> или <code>--network=host</code> сажает контейнер в пространство хоста. Если запускать контейнеры по очереди, номера могут совпасть: ядро переиспользует идентификатор, когда предыдущее пространство уже уничтожено.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сеть в чужом пространстве имён:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab cat /proc/net/dev
+docker run --rm --network=host cs-lab cat /proc/net/dev</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">lo:
+eth0:
+lo:
+services1:
+eth0:
+br-bc936e6eeaa4:
+br-dabce153f2d6:
+br-e8350b7ab79c:
+br-f3cd4cf8ca42:
+br-f86b6b88227d:</code></pre></details>
+<p class="lab-note">В своём сетевом пространстве у контейнера только <code>lo</code> и <code>eth0</code> (виртуальная пара, второй конец которой подключён к мосту Docker). С <code>--network=host</code> — все интерфейсы машины (здесь — ВМ WSL).</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-15.2">
+<div class="lab-head"><span class="lab-num">Лаба 15.2</span><b>Лимиты cgroups и что видит JVM</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти лимиты контейнера в файлах cgroups и сравнить с тем, что сообщает JVM.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -m 512m --cpus=1.5 cs-lab sh -c "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max; grep MemTotal /proc/meminfo; nproc"
+docker run --rm -m 512m --cpus=1.5 cs-lab java -XshowSettings:system -version
+docker run --rm -m 512m --cpus=1.5 cs-lab java -XX:+PrintFlagsFinal -version</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">536870912
+150000 100000
+max
+MemTotal:       16098464 kB
+2
+    Provider: cgroupv2
+    Effective CPU Count: 2
+    CPU Period: 100000us
+    CPU Quota: 150000us
+    CPU Shares: -1
+    List of Effective Processors, 18 total: 
+    Memory Limit: 512.00M
+      int ActiveProcessorCount                     = -1                                        {product} {default}
+   size_t MaxHeapSize                              = 134217728                                 {product} {ergonomic}
+     bool UseG1GC                                  = false                                     {product} {default}
+     bool UseSerialGC                              = true                                      {product} {ergonomic}</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что покажут <code>/proc/meminfo</code> и <code>nproc</code> по сравнению с файлами cgroups? Какой сборщик и какой размер кучи выберет JVM?</div>
+<div class="lab-ans" hidden><p><code>memory.max</code> = 536870912 (512 МБ), <code>cpu.max</code> = <code>150000 100000</code> (1,5 CPU), <code>pids.max</code> — <code>max</code>. Но <code>/proc/meminfo</code> показывает всю память ВМ (~16 ГБ): этот интерфейс о cgroups не знает. <code>nproc</code> показал 2 — новые версии coreutils, как и JVM, читают квоту из <code>cpu.max</code>; старые показали бы 18. А «List of Effective Processors, 18 total» — <code>--cpus</code> не ограничивает, на каких ядрах работать (это делает <code>--cpuset-cpus</code>), только сколько времени. JVM читает cgroups: «Effective CPU Count: 2» (⌈1,5⌉), лимит памяти 512 МБ, куча <code>MaxHeapSize</code> — 128 МБ (25%). Сборщик — Serial: машина с &lt; 2 процессоров или &lt; 1792 МБ памяти по эргономике не считается «серверной».</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-15.3">
+<div class="lab-head"><span class="lab-num">Лаба 15.3</span><b>Троттлинг процессора</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Нагрузить контейнер с лимитом 0,5 CPU четырьмя потоками и измерить, как опаздывает главный поток.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Burn.java</code>:</div>
+<pre data-title="Burn.java"><code class="java">import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Burn {
+    static String stat() throws Exception {
+        StringBuilder b = new StringBuilder();
+        for (String l : Files.readAllLines(Path.of("/sys/fs/cgroup/cpu.stat")))
+            if (l.startsWith("nr_periods") || l.startsWith("nr_throttled") || l.startsWith("throttled_usec")) b.append(l).append("  ");
+        return b.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("cpu.max = " + Files.readString(Path.of("/sys/fs/cgroup/cpu.max")).trim()
+                + ", availableProcessors = " + Runtime.getRuntime().availableProcessors());
+        System.out.println("до нагрузки:    " + stat());
+        Thread[] burners = new Thread[4];
+        for (int i = 0; i &lt; burners.length; i++) {
+            burners[i] = new Thread(() -&gt; { long x = 0, end = System.nanoTime() + 2_000_000_000L; while (System.nanoTime() &lt; end) x++; });
+            burners[i].start();
+        }
+        long worst = 0;                                  // главный поток просыпается каждые 10 мс
+        for (int i = 0; i &lt; 150; i++) {
+            long s = System.nanoTime();
+            Thread.sleep(10);
+            worst = Math.max(worst, (System.nanoTime() - s) / 1_000_000 - 10);
+        }
+        for (Thread t : burners) t.join();
+        System.out.println("после нагрузки: " + stat());
+        System.out.println("максимальное опоздание пробуждения из sleep(10): " + worst + " мс");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cpus=0.5 -v "${PWD}:/lab" cs-lab java Burn.java
+docker run --rm --cpus=8 -v "${PWD}:/lab" cs-lab java Burn.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">cpu.max = 50000 100000, availableProcessors = 1
+до нагрузки:    nr_periods 62  nr_throttled 60  throttled_usec 8316214  
+после нагрузки: nr_periods 90  nr_throttled 88  throttled_usec 18321642  
+максимальное опоздание пробуждения из sleep(10): 90 мс
+cpu.max = 800000 100000, availableProcessors = 8
+до нагрузки:    nr_periods 19  nr_throttled 0  throttled_usec 0  
+после нагрузки: nr_periods 39  nr_throttled 0  throttled_usec 0  
+максимальное опоздание пробуждения из sleep(10): 8 мс</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Каким будет максимальное опоздание при 0,5 CPU и при 8 CPU? Почему <code>nr_throttled</code> уже не ноль «до нагрузки»?</div>
+<div class="lab-ans" hidden><p>При 0,5 CPU — десятки миллисекунд (здесь ~90 мс): четыре потока выжигают 50 мс квоты за ~12 мс, и вся группа, включая главный поток, стоит до конца периода. При 8 CPU квоты хватает — опоздание 1–3 мс. «До нагрузки» троттлинг уже был: однофайловый запуск компилирует <code>Burn.java</code> в памяти, а JIT и служебные потоки JVM на старте работают параллельно — квота выгорает на прогреве. Именно так проявляется слишком тесный <code>limits.cpu</code> у Java-сервисов: медленный старт и всплески p99.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-15.4">
+<div class="lab-head"><span class="lab-num">Лаба 15.4</span><b>Права: capabilities и seccomp</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, чем root в контейнере отличается от root на хосте.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text"></div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm cs-lab sh -c "id -u; grep -E 'CapEff|Seccomp:' /proc/self/status; mount -t tmpfs none /mnt 2&gt;&amp;1 | head -1"
+docker run --rm --privileged cs-lab sh -c "id -u; grep -E 'CapEff|Seccomp:' /proc/self/status; mount -t tmpfs none /mnt &amp;&amp; echo смонтировано"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">0
+CapEff:	00000000a80425fb
+Seccomp:	2
+mount: /mnt: permission denied.
+0
+CapEff:	000001ffffffffff
+Seccomp:	2
+смонтировано</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сможет ли root (uid 0) в обычном контейнере смонтировать файловую систему? Чем отличаются маски CapEff?</div>
+<div class="lab-ans" hidden><p>В обычном контейнере uid 0, но <code>CapEff</code> — урезанная маска (около 14 прав из 41: нет <code>SYS_ADMIN</code>, <code>SYS_PTRACE</code>, <code>NET_ADMIN</code>…), <code>Seccomp: 2</code> — включён фильтр системных вызовов; <code>mount</code> отказывает: «permission denied». С <code>--privileged</code> — все права (<code>000001ffffffffff</code>), и монтирование работает (фильтр seccomp на этой версии Docker Desktop остался включён — проверяйте, а не предполагайте): такой контейнер почти не отличается от root на машине. Поэтому <code>--privileged</code> в продакшене — тревожный сигнал, а для отладки лучше добавлять одно нужное право (<code>--cap-add=SYS_PTRACE</code>).</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">15.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем контейнер принципиально отличается от виртуальной машины?</p><ul><li>контейнер быстрее, потому что эмулирует меньше устройств</li><li>у контейнера нет своего ядра: это процессы общего ядра, изолированные пространствами имён и ограниченные cgroups</li><li>контейнер работает только на Linux-хосте без виртуализации</li><li>ничем, это маркетинг</li></ul><div class="why">ВМ виртуализирует железо для целой ОС; контейнер ограничивает видимость и ресурсы процессов.</div></div>
+<div class="mcq" data-ok="3"><p>Контейнер с <code>--cpus=1</code>, JVM запускает 8 потоков GC одновременно. Что произойдёт?</p><ul><li>JVM упадёт</li><li>потоки поделят одно ядро без потерь</li><li>лимит не действует на служебные потоки</li><li>квота 100 мс на период выгорит примерно за 12 мс, и вся группа будет заморожена до конца периода — паузы в десятки мс</li></ul><div class="why">Квота cgroups — на сумму всех потоков. JVM, увидев 1 CPU, уменьшит число потоков GC, но всплески всё равно возможны.</div></div>
+<div class="mcq" data-ok="0"><p>Откуда JVM знает лимит памяти контейнера?</p><ul><li>читает файлы cgroups (memory.max) при старте</li><li>из переменной окружения JAVA_OPTS</li><li>спрашивает Docker по API</li><li>из /proc/meminfo — там память хоста</li></ul><div class="why">/proc/meminfo в контейнере показывает память всей машины (или ВМ) — классическая ловушка старых JVM и утилит.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как устроена аппаратная виртуализация процессора и памяти?</summary><div class="a"><p>VT-x/AMD-V добавляют гостевой режим: гостевое ядро исполняется на настоящем процессоре в своём «кольце 0», а привилегированные операции и события вызывают VM exit в гипервизор. Память транслируется в два уровня: таблицы страниц гостя и вложенные таблицы гипервизора (EPT/NPT), что удорожает промахи TLB. Устройства обычно паравиртуальные (virtio) — гость знает о гипервизоре и общается с ним через кольца в общей памяти.</p></div></details>
+<details class="q"><summary>Из каких механизмов ядра состоит контейнер?</summary><div class="a"><p>Пространства имён (pid, mnt, net, uts, ipc, user, cgroup) — изоляция видимости; cgroups — лимиты и учёт CPU, памяти, числа процессов, ввода-вывода; overlayfs — слоистая файловая система образа; seccomp — фильтр системных вызовов; capabilities — урезанные права root. Всё это настраивает рантайм (runc, crun), а Docker и Kubernetes управляют рантаймом.</p></div></details>
+<details class="q"><summary>Что такое троттлинг CPU и как его обнаружить?</summary><div class="a"><p>Когда потоки группы израсходовали квоту cpu.max в текущем периоде (обычно 100 мс), ядро не даёт им работать до следующего периода. Средняя загрузка при этом может быть низкой, а задержки отдельных запросов — большими. Видно по cpu.stat (nr_throttled, throttled_usec), метрике container_cpu_cfs_throttled_seconds_total, по хвостам задержек; лечится увеличением или снятием лимита, уменьшением всплесков параллелизма.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

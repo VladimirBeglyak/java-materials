@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Конвейер, предсказание ветвлений, SIMD</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+<style>
+.pipe { border-collapse: collapse; font: 12px var(--font-mono); margin: 8px 0; }
+.pipe td, .pipe th { border: 1px solid var(--line); padding: 3px 5px; text-align: center; min-width: 30px; }
+.pipe th { color: var(--fg-muted); font-weight: 600; }
+.pipe td.s-IF { background: var(--info-soft); } .pipe td.s-ID { background: var(--accent-soft); } .pipe td.s-EX { background: var(--ok-soft); }
+.pipe td.s-MEM { background: var(--warn-soft); } .pipe td.s-WB { background: var(--bg-sunk); } .pipe td.stall { background: var(--bad-soft); color: var(--bad); }
+.pipe td.flush { background: repeating-linear-gradient(45deg, var(--bad-soft), var(--bad-soft) 4px, transparent 4px, transparent 8px); color: var(--bad); }
+.pipe td.lbl { text-align: left; white-space: nowrap; }
+</style>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ПРОЦЕССОР</div>
+  <h1>Конвейер, предсказание ветвлений, SIMD</h1>
+  <p class="lead">Современное ядро выполняет не одну команду за такт, а 4–8, хотя каждая отдельная команда проходит десяток этапов. Как: конвейер, несколько исполнительных блоков, внеочередное исполнение с переименованием регистров, предсказание переходов и спекуляция, векторные команды. Это объясняет загадки производительности: почему обработка отсортированного массива в 7 раз быстрее неотсортированного, почему четыре сумматора вместо одного ускоряют цикл вдвое и почему JIT превращает ваш цикл в векторные команды — а иногда нет.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">конвейер и конфликты</span><span class="tag">предсказание переходов</span><span class="tag">out-of-order</span><span class="tag">переименование регистров</span><span class="tag">ILP</span><span class="tag">SIMD и Vector API</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pipeline"><span class="h-num">5.1</span>Конвейер: много команд одновременно</h2>
+<p>Цикл исполнения (тема 03) состоит из этапов: выборка (IF), декодирование (ID), исполнение (EX), обращение к памяти (MEM), запись результата (WB). Если ждать, пока команда пройдёт все пять этапов, и только потом начинать следующую, каждый блок большую часть времени простаивает. <b>Конвейер</b> работает как сборочная линия: пока одна команда исполняется, следующая декодируется, а третья выбирается из памяти. Каждый этап отделён регистрами, поэтому такт можно сделать короче — он определяется самым медленным этапом, а не всей командой (тема 02).</p>
+<ul>
+  <li><b>Задержка</b> команды не уменьшается (пять этапов — пять тактов), а <b>пропускная способность</b> растёт: в идеале одна команда завершается каждый такт.</li>
+  <li>Реальные конвейеры длиннее — 14–20 этапов у современных x86 и ARM: чем короче этап, тем выше частота.</li>
+</ul>
+<h3>Конфликты (hazards)</h3>
+<div class="table-wrap"><table>
+<tr><th>Конфликт</th><th>Пример</th><th>Решение в железе</th></tr>
+<tr><td><b>по данным</b></td><td><code>add rax, rbx</code>, затем <code>add rcx, rax</code> — вторая ждёт результат первой</td><td><b>обход (forwarding)</b>: результат передаётся с выхода АЛУ прямо на вход следующей команды, минуя запись в регистр; если не успевает — пузырь (stall)</td></tr>
+<tr><td><b>по управлению</b></td><td>условный переход: какую команду выбирать следующей, пока условие не вычислено?</td><td><b>предсказание перехода</b> и спекулятивное исполнение; при ошибке — сброс конвейера (раздел 5.2)</td></tr>
+<tr><td><b>структурный</b></td><td>две команды хотят один блок (один порт памяти)</td><td>несколько блоков, раздельные кэши команд и данных</td></tr>
+</table></div>
+
+<div class="widget" id="pipeW">
+  <div class="widget-title">Симулятор 5-этапного конвейера</div>
+  <p class="hint">Выберите программу. Каждая строка — команда, столбец — такт. Красное — пузыри (ожидание данных), штриховка — команды, выбранные по неверному предсказанию и выброшенные.</p>
+  <div class="controls"><label>программа<select id="pipeP">
+    <option value="indep">независимые команды</option>
+    <option value="dep">цепочка зависимостей с обходом</option>
+    <option value="load">загрузка и сразу использование</option>
+    <option value="branch">переход, предсказан верно</option>
+    <option value="miss">переход, предсказан неверно</option></select></label>
+    <label><input type="checkbox" id="pipeFwd" checked> обход (forwarding)</label></div>
+  <div style="overflow-x:auto"><table class="pipe" id="pipeT"></table></div>
+  <div class="out" id="pipeOut"></div>
+</div>
+<script>
+(function () {
+  var P = {
+    indep: [["add r1, r2, r3"], ["sub r4, r5, r6"], ["and r7, r8, r9"], ["or  r10, r11, r12"], ["xor r13, r14, r15"]],
+    dep: [["add r1, r2, r3", null], ["add r4, r1, r5", 0], ["add r6, r4, r7", 1], ["add r8, r6, r9", 2]],
+    load: [["load r1, [r2]", null, "load"], ["add r3, r1, r4", 0], ["sub r5, r6, r7"], ["or  r8, r3, r9", 1]],
+    branch: [["cmp r1, r2"], ["jne loop  (предсказан: переход)"], ["add r3, r3, 1  ← цель"], ["sub r4, r4, 1"]],
+    miss: [["cmp r1, r2"], ["jne loop  (предсказан: переход)", null, "miss"], ["add r3, r3, 1  ← цель (зря)", null, "wrong"], ["sub r4, r4, 1  (зря)", null, "wrong"], ["mov r5, r6  ← правильная ветка"]]
+  };
+  var ST = ["IF", "ID", "EX", "MEM", "WB"], sel = document.getElementById("pipeP"), fwd = document.getElementById("pipeFwd"), tbl = document.getElementById("pipeT"), out = document.getElementById("pipeOut");
+  function run() {
+    var prog = P[sel.value], f = fwd.checked, rows = [], nextIF = 0, stalls = 0, flushed = 0, missAt = -1;
+    prog.forEach(function (c, i) {
+      var row = { text: c[0] }, wrong = c[2] === "wrong";
+      var IF = (!wrong && missAt >= 0) ? missAt + 1 : nextIF;
+      var exNeed = IF + 2;
+      if (c[1] != null) {
+        var dep = rows[c[1]], depLoad = prog[c[1]][2] === "load";
+        // с обходом: результат АЛУ доступен в следующем такте, загрузки — после MEM; без обхода — после WB источника
+        exNeed = Math.max(exNeed, f ? (depLoad ? dep.MEM + 1 : dep.EX + 1) : dep.WB + 1);
+      }
+      if (rows.length && rows[rows.length - 1].EX != null) exNeed = Math.max(exNeed, rows[rows.length - 1].EX + 1);
+      var st = exNeed - (IF + 2);
+      row.IF = IF; row.ID = IF + 1; row.EX = exNeed; row.MEM = exNeed + 1; row.WB = exNeed + 2;
+      if (st > 0) { row.stall = []; for (var k = IF + 2; k < exNeed; k++) row.stall.push(k); stalls += st; }
+      if (wrong) { row.flushed = true; flushed++; ["IF", "ID", "EX", "MEM", "WB"].forEach(function (x) { if (row[x] > missAt) row[x] = null; }); }
+      if (c[2] === "miss") missAt = row.EX;
+      rows.push(row);
+      nextIF = IF + 1 + Math.max(0, st);
+    });
+    var last = 0; rows.forEach(function (r) { [r.WB, r.EX, r.ID].forEach(function (x) { if (x != null && x > last) last = x; }); });
+    var h = "<tr><th class='lbl'>команда \\ такт</th>"; for (var c = 0; c <= last; c++) h += "<th>" + (c + 1) + "</th>"; h += "</tr>";
+    rows.forEach(function (r) {
+      h += "<tr><td class='lbl'>" + r.text + "</td>";
+      for (var c = 0; c <= last; c++) {
+        var cell = "", cls = "";
+        ST.forEach(function (s) { if (r[s] === c) { cell = s; cls = r.flushed ? "flush" : "s-" + s; } });
+        if (r.stall && r.stall.indexOf(c) >= 0) { cell = "—"; cls = "stall"; }
+        h += "<td class='" + cls + "'>" + cell + "</td>";
+      }
+      h += "</tr>";
+    });
+    tbl.innerHTML = h;
+    var done = rows.filter(function (r) { return !r.flushed; }).length;
+    out.textContent = "Завершено команд: " + done + " за " + (last + 1) + " тактов (без конвейера — " + done * 5 + ")" +
+      (stalls ? "\nПузырей из-за зависимостей: " + stalls + (f ? (sel.value === "load" ? " — даже с обходом: данные из памяти готовы только после MEM" : "") : " — включите обход, чтобы сократить") : "") +
+      (flushed ? "\nСброшено ошибочно выбранных команд: " + flushed + ". В реальном конвейере из 15–20 этапов неверное предсказание стоит 15–20 тактов." : "") +
+      (sel.value === "indep" ? "\nИдеал: после заполнения конвейера каждая следующая команда завершается через такт." : "");
+  }
+  sel.addEventListener("change", run); fwd.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="branch"><span class="h-num">5.2</span>Предсказание переходов</h2>
+<p>Условный переход встречается в среднем каждые 5–7 команд. Узнать, куда он пойдёт, можно только на этапе исполнения — через 10–15 тактов после выборки. Ждать нельзя: конвейер опустеет. Поэтому процессор <b>угадывает</b> направление и адрес перехода сразу при выборке и продолжает выбирать команды по предсказанию. Если угадал — ничего не потеряно. Если нет — всё, что выбрано после перехода, выбрасывается, и выборка начинается заново: <b>штраф 15–20 тактов</b>.</p>
+<ul>
+  <li><b>Буфер целей переходов</b> (BTB) помнит для адресов переходов, куда они прыгали в прошлый раз, — так процессор знает адрес цели ещё до декодирования.</li>
+  <li><b>Двухбитный счётчик</b> на каждый переход: состояния «точно нет / скорее нет / скорее да / точно да». Одна аномалия (выход из цикла) не переучивает предсказатель.</li>
+  <li><b>Предсказатели с историей</b> (gshare, TAGE, перцептронные) учитывают, как шли последние десятки переходов, и распознают шаблоны вроде «через раз» или «каждый пятый». Точность на типичном коде — 95–99%.</li>
+  <li><b>Возвраты</b> предсказываются отдельным стеком адресов возврата (RAS), <b>косвенные переходы</b> (виртуальные вызовы, <code>switch</code> по таблице) — своим предсказателем по истории.</li>
+</ul>
+<div class="widget" id="bpW">
+  <div class="widget-title">Предсказатель переходов: 1 бит, 2 бита, 2 бита с историей</div>
+  <p class="hint">Задайте последовательность исходов перехода: T — переход выполнен, N — нет. Сравните точность трёх схем.</p>
+  <div class="controls"><label>исходы<input type="text" id="bpIn" value="TTTTTTTN TTTTTTTN TTTTTTTN"></label>
+    <button class="btn" type="button" data-v="TTTTTTTN TTTTTTTN TTTTTTTN">цикл на 8</button>
+    <button class="btn" type="button" data-v="TNTNTNTNTNTNTNTNTNTNTNTN">через раз</button>
+    <button class="btn" type="button" data-v="TTNTTNTTNTTNTTNTTNTTNTTN">шаблон TTN</button>
+    <button class="btn" type="button" data-v="random">случайно</button>
+    <button class="btn" type="button" data-v="TTTTTTTTTTTTNNNNNNNNNNNN">отсортировано</button></div>
+  <div class="out" id="bpOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("bpIn"), out = document.getElementById("bpOut");
+  function run() {
+    var seq = inp.value.toUpperCase().replace(/[^TN]/g, "").split("");
+    if (!seq.length) { out.textContent = "Введите последовательность из T и N"; return; }
+    var b1 = 1, b2 = 2, hist = 0, tab = [2, 2, 2, 2], r1 = "", r2 = "", r3 = "", ok = [0, 0, 0];
+    seq.forEach(function (o) {
+      var t = o === "T";
+      var p1 = b1 === 1, p2 = b2 >= 2, p3 = tab[hist] >= 2;
+      r1 += p1 === t ? "·" : "✗"; r2 += p2 === t ? "·" : "✗"; r3 += p3 === t ? "·" : "✗";
+      if (p1 === t) ok[0]++; if (p2 === t) ok[1]++; if (p3 === t) ok[2]++;
+      b1 = t ? 1 : 0; b2 = t ? Math.min(3, b2 + 1) : Math.max(0, b2 - 1);
+      tab[hist] = t ? Math.min(3, tab[hist] + 1) : Math.max(0, tab[hist] - 1);
+      hist = ((hist << 1) | (t ? 1 : 0)) & 3;
+    });
+    function pc(x) { return Math.round(x / seq.length * 100) + "%"; }
+    out.textContent = "исходы:            " + seq.join("") +
+      "\n1 бит (как в прошлый раз): " + r1 + "  " + pc(ok[0]) +
+      "\n2-битный счётчик:          " + r2 + "  " + pc(ok[1]) +
+      "\n2 бита + история 2 перехода: " + r3 + "  " + pc(ok[2]) +
+      "\n\n· угадал, ✗ ошибка (штраф ~15–20 тактов на реальном ядре)." +
+      "\nСчётчик ошибается один раз на выходе из цикла, а не два, как однобитный. История позволяет выучить шаблоны вроде «через раз». Случайные данные не предсказывает ничто — 50%.";
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#bpW [data-v]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var v = b.getAttribute("data-v");
+      if (v === "random") { v = ""; for (var i = 0; i < 32; i++) v += Math.random() < 0.5 ? "T" : "N"; }
+      inp.value = v; run();
+    });
+  });
+  run();
+})();
+</script>
+<h3>Как избежать штрафа</h3>
+<pre data-title="ветвление против арифметики"><code class="java">// данные случайны — переход «x &gt;= 128» угадывается в 50% случаев
+for (int x : data) if (x &gt;= 128) sum += x;
+
+// без перехода: маска из знакового бита (x - 128) &gt;&gt; 31 — это 0 или -1
+for (int x : data) sum += x &amp; ~((x - 128) &gt;&gt; 31);
+
+// компиляторы часто делают это сами командой условной пересылки:
+//   cmp eax, 128 ; cmovge edx, eax  — обе ветки вычисляются, выбор без перехода</code></pre>
+<p>C2 решает, ставить ли переход или <code>cmov</code>, <b>по профилю</b>, собранному интерпретатором: если ветка почти всегда идёт в одну сторону, переход выгоднее (он предсказуем, а <code>cmov</code> удлиняет цепочку зависимостей); если 50/50 — может выбрать <code>cmov</code>. Поэтому тот же код на других данных может работать по-разному. Классический пример — <b>отсортированные данные</b>: переход превращается в «сначала всегда N, потом всегда T» и предсказывается почти идеально (лаба 5.1).</p>
+
+<h2 id="ooo"><span class="h-num">5.3</span>Суперскалярность и внеочередное исполнение</h2>
+<p>Конвейер даёт до одной команды за такт. Чтобы получить больше, ядро <b>суперскалярное</b>: выбирает и декодирует 4–8 команд за такт и имеет много исполнительных блоков (несколько АЛУ, блоки загрузки и сохранения, FP/SIMD-блоки). Но соседние команды часто зависят друг от друга, поэтому ядро ещё и исполняет их <b>не по порядку</b> (out-of-order):</p>
+<ol class="steps">
+  <li><b>Переименование регистров.</b> Каждой записи в архитектурный регистр (<code>RAX</code>) выделяется новый физический регистр из пула в 200–300. Это убирает ложные зависимости: две независимые команды, пишущие в <code>RAX</code> в разных местах цикла, больше не мешают друг другу.</li>
+  <li><b>Окно команд</b> (буфер переупорядочивания, ROB, на 300–600 мест). Команды ждут в нём своих операндов; любая, у которой операнды готовы, отправляется на свободный блок — даже если стоит позже ожидающей.</li>
+  <li><b>Завершение по порядку</b> (retirement). Результаты становятся «официальными» строго в порядке программы — так прерывания и исключения видят согласованное состояние, как будто команды шли по одной.</li>
+</ol>
+<p>Главное следствие для программиста — <b>параллелизм на уровне команд (ILP)</b> ограничен цепочками зависимостей. Сумма массива одним аккумулятором — цепочка: каждое сложение ждёт предыдущее (4 такта у <code>double</code>). Четыре аккумулятора — четыре независимые цепочки, которые ядро исполняет одновременно:</p>
+<pre><code class="java">double s = 0;
+for (int i = 0; i &lt; n; i++) s += a[i];                 // цепочка: такт задержки FP-сложения на элемент
+
+double s0 = 0, s1 = 0, s2 = 0, s3 = 0;                   // 4 независимые цепочки — в лабе 5.2 вдвое быстрее
+for (int i = 0; i + 3 &lt; n; i += 4) { s0 += a[i]; s1 += a[i+1]; s2 += a[i+2]; s3 += a[i+3]; }</code></pre>
+<p>Почему JIT не делает это сам? Сложение <code>double</code> не ассоциативно (тема 01): перестановка изменила бы результат в последних битах, а Java требует точной семантики. Для целых чисел ассоциативность есть, и там C2 переставляет и векторизует смело. Тот же эффект объясняет, почему <code>LongAdder</code> и параллельные стримы иногда дают разные результаты суммирования <code>double</code>.</p>
+<div class="callout info"><span class="c-title">Спекуляция и Spectre</span>
+Внеочередное ядро исполняет команды по предсказанному пути задолго до того, как становится известно, нужны ли они. Отменяются результаты в регистрах — но не следы в кэше. На этом построены атаки Spectre (2018): спекулятивно выполненный код читает секрет и оставляет его отпечаток в кэше, который потом измеряется по времени доступа. Подробно — тема 17; для JVM это означает, в частности, отключение некоторых оптимизаций и барьеры в коде, работающем с недоверенными данными.
+</div>
+
+<h2 id="simd"><span class="h-num">5.4</span>SIMD: одна команда — много данных</h2>
+<p><b>Векторные регистры</b> хранят сразу несколько чисел, а одна команда обрабатывает их все: <code>vaddps ymm0, ymm1, ymm2</code> складывает восемь пар float за раз.</p>
+<div class="table-wrap"><table>
+<tr><th>Расширение</th><th>Ширина регистра</th><th>float за команду</th><th>Где</th></tr>
+<tr><td>SSE2 (XMM)</td><td>128 бит</td><td>4</td><td>любой x86-64 (обязательная часть архитектуры)</td></tr>
+<tr><td>AVX2 (YMM)</td><td>256 бит</td><td>8</td><td>x86 с 2013 года — в том числе машина, на которой сняты лабы</td></tr>
+<tr><td>AVX-512 (ZMM)</td><td>512 бит</td><td>16</td><td>серверные Intel, AMD Zen 4/5</td></tr>
+<tr><td>NEON</td><td>128 бит</td><td>4</td><td>все ARM64 (Apple M, Graviton)</td></tr>
+<tr><td>SVE / SVE2</td><td>128–2048 бит (выбирает процессор)</td><td>4–64</td><td>Graviton 3/4, Neoverse</td></tr>
+</table></div>
+<ul>
+  <li><b>Автовекторизация.</b> C2 (оптимизация SuperWord) векторизует простые циклы по массивам: поэлементные операции, копирование, заполнение, некоторые целочисленные редукции. Внутренние функции JDK (<code>Arrays.fill</code>, <code>equals</code>, <code>mismatch</code>, <code>String.indexOf</code>, кодирование UTF-8) — интринсики на векторных командах.</li>
+  <li><b>Чего C2 не векторизует</b>: циклы с зависимостью между итерациями, условными переходами внутри, вызовами, а также редукции <code>double</code>/<code>float</code> (из-за неассоциативности).</li>
+  <li><b>Vector API</b> (<code>jdk.incubator.vector</code>, в инкубаторе с Java 16, в Java 25 — десятый раунд; ждёт проекта Valhalla) — явное векторное программирование, переносимое между AVX и NEON: <code>FloatVector.SPECIES_PREFERRED</code> выбирает ширину под процессор. Применяется в библиотеках машинного обучения, поиска (Lucene), обработки изображений.</li>
+</ul>
+<pre data-title="скалярное произведение через Vector API"><code class="java">static final VectorSpecies&lt;Float&gt; S = FloatVector.SPECIES_PREFERRED;   // 8 float на AVX2
+
+static float dot(float[] a, float[] b) {
+    var acc = FloatVector.zero(S);
+    int i = 0;
+    for (; i &lt; S.loopBound(a.length); i += S.length())
+        acc = FloatVector.fromArray(S, a, i).fma(FloatVector.fromArray(S, b, i), acc); // 8 умножений-сложений
+    float s = acc.reduceLanes(VectorOperators.ADD);
+    for (; i &lt; a.length; i++) s += a[i] * b[i];     // хвост
+    return s;
+}</code></pre>
+
+<h2 id="java"><span class="h-num">5.5</span>Что всё это значит для Java-кода</h2>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Практическое правило</th></tr>
+<tr><td>предсказание переходов</td><td>предсказуемые ветки почти бесплатны, случайные — дороги; сортировка/группировка данных перед обработкой, таблицы вместо цепочек <code>if</code> на горячем пути</td></tr>
+<tr><td>косвенные переходы</td><td>виртуальный вызов с одним-двумя реальными типами JIT встраивает по профилю (мономорфный вызов); с многими типами — косвенный переход и нет встраивания (<a href="../jvm/17-jit-optimizations.html">JVM, тема 17</a>)</td></tr>
+<tr><td>ILP</td><td>длинные цепочки зависимостей ограничивают скорость; несколько независимых аккумуляторов, разрыв зависимостей</td></tr>
+<tr><td>SIMD</td><td>простые циклы по примитивным массивам векторизуются; <code>List&lt;Integer&gt;</code> — никогда (объекты по ссылкам); для тяжёлой математики — Vector API</td></tr>
+<tr><td>измерение</td><td>«быстрее» без JMH — не доказано: прогрев, профиль, удаление мёртвого кода, частота ядра меняют результат</td></tr>
+</table></div>
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">5.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Измеряем эффекты конвейера на Java: цену неверно предсказанных переходов, параллелизм независимых цепочек и векторные команды. Модуль IDEA — <code>cs05</code>. Это ручные замеры через <code>System.nanoTime</code>: они показывают порядок эффекта, но не заменяют JMH. Абсолютные числа зависят от процессора; смотрите на соотношения.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-5.1">
+<div class="lab-head"><span class="lab-num">Лаба 5.1</span><b>Отсортированный массив быстрее?</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Воспроизвести знаменитый эффект: один и тот же цикл по тем же данным, но в другом порядке, работает в разы быстрее.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Branch.java</code>:</div>
+<pre data-title="Branch.java"><code class="java">import java.util.Arrays;
+import java.util.Random;
+
+public class Branch {
+    static long sumIf(int[] a) {
+        long s = 0;
+        for (int x : a) if (x &gt;= 128) s += x;
+        return s;
+    }
+
+    static long sumBranchless(int[] a) {
+        long s = 0;
+        for (int x : a) s += x &amp; ~((x - 128) &gt;&gt; 31);   // маска: 0, если x &lt; 128, иначе все единицы
+        return s;
+    }
+
+    public static void main(String[] args) {
+        int[] data = new Random(42).ints(32 * 1024 * 1024, 0, 256).toArray();
+        int[] sorted = data.clone();
+        Arrays.sort(sorted);
+        for (int r = 0; r &lt; 4; r++) {
+            long t0 = System.nanoTime(); long a = sumIf(data);
+            long t1 = System.nanoTime(); long b = sumIf(sorted);
+            long t2 = System.nanoTime(); long c = sumBranchless(data);
+            long t3 = System.nanoTime();
+            System.out.printf("if, случайные: %4d мс | if, отсортированные: %4d мс | без перехода, случайные: %4d мс  (%b)%n",
+                    (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000, a == b &amp;&amp; b == c);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз будут различаться три столбца? Ведь данные и число операций одни и те же.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Branch.java
+java Branch</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">if, случайные:  116 мс | if, отсортированные:   12 мс | без перехода, случайные:   13 мс  (true)
+if, случайные:  114 мс | if, отсортированные:   21 мс | без перехода, случайные:   15 мс  (true)
+if, случайные:  114 мс | if, отсортированные:   14 мс | без перехода, случайные:   10 мс  (true)
+if, случайные:  115 мс | if, отсортированные:   15 мс | без перехода, случайные:    9 мс  (true)</code></pre></details>
+<div class="lab-ans" hidden><p>На этой машине: около 115 мс на случайных данных против 11–17 мс на отсортированных — в 7–10 раз. На случайных данных переход <code>x &gt;= 128</code> угадывается в половине случаев, и каждая ошибка стоит ~15–20 тактов. На отсортированных — сначала всегда «нет», потом всегда «да»: предсказатель ошибается один-два раза на 32 млн итераций. Версия без перехода быстра на любых данных: ей нечего предсказывать. C2 мог бы и сам поставить <code>cmov</code> — но решает по профилю, и здесь оставил переход.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Поменяйте порог на 255 (переход почти всегда «нет»).</summary><div>Случайный массив станет почти таким же быстрым, как отсортированный: переход стал предсказуемым. Дорого не ветвление само по себе, а непредсказуемое ветвление.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-5.2">
+<div class="lab-head"><span class="lab-num">Лаба 5.2</span><b>Цепочки зависимостей и ILP</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что ядро исполняет независимые цепочки параллельно, а одна длинная цепочка ограничена задержкой операции.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Ilp.java</code>:</div>
+<pre data-title="Ilp.java"><code class="java">public class Ilp {
+    static double one(double[] a) {
+        double s = 0;
+        for (int i = 0; i &lt; a.length; i++) s += a[i];
+        return s;
+    }
+
+    static double four(double[] a) {
+        double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        int i = 0;
+        for (; i + 3 &lt; a.length; i += 4) { s0 += a[i]; s1 += a[i + 1]; s2 += a[i + 2]; s3 += a[i + 3]; }
+        for (; i &lt; a.length; i++) s0 += a[i];
+        return s0 + s1 + s2 + s3;
+    }
+
+    static long oneLong(long[] a) {
+        long s = 0;
+        for (int i = 0; i &lt; a.length; i++) s += a[i];
+        return s;
+    }
+
+    public static void main(String[] args) {
+        double[] a = new double[4096];
+        long[] l = new long[4096];
+        for (int i = 0; i &lt; a.length; i++) { a[i] = i * 0.5; l[i] = i; }
+        int reps = 20_000;
+        double n = (double) reps * a.length;
+        for (int r = 0; r &lt; 4; r++) {
+            long t0 = System.nanoTime(); double x = 0; for (int k = 0; k &lt; reps; k++) x += one(a);
+            long t1 = System.nanoTime(); double y = 0; for (int k = 0; k &lt; reps; k++) y += four(a);
+            long t2 = System.nanoTime(); long z = 0;  for (int k = 0; k &lt; reps; k++) z += oneLong(l);
+            long t3 = System.nanoTime();
+            System.out.printf("double, 1 сумматор: %.3f нс/эл | double, 4 сумматора: %.3f нс/эл | long, 1 сумматор: %.3f нс/эл%n",
+                    (t1 - t0) / n, (t2 - t1) / n, (t3 - t2) / n);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой вариант медленнее всех? Как поведёт себя <code>long</code> с одним сумматором по сравнению с <code>double</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Ilp.java
+java Ilp</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">double, 1 сумматор: 0.528 нс/эл | double, 4 сумматора: 0.295 нс/эл | long, 1 сумматор: 0.300 нс/эл
+double, 1 сумматор: 0.463 нс/эл | double, 4 сумматора: 0.240 нс/эл | long, 1 сумматор: 0.232 нс/эл
+double, 1 сумматор: 0.466 нс/эл | double, 4 сумматора: 0.254 нс/эл | long, 1 сумматор: 0.237 нс/эл
+double, 1 сумматор: 0.476 нс/эл | double, 4 сумматора: 0.246 нс/эл | long, 1 сумматор: 0.243 нс/эл</code></pre></details>
+<div class="lab-ans" hidden><p><code>double</code> с одним сумматором — самый медленный: каждое сложение ждёт предыдущее (задержка FP-сложения — несколько тактов). Четыре сумматора — примерно вдвое быстрее: четыре независимые цепочки идут параллельно. <code>long</code> с одним сумматором идёт так же быстро, как четыре сумматора <code>double</code>: задержка целого сложения — 1 такт, и даже единственная цепочка не тормозит (здесь упираемся уже в чтение массива и накладные расходы цикла). Целое сложение ещё и ассоциативно — C2 вправе переставлять и векторизовать его, а для <code>double</code> не вправе: изменился бы результат.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-5.3">
+<div class="lab-head"><span class="lab-num">Лаба 5.3</span><b>SIMD: автовекторизация и Vector API</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить обычный цикл, который C2 векторизует сам, с редукцией, которую он не векторизует, и то же на Vector API.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Simd.java</code>:</div>
+<pre data-title="Simd.java"><code class="java">import jdk.incubator.vector.FloatVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
+public class Simd {
+    static final VectorSpecies&lt;Float&gt; S = FloatVector.SPECIES_PREFERRED;
+
+    static void mapScalar(float[] a, float[] b, float[] c) {
+        for (int i = 0; i &lt; a.length; i++) c[i] = a[i] * b[i] + 1f;
+    }
+
+    static void mapVector(float[] a, float[] b, float[] c) {
+        int i = 0;
+        for (; i &lt; S.loopBound(a.length); i += S.length())
+            FloatVector.fromArray(S, a, i).mul(FloatVector.fromArray(S, b, i)).add(1f).intoArray(c, i);
+        for (; i &lt; a.length; i++) c[i] = a[i] * b[i] + 1f;
+    }
+
+    static float dotScalar(float[] a, float[] b) {
+        float s = 0;
+        for (int i = 0; i &lt; a.length; i++) s += a[i] * b[i];
+        return s;
+    }
+
+    static float dotVector(float[] a, float[] b) {
+        var acc = FloatVector.zero(S);
+        int i = 0;
+        for (; i &lt; S.loopBound(a.length); i += S.length())
+            acc = FloatVector.fromArray(S, a, i).fma(FloatVector.fromArray(S, b, i), acc);
+        float s = acc.reduceLanes(VectorOperators.ADD);
+        for (; i &lt; a.length; i++) s += a[i] * b[i];
+        return s;
+    }
+
+    public static void main(String[] args) {
+        System.out.println("предпочтительный вектор: " + S + " — float в регистре: " + S.length());
+        float[] a = new float[1 &lt;&lt; 16], b = new float[a.length], c = new float[a.length];
+        for (int i = 0; i &lt; a.length; i++) { a[i] = i % 7; b[i] = i % 5; }
+        double n = 2000.0 * a.length;
+        for (int r = 0; r &lt; 4; r++) {
+            long t0 = System.nanoTime(); for (int k = 0; k &lt; 2000; k++) mapScalar(a, b, c);
+            long t1 = System.nanoTime(); for (int k = 0; k &lt; 2000; k++) mapVector(a, b, c);
+            long t2 = System.nanoTime(); float x = 0; for (int k = 0; k &lt; 2000; k++) x += dotScalar(a, b);
+            long t3 = System.nanoTime(); float y = 0; for (int k = 0; k &lt; 2000; k++) y += dotVector(a, b);
+            long t4 = System.nanoTime();
+            System.out.printf("c=a*b+1: цикл %.3f, Vector API %.3f нс/эл | скалярное произведение: цикл %.3f, Vector API %.3f нс/эл%n",
+                    (t1 - t0) / n, (t2 - t1) / n, (t3 - t2) / n, (t4 - t3) / n);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Модуль инкубатора нужно подключить явно — при компиляции и при запуске:</div>
+<p class="lab-ide"><span>IDEA</span>В IDEA: Run → Edit Configurations → VM options: <code>--add-modules jdk.incubator.vector</code>; и Settings → Build → Compiler → Java Compiler → Additional command line parameters: то же.</p>
+</li>
+<li class="lab-step predict"><div class="lab-text">Где Vector API даст выигрыш, а где — нет?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac --add-modules jdk.incubator.vector Simd.java
+java --add-modules jdk.incubator.vector Simd</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">warning: [incubating] using incubating module(s): jdk.incubator.vector
+1 warning
+WARNING: Using incubator modules: jdk.incubator.vector
+предпочтительный вектор: Species[float, 8, S_256_BIT] — float в регистре: 8
+c=a*b+1: цикл 0.145, Vector API 0.523 нс/эл | скалярное произведение: цикл 0.531, Vector API 0.347 нс/эл
+c=a*b+1: цикл 0.084, Vector API 0.109 нс/эл | скалярное произведение: цикл 0.481, Vector API 0.120 нс/эл
+c=a*b+1: цикл 0.082, Vector API 0.116 нс/эл | скалярное произведение: цикл 0.482, Vector API 0.126 нс/эл
+c=a*b+1: цикл 0.086, Vector API 0.114 нс/эл | скалярное произведение: цикл 0.483, Vector API 0.117 нс/эл</code></pre></details>
+<div class="lab-ans" hidden><p>Регистр AVX2 — 256 бит, 8 float (<code>S_256_BIT</code>). Поэлементная операция <code>c = a*b + 1</code> у обычного цикла уже быстрая: C2 векторизовал её сам, и Vector API не выигрывает (даже чуть медленнее). Скалярное произведение — редукция <code>float</code>: C2 обязан складывать по порядку и не векторизует, а Vector API с FMA быстрее примерно в 4 раза. Первый раунд у Vector API медленный: пока код не скомпилирован C2, векторные объекты — настоящие объекты в куче.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-XX:UseAVX=0</code>.</summary><div>Процессор как будто без AVX: <code>SPECIES_PREFERRED</code> станет 128-битным (4 float, SSE), и оба векторных варианта замедлятся.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">5.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что даёт конвейер?</p><ul><li>уменьшает задержку каждой команды</li><li>повышает пропускную способность: одновременно в работе несколько команд на разных этапах</li><li>убирает зависимости между командами</li><li>позволяет обойтись без кэша</li></ul><div class="why">Каждая команда проходит все этапы, но новая начинается каждый такт; плюс короткие этапы позволяют поднять частоту.</div></div>
+<div class="mcq" data-ok="3"><p>Почему цикл <code>if (x &gt;= 128) sum += x</code> по отсортированному массиву быстрее, чем по случайному?</p><ul><li>отсортированный массив лучше кэшируется</li><li>JIT пропускает половину элементов</li><li>в отсортированном меньше элементов ≥ 128</li><li>переход становится предсказуемым, и процессор не сбрасывает конвейер</li></ul><div class="why">Объём данных и обращения к памяти одинаковые; разница — в ошибках предсказания (≈ 50% против ≈ 0%).</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужно переименование регистров?</p><ul><li>чтобы убрать ложные зависимости между независимыми командами, пишущими в один архитектурный регистр</li><li>чтобы увеличить число регистров в ISA</li><li>для защиты от Spectre</li><li>для совместимости с 32-битным кодом</li></ul><div class="why">Каждая запись получает свой физический регистр; остаются только настоящие зависимости по данным.</div></div>
+<div class="mcq" data-ok="2"><p>Почему C2 не векторизует суммирование массива <code>double</code>?</p><ul><li>double не помещается в векторный регистр</li><li>векторных команд для double нет</li><li>сложение с плавающей точкой не ассоциативно, и перестановка изменила бы результат</li><li>из-за проверки границ массива</li></ul><div class="why">Java гарантирует строгий порядок вычислений. Целые редукции векторизуются; для double — явный Vector API или несколько аккумуляторов вручную.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что происходит при неверном предсказании перехода?</summary><div class="a"><p>Команды, выбранные и частично исполненные по предсказанному пути, выбрасываются (результаты в физических регистрах не фиксируются), выборка начинается с правильного адреса. Конвейер заново заполняется — 15–20 тактов потерь. Побочные эффекты в кэше остаются — это основа атак класса Spectre.</p></div></details>
+<details class="q"><summary>Объясните разницу между задержкой и пропускной способностью на примере сложения double.</summary><div class="a"><p>Задержка — через сколько тактов готов результат одной операции (около 4). Пропускная способность — сколько независимых операций можно начать за такт (2 на современных ядрах). Цепочка зависимых сложений ограничена задержкой, независимые — пропускной способностью; отсюда выигрыш нескольких аккумуляторов.</p></div></details>
+<details class="q"><summary>Что такое внеочередное исполнение и почему программа этого не замечает?</summary><div class="a"><p>Ядро держит окно из сотен команд и исполняет те, чьи операнды готовы, не дожидаясь более ранних. Результаты фиксируются (retire) строго в порядке программы, исключения и прерывания возникают «точно». Для одного потока это невидимо; другим ядрам порядок записей в память может быть виден иначе — это модель памяти (тема 07).</p></div></details>
+<details class="q"><summary>Когда стоит использовать Vector API?</summary><div class="a"><p>Когда горячий цикл — это численная обработка массивов, которую C2 не векторизует сам: редукции с плавающей точкой, сложные условия через маски, поиск, обработка байтовых буферов. Перед этим стоит проверить JMH и профилировщиком, что цикл действительно узкое место. API в инкубаторе — нужен <code>--add-modules jdk.incubator.vector</code>, а сигнатуры могут меняться.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

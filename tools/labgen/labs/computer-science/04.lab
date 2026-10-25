@@ -1,0 +1,284 @@
+@chapter 04 | quiz
+@intro
+<p>Видим стек и кадры своими глазами: адреса локальных переменных и адреса возврата в C, пролог и эпилог в ассемблере, стеки потоков в карте памяти процесса, системные вызовы, которыми JVM создаёт поток, и глубину рекурсии Java при разных <code>-Xss</code>. Лабы 4.1–4.4 — в Docker-образе <code>cs-lab</code> (Linux), 4.5–4.6 — на вашей машине. Модуль IDEA — <code>cs04</code>.</p>
+@end
+
+@lab 4.1 | Кадры в C: адреса и цепочка RBP | 25 мин
+@goal
+<p>Увидеть, что стек растёт вниз, что кадры связаны сохранёнными RBP, и что адрес возврата указывает на строку вызова.</p>
+@end
+@file frames.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+long global_counter = 42;
+
+void walk(void) {
+    void **fp = __builtin_frame_address(0);          // RBP текущего кадра
+    for (int depth = 0; depth < 4; depth++) {
+        printf("  кадр %d: RBP=%p  [RBP]=сохранённый RBP=%p  [RBP+8]=адрес возврата=%p\n",
+               depth, (void *)fp, fp[0], fp[1]);
+        fp = (void **)fp[0];                          // переход к кадру вызывающего
+    }
+}
+
+long square(long x) {
+    long local_sq = x * x;
+    printf("square(%ld): &x=%p  &local_sq=%p\n", x, (void *)&x, (void *)&local_sq);
+    if (x == 3) walk();
+    return local_sq;
+}
+
+long sum_sq(long a, long b) {
+    long local_a = square(a);
+    long local_b = square(b);
+    printf("sum_sq:     &local_a=%p &local_b=%p\n", (void *)&local_a, (void *)&local_b);
+    return local_a + local_b;
+}
+
+int main(void) {
+    long m = 1;
+    long *heap = malloc(sizeof(long));
+    printf("main:       &m=%p\n", (void *)&m);
+    printf("куча:       %p\nглобальная: %p\nкод:        main=%p sum_sq=%p square=%p\n",
+           (void *)heap, (void *)&global_counter, (void *)main, (void *)sum_sq, (void *)square);
+    printf("результат:  %ld\n\n", sum_sq(3, 4));
+
+    FILE *maps = fopen("/proc/self/maps", "r");       // карта памяти этого процесса
+    char line[512];
+    while (fgets(line, sizeof line, maps))
+        if (strstr(line, "[stack]") || strstr(line, "[heap]") || strstr(line, "/frames")) fputs(line, stdout);
+    return 0;
+}
+@end
+@step Скомпилируйте без оптимизаций, с указателем кадра и отладочной информацией, и запустите:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -g -fno-omit-frame-pointer -no-pie -o frames frames.c && ./frames" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -O0 -g -fno-omit-frame-pointer -no-pie -o frames frames.c && ./frames"
+@end
+@predict Сравните адреса <code>&amp;m</code> (main), <code>&amp;local_a</code> (sum_sq) и <code>&amp;local_sq</code> (square). В какую сторону растёт стек? Совпадут ли адреса <code>&amp;local_sq</code> у двух вызовов <code>square</code>? Как связаны соседние строки «кадр N»?
+@answer
+<p>Адреса убывают: <code>main</code> &gt; <code>sum_sq</code> &gt; <code>square</code> — стек растёт вниз. Оба вызова <code>square</code> показывают <b>одинаковые</b> адреса: второй вызов занял ту же память, что и первый (он был снесён). В <code>walk</code> «сохранённый RBP» кадра N равен «RBP» кадра N+1 — это связный список кадров. Адреса возврата кадров 1–2 — внутри кода программы (рядом с адресами <code>square</code>/<code>sum_sq</code>/<code>main</code>), кадров 3+ — внутри libc (<code>__libc_start_main</code> вызвала <code>main</code>). Стек (<code>[stack]</code>) — у верхней границы адресов, куча и код программы — внизу.</p>
+@end
+@step Превратите адреса возврата кадров 0–2 в номера строк исходника (флаг <code>-no-pie</code> делает адреса кода одинаковыми от запуска к запуску; если у вас они другие — подставьте свои):
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "addr2line -f -e frames 0x4012b5 0x4012fe 0x4013f6" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c 'for a in $(./frames | grep -o "адрес возврата=0x40[0-9a-f]*" | cut -d= -f2 | head -3); do addr2line -f -e frames $a; done'
+@end
+@note <code>addr2line</code> по отладочной информации (DWARF) переводит адрес в функцию и строку. Каждый адрес возврата указывает на строку <b>после</b> вызова: в <code>square</code> (где вызвана <code>walk</code>), в <code>sum_sq</code> (где вызвана <code>square</code>) и в <code>main</code>. Именно так строится любой стек-трейс.
+@try
+Уберите <code>-fno-omit-frame-pointer</code> и добавьте <code>-O2</code>. ::: Цепочка развалится: RBP перестанет быть указателем кадра, <code>walk</code> напечатает мусор или упадёт, а <code>square</code> встроится в <code>sum_sq</code>. Поэтому профилировщики для продакшена либо требуют frame pointers (в последних версиях Fedora и Ubuntu их снова включили по умолчанию), либо разбирают таблицы <code>.eh_frame</code>.
+@end
+
+@lab 4.2 | Пролог, эпилог и исчезающий кадр | 15 мин
+@goal
+<p>Найти в ассемблере создание и снос кадра и увидеть, как оптимизатор от них избавляется.</p>
+@end
+@file calls.c
+long square(long x) {
+    long local_sq = x * x;
+    return local_sq;
+}
+
+long sum_sq(long a, long b) {
+    return square(a) + square(b);
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab gcc -O0 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - calls.c ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc -O0 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - calls.c | grep -v "^\s*\.\(file\|text\|globl\|type\|size\|ident\|section\|intel_syntax\)"
+@end
+@predict Найдите в <code>-O0</code> пролог и эпилог. Что останется от <code>sum_sq</code> при <code>-O2</code>? Будет ли там <code>call</code>?
+@answer
+<p>Пролог: <code>push rbp</code>, <code>mov rbp, rsp</code>; аргументы сохраняются в кадр (<code>mov QWORD PTR -24[rbp], rdi</code>), эпилог: <code>pop rbp</code> / <code>leave</code> и <code>ret</code>. <code>square</code> — листовая функция (никого не вызывает), поэтому без <code>sub rsp</code>: ей хватает red zone. При <code>-O2</code> кадров нет совсем: <code>square</code> — <code>imul</code> и <code>ret</code>, а <code>sum_sq</code> встроила оба вызова — два умножения и сложение, <b>без call</b>. Встроенная функция не создаёт кадр — так же поступает JIT в JVM.</p>
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - calls.c ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - calls.c | grep -v "^\s*\.\(file\|text\|globl\|type\|size\|ident\|section\|intel_syntax\|p2align\)"
+@end
+
+@lab 4.3 | Стеки потоков в карте памяти | 20 мин
+@goal
+<p>Создать потоки pthread и найти их стеки и guard-страницы в <code>/proc/self/maps</code>.</p>
+@end
+@file threads.c
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+
+pthread_barrier_t ready, done;
+void *locals[2];
+
+void *worker(void *arg) {
+    long local = (long)arg;
+    locals[local - 1] = &local;
+    printf("поток %ld: &local = %p\n", local, (void *)&local);
+    pthread_barrier_wait(&ready);   // сообщить main, что стек создан
+    pthread_barrier_wait(&done);    // и жить, пока main читает карту памяти
+    return NULL;
+}
+
+int main(void) {
+    long local_main = 0;
+    printf("main:     &local = %p\n", (void *)&local_main);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    size_t sz, guard;
+    pthread_attr_getstacksize(&attr, &sz);
+    pthread_attr_getguardsize(&attr, &guard);
+    printf("стек нового потока по умолчанию: %zu КБ, guard: %zu КБ\n", sz / 1024, guard / 1024);
+
+    pthread_barrier_init(&ready, NULL, 3);
+    pthread_barrier_init(&done, NULL, 3);
+    pthread_t t[2];
+    for (long i = 0; i < 2; i++) pthread_create(&t[i], NULL, worker, (void *)(i + 1));
+    pthread_barrier_wait(&ready);
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    char line[512], prev[512] = "";
+    puts("\nкарта памяти: области, в которых лежат стеки (и строка перед каждой):");
+    while (fgets(line, sizeof line, maps)) {
+        unsigned long a, b;
+        sscanf(line, "%lx-%lx", &a, &b);
+        int hit = strstr(line, "[stack]") != NULL;
+        for (int i = 0; i < 2; i++) hit |= (unsigned long)locals[i] >= a && (unsigned long)locals[i] < b;
+        if (hit) printf("  %s\n  %.*s   <- %lu KB\n", prev, (int)strcspn(line, "\n"), line, (b - a) / 1024);
+        strcpy(prev, line);
+        prev[strcspn(prev, "\n")] = 0;
+    }
+    pthread_barrier_wait(&done);
+    for (int i = 0; i < 2; i++) pthread_join(t[i], NULL);
+    return 0;
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -pthread -o threads threads.c && ./threads" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c 'gcc -O0 -pthread -o threads threads.c && ./threads'
+@end
+@predict Какой размер стека по умолчанию у нового потока? Где стеки потоков относительно стека <code>main</code>? Сколько займут в карте памяти два стека потоков?
+@answer
+<p>8192 КБ — glibc берёт размер из <code>ulimit -s</code>, guard — 4 КБ. Стеки потоков лежат в области mmap, далеко ниже стека главного потока <code>[stack]</code>, и соседствуют друг с другом. Здесь оба стека слились в <b>одну</b> область <code>rw-p</code> на 16392 КБ = 2 × (8192 + 4) КБ: guard-страниц как отдельных строк <code>---p</code> не видно. Почему — покажет следующий шаг. Стек <code>[stack]</code> главного потока маленький (132 КБ): ядро растит его по мере надобности до лимита.</p>
+@end
+@step Посмотрите, какими системными вызовами glibc создаёт стек и guard:
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "strace -f -e trace=mmap,mprotect,madvise,clone,clone3 ./threads 2>&1 | grep -E 'MAP_STACK|GUARD|clone'" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "strace -f -e trace=mmap,mprotect,madvise,clone,clone3 ./threads 2>&1 | grep -E 'MAP_STACK|GUARD|clone'"
+@end
+@note <code>mmap(NULL, 8392704, …, MAP_STACK)</code> — 8 МБ + 4 КБ под стек и guard. <code>madvise(…, 4096, MADV_GUARD_INSTALL)</code> — новый (Linux 6.13, glibc 2.42+) способ поставить guard-страницу: она недоступна, но не создаёт отдельную область в таблице ядра, поэтому <code>/proc/self/maps</code> её не показывает. На старых системах здесь <code>mprotect(…, PROT_NONE)</code> и строка <code>---p</code> в карте. <code>clone3</code> вернул <code>ENOSYS</code>: фильтр системных вызовов Docker (seccomp) его не пропускает, и glibc откатывается на старый <code>clone</code> — та же операция, другой формат аргументов.
+@try
+Запустите с <code>ulimit -s 1024</code> перед <code>./threads</code> (внутри <code>sh -c</code>). ::: Размер по умолчанию станет 1024 КБ, области в карте — около 1 МБ. JVM этим путём не пользуется: она передаёт размер явно из <code>-Xss</code>.
+Создайте потоки по очереди с <code>pthread_join</code> сразу после <code>pthread_create</code> и напечатайте <code>&amp;local</code>. ::: Адреса совпадут: glibc кэширует стек завершённого потока и отдаёт его следующему, не вызывая <code>munmap</code>/<code>mmap</code> заново.
+@end
+
+@lab 4.4 | Как JVM создаёт поток: системные вызовы | 20 мин
+@goal
+<p>Проследить <code>Thread.start()</code> до системных вызовов: выделение стека, <code>clone</code>, защитные зоны HotSpot.</p>
+@end
+@file Spawn.java
+public class Spawn {
+    public static void main(String[] args) throws Exception {
+        System.out.println(">>> start");
+        Thread t = new Thread(null, () -> System.out.println("в потоке " + Thread.currentThread().getName()),
+                "worker", 512 * 1024);           // стек 512 КБ
+        t.start();
+        t.join();
+        System.out.println("<<< end");
+    }
+}
+@end
+@step Запустите под <code>strace</code> (нужна возможность трассировки — флаг <code>--cap-add=SYS_PTRACE</code>), оставив только вызовы между маркерами:
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac Spawn.java && strace -f -e trace=write,mmap,mprotect,clone,clone3 java Spawn 2>&1 | sed -n '/>>> start/,/<<< end/p' | grep -E 'MAP_STACK|clone|PROT_NONE|write'" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac Spawn.java && strace -f -e trace=write,mmap,mprotect,clone,clone3 java Spawn 2>&1 | sed -n '/>>> start/,/<<< end/p' | grep -E 'MAP_STACK|clone|PROT_NONE|write'"
+@end
+@predict Найдите в выводе: (1) выделение стека — какого размера? (2) создание потока — какие флаги и что такое <code>child_stack</code>? (3) что делает новый поток со своим стеком сразу после старта?
+@answer
+<p>(1) <code>mmap(NULL, 524288, …, MAP_STACK)</code> — ровно 512 КБ, заказанные в конструкторе <code>Thread</code>. (2) <code>clone(child_stack=…, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|…)</code> — новая задача ядра, разделяющая с родителем память, файлы и обработчики сигналов; <code>child_stack</code> — начальное значение RSP, адрес у верхнего края только что выделенной области. Вызов в выводе разорван строкой «Process N attached» — strace подключился к новому потоку. (3) Уже от имени нового потока (<code>[pid N]</code>) — <code>mprotect(адрес начала области стека, 16384, PROT_NONE)</code>: HotSpot закрывает 16 КБ у дна стека — зоны reserved + yellow + red (1 + 2 + 1 страница). Строка <code>mmap(…, 67108864 или 134217728, PROT_NONE…)</code> — это не стек, а резерв адресного пространства под арену malloc glibc для нового потока (64–128 МБ, физически не занят). После печати поток снимает защиту (<code>MAP_NORESERVE</code>) перед завершением.</p>
+@end
+@step Сравните с размерами защитных зон, которые печатает сама JVM:
+@run
+docker run --rm cs-lab java -XX:+PrintFlagsFinal -version | grep -E " (StackRedPages|StackYellowPages|StackReservedPages|StackShadowPages|ThreadStackSize) " ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E " (StackRedPages|StackYellowPages|StackReservedPages|StackShadowPages|ThreadStackSize) "
+@end
+@try
+Уберите <code>512 * 1024</code> из конструктора. Какой размер будет у <code>mmap</code>? ::: 1 МБ (<code>ThreadStackSize = 1024</code> КБ) плюс выравнивание — значение <code>-Xss</code> по умолчанию на Linux x64. С <code>java -Xss4m</code> — 4 МБ.
+@end
+
+@lab 4.5 | Глубина рекурсии и StackOverflowError | 15 мин
+@goal
+<p>Измерить, сколько кадров помещается в стек, и как это зависит от размера стека, размера кадра и режима исполнения.</p>
+@end
+@file Depth.java
+public class Depth {
+    static int depth;
+
+    static void small() { depth++; small(); }
+
+    static long big(long a, long b, long c, long d) {
+        depth++;
+        long x = a + 1, y = b + 2, z = c + 3, w = d + 4, v = x * y, u = z * w;
+        return big(x, y, z, w) + v + u;
+    }
+
+    static int measure(Runnable r, long stackSize) throws InterruptedException {
+        int[] res = new int[1];
+        Thread t = new Thread(null, () -> {
+            depth = 0;
+            try { r.run(); } catch (StackOverflowError e) { res[0] = depth; }
+        }, "probe", stackSize);
+        t.start();
+        t.join();
+        return res[0];
+    }
+
+    public static void main(String[] args) throws Exception {
+        for (long kb : new long[] {256, 1024, 4096}) {
+            int s = measure(Depth::small, kb * 1024);
+            int b = measure(() -> big(1, 2, 3, 4), kb * 1024);
+            System.out.printf("стек %4d КБ: small() — %7d кадров (~%d байт на кадр), big() — %6d кадров (~%d байт)%n",
+                    kb, s, kb * 1024 / s, b, kb * 1024 / b);
+        }
+    }
+}
+@end
+@predict Во сколько раз вырастет глубина при стеке 4 МБ вместо 1 МБ? У какого метода кадр больше? Как изменится картина с <code>-Xint</code> (только интерпретатор)?
+@answer
+<p>С <code>-Xint</code> картина «учебная»: глубина почти пропорциональна размеру стека, кадр <code>small</code> около 90 байт, <code>big</code> — около 250 (больше аргументов и локальных переменных). В обычном режиме числа «плавают»: первые вызовы идут в интерпретаторе (большие кадры), потом метод компилируется, и кадры уменьшаются. А C2 ещё и <b>встраивает рекурсию</b> на несколько уровней — один нативный кадр на несколько Java-вызовов, поэтому при стеке 4 МБ «байт на кадр» у <code>big()</code> может оказаться меньше, чем у <code>small()</code>. Глубина рекурсии до <code>StackOverflowError</code> — не константа программы.</p>
+@end
+@run
+javac Depth.java
+java Depth
+java -Xint Depth
+@end
+@try
+Почему в <code>measure</code> рекурсия запускается в отдельном потоке, а не в <code>main</code>? ::: Чтобы задать размер стека параметром <code>stackSize</code> конструктора <code>Thread</code>, не перезапуская JVM с другим <code>-Xss</code>. Спецификация разрешает JVM игнорировать этот параметр, но HotSpot его учитывает.
+@end
+
+@lab 4.6 | Стек Java-потока: StackWalker и служебные потоки | 10 мин
+@goal
+<p>Пройти по кадрам текущего потока средствами Java и увидеть, какие потоки JVM создаёт ещё до <code>main</code>.</p>
+@end
+@file Walk.java
+import java.util.Map;
+
+public class Walk {
+    public static void main(String[] args) {
+        level1();
+        System.out.println("\nпотоки JVM при старте:");
+        Map<Thread, StackTraceElement[]> all = Thread.getAllStackTraces();
+        all.keySet().stream()
+                .sorted((a, b) -> a.getName().compareTo(b.getName()))
+                .forEach(t -> System.out.printf("  %-20s daemon=%-5s кадров в стеке: %d%n",
+                        t.getName(), t.isDaemon(), all.get(t).length));
+    }
+
+    static void level1() { level2(42); }
+
+    static void level2(int x) {
+        StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE)
+                .forEach(f -> System.out.printf("  %s.%s строка %d (bci %d)%n",
+                        f.getDeclaringClass().getSimpleName(), f.getMethodName(), f.getLineNumber(), f.getByteCodeIndex()));
+    }
+}
+@end
+@predict Сколько кадров покажет <code>StackWalker</code> внутри <code>level2</code>? Какие потоки, кроме <code>main</code>, уже существуют?
+@answer
+<p>Три кадра: <code>level2</code>, <code>level1</code>, <code>main</code> — с номерами строк и индексами байткода (bci), где произошёл вызов. Кадры самой JVM и лаунчера Java не показывает. Служебные потоки: <code>Reference Handler</code> и <code>Finalizer</code> (обработка ссылок, тема JVM 15), <code>Signal Dispatcher</code> (сигналы ОС, например Ctrl+Break для дампа потоков), <code>Common-Cleaner</code>, <code>Notification Thread</code>, а в IDEA — ещё потоки отладчика или агента. Потоков GC и JIT-компилятора здесь нет: это нативные потоки JVM без объекта <code>Thread</code>, их видно в <code>jcmd &lt;pid&gt; Thread.print</code>.</p>
+@end
+@run
+javac Walk.java
+java Walk
+@end

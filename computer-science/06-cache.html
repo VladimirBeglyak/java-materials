@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Иерархия памяти и кэши</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · ПАМЯТЬ</div>
+  <h1>Иерархия памяти и кэши</h1>
+  <p class="lead">Процессор выполняет сложение за доли наносекунды, а чтение из оперативной памяти занимает около 100 нс — время сотен команд. Между ними стоят кэши: маленькие, быстрые, автоматические. Почти вся современная производительность — это попадания в кэш. Разберём, как устроены уровни L1–L3, что такое кэш-линия и ассоциативность, почему важны локальность и предвыборка, и что из этого следует для массивов, списков и объектов в Java.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">L1, L2, L3, DRAM</span><span class="tag">кэш-линия 64 байта</span><span class="tag">локальность</span><span class="tag">ассоциативность</span><span class="tag">предвыборка</span><span class="tag">DRAM изнутри</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="hierarchy"><span class="h-num">6.1</span>Иерархия: от регистра до диска</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Объём (типично, 2026)</th><th>Задержка</th><th>Если бы 1 такт был 1 секундой</th></tr>
+<tr><td>регистр</td><td>~1 КБ архитектурных</td><td>0 тактов</td><td>—</td></tr>
+<tr><td>L1 данных (на ядро)</td><td>32–64 КБ</td><td>4–5 тактов (~1 нс)</td><td>5 секунд</td></tr>
+<tr><td>L2 (на ядро или пару)</td><td>1–3 МБ</td><td>12–16 тактов (~3–5 нс)</td><td>15 секунд</td></tr>
+<tr><td>L3 (общий на кристалл)</td><td>16–128 МБ</td><td>40–70 тактов (~10–30 нс)</td><td>1 минута</td></tr>
+<tr><td>оперативная память DDR5</td><td>16 ГБ – 2 ТБ</td><td>~80–120 нс</td><td>6–8 минут</td></tr>
+<tr><td>SSD NVMe</td><td>терабайты</td><td>~20–100 мкс</td><td>1–4 дня</td></tr>
+<tr><td>HDD</td><td>десятки ТБ</td><td>~5–10 мс</td><td>год</td></tr>
+<tr><td>сеть внутри дата-центра</td><td>—</td><td>~0,1–0,5 мс</td><td>месяцы</td></tr>
+</table></div>
+<p>Машина, на которой сняты лабы (Intel Core Ultra 5 125H): L1d — 48 КБ на P-ядро, L2 — 2 МБ, L3 — 18 МБ общий. Измерение в лабе 6.1 даёт ступени: ~1,3 нс, ~5 нс, ~30 нс и 120–200 нс — каждая отражает уровень, в который помещается рабочий набор данных.</p>
+<p><b>Почему не сделать всю память быстрой?</b> Быстрая память — SRAM в 6 транзисторов на бит, она большая, горячая и дорогая (тема 02); кроме того, чем больше массив памяти, тем длиннее провода и тем дольше сигнал. Поэтому рядом с ядром — маленький быстрый кэш, дальше — больше и медленнее. Иерархия работает, потому что программы обладают <b>локальностью</b>.</p>
+
+<h2 id="locality"><span class="h-num">6.2</span>Локальность и кэш-линия</h2>
+<ul>
+  <li><b>Временная локальность</b>: к недавно использованным данным скоро обратятся снова (переменные цикла, вершина стека, горячие объекты).</li>
+  <li><b>Пространственная локальность</b>: после обращения к адресу скоро обратятся к соседним (обход массива, поля одного объекта, следующая команда).</li>
+</ul>
+<p>Поэтому кэш работает не с байтами, а с <b>кэш-линиями</b> — блоками по <b>64 байта</b>, выровненными по адресу, кратному 64. Промах при чтении одного <code>int</code> загружает всю линию — 16 <code>int</code>, 8 <code>long</code> или ссылок; следующие 15 обращений к соседям бесплатны. Все обмены между уровнями — целыми линиями.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" role="img" aria-label="Обход по строкам использует каждую кэш-линию полностью, обход по столбцам загружает новую линию на каждый элемент">
+  <g font-size="12.5">
+    <text x="20" y="22" font-weight="700">int[][] m — обход по строкам: m[i][0], m[i][1], …</text>
+    <g id="rowsG"></g>
+    <text x="430" y="22" font-weight="700">обход по столбцам: m[0][j], m[1][j], …</text>
+    <g id="colsG"></g>
+    <text x="20" y="214" class="muted">одна линия — 16 int; загружено 1 линия на 16 элементов</text>
+    <text x="430" y="214" class="muted">каждый элемент — в другой строке, новая линия на каждый</text>
+  </g>
+</svg>
+<script>
+(function () {
+  function grid(id, x0, cols) {
+    var h = "";
+    for (var r = 0; r < 6; r++) for (var c = 0; c < 16; c++) {
+      var x = x0 + c * 22, y = 34 + r * 28, n = cols ? c * 6 + r : r * 16 + c, hot = cols ? c === 0 : r === 0;
+      var cls = (cols ? (c === 0) : (r === 0)) ? "box-acc" : "box";
+      h += '<rect x="' + x + '" y="' + y + '" width="20" height="24" rx="3" class="' + cls + '"/>';
+      if (hot) h += '<text x="' + (x + 10) + '" y="' + (y + 16) + '" text-anchor="middle" font-size="10" class="mono">' + (cols ? r + 1 : c + 1) + '</text>';
+    }
+    for (var r2 = 0; r2 < 6; r2++) h += '<rect x="' + (x0 - 3) + '" y="' + (32 + r2 * 28) + '" width="358" height="28" rx="4" fill="none" class="ln-dash"/>';
+    document.getElementById(id).innerHTML = h;
+  }
+  grid("rowsG", 20, false); grid("colsG", 430, true);
+})();
+</script>
+<figcaption>Каждая строка <code>int[]</code> лежит в памяти подряд (пунктир — кэш-линии). По строкам — шесть элементов первой строки берутся из одной линии. По столбцам — каждое обращение попадает в новую строку и новую линию, а к моменту возврата за соседним элементом линия уже вытеснена. На матрице 4096×4096 разница достигает 5–10 раз (лаба 6.2).</figcaption>
+</figure>
+
+<h2 id="structure"><span class="h-num">6.3</span>Как устроен кэш: тег, набор, ассоциативность</h2>
+<p>Кэш должен быстро ответить: «есть ли у меня линия с адресом A?». Перебирать все тысячи линий некогда, поэтому адрес делится на три части:</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 120" role="img" aria-label="Адрес делится на тег, индекс набора и смещение внутри линии">
+  <g font-size="13">
+    <rect x="20" y="20" width="420" height="40" rx="5" class="box-info"/><text x="230" y="45" text-anchor="middle" font-weight="700">тег (старшие биты)</text>
+    <rect x="440" y="20" width="200" height="40" rx="5" class="box-warn"/><text x="540" y="45" text-anchor="middle" font-weight="700">индекс набора</text>
+    <rect x="640" y="20" width="160" height="40" rx="5" class="box-ok"/><text x="720" y="45" text-anchor="middle" font-weight="700">смещение (6 бит)</text>
+    <text x="230" y="84" text-anchor="middle" class="muted" font-size="12">сравнивается с тегами линий набора</text>
+    <text x="540" y="84" text-anchor="middle" class="muted" font-size="12">выбирает набор (6 бит для 64 наборов)</text>
+    <text x="720" y="84" text-anchor="middle" class="muted" font-size="12">байт внутри 64-байтной линии</text>
+    <text x="20" y="110" class="muted" font-size="12">Пример: L1d 48 КБ, 12-канальный: 48 КБ / 64 Б = 768 линий = 64 набора × 12 линий</text>
+  </g>
+</svg>
+</figure>
+<ul>
+  <li><b>Прямое отображение</b> (1 линия в наборе): каждый адрес может лежать ровно в одном месте. Просто и быстро, но два адреса с одинаковым индексом постоянно вытесняют друг друга — <b>конфликтные промахи</b>.</li>
+  <li><b>N-канальная ассоциативность</b>: в наборе N линий, адрес может лечь в любую из них; при поиске сравниваются N тегов параллельно. L1 — 8–12 каналов, L2 — 10–16, L3 — 12–20.</li>
+  <li><b>Замещение</b>: когда набор полон, вытесняется линия, к которой дольше всего не обращались (приближения LRU).</li>
+  <li><b>Запись</b>: кэши <b>write-back</b> — изменённая линия помечается «грязной» и пишется в следующий уровень только при вытеснении. Запись в отсутствующую линию сначала загружает её (write-allocate).</li>
+</ul>
+<p>Типы промахов («три C»): <b>обязательные</b> (compulsory — первое обращение), <b>ёмкостные</b> (capacity — данные не помещаются), <b>конфликтные</b> (conflict — помещаются, но мешают друг другу в одном наборе). Последний тип объясняет «загадочное» падение скорости на матрицах размером ровно степень двойки: строки длиной 4096 × 4 байта = 16 КБ отображаются в одни и те же наборы, и обход по столбцам выталкивает сам себя.</p>
+
+<div class="widget" id="cacheW">
+  <div class="widget-title">Симулятор кэша</div>
+  <p class="hint">Кэш из 8 линий по 16 байт (уменьшен для наглядности). Выберите организацию и шаблон обращений — каждая клетка показывает обращение: зелёное — попадание, красное — промах.</p>
+  <div class="controls">
+    <label>организация<select id="cAssoc"><option value="1">прямое отображение (8 наборов × 1)</option><option value="2" selected>2-канальный (4 × 2)</option><option value="4">4-канальный (2 × 4)</option><option value="8">полностью ассоциативный (1 × 8)</option></select></label>
+    <label>обращения<select id="cPat">
+      <option value="seq">последовательно: int 0..63</option>
+      <option value="stride">шаг 16 байт (по линии на int)</option>
+      <option value="rows">матрица 8×8 int по строкам</option>
+      <option value="cols">матрица 8×8 int по столбцам</option>
+      <option value="conflict">два массива с шагом 128 байт (конфликт)</option>
+      <option value="reuse">рабочий набор 6 линий, повтор ×4</option>
+      <option value="big">рабочий набор 10 линий, повтор ×4</option></select></label>
+  </div>
+  <div class="cells" id="cGrid" style="grid-template-columns:repeat(auto-fill,minmax(46px,1fr))"></div>
+  <div class="out" id="cOut"></div>
+</div>
+<script>
+(function () {
+  var as = document.getElementById("cAssoc"), pat = document.getElementById("cPat"), grid = document.getElementById("cGrid"), out = document.getElementById("cOut");
+  var LINE = 16, LINES = 8;
+  function addrs(p) {
+    var a = [], i, j, k;
+    if (p === "seq") for (i = 0; i < 64; i++) a.push(i * 4);
+    if (p === "stride") for (i = 0; i < 32; i++) a.push(i * 16);
+    if (p === "rows") for (i = 0; i < 8; i++) for (j = 0; j < 8; j++) a.push((i * 8 + j) * 4);
+    if (p === "cols") for (j = 0; j < 8; j++) for (i = 0; i < 8; i++) a.push((i * 8 + j) * 4);
+    if (p === "conflict") for (k = 0; k < 16; k++) { a.push((k * 4) % 16); a.push(128 + (k * 4) % 16); }
+    if (p === "reuse") for (k = 0; k < 4; k++) for (i = 0; i < 6; i++) a.push(i * LINE);
+    if (p === "big") for (k = 0; k < 4; k++) for (i = 0; i < 10; i++) a.push(i * LINE);
+    return a;
+  }
+  function run() {
+    var ways = +as.value, sets = LINES / ways, cache = [], hits = 0, cls = { compulsory: 0, other: 0 }, seen = {}, t = 0, html = "";
+    for (var s = 0; s < sets; s++) cache.push([]);
+    addrs(pat.value).forEach(function (ad) {
+      var line = Math.floor(ad / LINE), set = line % sets, tag = Math.floor(line / sets), S = cache[set], hit = false;
+      for (var w = 0; w < S.length; w++) if (S[w].tag === tag) { hit = true; S[w].t = ++t; }
+      if (!hit) {
+        if (!seen[line]) cls.compulsory++; else cls.other++;
+        seen[line] = 1;
+        if (S.length < ways) S.push({ tag: tag, t: ++t }); else { var lru = 0; for (w = 1; w < S.length; w++) if (S[w].t < S[lru].t) lru = w; S[lru] = { tag: tag, t: ++t }; }
+      } else hits++;
+      html += '<div class="' + (hit ? "hit" : "miss") + '"><small>адр ' + ad + '</small>набор ' + set + '</div>';
+    });
+    grid.innerHTML = html;
+    var n = addrs(pat.value).length;
+    out.textContent = "обращений: " + n + ", попаданий: " + hits + " (" + Math.round(hits / n * 100) + "%), промахов: " + (n - hits) +
+      "\n  из них обязательных (первое обращение к линии): " + cls.compulsory + ", ёмкостных/конфликтных (линия была, но вытеснена): " + cls.other +
+      ({ seq: "\nПоследовательный обход: один промах на линию (4 int), остальные — попадания.",
+         stride: "\nШаг равен длине линии: каждое обращение — новая линия, пространственная локальность не работает.",
+         rows: "\nПо строкам — как последовательный обход.",
+         cols: "\nПо столбцам: соседние обращения в разных линиях. Если линии всей матрицы не помещаются в кэш, данные вытесняются раньше, чем понадобятся снова.",
+         conflict: "\nАдреса 0 и 128 попадают в один набор. При прямом отображении они выталкивают друг друга на каждом обращении — увеличьте ассоциативность.",
+         reuse: "\n6 линий помещаются в кэш из 8: после первого прохода — только попадания (временная локальность).",
+         big: "\n10 линий не помещаются в 8: при LRU и циклическом обходе каждая линия вытесняется ровно перед повторным использованием — 0% попаданий. Ёмкостные промахи." })[pat.value];
+  }
+  as.addEventListener("change", run); pat.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="prefetch"><span class="h-num">6.4</span>Предвыборка и полоса пропускания</h2>
+<p>Аппаратный <b>предвыборщик</b> (prefetcher) замечает регулярные шаблоны — последовательный обход, постоянный шаг вперёд или назад — и загружает линии заранее, до того как программа к ним обратится. Поэтому последовательное чтение большого массива упирается не в задержку памяти (100 нс на линию), а в её <b>пропускную способность</b>: DDR5 даёт десятки ГБ/с на канал, то есть линию раз в несколько наносекунд.</p>
+<p>Предвыборщик бессилен против <b>погони за указателями</b> (pointer chasing): адрес следующего элемента становится известен только после чтения текущего. Связный список, дерево, граф объектов, <code>HashMap</code> с цепочками — каждое звено может стоить полного промаха. Это измерение в лабе 6.1: случайный обход по кругу 512 МБ — около 200 нс на шаг.</p>
+<div class="table-wrap"><table>
+<tr><th>Структура</th><th>Как лежит в памяти</th><th>Обход</th></tr>
+<tr><td><code>int[]</code>, <code>long[]</code></td><td>значения подряд</td><td>последовательный, предвыборка, векторизация — гигабайты в секунду</td></tr>
+<tr><td><code>Object[]</code>, <code>ArrayList&lt;T&gt;</code></td><td>подряд лежат <b>ссылки</b>, объекты — где угодно в куче</td><td>одно лишнее обращение на элемент; быстро, если объекты созданы подряд (TLAB кладёт их рядом)</td></tr>
+<tr><td><code>LinkedList</code></td><td>узел → следующий узел, узел → объект</td><td>погоня за указателями: два зависимых обращения на элемент</td></tr>
+<tr><td><code>HashMap</code></td><td>массив бакетов → узел → ключ/значение</td><td>2–4 промаха на поиск при большом размере</td></tr>
+</table></div>
+
+<h2 id="dram"><span class="h-num">6.5</span>Оперативная память изнутри</h2>
+<ul>
+  <li><b>DRAM</b> организована в банки, строки (row, ~8 КБ) и столбцы. Чтобы прочитать данные, нужно «открыть» строку (activate) в буфер усилителей, затем читать столбцы. Попадание в уже открытую строку быстрее; переход к другой строке банка — дольше. Отсюда снова выигрыш последовательного доступа.</li>
+  <li><b>Каналы памяти</b>: у настольного процессора 2 канала, у серверного — 8–12. Полоса пропускания суммируется; поэтому сервер на 128 ядер может «голодать», если все ядра одновременно читают память.</li>
+  <li><b>NUMA</b> (многосокетные серверы, тема 07): у каждого процессора своя память; чтение «чужой» дороже на 30–100%. JVM умеет выделять память рядом с потоком (<code>-XX:+UseNUMA</code> для Parallel GC и G1).</li>
+  <li><b>Регенерация</b>: конденсаторы теряют заряд, каждые ~64 мс каждая строка перечитывается и перезаписывается — небольшая доля времени памяти уходит на это.</li>
+  <li><b>ECC</b> в серверах: дополнительные биты на слово исправляют одиночные ошибки (от космических лучей и износа) и обнаруживают двойные.</li>
+</ul>
+
+<h2 id="java"><span class="h-num">6.6</span>Кэш и Java: что из этого следует</h2>
+<div class="table-wrap"><table>
+<tr><th>Ситуация</th><th>Почему важно</th><th>Что делать</th></tr>
+<tr><td>двумерные массивы</td><td><code>int[][]</code> — массив ссылок на строки; внутренний цикл должен идти по последнему индексу</td><td><code>for i … for j … m[i][j]</code>; для числодробилок — один плоский <code>int[]</code> с индексом <code>i * cols + j</code></td></tr>
+<tr><td>коллекции обёрток</td><td><code>List&lt;Integer&gt;</code> — ссылки на объекты по 16 байт: в 4–5 раз больше памяти и промахов, чем <code>int[]</code></td><td>примитивные массивы, <code>IntStream</code>, библиотеки примитивных коллекций (fastutil, Eclipse Collections)</td></tr>
+<tr><td>размер объекта</td><td>заголовок 12 байт (8 — с компактными заголовками, <code>-XX:+UseCompactObjectHeaders</code> в Java 25, <a href="../jvm/10-object-layout.html">JVM, тема 10</a>) и выравнивание до 8 — на маленьких объектах это половина памяти</td><td>меньше мелких объектов в горячих структурах; records и будущие value-классы (Valhalla) — плотнее</td></tr>
+<tr><td>сжатые ссылки</td><td>ссылка 4 байта вместо 8 — вдвое больше ссылок в кэш-линии</td><td>куча до 32 ГБ включает их автоматически; 33 ГБ кучи могут быть медленнее 31 ГБ</td></tr>
+<tr><td>сборщик мусора</td><td>копирующие сборщики раскладывают живые объекты подряд — улучшают локальность; при этом сам обход графа объектов — погоня за указателями</td><td>понимать, почему GC «ест» полосу памяти и кэш (<a href="../jvm/12-gc-basics.html">JVM, тема 12</a>)</td></tr>
+<tr><td>общие изменяемые данные</td><td>запись одного ядра делает линию недействительной в кэшах остальных</td><td>тема 07: ложное разделение и <code>@Contended</code></td></tr>
+</table></div>
+<div class="callout interview"><span class="c-title">«Почему ArrayList быстрее LinkedList даже на вставках в середину?»</span>
+Асимптотика говорит: вставка в середину <code>LinkedList</code> — O(1), в <code>ArrayList</code> — O(n). Но до места вставки в списке нужно <i>дойти</i> — O(n) погони за указателями с промахом кэша на каждом узле, а <code>ArrayList</code> сдвигает хвост одним <code>System.arraycopy</code> по последовательной памяти со скоростью полосы пропускания. Константы различаются в десятки раз, и на практике <code>ArrayList</code> выигрывает почти всегда (<a href="../java-core/08-collections.html">Java Core, тема 08</a>).
+</div>
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">6.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Измеряем иерархию памяти из Java: задержку каждого уровня, цену обхода по столбцам, шаг обращения и разницу между массивом примитивов, списком обёрток и связным списком. Модуль IDEA — <code>cs06</code>. Программам нужна память — в лабах указан <code>-Xmx</code>; в IDEA задайте его в VM options.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-6.1">
+<div class="lab-head"><span class="lab-num">Лаба 6.1</span><b>Лестница задержек</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти по времени доступа границы L1, L2, L3 и оперативной памяти своего процессора.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Latency.java</code>:</div>
+<pre data-title="Latency.java"><code class="java">import java.util.Random;
+
+public class Latency {
+    public static void main(String[] args) {
+        Random rnd = new Random(1);
+        for (int kb : new int[] {16, 32, 64, 256, 1024, 2048, 8192, 16384, 32768, 131072, 524288}) {
+            int n = kb * 1024 / 4;
+            // случайный цикл: next[i] — индекс следующего элемента; предвыборщик его не угадает
+            int[] perm = new int[n];
+            for (int i = 0; i &lt; n; i++) perm[i] = i;
+            for (int i = n - 1; i &gt; 0; i--) { int j = rnd.nextInt(i + 1); int t = perm[i]; perm[i] = perm[j]; perm[j] = t; }
+            int[] next = new int[n];
+            for (int i = 0; i &lt; n; i++) next[perm[i]] = perm[(i + 1) % n];
+
+            int p = 0;
+            for (int i = 0; i &lt; 1_000_000; i++) p = next[p];         // прогрев
+            long steps = 20_000_000, t0 = System.nanoTime();
+            for (long i = 0; i &lt; steps; i++) p = next[p];             // каждое чтение зависит от предыдущего
+            long t1 = System.nanoTime();
+            System.out.printf("рабочий набор %7d КБ: %6.1f нс на обращение%s%n", kb, (t1 - t0) / (double) steps, p &lt; 0 ? "!" : "");
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">На каких размерах рабочего набора будут «ступени»? Сопоставьте их с размерами кэшей своего процессора (Диспетчер задач → Производительность → ЦП или <code>lscpu</code> в Linux).</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Latency.java
+java -Xmx3g Latency</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">рабочий набор      16 КБ:    1.2 нс на обращение
+рабочий набор      32 КБ:    1.5 нс на обращение
+рабочий набор      64 КБ:    2.2 нс на обращение
+рабочий набор     256 КБ:    3.4 нс на обращение
+рабочий набор    1024 КБ:    5.0 нс на обращение
+рабочий набор    2048 КБ:    6.7 нс на обращение
+рабочий набор    8192 КБ:   59.0 нс на обращение
+рабочий набор   16384 КБ:  140.2 нс на обращение
+рабочий набор   32768 КБ:  146.3 нс на обращение
+рабочий набор  131072 КБ:  179.9 нс на обращение
+рабочий набор  524288 КБ:  180.9 нс на обращение</code></pre></details>
+<div class="lab-ans" hidden><p>Ступени видны там, где набор перестаёт помещаться в очередной уровень. На этой машине (L1d 48 КБ, L2 2 МБ, L3 18 МБ): до 32 КБ — ~1,3–1,6 нс (L1), 64 КБ – 2 МБ — 2–6 нс (L2), 8 МБ — ~30 нс (L3), от 16 МБ — 120–200 нс (оперативная память). Рост внутри последней ступени — промахи TLB (тема 08): для 512 МБ случайных адресов не хватает и кэша трансляций страниц. Погоня за указателями — худший случай, отсюда «чистые» задержки.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-XX:+UseLargePages</code> или <code>-XX:+UseTransparentHugePages</code> (Linux).</summary><div>На больших наборах время уменьшится: страницы по 2 МБ сокращают промахи TLB. На Windows большие страницы требуют права «Lock pages in memory», без них JVM выдаст предупреждение и продолжит с обычными.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-6.2">
+<div class="lab-head"><span class="lab-num">Лаба 6.2</span><b>По строкам или по столбцам</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить два порядка обхода одной матрицы и плоский массив.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Traverse.java</code>:</div>
+<pre data-title="Traverse.java"><code class="java">public class Traverse {
+    static final int N = 4096;
+
+    static long rows(int[][] m)  { long s = 0; for (int i = 0; i &lt; N; i++) for (int j = 0; j &lt; N; j++) s += m[i][j]; return s; }
+    static long cols(int[][] m)  { long s = 0; for (int j = 0; j &lt; N; j++) for (int i = 0; i &lt; N; i++) s += m[i][j]; return s; }
+    static long flat(int[] f)    { long s = 0; for (int k = 0; k &lt; f.length; k++) s += f[k]; return s; }
+
+    public static void main(String[] args) {
+        int[][] m = new int[N][N];
+        int[] f = new int[N * N];
+        for (int i = 0; i &lt; N; i++) for (int j = 0; j &lt; N; j++) { m[i][j] = i ^ j; f[i * N + j] = i ^ j; }
+        for (int r = 0; r &lt; 4; r++) {
+            long t0 = System.nanoTime(); long a = rows(m);
+            long t1 = System.nanoTime(); long b = cols(m);
+            long t2 = System.nanoTime(); long c = flat(f);
+            long t3 = System.nanoTime();
+            System.out.printf("по строкам %4d мс | по столбцам %5d мс | плоский массив %4d мс  (%b)%n",
+                    (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000, a == b &amp;&amp; b == c);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Матрица 4096×4096 int — 64 МБ. Во сколько раз обход по столбцам медленнее, и есть ли выигрыш у плоского массива?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Traverse.java
+java -Xmx1g Traverse</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">по строкам   11 мс | по столбцам   166 мс | плоский массив    7 мс  (true)
+по строкам    7 мс | по столбцам   159 мс | плоский массив    7 мс  (true)
+по строкам    4 мс | по столбцам   147 мс | плоский массив    4 мс  (true)
+по строкам    7 мс | по столбцам   157 мс | плоский массив    4 мс  (true)</code></pre></details>
+<div class="lab-ans" hidden><p>По столбцам — в 20–30 раз медленнее (на этой машине ~150 мс против 4–10): каждое обращение — новая линия в новой строке, и 4096 строк не помещаются в кэш, а длина строки 16 КБ (степень двойки) ещё и сталкивает их в одних наборах. По строкам и плоский массив — почти одинаково: память читается последовательно, предвыборка и векторизация работают; плоский массив чуть быстрее за счёт отсутствия ссылки на каждую строку.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте <code>N = 4100</code>.</summary><div>Обход по столбцам заметно ускорится (но останется медленнее строк): длина строки больше не степень двойки, и строки перестают конфликтовать в одних и тех же наборах кэша.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-6.3">
+<div class="lab-head"><span class="lab-num">Лаба 6.3</span><b>Кэш-линия своими глазами</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что стоимость определяется числом затронутых линий, а не числом обращений.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Stride.java</code>:</div>
+<pre data-title="Stride.java"><code class="java">public class Stride {
+    public static void main(String[] args) {
+        int[] a = new int[64 * 1024 * 1024];            // 256 МБ
+        for (int step : new int[] {1, 2, 4, 8, 16, 32, 64, 128}) {
+            long best = Long.MAX_VALUE;
+            for (int r = 0; r &lt; 3; r++) {
+                long t0 = System.nanoTime();
+                for (int i = 0; i &lt; a.length; i += step) a[i]++;
+                best = Math.min(best, System.nanoTime() - t0);
+            }
+            long touched = a.length / step;
+            System.out.printf("шаг %3d int (%4d байт): %5d мс, обращений %,11d, %.2f нс на обращение%n",
+                    step, step * 4, best / 1_000_000, touched, best / (double) touched);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Как изменится время цикла при шагах 1, 2, 4, 8, 16? А после 16?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Stride.java
+java -Xmx1g Stride</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">шаг   1 int (   4 байт):    41 мс, обращений  67,108,864, 0.62 нс на обращение
+шаг   2 int (   8 байт):    27 мс, обращений  33,554,432, 0.82 нс на обращение
+шаг   4 int (  16 байт):    24 мс, обращений  16,777,216, 1.47 нс на обращение
+шаг   8 int (  32 байт):    20 мс, обращений   8,388,608, 2.41 нс на обращение
+шаг  16 int (  64 байт):    17 мс, обращений   4,194,304, 4.09 нс на обращение
+шаг  32 int ( 128 байт):    14 мс, обращений   2,097,152, 6.81 нс на обращение
+шаг  64 int ( 256 байт):    13 мс, обращений   1,048,576, 13.16 нс на обращение
+шаг 128 int ( 512 байт):     7 мс, обращений     524,288, 14.83 нс на обращение</code></pre></details>
+<div class="lab-ans" hidden><p>При шагах 1–16 общее время уменьшается гораздо медленнее, чем число обращений (в 16 раз меньше работы — далеко не в 16 раз быстрее): узкое место — загрузка линий из памяти, а линий затронуто одинаково, все. С шага 16 int (64 байта) каждое обращение — отдельная линия, и время на обращение растёт до цены промаха с предвыборкой. Дальше общее время падает, хотя и медленнее, чем число затронутых линий: часть цены — переходы между страницами памяти (TLB) и предвыборка, которая тянет и ненужные соседние линии.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-6.4">
+<div class="lab-head"><span class="lab-num">Лаба 6.4</span><b>Массив, ArrayList, LinkedList</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить обход одних и тех же чисел в трёх раскладках памяти и увидеть цену перемешанных объектов.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Layouts.java</code>:</div>
+<pre data-title="Layouts.java"><code class="java">import java.util.*;
+
+public class Layouts {
+    public static void main(String[] args) {
+        int n = 5_000_000;
+        int[] arr = new int[n];
+        List&lt;Integer&gt; list = new ArrayList&lt;&gt;(n), shuffled;
+        LinkedList&lt;Integer&gt; linked = new LinkedList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) { arr[i] = i; Integer boxed = i + 1000; list.add(boxed); linked.add(boxed); }
+        shuffled = new ArrayList&lt;&gt;(list);
+        Collections.shuffle(shuffled, new Random(1));   // те же объекты, другой порядок обхода
+
+        for (int r = 0; r &lt; 3; r++) {
+            long t0 = System.nanoTime(); long s1 = 0; for (int x : arr) s1 += x;
+            long t1 = System.nanoTime(); long s2 = 0; for (int x : list) s2 += x;
+            long t2 = System.nanoTime(); long s3 = 0; for (int x : shuffled) s3 += x;
+            long t3 = System.nanoTime(); long s4 = 0; for (int x : linked) s4 += x;
+            long t4 = System.nanoTime();
+            System.out.printf("int[] %3d мс | ArrayList по порядку %3d мс | ArrayList перемешанный %4d мс | LinkedList %3d мс  (%b)%n",
+                    (t1 - t0) / 1_000_000, (t2 - t1) / 1_000_000, (t3 - t2) / 1_000_000, (t4 - t3) / 1_000_000,
+                    s2 == s3 &amp;&amp; s3 == s4 &amp;&amp; s1 &lt; s2);   // суммы печатаем, чтобы JIT не выбросил циклы
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Расставьте четыре варианта по скорости. Почему перемешанный <code>ArrayList</code> медленнее, хотя это тот же список тех же объектов?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Layouts.java
+java -Xmx2g Layouts</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">int[]   7 мс | ArrayList по порядку  19 мс | ArrayList перемешанный   64 мс | LinkedList  24 мс  (true)
+int[]  11 мс | ArrayList по порядку  33 мс | ArrayList перемешанный  109 мс | LinkedList  20 мс  (true)
+int[]   1 мс | ArrayList по порядку   9 мс | ArrayList перемешанный  101 мс | LinkedList  20 мс  (true)</code></pre></details>
+<div class="lab-ans" hidden><p><code>int[]</code> — быстрее всех (последовательные значения, векторизация). <code>ArrayList</code> по порядку — в разы медленнее, но терпимо: объекты <code>Integer</code> создавались подряд и лежат в куче почти последовательно, предвыборщик помогает. <code>LinkedList</code> — ещё медленнее (узел → следующий узел, узел → объект), хотя узлы тоже созданы подряд. <b>Перемешанный</b> <code>ArrayList</code> — самый медленный: массив ссылок читается последовательно, но каждая ссылка ведёт в случайное место кучи — промах на каждом элементе. Порядок данных в памяти важнее, чем «тип коллекции». Отдельные раунды могут выбиваться — например, из-за сборки мусора посреди замера.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-XX:+UseParallelGC</code> и добавьте <code>System.gc()</code> после перемешивания.</summary><div>Копирующий сборщик перекладывает живые объекты в порядке обхода графа ссылок — из массива <code>shuffled</code> они могут оказаться в новом порядке подряд, и перемешанный список ускорится. GC меняет локальность данных — иногда к лучшему.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">6.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой размер кэш-линии на современных x86 и ARM?</p><ul><li>8 байт</li><li>4 КБ</li><li>64 байта</li><li>1 МБ</li></ul><div class="why">64 байта. Apple M-серии используют 128-байтные линии в некоторых кэшах — ещё одна причина не закладываться на конкретное число в коде, а использовать @Contended.</div></div>
+<div class="mcq" data-ok="0"><p>Почему обход связного списка из миллиона элементов медленнее обхода массива той же длины?</p><ul><li>каждый следующий адрес известен только после чтения текущего узла, предвыборка не работает, почти каждый шаг — промах</li><li>список занимает меньше памяти</li><li>у списка нет индексов</li><li>JIT не компилирует методы LinkedList</li></ul><div class="why">Погоня за указателями: задержка памяти не перекрывается. Массив читается последовательно с предвыборкой.</div></div>
+<div class="mcq" data-ok="3"><p>Что такое конфликтный промах?</p><ul><li>промах при первом обращении</li><li>промах из-за того, что данные больше кэша</li><li>промах при записи из двух потоков</li><li>промах, когда данных немного, но они отображаются в один набор и вытесняют друг друга</li></ul><div class="why">Лечится большей ассоциативностью или изменением раскладки (например, длина строки матрицы не степень двойки).</div></div>
+<div class="mcq" data-ok="1"><p>Почему при обходе массива по порядку скорость упирается в полосу пропускания памяти, а не в её задержку?</p><ul><li>массивы кэшируются целиком</li><li>предвыборщик загружает следующие линии заранее, и много запросов к памяти идут параллельно</li><li>JVM копирует массив в регистры</li><li>у массивов нет задержки</li></ul><div class="why">Задержка перекрывается параллельными запросами; остаётся предел — сколько байт в секунду отдаёт память.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите иерархию памяти и порядок задержек.</summary><div class="a"><p>Регистры (0 тактов), L1 32–64 КБ (~1 нс), L2 1–3 МБ (~4 нс), L3 десятки МБ (~10–30 нс), DRAM гигабайты (~100 нс), SSD (~десятки мкс), HDD (~мс), сеть (~0,1–100 мс). Каждый уровень на порядок больше и медленнее предыдущего; работает это благодаря временной и пространственной локальности программ.</p></div></details>
+<details class="q"><summary>Как кэш находит линию по адресу?</summary><div class="a"><p>Младшие 6 бит — смещение в 64-байтной линии, следующие биты — номер набора, остальные — тег. Аппаратно выбирается набор, и теги всех его линий (N для N-канального кэша) сравниваются параллельно. Совпадение — попадание; нет — промах и загрузка линии из следующего уровня с вытеснением давно неиспользованной линии набора.</p></div></details>
+<details class="q"><summary>Почему обход двумерного массива по столбцам медленнее?</summary><div class="a"><p>Элементы строки лежат подряд, строки — отдельными объектами. По строкам одна загруженная линия даёт 16 int подряд; по столбцам каждое обращение — в другую строку и другую линию, и к моменту возврата к соседнему элементу линия уже вытеснена. Плюс предвыборщик хуже распознаёт такой шаблон.</p></div></details>
+<details class="q"><summary>Как бы вы сделали структуру данных дружелюбной к кэшу?</summary><div class="a"><p>Данные, которые обрабатываются вместе, — рядом в памяти: массивы примитивов вместо коллекций объектов, «структура массивов» (отдельные массивы полей) вместо «массива структур» для обработки одного поля, открытая адресация вместо цепочек в хеш-таблице, B-деревья с широкими узлами вместо бинарных. Меньше уровней косвенности — меньше промахов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

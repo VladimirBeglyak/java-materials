@@ -1,0 +1,180 @@
+@chapter 07 | quiz
+@intro
+<p>Ловим эффекты многоядерности: ложное разделение кэш-линии, переупорядочивание store → load на x86, цену конкуренции за одну линию и машинные команды, в которые превращаются атомарные операции. Модуль IDEA — <code>cs07</code>. Лаба 7.4 — в Docker-образе <code>cs-lab</code>.</p>
+@end
+
+@lab 7.1 | Ложное разделение | 15 мин
+@goal
+<p>Два потока пишут каждый в свою ячейку. Измерить, во что обходится соседство ячеек в одной кэш-линии.</p>
+@end
+@file FalseSharing.java
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+
+public class FalseSharing {
+    static final VarHandle AH = MethodHandles.arrayElementVarHandle(long[].class);
+    static final int ITER = 20_000_000;
+
+    // threads потоков; поток t увеличивает свою ячейку cells[t * step]
+    static long run(long[] cells, int threads, int step, boolean vol) throws InterruptedException {
+        Thread[] ts = new Thread[threads];
+        for (int t = 0; t < threads; t++) {
+            int idx = t * step;
+            ts[t] = new Thread(() -> {
+                for (int k = 0; k < ITER; k++) {
+                    if (vol) AH.setVolatile(cells, idx, (long) AH.getVolatile(cells, idx) + 1);
+                    else     AH.setOpaque(cells, idx, (long) AH.getOpaque(cells, idx) + 1);
+                }
+            });
+        }
+        long t0 = System.nanoTime();
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        long[] cells = new long[16 * 16];
+        run(cells, 2, 1, true); run(cells, 2, 16, false);        // прогрев
+        for (int threads : new int[] {2, 4, 8}) {
+            System.out.printf("потоков %d | volatile: соседние ячейки %5d мс, через 128 байт %4d мс | opaque: соседние %4d мс, через 128 байт %4d мс%n",
+                    threads, run(cells, threads, 1, true), run(cells, threads, 16, true),
+                    run(cells, threads, 1, false), run(cells, threads, 16, false));
+        }
+    }
+}
+@end
+@note Каждый поток делает 20 млн увеличений <b>своей</b> ячейки — логически потоки ничего не делят. «Соседние» — ячейки 0, 1, 2… в одной кэш-линии; «через 128 байт» — индексы 0, 16, 32… <code>volatile</code>-запись на x86 ждёт опустошения буфера записи (тема 7.5), <code>opaque</code> — обычный <code>mov</code> без барьера.
+@predict Во сколько раз «соседние» медленнее «разнесённых» для volatile? Растёт ли разница с числом потоков? Будет ли такой же эффект у opaque?
+@answer
+<p>Для volatile — в 4–20 раз, и разница растёт с числом потоков: разнесённые ячейки идут за одно и то же время при 2, 4 и 8 потоках (каждое ядро держит свою линию в M), а соседние замедляются почти линейно — одна линия по очереди путешествует ко всем ядрам. Для opaque эффект есть, но в разы слабее: записи копятся в буфере записи, свои чтения ядро берёт прямо из него, и линия перетаскивается не на каждой итерации, а пачками. Ложное разделение больнее всего бьёт как раз по коду с барьерами и атомиками — счётчикам, флагам, блокировкам.</p>
+@end
+@run
+javac FalseSharing.java
+java FalseSharing
+@end
+@try
+Поменяйте шаг 16 на 8 (64 байта). ::: Обычно тоже быстро — ячейки в соседних линиях. Но на ряде процессоров Intel предвыборщик загружает линии парами (spatial prefetcher), и соседние 64-байтные линии мешают друг другу; поэтому <code>@Contended</code> по умолчанию отступает 128 байт.
+@end
+
+@lab 7.2 | Переупорядочивание store → load | 15 мин
+@goal
+<p>Поймать «невозможный» результат теста Деккера на x86 и убедиться, что <code>volatile</code> его запрещает.</p>
+@end
+@file Reorder.java
+public class Reorder {
+    static int x, y, r1, r2;
+    static volatile int vx, vy;
+    static volatile int go1, go2, done1, done2;   // служебная синхронизация раундов
+
+    public static void main(String[] args) throws Exception {
+        boolean useVolatile = args.length > 0 && args[0].equals("volatile");
+        int n = 2_000_000;
+        Thread a = new Thread(() -> {
+            for (int i = 1; i <= n; i++) {
+                while (go1 != i) Thread.onSpinWait();
+                if (useVolatile) { vx = 1; r1 = vy; } else { x = 1; r1 = y; }
+                done1 = i;
+            }
+        });
+        Thread b = new Thread(() -> {
+            for (int i = 1; i <= n; i++) {
+                while (go2 != i) Thread.onSpinWait();
+                if (useVolatile) { vy = 1; r2 = vx; } else { y = 1; r2 = x; }
+                done2 = i;
+            }
+        });
+        a.start(); b.start();
+        int both0 = 0;
+        for (int i = 1; i <= n; i++) {
+            x = 0; y = 0; vx = 0; vy = 0;
+            go1 = i; go2 = i;                                  // старт раунда для обоих потоков
+            while (done1 != i || done2 != i) Thread.onSpinWait();
+            if (r1 == 0 && r2 == 0) both0++;
+        }
+        a.join(); b.join();
+        System.out.printf("%s: r1 == 0 && r2 == 0 — %d раз из %d%n", useVolatile ? "volatile" : "обычные поля", both0, n);
+    }
+}
+@end
+@predict При любом чередовании команд двух потоков хотя бы одна из переменных r1, r2 должна быть 1. Сколько раз встретится r1 == 0 &amp;&amp; r2 == 0 с обычными полями и с volatile?
+@answer
+<p>С обычными полями — десятки или сотни тысяч раз (на этой машине от 10 до 25% раундов, от запуска к запуску по-разному): обе записи сидят в буферах записи своих ядер, а чтения уже прошли и получили старые нули. Переставить могли и процессор (store buffer), и JIT — JMM разрешает обоим. С <code>volatile</code> — ни разу: после volatile-записи JIT ставит <code>lock addl</code>, который ждёт опустошения буфера, прежде чем выполнится чтение.</p>
+@end
+@run
+javac Reorder.java
+java Reorder
+java Reorder volatile
+@end
+@try
+Оставьте volatile только у <code>vx</code> и <code>vy</code> на запись, а читайте обычные поля. ::: Так нельзя по смыслу JMM: гарантия «volatile-запись не переставляется с последующим volatile-чтением» требует volatile с обеих сторон. На x86 барьер после записи всё равно спасёт, на ARM — нет. Корректность нельзя проверять тестом на одной архитектуре — только рассуждением по модели памяти (и инструментами вроде jcstress).
+@end
+
+@lab 7.3 | Конкуренция за линию: AtomicLong, LongAdder, synchronized | 15 мин
+@goal
+<p>Измерить, как растёт стоимость одного общего счётчика с числом потоков.</p>
+@end
+@file Contention.java
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+
+public class Contention {
+    static final int TOTAL = 40_000_000;
+    static long syncCounter;
+    static synchronized void syncInc() { syncCounter++; }
+
+    static long time(int threads, Runnable inc) throws InterruptedException {
+        Thread[] ts = new Thread[threads];
+        int per = TOTAL / threads;
+        for (int i = 0; i < threads; i++) ts[i] = new Thread(() -> { for (int k = 0; k < per; k++) inc.run(); });
+        long t0 = System.nanoTime();
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        AtomicLong atomic = new AtomicLong();
+        LongAdder adder = new LongAdder();
+        time(4, atomic::incrementAndGet); time(4, adder::increment); time(4, Contention::syncInc);   // прогрев
+        System.out.println("40 млн увеличений одного счётчика, мс:");
+        for (int t : new int[] {1, 2, 4, 8, 16}) {
+            System.out.printf("потоков %2d: AtomicLong %5d | LongAdder %5d | synchronized %5d%n",
+                    t, time(t, atomic::incrementAndGet), time(t, adder::increment), time(t, Contention::syncInc));
+        }
+    }
+}
+@end
+@predict Как изменится время <code>AtomicLong</code> при переходе от 1 к 16 потокам? А у <code>LongAdder</code>?
+@answer
+<p><code>AtomicLong</code> с одним потоком — быстрый (линия всё время в своём L1, <code>lock xadd</code> ~ 20 тактов), а с 2+ потоками время <b>растёт</b>, хотя работы столько же: каждая операция ждёт, пока линия придёт от другого ядра. <code>LongAdder</code> с ростом числа потоков ускоряется или держится: у потоков свои ячейки в разных линиях. <code>synchronized</code> — медленнее всех под конкуренцией: при столкновениях потоки паркуются в ядре ОС, а это переключения контекста (тема 11).</p>
+@end
+@run
+javac Contention.java
+java Contention
+@end
+
+@lab 7.4 | Атомики в машинном коде | 10 мин
+@goal
+<p>Посмотреть, во что компилятор превращает атомарные операции и барьеры на x86-64.</p>
+@end
+@file atomics.c
+#include <stdatomic.h>
+
+atomic_long counter;
+atomic_int flag;
+
+void store_seq_cst(int v)  { atomic_store(&flag, v); }                                   // как volatile-запись
+void store_release(int v)  { atomic_store_explicit(&flag, v, memory_order_release); }    // VarHandle.setRelease
+int  load_acquire(void)    { return atomic_load_explicit(&flag, memory_order_acquire); }  // volatile-чтение
+long fetch_add(void)       { return atomic_fetch_add(&counter, 1); }                      // getAndIncrement
+int  cas(long expected)    { return atomic_compare_exchange_strong(&counter, &expected, 42); } // compareAndSet
+void fence(void)           { atomic_thread_fence(memory_order_seq_cst); }
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - atomics.c ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - atomics.c | grep -v "^\s*\.\(file\|text\|globl\|type\|size\|ident\|section\|intel_syntax\|p2align\|comm\)"
+@end
+@predict Какие функции превратятся в обычный <code>mov</code>, а где появятся <code>lock</code>, <code>xchg</code> или <code>mfence</code>?
+@answer
+<p>Release-запись и acquire-чтение — обычные <code>mov</code>: на x86 (TSO) эти гарантии бесплатны. Seq-cst запись — <code>xchg</code> (неявно с <code>lock</code>: это и запись, и полный барьер). <code>fetch_add</code> — <code>lock xadd</code>, CAS — <code>lock cmpxchg</code>, полный барьер — <code>mfence</code> (или <code>lock or</code> на вершину стека). HotSpot генерирует для Java то же самое: <code>getAcquire</code>/volatile-чтение — <code>mov</code>, volatile-запись — <code>mov</code> + <code>lock addl</code>.</p>
+@end

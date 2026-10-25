@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Процессы, потоки, планировщик</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ОПЕРАЦИОННАЯ СИСТЕМА</div>
+  <h1>Процессы, потоки, планировщик</h1>
+  <p class="lead">На машине с 18 логическими процессорами одновременно существуют тысячи потоков. Кто решает, какой из них сейчас исполняется, сколько ему можно работать и на каком ядре? Разберём жизненный цикл процесса (fork, exec, wait, зомби), состояния потоков в ядре и почему они не совпадают с <code>Thread.State</code>, как устроен справедливый планировщик Linux, сколько стоит переключение контекста, как процессы общаются между собой и сколько потоков на самом деле нужно Java-приложению.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">fork, exec, wait</span><span class="tag">состояния R/S/D/Z</span><span class="tag">CFS и EEVDF</span><span class="tag">nice и приоритеты</span><span class="tag">переключение контекста</span><span class="tag">IPC</span><span class="tag">размер пула</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="process"><span class="h-num">11.1</span>Процесс: жизненный цикл</h2>
+<p>Для ядра Linux процесс и поток — одна структура <code>task_struct</code>: идентификатор, состояние, указатели на адресное пространство (<code>mm</code>), таблицу файлов, обработчики сигналов, учётные данные, статистика планирования. Потоки одного процесса ссылаются на общие <code>mm</code> и таблицу файлов (тема 04). PID процесса — это идентификатор его главного потока (TGID), у остальных потоков свои TID.</p>
+<ol class="steps">
+  <li><b><code>fork()</code></b> создаёт копию вызывающего процесса: те же страницы памяти (copy-on-write, тема 08), копия таблицы дескрипторов. В родителе возвращает PID потомка, в потомке — 0.</li>
+  <li><b><code>execve(path, argv, envp)</code></b> заменяет программу в текущем процессе: старое адресное пространство уничтожается, загружается новый исполняемый файл (тема 14). PID и открытые файлы (кроме помеченных close-on-exec) сохраняются — так shell передаёт программе перенаправленные stdin и stdout.</li>
+  <li><b><code>exit(code)</code></b> освобождает почти всё, но запись о процессе остаётся, пока родитель не прочитает код завершения через <b><code>wait()</code></b>. Процесс в этом промежутке — <b>зомби</b> (состояние Z): памяти не занимает, но занимает PID.</li>
+  <li><b>Сирота</b>: родитель умер раньше — процесс усыновляет PID 1 (тема 09).</li>
+</ol>
+<p>Почему два шага (fork + exec), а не одна «запусти программу»? Между ними потомок может настроить себе окружение: перенаправить дескрипторы, сменить каталог, права, лимиты. Цена — копирование таблиц страниц большого родителя; поэтому есть <code>vfork</code>, <code>posix_spawn</code> и <code>clone</code> с флагами, а JVM запускает процессы через <code>posix_spawn</code> и вспомогательную программу <code>jspawnhelper</code>. Windows устроена иначе: <code>CreateProcess</code> сразу создаёт новый процесс с новой программой, без fork.</p>
+
+<h2 id="states"><span class="h-num">11.2</span>Состояния потока: в ядре и в Java</h2>
+<div class="table-wrap"><table>
+<tr><th>Ядро Linux (<code>ps</code>, <code>top</code>)</th><th>Смысл</th><th>Что может показывать Java (<code>Thread.State</code>)</th></tr>
+<tr><td><b>R</b> running / runnable</td><td>исполняется или стоит в очереди на процессор</td><td><code>RUNNABLE</code></td></tr>
+<tr><td><b>S</b> interruptible sleep</td><td>ждёт события: данных из сокета, таймера, futex</td><td><code>RUNNABLE</code> (блокирующий ввод-вывод!), <code>WAITING</code>, <code>TIMED_WAITING</code>, <code>BLOCKED</code></td></tr>
+<tr><td><b>D</b> uninterruptible sleep</td><td>ждёт завершения ввода-вывода в ядре (диск, NFS); даже SIGKILL подождёт</td><td><code>RUNNABLE</code></td></tr>
+<tr><td><b>T</b> stopped</td><td>остановлен сигналом или отладчиком</td><td>—</td></tr>
+<tr><td><b>Z</b> zombie</td><td>завершён, ждёт <code>wait</code> родителя</td><td>—</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">RUNNABLE не значит «работает»</span>
+Поток Java, заблокированный в <code>socket.read()</code> или <code>FileInputStream.read()</code>, имеет состояние <code>RUNNABLE</code>: JVM не знает, что нативный вызов уснул в ядре (лаба 11.4). Поэтому в дампе потоков сотни «RUNNABLE» потоков на <code>SocketInputStream.read</code> — это не загрузка процессора, а ожидание ответа удалённой стороны. Реальное использование процессора видно в <code>top -H</code> (по потокам) и в поле <code>cpu=</code> дампа потоков.
+</div>
+<p><b>Load average</b> (в <code>uptime</code>, <code>top</code>) в Linux — среднее число потоков в состояниях R <i>и</i> D за 1, 5 и 15 минут. Load 18 на 18-процессорной машине — полная загрузка; но высокий load при низкой загрузке процессора значит, что потоки стоят в D — ждут диска.</p>
+
+<h2 id="scheduler"><span class="h-num">11.3</span>Планировщик</h2>
+<p>У каждого логического процессора — своя <b>очередь выполнения</b> (runqueue) готовых потоков. Планировщик вызывается, когда поток засыпает (системный вызов), просыпается другой поток (прерывание, wake-up), истекает квант по таймеру (тема 10). Цели противоречат друг другу: <b>пропускная способность</b> (реже переключаться), <b>отзывчивость</b> (быстро запускать проснувшиеся интерактивные потоки), <b>справедливость</b> (каждому по доле).</p>
+<ul>
+  <li><b>CFS</b> (Completely Fair Scheduler, Linux 2.6.23–6.5) и его преемник <b>EEVDF</b> (Linux 6.6+): каждому потоку идёт «виртуальное время работы» (<code>vruntime</code>) — реальное время, делённое на вес. Запускается поток с наименьшим vruntime (EEVDF дополнительно учитывает «право на время» и сроки, чтобы короткие задачи с малой задержкой не ждали). Потоки, которые много спят, отстают по vruntime и при пробуждении быстро получают процессор — так интерактивные задачи остаются отзывчивыми без эвристик.</li>
+  <li><b>nice</b> от −20 до 19 меняет вес: каждая ступень — примерно ±10% процессорного времени (вес nice 0 = 1024, nice 5 = 335, nice −5 = 3121). <code>Thread.setPriority</code> в Java на Linux по умолчанию <b>ничего не делает</b> — все потоки JVM получают одинаковый nice.</li>
+  <li><b>Реальное время</b>: политики <code>SCHED_FIFO</code> и <code>SCHED_RR</code> всегда вытесняют обычные потоки — для звука, управления оборудованием. Ошибка в таком потоке может «повесить» ядро процессора.</li>
+  <li><b>Балансировка</b>: планировщик переносит потоки между очередями ядер, учитывая кэши (ядра одного L2/L3), NUMA и гибридные P/E-ядра. <b>Привязка</b> (<code>taskset</code>, <code>sched_setaffinity</code>, cpusets контейнеров) ограничивает, где поток может работать — JVM учитывает её в <code>availableProcessors()</code>.</li>
+  <li><b>Windows</b>: 32 уровня приоритета, кванты по 2–6 тиков, повышение приоритета потоку, который получил ввод или дождался ввода-вывода; P/E-ядра — с подсказками Thread Director процессора.</li>
+</ul>
+
+<div class="widget" id="schW">
+  <div class="widget-title">Симулятор планировщика: один процессор, три задачи, 60 мс</div>
+  <p class="hint">A и B считают без остановки, C — «интерактивная»: работает 1 мс, затем ждёт ввод 5 мс. Сравните простую карусель с фиксированным квантом и справедливое планирование по виртуальному времени; поменяйте nice у B.</p>
+  <div class="controls">
+    <label>алгоритм<select id="schAlg"><option value="rr">карусель (round robin), квант 4 мс</option><option value="fair" selected>справедливый (по vruntime, как CFS)</option></select></label>
+    <label>nice у B<select id="schNice"><option value="0" selected>0</option><option value="5">5</option><option value="10">10</option><option value="-5">−5</option></select></label>
+  </div>
+  <div class="out" id="schOut"></div>
+</div>
+<script>
+(function () {
+  var alg = document.getElementById("schAlg"), nice = document.getElementById("schNice"), out = document.getElementById("schOut");
+  var W = { "-5": 3121, "0": 1024, "5": 335, "10": 110 };
+  function run() {
+    var T = [{ n: "A", w: 1024, cpu: true }, { n: "B", w: W[nice.value], cpu: true }, { n: "C", w: 1024, burst: 1, sleep: 5 }];
+    T.forEach(function (t) { t.vr = 0; t.used = 0; t.readyAt = 0; t.left = t.burst || 0; t.waits = []; t.wokeAt = 0; });
+    var line = "", cur = null, slice = 0, rrq = [0, 1, 2], gran = 1;
+    for (var ms = 0; ms < 60; ms++) {
+      T.forEach(function (t) { if (!t.cpu && t.readyAt === ms && t.left === 0) { t.left = t.burst; t.wokeAt = ms; t.waiting = true; } });
+      var ready = T.filter(function (t) { return t.cpu || t.left > 0; });
+      var pick;
+      if (alg.value === "rr") {
+        if (cur && (cur.cpu || cur.left > 0) && slice < 4) pick = cur;
+        else {
+          if (cur) { var i = rrq.indexOf(T.indexOf(cur)); rrq.splice(i, 1); rrq.push(T.indexOf(cur)); }
+          pick = null; for (var k = 0; k < rrq.length; k++) { var c = T[rrq[k]]; if (c.cpu || c.left > 0) { pick = c; break; } }
+          slice = 0;
+        }
+      } else {
+        var minvr = Math.min.apply(null, ready.map(function (t) { return t.vr; }));
+        // проснувшаяся задача не получает «долг» за время сна: vruntime не меньше минимального минус небольшой бонус
+        T.forEach(function (t) { if (t.waiting && t.wokeAt === ms) t.vr = Math.max(t.vr, minvr - 1); });
+        ready.sort(function (a, b) { return a.vr - b.vr; });
+        pick = (cur && ready.indexOf(cur) >= 0 && slice < gran && cur.vr <= ready[0].vr + 0.5) ? cur : ready[0];
+        if (pick !== cur) slice = 0;
+      }
+      if (!pick) { line += "·"; cur = null; continue; }
+      if (pick.waiting) { pick.waits.push(ms - pick.wokeAt); pick.waiting = false; }
+      line += pick.n; pick.used++; slice++; pick.vr += 1024 / pick.w;
+      if (!pick.cpu) { pick.left--; if (pick.left === 0) pick.readyAt = ms + 1 + pick.sleep; }
+      cur = pick;
+    }
+    var L = ["время, мс:  " + "0         10        20        30        40        50", "процессор:  " + line, ""];
+    T.forEach(function (t) {
+      L.push(t.n + (t.cpu ? " (счётная" + (t.n === "B" ? ", nice " + nice.value : "") + ")" : " (интерактивная)") + ": " + t.used + " мс процессора (" + Math.round(t.used / 60 * 100) + "%)" +
+        (t.waits.length ? ", ожидание после пробуждения: среднее " + (t.waits.reduce(function (a, b) { return a + b; }, 0) / t.waits.length).toFixed(1) + " мс, максимум " + Math.max.apply(null, t.waits) + " мс" : ""));
+    });
+    L.push(alg.value === "rr" ? "\nКарусель: проснувшаяся C ждёт, пока A и B доработают свои кванты по 4 мс, — заметная задержка реакции." : "\nСправедливый: C мало работала, её vruntime отстаёт, и после пробуждения она идёт почти сразу. nice у B меняет долю процессора между A и B через вес.");
+    out.textContent = L.join("\n");
+  }
+  alg.addEventListener("change", run); nice.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="switch"><span class="h-num">11.4</span>Переключение контекста</h2>
+<p>Чтобы отдать процессор другому потоку, ядро сохраняет регистры текущего (в том числе <code>RSP</code> и <code>RIP</code>, векторные регистры — лениво), выбирает следующий, загружает его регистры, а если это поток <b>другого процесса</b> — ещё и меняет <code>CR3</code> (таблицы страниц) с частичным сбросом TLB.</p>
+<ul>
+  <li><b>Прямая цена</b> — единицы микросекунд на пару «уснул — проснулся» вместе с работой ядра; в лабе 11.2 круг «поток A будит B, B будит A» стоит ~10 мкс на Windows и ~30 мкс в WSL.</li>
+  <li><b>Косвенная цена</b> часто больше: новый поток вытесняет из L1/L2 данные старого, при смене процесса — переводы из TLB. Поток возвращается к «холодным» кэшам.</li>
+  <li><b>Добровольные и вынужденные</b> переключения: поток сам засыпает (системный вызов, ожидание) или его вытесняет планировщик. Счётчики — в <code>/proc/&lt;pid&gt;/status</code> (<code>voluntary_ctxt_switches</code>, <code>nonvoluntary_ctxt_switches</code>); много вынужденных — потоков больше, чем ядер.</li>
+  <li><b>Виртуальные потоки</b> Java переключаются в пользовательском режиме: продолжение одного снимается с потока-носителя, другое ставится — без ядра, без смены стека ОС. В лабе 11.2 круг стоит 0,35–1,7 мкс.</li>
+</ul>
+
+<h2 id="ipc"><span class="h-num">11.5</span>Как процессы общаются (IPC)</h2>
+<div class="table-wrap"><table>
+<tr><th>Механизм</th><th>Как работает</th><th>Где встречается</th></tr>
+<tr><td><b>канал</b> (pipe)</td><td>однонаправленный буфер в ядре (64 КБ), два дескриптора; запись блокируется, если буфер полон</td><td><code>ls | grep</code>; <code>Process.getInputStream()</code> — это канал к stdout потомка</td></tr>
+<tr><td><b>сокет</b> (TCP, Unix domain)</td><td>двунаправленный поток или датаграммы; Unix-сокеты — через файл на диске, без сетевого стека</td><td>Docker API (<code>/var/run/docker.sock</code>), PostgreSQL локально, gRPC между сайдкарами</td></tr>
+<tr><td><b>общая память</b></td><td>одна и та же физическая страница в двух адресных пространствах (<code>mmap</code> с <code>MAP_SHARED</code>, <code>shm_open</code>)</td><td>быстрейший обмен; Chronicle Queue, Aeron, базы данных; нужна синхронизация (тема 07)</td></tr>
+<tr><td><b>сигналы</b></td><td>уведомление без данных</td><td>управление: остановить, перечитать конфиг (SIGHUP)</td></tr>
+<tr><td><b>файлы</b></td><td>запись и чтение общего файла, блокировки <code>flock</code></td><td>PID-файлы, <code>hsperfdata</code> — так <code>jps</code> и <code>jcmd</code> находят JVM</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Дедлок на канале с дочерним процессом</span>
+Если Java-код запускает процесс и ждёт его завершения (<code>waitFor()</code>), не читая его stdout, а процесс пишет много, — буфер канала (64 КБ) заполнится, процесс заблокируется на <code>write</code>, и оба будут ждать друг друга вечно. Читайте вывод в отдельном потоке, перенаправляйте его в файл (<code>redirectOutput</code>) или объединяйте с stderr и сливайте (<code>redirectErrorStream(true)</code> + <code>transferTo</code>).
+</div>
+
+<h2 id="pool"><span class="h-num">11.6</span>Сколько потоков нужно</h2>
+<ul>
+  <li><b>Счётные задачи</b>: потоков ≈ ядер (<code>availableProcessors()</code>). Больше — не быстрее: они лишь вытесняют друг друга и портят кэши (лаба 11.3). Так устроены <code>ForkJoinPool.commonPool()</code> и параллельные стримы.</li>
+  <li><b>Задачи с ожиданием</b> (запросы к БД, HTTP): оценка Гётца — <i>ядер × (1 + время ожидания / время счёта)</i>. При 90% ожидания на 8 ядрах — около 80 потоков.</li>
+  <li><b>Тысячи одновременных ожиданий</b> — платформенные потоки дороги (стек, структура в ядре, переключения в ядре). Решения — асинхронный ввод-вывод (тема 13, WebFlux) или <b>виртуальные потоки</b>, которые делают блокирующий код таким же дешёвым при ожидании.</li>
+  <li>И главное ограничение часто не процессор, а <b>общие ресурсы</b>: пул соединений к БД на 20 соединений не станет быстрее от 500 потоков.</li>
+</ul>
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">11.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Смотрим на процессы и потоки глазами ядра: дерево процессов и зомби, цену переключения контекста для платформенных и виртуальных потоков, вред лишних потоков на счётной задаче и расхождение <code>Thread.State</code> с состоянием в ядре. Лабы 11.1 и 11.4 — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs11</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-11.1">
+<div class="lab-head"><span class="lab-num">Лаба 11.1</span><b>fork, exec, зомби</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Создать дочерние процессы, увидеть зомби и то, как <code>wait</code> его убирает.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>zombie.c</code>:</div>
+<pre data-title="zombie.c"><code class="txt">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+
+int main(void) {
+    pid_t child = fork();
+    if (child == 0) {                                   // потомок
+        printf("потомок: мой PID %d, родитель %d — завершаюсь с кодом 7\n", getpid(), getppid());
+        exit(7);
+    }
+    sleep(1);                                           // потомок уже завершился, но wait ещё не вызван
+    printf("родитель: потомок %d завершился, смотрим ps:\n", child);
+    fflush(stdout);
+    char cmd[64];
+    snprintf(cmd, sizeof cmd, "ps -o pid,ppid,stat,comm -p %d", child);
+    system(cmd);                                        // system = fork + exec("sh -c …") + wait
+
+    int status;
+    waitpid(child, &amp;status, 0);
+    printf("родитель: wait вернул код %d, ps снова:\n", WEXITSTATUS(status));
+    fflush(stdout);
+    system(cmd);
+    return 0;
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -o zombie zombie.c &amp;&amp; ./zombie"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">потомок: мой PID 13, родитель 12 — завершаюсь с кодом 7
+родитель: потомок 13 завершился, смотрим ps:
+    PID    PPID STAT COMMAND
+     13      12 Z    zombie
+родитель: wait вернул код 7, ps снова:
+    PID    PPID STAT COMMAND</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какое состояние покажет <code>ps</code> у потомка до <code>wait</code>? А после?</div>
+<div class="lab-ans" hidden><p>До <code>wait</code> — <code>Z</code> (зомби, в столбце COMMAND — <code>[zombie] &lt;defunct&gt;</code>): процесс завершился, но запись с кодом 7 ждёт родителя. После <code>waitpid</code> родитель получил код 7, запись удалена — <code>ps</code> ничего не находит (только заголовок). Обратите внимание: <code>system()</code> сам по себе — fork, exec оболочки и wait.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-11.2">
+<div class="lab-head"><span class="lab-num">Лаба 11.2</span><b>Цена переключения: платформенные и виртуальные потоки</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить «пинг-понг» двух потоков, которые по очереди будят друг друга, — каждый ход требует уснуть и разбудить другого.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>PingPong.java</code>:</div>
+<pre data-title="PingPong.java"><code class="java">import java.util.concurrent.locks.LockSupport;
+
+public class PingPong {
+    static volatile int turn;
+
+    static long roundTripNanos(boolean virtual, int rounds) throws InterruptedException {
+        Thread[] t = new Thread[2];
+        Runnable a = () -&gt; { for (int i = 0; i &lt; rounds; i++) { while (turn != 0) LockSupport.park(); turn = 1; LockSupport.unpark(t[1]); } };
+        Runnable b = () -&gt; { for (int i = 0; i &lt; rounds; i++) { while (turn != 1) LockSupport.park(); turn = 0; LockSupport.unpark(t[0]); } };
+        t[0] = virtual ? Thread.ofVirtual().unstarted(a) : Thread.ofPlatform().unstarted(a);
+        t[1] = virtual ? Thread.ofVirtual().unstarted(b) : Thread.ofPlatform().unstarted(b);
+        long t0 = System.nanoTime();
+        t[0].start(); t[1].start(); t[0].join(); t[1].join();
+        return (System.nanoTime() - t0) / rounds;
+    }
+
+    public static void main(String[] args) throws Exception {
+        for (int r = 0; r &lt; 3; r++) {
+            turn = 0;
+            long p = roundTripNanos(false, 200_000);
+            turn = 0;
+            long v = roundTripNanos(true, 200_000);
+            System.out.printf("круг A→B→A: платформенные %,6d нс | виртуальные %,6d нс%n", p, v);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз круг у виртуальных потоков дешевле?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac PingPong.java
+java PingPong</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">круг A→B→A: платформенные 16,272 нс | виртуальные  1,769 нс
+круг A→B→A: платформенные 12,985 нс | виртуальные  1,060 нс
+круг A→B→A: платформенные  9,014 нс | виртуальные  1,059 нс</code></pre></details>
+<div class="lab-ans" hidden><p>Платформенные — около 10 мкс на круг на Windows (два засыпания в ядре, два пробуждения, переключения контекста и, возможно, переход на другое ядро). Виртуальные — 1–2 мкс: «уснуть» — снять продолжение с потока-носителя, «разбудить» — поставить в очередь планировщика ForkJoinPool, всё в пользовательском режиме. Разница — примерно на порядок.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите с <code>-Djdk.virtualThreadScheduler.parallelism=1</code>.</summary><div>Виртуальные потоки станут ещё быстрее (сотни наносекунд): оба живут на одном носителе, и переключение — просто смена продолжения в том же потоке ОС, без межъядерной передачи данных и пробуждений.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-11.3">
+<div class="lab-head"><span class="lab-num">Лаба 11.3</span><b>Больше потоков — не быстрее</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Запустить одну и ту же счётную работу в пулах разного размера.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Oversub.java</code>:</div>
+<pre data-title="Oversub.java"><code class="java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.*;
+
+public class Oversub {
+    static long work(long seed) {                       // чистый счёт, без памяти и ожиданий
+        long x = seed;
+        for (int i = 0; i &lt; 20_000_000; i++) x = x * 6364136223846793005L + 1442695040888963407L;
+        return x;
+    }
+
+    public static void main(String[] args) throws Exception {
+        int cores = Runtime.getRuntime().availableProcessors();
+        System.out.println("логических процессоров: " + cores);
+        int tasks = 288;
+        for (int threads : new int[] {1, cores / 2, cores, cores * 4, cores * 16}) {
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            List&lt;Future&lt;Long&gt;&gt; fs = new ArrayList&lt;&gt;();
+            long t0 = System.nanoTime();
+            for (int i = 0; i &lt; tasks; i++) { long s = i; fs.add(pool.submit(() -&gt; work(s))); }
+            long sum = 0;
+            for (Future&lt;Long&gt; f : fs) sum += f.get();
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            pool.shutdown();
+            System.out.printf("потоков %4d: %5d мс  (%x)%n", threads, ms, sum &amp; 0xF);
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Где будет минимум времени? Что произойдёт при 4× и 16× больше потоков, чем процессоров?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Oversub.java
+java Oversub</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">логических процессоров: 18
+потоков    1:   351 мс  (0)
+потоков    9:    45 мс  (0)
+потоков   18:    37 мс  (0)
+потоков   72:    41 мс  (0)
+потоков  288:    40 мс  (0)</code></pre></details>
+<div class="lab-ans" hidden><p>Время падает почти пропорционально до числа <i>физических</i> ядер, дальше рост слабее (SMT-«ядра» и E-ядра делят ресурсы), минимум — около числа логических процессоров. При 4× и 16× потоков быстрее не становится, обычно чуть медленнее: потоков больше, чем процессоров, планировщик вытесняет их по кванту, растут переключения и промахи кэша. Для счётной работы пул больше <code>availableProcessors()</code> не нужен.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-11.4">
+<div class="lab-head"><span class="lab-num">Лаба 11.4</span><b>Thread.State против состояния в ядре</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сравнить, что о потоках говорит Java и что говорит ядро Linux.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>States.java</code>:</div>
+<pre data-title="States.java"><code class="java">import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+
+public class States {
+    static final Map&lt;String, Long&gt; tids = new HashMap&lt;&gt;();
+
+    static String kernelState(long tid) throws IOException {      // третье поле /proc/&lt;pid&gt;/task/&lt;tid&gt;/stat
+        String s = Files.readString(Path.of("/proc/self/task/" + tid + "/stat"));
+        return s.substring(s.lastIndexOf(')') + 2, s.lastIndexOf(')') + 3);
+    }
+
+    static void register(String name) {
+        Thread.currentThread().setName(name);
+        try {
+            long tid = Long.parseLong(Files.readSymbolicLink(Path.of("/proc/thread-self")).getFileName().toString());
+            synchronized (tids) { tids.put(name, tid); }
+        } catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Object lock = new Object();
+        Process sleeper = new ProcessBuilder("sleep", "30").start();   // канал, в который никто не пишет
+        Thread[] ts = {
+            new Thread(() -&gt; { register("счёт"); long x = 0; while (true) x++; }),
+            new Thread(() -&gt; { register("sleep"); try { Thread.sleep(30_000); } catch (InterruptedException e) { } }),
+            new Thread(() -&gt; { register("монитор"); synchronized (lock) { } }),
+            new Thread(() -&gt; { register("чтение"); try { sleeper.getInputStream().read(); } catch (IOException e) { } }),
+        };
+        synchronized (lock) {
+            for (Thread t : ts) { t.setDaemon(true); t.start(); }
+            Thread.sleep(800);
+            for (Thread t : ts)
+                System.out.printf("%-8s Java: %-14s ядро: %s%n", t.getName(), t.getState(), kernelState(tids.get(t.getName())));
+        }
+        sleeper.destroy();
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab java States.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">счёт     Java: RUNNABLE       ядро: R
+sleep    Java: TIMED_WAITING  ядро: S
+монитор  Java: BLOCKED        ядро: S
+чтение   Java: RUNNABLE       ядро: S</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие состояния покажут Java и ядро для каждого из четырёх потоков?</div>
+<div class="lab-ans" hidden><p>«счёт» — <code>RUNNABLE</code> / <code>R</code>: совпадает. «sleep» — <code>TIMED_WAITING</code> / <code>S</code>. «монитор» — <code>BLOCKED</code> / <code>S</code>: ожидание монитора в ядре — это сон на futex. «чтение» — <code>RUNNABLE</code> / <code>S</code>: Java считает поток работающим, а он спит в ядре в <code>read</code> из пустого канала. Именно поэтому «много RUNNABLE в дампе» не означает загрузки процессора.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">11.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что такое процесс-зомби?</p><ul><li>процесс, который завис и не отвечает</li><li>завершившийся процесс, чей код завершения ещё не забрал родитель через wait</li><li>процесс без родителя</li><li>процесс, убитый OOM killer</li></ul><div class="why">Зомби почти ничего не занимает, но держит PID. Много зомби — признак родителя, который не вызывает wait (или PID 1 в контейнере, не собирающего детей).</div></div>
+<div class="mcq" data-ok="3"><p>Поток Java заблокирован в <code>socket.getInputStream().read()</code>. Какое у него <code>Thread.State</code>?</p><ul><li>BLOCKED</li><li>WAITING</li><li>TIMED_WAITING</li><li>RUNNABLE, хотя в ядре он спит (S)</li></ul><div class="why">JVM не отслеживает, что нативный вызов заблокирован. Смотрите стек: верхний кадр — нативный метод чтения.</div></div>
+<div class="mcq" data-ok="0"><p>Почему справедливый планировщик (CFS/EEVDF) быстро запускает проснувшийся интерактивный поток?</p><ul><li>поток мало работал, его виртуальное время отстаёт, и он оказывается первым в очереди</li><li>у интерактивных потоков приоритет реального времени</li><li>планировщик угадывает по имени процесса</li><li>интерактивные потоки работают на отдельном ядре</li></ul><div class="why">Без эвристик: справедливость по vruntime сама даёт отзывчивость.</div></div>
+<div class="mcq" data-ok="2"><p>Счётная задача на 8-ядерной машине. Что будет, если запустить её в пуле из 64 потоков вместо 8?</p><ul><li>в 8 раз быстрее</li><li>так же быстро</li><li>не быстрее, а обычно чуть медленнее: потоки вытесняют друг друга, растут переключения и промахи кэша</li><li>JVM упадёт</li></ul><div class="why">Процессоров 8 — одновременно работает максимум 8 потоков.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните fork и exec. Зачем их два?</summary><div class="a"><p>fork создаёт копию процесса (с copy-on-write памятью и копией дескрипторов), exec заменяет программу внутри процесса, сохраняя PID и открытые файлы. Между ними потомок настраивает окружение для новой программы — перенаправления, каталог, права. Так shell реализует конвейеры и перенаправления. Для эффективности есть posix_spawn и vfork, которые не копируют адресное пространство.</p></div></details>
+<details class="q"><summary>Что сохраняется и восстанавливается при переключении контекста и сколько это стоит?</summary><div class="a"><p>Регистры потока (общие, RIP, RSP, флаги, векторные), при смене процесса — CR3 и, частично, TLB. Прямая цена — микросекунды вместе с работой планировщика; косвенная — холодные кэши и TLB после переключения. Поэтому лишние потоки и частые блокировки снижают производительность, а виртуальные потоки, переключаемые без ядра, дешевле на порядок.</p></div></details>
+<details class="q"><summary>Почему Thread.setPriority почти бесполезен на Linux?</summary><div class="a"><p>HotSpot на Linux по умолчанию не отображает Java-приоритеты на nice (флаг ThreadPriorityPolicy требует прав и специальных настроек), и все потоки JVM получают одинаковый вес. Управлять долей процессора правильнее на уровне процесса или контейнера: nice, cgroups (cpu.weight, лимиты CPU).</p></div></details>
+<details class="q"><summary>Как выбрать размер пула потоков?</summary><div class="a"><p>Для счётных задач — число ядер. Для задач с ожиданием — ядра × (1 + ожидание/счёт), проверяя замером. Учитывать общие ограничения: размер пула соединений, лимиты удалённых сервисов. Если одновременных ожиданий тысячи — виртуальные потоки или асинхронный ввод-вывод вместо огромного пула.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

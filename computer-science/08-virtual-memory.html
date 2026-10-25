@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Виртуальная память</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ПАМЯТЬ</div>
+  <h1>Виртуальная память</h1>
+  <p class="lead">Ни одна программа не видит настоящих адресов оперативной памяти. Каждый процесс живёт в собственном виртуальном адресном пространстве, а процессор на каждом обращении переводит виртуальный адрес в физический по таблицам страниц, которые ведёт ядро. Это даёт изоляцию процессов, защиту памяти, ленивое выделение, отображение файлов, общие библиотеки и copy-on-write. И объясняет, почему у JVM с <code>-Xmx4g</code> «виртуальной» памяти 7 ГБ, а «настоящей» — 100 МБ.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">страницы</span><span class="tag">таблицы страниц</span><span class="tag">MMU и TLB</span><span class="tag">page fault</span><span class="tag">mmap</span><span class="tag">copy-on-write</span><span class="tag">huge pages</span><span class="tag">RSS и overcommit</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">8.1</span>Зачем нужна виртуальная память</h2>
+<p>Без неё программа работала бы с физическими адресами: любая ошибка в одной программе портила бы чужую память, каждая программа должна была бы знать, куда её загрузили, а памяти было бы ровно столько, сколько стоит планок. Виртуальная память решает всё это одним механизмом — <b>трансляцией адресов</b>:</p>
+<ul>
+  <li><b>Изоляция</b>: адрес <code>0x7fff…</code> в процессе A и тот же адрес в процессе B — разные физические ячейки. Процесс физически не может адресовать чужую память.</li>
+  <li><b>Защита</b>: у каждой страницы есть права — чтение, запись, исполнение, доступ из пользовательского режима. Запись в код или исполнение данных вызывает аппаратное исключение.</li>
+  <li><b>Ленивость</b>: адресное пространство можно зарезервировать, не выделяя физической памяти; страница появляется при первом обращении.</li>
+  <li><b>Общие страницы</b>: код <code>libc</code> или <code>libjvm.so</code> загружен в память один раз и отображён во все процессы; после <code>fork</code> родитель и потомок делят страницы до первой записи.</li>
+  <li><b>Отображение файлов</b>: файл можно «положить» в адресное пространство и работать с ним как с массивом.</li>
+</ul>
+
+<h2 id="paging"><span class="h-num">8.2</span>Страницы и таблицы страниц</h2>
+<p>Память делится на <b>страницы</b> — обычно по 4 КБ (на Apple M и некоторых ARM-серверах — 16 КБ или 64 КБ). Трансляция работает постранично: младшие 12 бит адреса — смещение внутри страницы, остальные — номер виртуальной страницы, который отображается в номер физической (кадра, frame).</p>
+<p>Таблица «номер страницы → кадр» для 48-битного адресного пространства содержала бы 2³⁶ записей — 512 ГБ на процесс. Поэтому она <b>многоуровневая</b>: дерево, где хранятся только используемые ветви. На x86-64 — четыре уровня по 9 бит индекса (PML4 → PDPT → PD → PT), с 5-уровневыми таблицами (LA57) — пять уровней и 57-битные адреса.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" role="img" aria-label="48-битный виртуальный адрес разбит на четыре 9-битных индекса таблиц и 12-битное смещение">
+  <defs><marker id="pt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <g font-size="12.5">
+    <rect x="20" y="14" width="120" height="36" rx="5" class="box"/><text x="80" y="37" text-anchor="middle" class="muted">47…63: копии бита 47</text>
+    <rect x="140" y="14" width="130" height="36" rx="5" class="box-info"/><text x="205" y="37" text-anchor="middle">PML4 (9 бит)</text>
+    <rect x="270" y="14" width="130" height="36" rx="5" class="box-acc"/><text x="335" y="37" text-anchor="middle">PDPT (9 бит)</text>
+    <rect x="400" y="14" width="130" height="36" rx="5" class="box-warn"/><text x="465" y="37" text-anchor="middle">PD (9 бит)</text>
+    <rect x="530" y="14" width="130" height="36" rx="5" class="box-ok"/><text x="595" y="37" text-anchor="middle">PT (9 бит)</text>
+    <rect x="660" y="14" width="140" height="36" rx="5" class="box"/><text x="730" y="37" text-anchor="middle">смещение (12 бит)</text>
+    <rect x="20" y="100" width="90" height="40" rx="6" class="box-bad"/><text x="65" y="125" text-anchor="middle" class="mono">CR3</text>
+    <rect x="140" y="90" width="130" height="60" rx="6" class="box-info"/><text x="205" y="125" text-anchor="middle">таблица L4</text>
+    <rect x="290" y="90" width="110" height="60" rx="6" class="box-acc"/><text x="345" y="125" text-anchor="middle">L3</text>
+    <rect x="420" y="90" width="110" height="60" rx="6" class="box-warn"/><text x="475" y="125" text-anchor="middle">L2</text>
+    <rect x="550" y="90" width="110" height="60" rx="6" class="box-ok"/><text x="605" y="125" text-anchor="middle">L1 → кадр</text>
+    <rect x="680" y="90" width="120" height="60" rx="6" class="box"/><text x="740" y="117" text-anchor="middle">физическая</text><text x="740" y="135" text-anchor="middle">страница</text>
+    <path d="M110 120 L138 120" class="ln-acc" marker-end="url(#pt)"/><path d="M270 120 L288 120" class="ln-acc" marker-end="url(#pt)"/><path d="M400 120 L418 120" class="ln-acc" marker-end="url(#pt)"/><path d="M530 120 L548 120" class="ln-acc" marker-end="url(#pt)"/><path d="M660 120 L678 120" class="ln-acc" marker-end="url(#pt)"/>
+    <text x="20" y="180" class="muted">CR3 — регистр с физическим адресом корневой таблицы текущего процесса; ядро меняет его при переключении процессов.</text>
+    <text x="20" y="200" class="muted">Каждая таблица — одна страница из 512 записей по 8 байт. Запись (PTE): номер кадра + биты present, writable, user, NX,</text>
+    <text x="20" y="218" class="muted">accessed, dirty. Если present = 0 — обращение вызывает page fault, и ядро решает, что делать.</text>
+  </g>
+</svg>
+</figure>
+
+<div class="widget" id="vaW">
+  <div class="widget-title">Разбор виртуального адреса x86-64</div>
+  <p class="hint">Вставьте адрес из лабораторной (например, адрес локальной переменной из главы 04) — увидите, по каким индексам процессор пройдёт таблицы.</p>
+  <div class="controls"><label>адрес (hex)<input type="text" id="vaIn" value="0x7fffd42b9ed8"></label>
+    <button class="btn" type="button" data-v="0x7fffd42b9ed8">стек</button><button class="btn" type="button" data-v="0x401352">код</button><button class="btn" type="button" data-v="0x138e1010">куча malloc</button><button class="btn" type="button" data-v="0xffff800000000000">ядро</button><button class="btn" type="button" data-v="0x0000900000000000">неканонический</button></div>
+  <div class="out" id="vaOut"></div>
+</div>
+<script>
+(function () {
+  var inp = document.getElementById("vaIn"), out = document.getElementById("vaOut");
+  function run() {
+    var t = inp.value.trim().toLowerCase().replace(/^0x/, "").replace(/_/g, "");
+    if (!/^[0-9a-f]{1,16}$/.test(t)) { out.textContent = "Введите шестнадцатеричный адрес"; return; }
+    var v = BigInt("0x" + t), b47 = (v >> 47n) & 1n, top = v >> 48n;
+    var canon = (b47 === 0n && top === 0n) || (b47 === 1n && top === 0xffffn);
+    var idx = function (sh) { return Number((v >> BigInt(sh)) & 511n); };
+    var L = [];
+    L.push("адрес        0x" + v.toString(16).padStart(16, "0"));
+    L.push("двоично      " + v.toString(2).padStart(64, "0").replace(/(.{4})(?=.)/g, "$1 "));
+    if (!canon) { L.push("\nНеканонический адрес: биты 48–63 должны повторять бит 47. Обращение по нему — общее исключение защиты (#GP), процесс получит SIGSEGV/SIGBUS."); out.textContent = L.join("\n"); return; }
+    L.push("\nPML4 индекс " + String(idx(39)).padStart(3) + "   (биты 39–47)");
+    L.push("PDPT индекс " + String(idx(30)).padStart(3) + "   (биты 30–38)  — каждая запись покрывает 1 ГБ");
+    L.push("PD   индекс " + String(idx(21)).padStart(3) + "   (биты 21–29)  — каждая запись покрывает 2 МБ");
+    L.push("PT   индекс " + String(idx(12)).padStart(3) + "   (биты 12–20)  — каждая запись покрывает 4 КБ");
+    L.push("смещение    0x" + Number(v & 4095n).toString(16).padStart(3, "0") + " (" + Number(v & 4095n) + ")   (биты 0–11)");
+    L.push("\nномер виртуальной страницы: 0x" + (v >> 12n).toString(16) + ", начало страницы 0x" + ((v >> 12n) << 12n).toString(16));
+    L.push(b47 ? "Верхняя половина адресного пространства — память ядра: из пользовательского режима недоступна (бит user = 0)." : "Нижняя половина — пользовательское пространство процесса (до 128 ТБ).");
+    L.push("Без TLB процессор сделал бы 4 обращения к памяти (по одному на уровень), чтобы найти кадр, — и только потом пятое за самими данными.");
+    out.textContent = L.join("\n");
+  }
+  inp.addEventListener("input", run);
+  document.querySelectorAll("#vaW [data-v]").forEach(function (b) { b.addEventListener("click", function () { inp.value = b.dataset.v; run(); }); });
+  run();
+})();
+</script>
+
+<h2 id="tlb"><span class="h-num">8.3</span>MMU и TLB</h2>
+<p>Трансляцию выполняет блок процессора <b>MMU</b> (memory management unit), аппаратно — ядро ОС лишь заполняет таблицы. Чтобы не обходить четыре уровня на каждом обращении, MMU кэширует готовые переводы в <b>TLB</b> (translation lookaside buffer): L1 dTLB — 64–96 записей, общий L2 TLB — 1–3 тысячи. С 4-КБ страницами L2 TLB покрывает лишь несколько мегабайт: программа, случайно гуляющая по гигабайтам (как в лабе 06.1), промахивается и мимо TLB. Промах TLB — обход таблиц (page walk): 4 зависимых чтения, которые, к счастью, часто попадают в кэш.</p>
+<ul>
+  <li><b>Большие страницы</b> (huge pages): 2 МБ (запись PD указывает сразу на кадр, без уровня PT) и 1 ГБ. Одна запись TLB покрывает в 512 раз больше памяти. Для больших куч JVM — заметный выигрыш (5–20% на некоторых нагрузках): <code>-XX:+UseLargePages</code> (заранее выделенные huge pages) или <code>-XX:+UseTransparentHugePages</code> (THP Linux).</li>
+  <li><b>Переключение процессов</b> меняет CR3 — переводы старого процесса в TLB становятся недействительными. Метки PCID позволяют не сбрасывать TLB полностью. Потоки одного процесса делят таблицы — переключение между ними TLB не трогает.</li>
+  <li><b>TLB shootdown</b>: когда ядро меняет отображение (munmap, mprotect, перенос страницы), оно должно сбросить устаревшие переводы на всех ядрах, где работают потоки процесса, — межпроцессорным прерыванием. Это одна из скрытых цен частых <code>mmap</code>/<code>munmap</code> (в том числе в JVM, когда она отдаёт память ОС).</li>
+</ul>
+
+<h2 id="faults"><span class="h-num">8.4</span>Page fault: что происходит при первом обращении</h2>
+<p>Если запись таблицы отсутствует (present = 0) или права не позволяют операцию, процессор генерирует исключение <b>page fault</b> и передаёт управление ядру (тема 10) с адресом и причиной. Ядро смотрит, что должно быть по этому адресу в описании адресного пространства процесса (области VMA — то, что видно в <code>/proc/&lt;pid&gt;/maps</code>):</p>
+<div class="table-wrap"><table>
+<tr><th>Случай</th><th>Что делает ядро</th><th>Цена</th></tr>
+<tr><td>первое касание анонимной памяти (куча, стек, <code>mmap</code> без файла)</td><td>берёт свободный кадр, заполняет нулями, вписывает в таблицу — <b>minor fault</b></td><td>~0,5–2 мкс на страницу</td></tr>
+<tr><td>первое чтение страницы отображённого файла, которая уже в page cache</td><td>просто вписывает кадр из кэша — minor fault</td><td>микросекунды</td></tr>
+<tr><td>страница файла не в памяти или выгружена в swap</td><td>читает с диска, процесс ждёт — <b>major fault</b></td><td>десятки мкс (SSD) – миллисекунды (HDD)</td></tr>
+<tr><td>запись в страницу copy-on-write (после <code>fork</code>, приватное отображение файла)</td><td>копирует кадр, отдаёт процессу копию с правом записи</td><td>копирование 4 КБ</td></tr>
+<tr><td>адрес вне всех областей или нарушение прав</td><td>посылает процессу сигнал <b>SIGSEGV</b> (в Windows — access violation)</td><td>процесс обычно погибает</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">SIGSEGV — штатный инструмент JVM</span>
+HotSpot сам ловит SIGSEGV и превращает его в нормальное поведение: обращение через <code>null</code> в JIT-коде — это чтение по адресу около нуля без явной проверки (неявная проверка на null), сигнал → JVM бросает <code>NullPointerException</code>. Защитные страницы стека → <code>StackOverflowError</code> (тема 04). Страница опроса safepoint — когда JVM нужно остановить потоки, она делает страницу недоступной (или меняет указатель опроса), и потоки «спотыкаются» на ней (<a href="../jvm/18-threads-locks.html">JVM, тема 18</a>). Поэтому в <code>hs_err</code>-файле аварии бывает SIGSEGV, хотя в обычной работе их тысячи.
+</div>
+
+<h2 id="rss"><span class="h-num">8.5</span>Сколько памяти на самом деле: VSZ, RSS, overcommit</h2>
+<ul>
+  <li><b>VSZ / VmSize</b> — размер всех областей адресного пространства, в том числе только зарезервированных. JVM с <code>-Xmx4g</code> сразу резервирует 4 ГБ под кучу, сотни мегабайт под code cache и class space, по мегабайту под стек каждого потока — VSZ легко достигает 7–10 ГБ.</li>
+  <li><b>RSS / VmRSS</b> (resident set size) — сколько физических страниц сейчас принадлежит процессу. Именно это потребляет оперативную память (за вычетом общих страниц библиотек, которые учитываются у всех). Лимиты контейнеров считают похожую величину.</li>
+  <li><b>Commit</b> в терминах JVM — часть зарезервированного, которую JVM разрешила использовать (<code>-Xms</code> — начальный commit кучи). Физически страницы всё равно появляются при касании; <code>-XX:+AlwaysPreTouch</code> касается их все при старте — медленнее запуск, но без page faults в работе и с честным RSS.</li>
+  <li><b>Overcommit</b>: Linux по умолчанию разрешает зарезервировать больше, чем есть памяти, надеясь, что всё сразу не понадобится. Если понадобится — <b>OOM killer</b> выбирает процесс-жертву и убивает его <code>SIGKILL</code> без предупреждения (в контейнере — по лимиту cgroup, тема 15). Для JVM это выглядит как внезапная смерть без <code>OutOfMemoryError</code> и без дампа.</li>
+  <li><b>Swap</b>: ядро может выгружать редко используемые страницы на диск. Для JVM это губительно: сборщик мусора обходит всю кучу, и выгруженные страницы превращаются в major faults и паузы в секунды. Серверы с JVM обычно запускают без swap или с минимальной «склонностью» к нему (<code>vm.swappiness</code>).</li>
+</ul>
+
+<h2 id="mmap"><span class="h-num">8.6</span>mmap, copy-on-write и общие страницы</h2>
+<p>Системный вызов <b><code>mmap</code></b> добавляет область в адресное пространство: анонимную (просто память) или отображающую файл. Через него работают <code>malloc</code> для больших блоков, загрузчик библиотек, стеки потоков, куча JVM, <code>FileChannel.map</code> (<code>MappedByteBuffer</code>) и FFM API (<code>Arena</code>, <code>MemorySegment</code>).</p>
+<ul>
+  <li><b>Отображение файла</b>: чтение страницы — копирование не нужно, процесс работает прямо со страницами page cache ядра (тема 12). Так базы данных и Kafka читают большие файлы, а JVM открывает модули JDK (<code>lib/modules</code>) и архив CDS.</li>
+  <li><b>Общие библиотеки</b>: код <code>libjvm.so</code> (~20 МБ) отображён во все Java-процессы машины, а в RAM лежит в одном экземпляре. То же для архива CDS — поэтому он экономит память на машине с десятком JVM.</li>
+  <li><b><code>fork</code> и copy-on-write</b>: потомок получает копию таблиц страниц, а сами страницы становятся общими и только для чтения. При первой записи любой из сторон происходит page fault, ядро копирует одну страницу. Поэтому <code>fork</code> гигантского процесса быстр, а <code>ProcessBuilder</code> в JVM использует <code>posix_spawn</code>/<code>vfork</code>, чтобы не копировать даже таблицы гигабайтной кучи.</li>
+</ul>
+
+<h2 id="jvm"><span class="h-num">8.7</span>JVM и виртуальная память: сводка</h2>
+<div class="table-wrap"><table>
+<tr><th>Область JVM</th><th>Как получена</th><th>Что видно</th></tr>
+<tr><td>куча</td><td>одна резервация на <code>-Xmx</code>, commit по мере роста, может отдаваться ОС (G1, ZGC uncommit)</td><td>большая анонимная область <code>rw-p</code>; при сжатых ссылках — в нижних 32 ГБ адресов</td></tr>
+<tr><td>metaspace и class space</td><td>резервация (class space по умолчанию 1 ГБ), commit кусками</td><td>области под <code>MaxMetaspaceSize</code></td></tr>
+<tr><td>code cache</td><td>резервация 240 МБ (<code>ReservedCodeCacheSize</code>), страницы с правом исполнения</td><td><code>rwxp</code> или переключение прав W^X</td></tr>
+<tr><td>стеки потоков</td><td><code>mmap</code> на каждый поток, защитные страницы</td><td>по области на поток (тема 04)</td></tr>
+<tr><td>прямые буферы, malloc-арены, GC-структуры</td><td><code>malloc</code>/<code>mmap</code> внутри JVM и библиотек</td><td>видно только в NMT (<a href="../jvm/09-runtime-areas.html">JVM, тема 09</a>)</td></tr>
+</table></div>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">8.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Смотрим на виртуальную память процесса Linux изнутри: зарезервированное против резидентного у JVM, цена первого касания страниц, copy-on-write после <code>fork</code> и карта адресного пространства Java-процесса. Лабы — в Docker-образе <code>cs-lab</code>, там есть <code>/proc</code>. Модуль IDEA — <code>cs08</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-8.1">
+<div class="lab-head"><span class="lab-num">Лаба 8.1</span><b>VmSize против VmRSS у JVM</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что JVM резервирует гигабайты адресов, а физическая память появляется по мере касания.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Rss.java</code>:</div>
+<pre data-title="Rss.java"><code class="java">import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Rss {
+    static String mem() throws Exception {
+        StringBuilder b = new StringBuilder();
+        for (String line : Files.readAllLines(Path.of("/proc/self/status")))
+            if (line.startsWith("VmSize") || line.startsWith("VmRSS"))
+                b.append(String.format("%-8s %,10d КБ   ", line.substring(0, line.indexOf(':') + 1),
+                        Long.parseLong(line.replaceAll("[^0-9]", ""))));
+        return b.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("старт:                    " + mem());
+        long[] big = new long[128 * 1024 * 1024];          // 1 ГБ
+        System.out.println("после new long[] на 1 ГБ: " + mem());
+        big = null;
+        System.gc();
+        System.out.println("после GC:                 " + mem());
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab java -Xmx4g Rss.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">старт:                    VmSize:   7,357,844 КБ   VmRSS:      128,016 КБ   
+после new long[] на 1 ГБ: VmSize:   7,624,100 КБ   VmRSS:    1,159,320 КБ   
+после GC:                 VmSize:   8,092,104 КБ   VmRSS:    1,179,388 КБ   </code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Насколько VmSize больше 4 ГБ кучи? Вырастет ли VmRSS сразу после <code>new long[]</code> или только после записи в массив? Уменьшится ли RSS после GC?</div>
+<div class="lab-ans" hidden><p>VmSize на старте ~7 ГБ: 4 ГБ резерва под кучу плюс class space (1 ГБ), code cache (240 МБ), стеки, библиотеки. VmRSS — около 100 МБ. После <code>new long[]</code> RSS сразу растёт на гигабайт: JVM обязана заполнить массив нулями и тем самым касается каждой страницы — хотя мы ещё ничего не записали. После GC RSS здесь не уменьшился, а VmSize даже вырос (GC выделил служебные структуры): G1 умеет возвращать ОС свободные регионы (uncommit), но делает это не всегда и не сразу — память процесса Java редко «отдаётся» мгновенно.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Теперь с предварительным касанием всей кучи:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab java -Xmx4g -Xms4g -XX:+AlwaysPreTouch Rss.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">старт:                    VmSize:   8,356,296 КБ   VmRSS:    4,378,084 КБ   
+после new long[] на 1 ГБ: VmSize:   8,356,296 КБ   VmRSS:    4,386,408 КБ   
+после GC:                 VmSize:   8,356,296 КБ   VmRSS:    4,387,436 КБ   </code></pre></details>
+<p class="lab-note">С <code>AlwaysPreTouch</code> RSS на старте — все 4 ГБ: JVM коснулась каждой страницы кучи при запуске. Запуск дольше, зато в работе нет page faults на первом касании, а нехватка памяти обнаружится сразу, а не через час под нагрузкой.</p>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-8.2">
+<div class="lab-head"><span class="lab-num">Лаба 8.2</span><b>Page faults и copy-on-write</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посчитать page faults при первом касании памяти и увидеть copy-on-write после <code>fork</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>cow.c</code>:</div>
+<pre data-title="cow.c"><code class="txt">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/resource.h&gt;
+#include &lt;sys/wait.h&gt;
+#include &lt;unistd.h&gt;
+
+long faults(void) { struct rusage u; getrusage(RUSAGE_SELF, &amp;u); return u.ru_minflt; }
+
+int main(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    size_t n = 64UL &lt;&lt; 20;                                       // 64 МБ
+    long f0 = faults();
+    char *p = mmap(NULL, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long f1 = faults();
+    for (size_t i = 0; i &lt; n; i += page) p[i] = 1;               // касаемся каждой страницы
+    long f2 = faults();
+    for (size_t i = 0; i &lt; n; i += page) p[i] = 2;               // второй проход
+    long f3 = faults();
+    printf("страница %ld байт\nmmap 64 МБ:           +%ld page faults\nпервая запись:        +%ld\nвторая запись:        +%ld\n",
+           page, f1 - f0, f2 - f1, f3 - f2);
+
+    int x = 42;
+    fflush(stdout);                                              // иначе буфер stdio скопируется в потомка
+    pid_t pid = fork();
+    if (pid == 0) {
+        long a = faults();
+        for (size_t i = 0; i &lt; n; i += page) p[i] = 3;           // пишем во все страницы — каждая копируется
+        x = 100;
+        printf("потомок:  &amp;x=%p x=%d, page faults при записи в 64 МБ: +%ld (copy-on-write)\n", (void *)&amp;x, x, faults() - a);
+        exit(0);
+    }
+    wait(NULL);
+    printf("родитель: &amp;x=%p x=%d, p[0]=%d — адреса те же, данные свои\n", (void *)&amp;x, x, p[0]);
+    return 0;
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O0 -o cow cow.c &amp;&amp; ./cow"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">страница 4096 байт
+mmap 64 МБ:           +0 page faults
+первая запись:        +16384
+вторая запись:        +0
+потомок:  &amp;x=0x7ffc0a0243e8 x=100, page faults при записи в 64 МБ: +16384 (copy-on-write)
+родитель: &amp;x=0x7ffc0a0243e8 x=42, p[0]=2 — адреса те же, данные свои</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько page faults даст <code>mmap</code> 64 МБ, первая запись и вторая? Сколько — запись потомка в те же 64 МБ после <code>fork</code>?</div>
+<div class="lab-ans" hidden><p><code>mmap</code> — ноль: только резервирование. Первая запись — 16384 (64 МБ / 4 КБ): по minor fault на страницу. Вторая — ноль: страницы уже есть. Потомок после <code>fork</code> снова получает около 16384 faults: все страницы общие и только для чтения, каждая запись — копия страницы (плюс пара страниц стека). Адрес <code>&amp;x</code> у родителя и потомка одинаковый, а значения разные: одинаковые виртуальные адреса отображены на разные физические кадры.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Уберите <code>fflush(stdout)</code> и запустите с выводом в канал: <code>./cow | cat</code>.</summary><div>Первые строки напечатаются дважды: при выводе в канал stdio буферизует целиком, буфер с ещё не выведенным текстом копируется в потомка вместе с памятью, и оба процесса выводят его при завершении. Copy-on-write копирует всё — даже то, о чём вы забыли.</div></details></li>
+<li><details><summary>Добавьте флаг <code>MAP_POPULATE</code> в <code>mmap</code>.</summary><div>Page faults переедут из «первой записи» в сам вызов <code>mmap</code> (ядро заполнит таблицы сразу) — аналог <code>AlwaysPreTouch</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-8.3">
+<div class="lab-head"><span class="lab-num">Лаба 8.3</span><b>Карта памяти Java-процесса</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в адресном пространстве JVM кучу, code cache, библиотеки и стеки потоков.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Maps.java</code>:</div>
+<pre data-title="Maps.java"><code class="java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+public class Maps {
+    public static void main(String[] args) throws Exception {
+        List&lt;String&gt; maps = Files.readAllLines(Path.of("/proc/self/maps"));
+        System.out.println("всего областей: " + maps.size());
+        long total = 0;
+        for (String l : maps) {
+            String[] f = l.split("\\s+", 6);
+            String[] ab = f[0].split("-");
+            long size = Long.parseUnsignedLong(ab[1], 16) - Long.parseUnsignedLong(ab[0], 16);
+            total += size;
+            String name = f.length &gt; 5 ? f[5].trim() : "";
+            if (size &gt;= 64L &lt;&lt; 20 || name.contains("libjvm") || name.contains("[stack]") || name.endsWith("modules") || name.endsWith(".jsa"))
+                System.out.printf("%12s  %s  %,9d КБ  %s%n", ab[0], f[1], size / 1024, name.isEmpty() ? "(анонимная)" : name);
+        }
+        System.out.printf("сумма областей: %,d МБ%n", total &gt;&gt; 20);
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab java -Xmx1g -XX:+UseG1GC Maps.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">всего областей: 200
+    28001000  rw-p      4,784 КБ  /opt/java/openjdk/lib/server/classes.jsa
+    284ad000  rw-p      9,124 КБ  /opt/java/openjdk/lib/server/classes.jsa
+    29160000  ---p  1,047,168 КБ  (анонимная)
+    c0000000  rw-p    251,904 КБ  (анонимная)
+    cf600000  ---p    794,624 КБ  (анонимная)
+    ffe00000  rw-p      1,168 КБ  /opt/java/openjdk/lib/server/classes.jsa
+79c284740000  ---p    116,608 КБ  (анонимная)
+79c28c2d1000  ---p    116,672 КБ  (анонимная)
+79c2934c1000  r--s    142,588 КБ  /opt/java/openjdk/lib/modules
+79c2a3fed000  r--p      2,956 КБ  /opt/java/openjdk/lib/server/libjvm.so
+79c2a42d0000  r-xp     17,012 КБ  /opt/java/openjdk/lib/server/libjvm.so
+79c2a536d000  r--p      3,144 КБ  /opt/java/openjdk/lib/server/libjvm.so
+79c2a567f000  r--p        944 КБ  /opt/java/openjdk/lib/server/libjvm.so
+79c2a576b000  rw-p        172 КБ  /opt/java/openjdk/lib/server/libjvm.so
+7ffce3210000  rw-p        132 КБ  [stack]
+сумма областей: 4,052 МБ</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Найдите в выводе кучу (1 ГБ), class space, code cache, <code>libjvm.so</code> и архив CDS. Какие у них права?</div>
+<div class="lab-ans" hidden><p><b>Куча</b> — две соседние анонимные области с адреса <code>0xc0000000</code> (3 ГБ): ~246 МБ <code>rw-p</code> (commit, <code>-Xms</code> по умолчанию) и ~776 МБ <code>---p</code> (резерв до <code>-Xmx1g</code>). Она заканчивается ровно на 4 ГБ — JVM специально положила кучу ниже 4 ГБ, чтобы сжатые ссылки работали без базы и сдвига (zero-based compressed oops). <b>Class space</b> — ~1 ГБ <code>---p</code> сразу за архивом CDS <code>classes.jsa</code> (их адрес меняется от запуска к запуску — рандомизация адресного пространства, ASLR). <b>Code cache</b> — две области по ~114 МБ <code>---p</code>: сегменты для профилируемого и оптимизированного кода, пока почти целиком только зарезервированы. <b><code>lib/modules</code></b> — <code>r--s</code>: файл модулей JDK отображён только на чтение и <i>общий</i> (s — shared) для всех процессов. <b><code>libjvm.so</code></b> — несколько областей: код <code>r-xp</code> (17 МБ), константы <code>r--p</code>, данные <code>rw-p</code>. Сумма — около 4 ГБ адресов при RSS ~100 МБ.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">8.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько уровней таблиц страниц обходит процессор x86-64 при промахе TLB (48-битные адреса)?</p><ul><li>1</li><li>2</li><li>4</li><li>12</li></ul><div class="why">PML4 → PDPT → PD → PT, по 9 бит индекса на уровень и 12 бит смещения. С 5-уровневыми таблицами (57 бит) — пять.</div></div>
+<div class="mcq" data-ok="0"><p>JVM запущена с <code>-Xmx8g</code>, но <code>top</code> показывает RSS 300 МБ. Почему?</p><ul><li>JVM резервирует адресное пространство под кучу, а физические страницы появляются только при первом касании</li><li>JVM сжимает кучу</li><li>top показывает неправильно</li><li>куча хранится на диске</li></ul><div class="why">Резервирование (VSZ) и резидентная память (RSS) — разные вещи. -XX:+AlwaysPreTouch заставит коснуться всех страниц при старте.</div></div>
+<div class="mcq" data-ok="3"><p>Что происходит при записи в страницу после <code>fork</code>?</p><ul><li>SIGSEGV</li><li>запись идёт в общую страницу, и её видят оба процесса</li><li>ядро копирует весь процесс</li><li>page fault, ядро копирует одну эту страницу, и процесс пишет в свою копию</li></ul><div class="why">Copy-on-write: общие страницы помечены «только чтение», копия делается лениво по одной странице.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем большие страницы (2 МБ) для JVM с большой кучей?</p><ul><li>они быстрее заполняются нулями</li><li>одна запись TLB покрывает 2 МБ вместо 4 КБ — меньше промахов TLB и обходов таблиц</li><li>они не учитываются в RSS</li><li>без них нельзя больше 32 ГБ</li></ul><div class="why">Цена — фрагментация и задержки при выделении (у THP), поэтому включают осознанно и проверяют замером.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как процессор переводит виртуальный адрес в физический?</summary><div class="a"><p>MMU сначала ищет перевод номера страницы в TLB. При промахе обходит многоуровневую таблицу страниц текущего процесса, начиная с адреса в CR3: индексы уровней — части виртуального адреса. Последняя запись даёт номер физического кадра и права; к нему прибавляется смещение внутри страницы. Если записи нет или права не позволяют — page fault, и решение принимает ядро.</p></div></details>
+<details class="q"><summary>Чем minor page fault отличается от major?</summary><div class="a"><p>Minor — страницу можно предоставить без ввода-вывода: обнулённый новый кадр, страница файла, уже лежащая в page cache, copy-on-write. Major — нужно читать с диска (файл не в кэше, swap): процесс блокируется на время ввода-вывода. Major faults в горячем пути — причина непредсказуемых пауз.</p></div></details>
+<details class="q"><summary>Почему OOM killer убивает Java-процесс без OutOfMemoryError?</summary><div class="a"><p>OutOfMemoryError — это когда JVM не может выделить объект в пределах своей кучи. OOM killer срабатывает на уровне ОС: процесс суммарно (куча + metaspace + стеки + прямые буферы + нативная память) превысил физическую память или лимит cgroup, и ядро завершает его SIGKILL, который нельзя перехватить. Лечение — ограничить все области JVM так, чтобы их сумма с запасом помещалась в лимит.</p></div></details>
+<details class="q"><summary>Как HotSpot использует аппаратную защиту памяти?</summary><div class="a"><p>Неявные проверки на null: обращение по адресу около нуля вызывает SIGSEGV, обработчик JVM превращает его в NullPointerException. Защитные страницы стека — StackOverflowError. Страница опроса safepoint — чтобы остановить потоки. Права W^X на code cache. Отображение файлов (CDS, lib/modules) — для быстрой загрузки и общего использования между процессами.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

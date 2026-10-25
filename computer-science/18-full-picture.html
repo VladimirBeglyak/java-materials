@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Всё вместе: путь java Hello и HTTP-запроса</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ИТОГ</div>
+  <h1>Всё вместе: путь java Hello и HTTP-запроса</h1>
+  <p class="lead">Две сквозные трассы через все слои курса. Первая — от нажатия Enter после <code>java Hello</code> до появления «Привет!» на экране: какие процессы, потоки, стеки, кадры, области памяти и системные вызовы появляются по дороге. Вторая — путь HTTP-запроса к Java-сервису: от сетевой карты до кадра метода контроллера и обратно. Каждый шаг ссылается на главу, где он разобран подробно.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">сквозная трасса</span><span class="tag">что создаётся при старте</span><span class="tag">поток main и его стек</span><span class="tag">первый кадр</span><span class="tag">путь запроса</span><span class="tag">бюджет задержек</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="hello"><span class="h-num">18.1</span>java Hello: от Enter до пикселя</h2>
+<div class="widget stepper">
+  <div class="widget-title">Трасса запуска java Hello</div>
+  <div class="st-stage"><pre class="out" style="min-height:190px"><span data-from="1" data-to="2">[железо → ядро]  клавиша Enter: контроллер клавиатуры → прерывание (тема 10)
+драйвер → подсистема ввода → терминал (в Windows — conhost/Windows Terminal,
+в Linux — эмулятор терминала через псевдотерминал pty)
+оболочка (bash/PowerShell) спала в read() на stdin — ядро её будит (тема 11)</span><span data-from="2" data-to="3">[оболочка → ядро]  разбор строки, поиск java в PATH (stat/access)
+создание процесса: fork/posix_spawn (Linux) или CreateProcess (Windows)
+СОЗДАНО: процесс — task_struct, PID 48, копия дескрипторов (stdin/stdout/stderr — тот же терминал)
+оболочка ждёт его в wait() (тема 11)</span><span data-from="3" data-to="4">[ядро]  execve("/opt/java/openjdk/bin/java", …) (тема 14)
+СОЗДАНО: новое адресное пространство, сегменты ELF лаунчера (16 КБ) и ld-linux,
+стек ГЛАВНОГО потока процесса (лимит ulimit -s = 8 МБ) с argv, envp, auxv на вершине (темы 04, 08)
+RIP = точка входа динамического загрузчика</span><span data-from="4" data-to="5">[ld.so]  отображает libc.so.6, libjli.so (по RPATH $ORIGIN/../lib), релокации, GOT
+→ main() лаунчера: разбор -cp, -Xss, -Xmx, JDK_JAVA_OPTIONS
+dlopen(".../lib/server/libjvm.so") — 30 МБ кода виртуальной машины (тема 14)</span><span data-from="5" data-to="6">[лаунчер]  НЕ запускает JVM в изначальном потоке: размер его стека задан ОС
+pthread_create с размером стека из -Xss (1 МБ) → mmap(MAP_STACK) + clone(CLONE_VM|CLONE_THREAD…)
+СОЗДАНО: поток TID 49 — будущий Java-поток main, его нативный стек 1 МБ (тема 04)
+изначальный поток 48 будет ждать его в pthread_join</span><span data-from="6" data-to="7">[JVM, поток 49]  JNI_CreateJavaVM: разбор флагов, эргономика по /proc и cgroups (тема 15)
+СОЗДАНО: резерв кучи (mmap -Xmx, ниже 4 ГБ для сжатых ссылок), class space 1 ГБ,
+code cache 240 МБ, metaspace — пока почти без физических страниц (тема 08)
+генерация шаблонного интерпретатора и заглушек в машинный код (тема 09)</span><span data-from="7" data-to="8">[JVM]  служебные потоки — каждый со своим стеком (clone): VM Thread, потоки GC,
+C1/C2 CompilerThread, Signal Dispatcher, Reference Handler, Finalizer, Common-Cleaner…
+→ около 18 потоков ОС в процессе (лаба 18.2)
+mmap lib/modules (r--s) и архива CDS classes.jsa: java.base уже разобран (темы 08, 09)</span><span data-from="8" data-to="9">[JVM]  initPhase1–3: System.out (FileOutputStream на дескрипторе 1 + буфер + кодировка),
+система модулей, загрузчики классов; прикладной загрузчик читает /tmp/Hello.class (openat, read)
+линковка и инициализация класса Hello (JVM, темы 05–06)</span><span data-from="9" data-to="10">[интерпретатор, поток 49]  ПЕРВЫЙ JAVA-КАДР: Hello.main(String[]) на нативном стеке потока
+кадр: слот 0 = args (ссылка на String[] в куче), стек операндов, Method*, bcp (тема 04, JVM 03)
+каждый вызов (println → PrintStream.write → … ) — новый кадр ниже предыдущего
+объекты строки — в TLAB в куче (bump pointer, JVM 11)</span><span data-from="10" data-to="11">[JVM → ядро]  "Привет!" → UTF-8 (12 байт + \n, тема 01) → write(1, …, 14) — системный вызов (тема 10)
+ядро: дескриптор 1 → псевдотерминал → процесс терминала просыпается и читает байты</span><span data-from="11" data-to="12">[терминал → GPU]  декодирует UTF-8, берёт глифы шрифта, растеризует текст,
+композитор окон собирает кадр на GPU → буфер кадра → контроллер дисплея на следующей VSync (тема 16)
+пиксели «Привет!» на экране — ~примерно через 100–300 мс после Enter</span><span data-from="12">[завершение]  main вернулся → DestroyJavaVM: ожидание недемонов, shutdown hooks,
+потоки JVM завершаются; изначальный поток 48 выходит из pthread_join и вызывает exit_group(0)
+ядро освобождает адресное пространство, закрывает дескрипторы, процесс — зомби до wait() оболочки
+оболочка получает код 0 и печатает приглашение (тема 11)</span></pre></div>
+  <section class="st-step" data-t="Нажатие Enter"><p>Аппаратное прерывание, драйвер, пробуждение спящей оболочки.</p></section>
+  <section class="st-step" data-t="Новый процесс"><p>Оболочка создаёт процесс; он наследует открытые терминальные дескрипторы.</p></section>
+  <section class="st-step" data-t="execve"><p>Ядро загружает исполняемый файл и строит стек главного потока.</p></section>
+  <section class="st-step" data-t="Динамическая компоновка"><p>Лаунчер — маленькая C-программа; виртуальная машина подгружается как библиотека.</p></section>
+  <section class="st-step" data-t="Поток main"><p>Ключевой момент: Java-метод main исполнится не в изначальном потоке, а в новом, со стеком размера -Xss.</p></section>
+  <section class="st-step" data-t="Память JVM"><p>Резервируются области; физические страницы появятся при касании.</p></section>
+  <section class="st-step" data-t="Служебные потоки"><p>GC, JIT, VM Thread и другие — каждый со своим стеком и guard-зонами.</p></section>
+  <section class="st-step" data-t="Классы"><p>Ядро java.base — из CDS, Hello.class — с диска (через page cache).</p></section>
+  <section class="st-step" data-t="Первый кадр"><p>Интерпретатор создаёт кадр main и исполняет байткод.</p></section>
+  <section class="st-step" data-t="write в ядро"><p>Строка превращается в байты и уходит системным вызовом.</p></section>
+  <section class="st-step" data-t="Экран"><p>Терминал и GPU превращают байты в пиксели.</p></section>
+  <section class="st-step" data-t="Выход"><p>Обратная последовательность: потоки, память, процесс, wait.</p></section>
+</div>
+
+<h2 id="created"><span class="h-num">18.2</span>Что и где создаётся при старте программы</h2>
+<p>Сводная таблица — ответ на вопрос «что такое поток, как создаётся стек, что такое кадр и что где хранится» для Java-программы на Linux x86-64:</p>
+<div class="table-wrap"><table>
+<tr><th>Сущность</th><th>Кто и когда создаёт</th><th>Где живёт</th><th>Что внутри</th></tr>
+<tr><td><b>процесс</b></td><td>ядро — по fork/posix_spawn + execve</td><td>структуры ядра (<code>task_struct</code>, <code>mm_struct</code>, таблица дескрипторов)</td><td>адресное пространство, дескрипторы, права, потоки</td></tr>
+<tr><td><b>изначальный поток процесса</b></td><td>ядро при execve</td><td>стек у верхней границы адресов, лимит <code>ulimit -s</code>, растёт по page faults</td><td>кадры лаунчера C; в нём JVM <i>не</i> исполняет Java-код</td></tr>
+<tr><td><b>поток Java main</b></td><td>лаунчер: <code>pthread_create</code> → <code>mmap</code> стека + <code>clone</code></td><td>стек размера <code>-Xss</code> в области mmap + guard-зоны HotSpot (тема 04)</td><td>кадры нативного кода JVM, затем Java-кадры <code>main</code> и всего, что он вызывает</td></tr>
+<tr><td><b>служебные потоки JVM</b></td><td>JVM при старте (и GC/JIT по мере надобности)</td><td>свои стеки</td><td>GC, компиляция, safepoint-операции, обработка ссылок и сигналов</td></tr>
+<tr><td><b>кадр Java-метода</b></td><td>интерпретатор или JIT-код — при каждом вызове</td><td>на нативном стеке потока, ниже кадра вызывающего</td><td>слоты локальных переменных (примитивы и <b>ссылки</b>), стек операндов, ссылка на метод, позиция в байткоде, мониторы; у JIT-кадра — регистры и «пролитые» значения</td></tr>
+<tr><td><b>объекты</b></td><td><code>new</code> — в TLAB потока</td><td>куча Java (одна резервация <code>mmap</code> на <code>-Xmx</code>)</td><td>заголовок + поля; на стеке — только ссылки на них</td></tr>
+<tr><td><b>классы</b></td><td>загрузчики классов при первом использовании</td><td>metaspace и class space (метаданные), объект <code>Class</code> со static-полями — в куче</td><td>байткод, пул констант, vtable</td></tr>
+<tr><td><b>машинный код</b></td><td>генерация интерпретатора при старте, JIT по счётчикам</td><td>code cache (исполняемые страницы)</td><td>скомпилированные методы, заглушки</td></tr>
+<tr><td><b>виртуальный поток</b></td><td><code>Thread.ofVirtual().start()</code></td><td>объект в куче; исполняется на стеке потока-носителя, при парковке кадры копируются в кучу</td><td>продолжение (Continuation) и его StackChunk</td></tr>
+</table></div>
+
+<h2 id="request"><span class="h-num">18.3</span>Путь HTTP-запроса к Java-сервису</h2>
+<div class="widget stepper">
+  <div class="widget-title">GET /orders/42 → Spring Boot в контейнере Kubernetes</div>
+  <div class="st-stage"><pre class="out" style="min-height:170px"><span data-from="1" data-to="2">[сеть → NIC]  пакеты TCP приходят на сервер; сетевая карта по DMA кладёт их в кольцо приёма
+прерывание → softirq → стек TCP/IP ядра → iptables/eBPF Kubernetes переадресуют
+на IP пода (виртуальная пара veth в сетевом пространстве имён пода, тема 15)</span><span data-from="2" data-to="3">[ядро → JVM]  данные — в буфере приёма сокета соединения (keep-alive: соединение уже принято раньше)
+поток-poller Tomcat/Netty в epoll_wait просыпается (тема 13)
+или виртуальный поток, запаркованный на read, ставится в очередь носителей</span><span data-from="3" data-to="4">[JVM]  поток обработки (из пула Tomcat или виртуальный) читает байты из сокета (read)
+HTTP-парсер создаёт объекты запроса в TLAB — короткоживущие, умрут в молодом поколении (JVM 12)
+код горячий: методы давно скомпилированы C2, виртуальные вызовы встроены по профилю (тема 05, JVM 17)</span><span data-from="4" data-to="5">[стек потока]  кадры: Thread.run → … → DispatcherServlet → прокси Spring (CGLIB/JDK proxy)
+→ OrderController.get(42) → OrderService → репозиторий — 50–150 кадров (тема 04)
+локальные переменные — в регистрах и кадрах; объекты — в куче, их поля читаются mov со смещением (тема 03)</span><span data-from="5" data-to="6">[JVM → БД]  JDBC берёт соединение из пула (HikariCP: CAS, без блокировки ядра, тема 07)
+write в сокет к PostgreSQL → ядро → сеть → БД → ответ → поток ждёт в read
+(платформенный поток спит в ядре — S; виртуальный паркуется и освобождает носитель, тема 13)</span><span data-from="6" data-to="7">[БД]  поиск по индексу: B-дерево в буферном кэше PostgreSQL (RAM) — микросекунды;
+если страницы нет в памяти — чтение с NVMe (десятки мкс, тема 12); коммит — fsync WAL (мс)</span><span data-from="7" data-to="8">[JVM]  ответ: ResultSet → объект Order → Jackson → JSON-байты UTF-8 в буфере
+write в сокет клиента → буфер отправки ядра → сегменты TCP → NIC по DMA → сеть
+кадры снимаются при возврате; объекты запроса становятся мусором</span><span data-from="8">[фон]  тем временем: G1/ZGC в своих потоках помечают и освобождают память (JVM 12–13),
+JIT докомпилирует новые горячие пути, планировщик ОС делит ядра между потоками (тема 11),
+и если у пода тесный limits.cpu — квота выгорает на всплеске, и часть запросов ждёт троттлинга (тема 15)</span></pre></div>
+  <section class="st-step" data-t="Пакет в сервер"><p>Сетевая карта, прерывание, стек TCP/IP, правила маршрутизации к поду.</p></section>
+  <section class="st-step" data-t="Пробуждение"><p>epoll или парковка виртуального потока — кто-то должен узнать, что данные пришли.</p></section>
+  <section class="st-step" data-t="Разбор запроса"><p>Горячий скомпилированный код и короткоживущие объекты.</p></section>
+  <section class="st-step" data-t="Стек вызовов"><p>Десятки кадров фреймворка до вашего метода.</p></section>
+  <section class="st-step" data-t="Запрос в БД"><p>Ещё одно сетевое путешествие и ожидание.</p></section>
+  <section class="st-step" data-t="База данных"><p>Буферный кэш, индексы, диск и fsync.</p></section>
+  <section class="st-step" data-t="Ответ"><p>Сериализация, write, сеть.</p></section>
+  <section class="st-step" data-t="Фоновая работа"><p>GC, JIT и планировщик работают параллельно с запросами.</p></section>
+</div>
+
+<h2 id="budget"><span class="h-num">18.4</span>Бюджет задержек</h2>
+<p>Числа, которые полезно держать в голове (порядки на 2026 год; ваша машина — в лабах этого курса):</p>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Время</th><th>Глава</th></tr>
+<tr><td>сложение в регистре</td><td>0,2–0,3 нс</td><td>03</td></tr>
+<tr><td>вызов функции</td><td>~1 нс</td><td>04, 10</td></tr>
+<tr><td>чтение L1 / L2 / L3</td><td>~1 / 4 / 10–30 нс</td><td>06</td></tr>
+<tr><td>неверно предсказанный переход</td><td>~5 нс</td><td>05</td></tr>
+<tr><td>CAS без конкуренции / с конкуренцией</td><td>~5 нс / ~50–100 нс</td><td>07</td></tr>
+<tr><td>чтение оперативной памяти (промах всех кэшей)</td><td>~100 нс</td><td>06</td></tr>
+<tr><td>системный вызов</td><td>~100–200 нс</td><td>10</td></tr>
+<tr><td>переключение контекста (пара потоков ОС)</td><td>~5–30 мкс на круг</td><td>11</td></tr>
+<tr><td>сжать 1 КБ, SHA-256 1 КБ</td><td>~1–3 мкс</td><td>16</td></tr>
+<tr><td>случайное чтение 4 КБ с NVMe</td><td>~20–100 мкс</td><td>12</td></tr>
+<tr><td>круг по сети внутри дата-центра</td><td>~100–500 мкс</td><td>13</td></tr>
+<tr><td>fsync на SSD</td><td>~0,5–3 мс</td><td>12</td></tr>
+<tr><td>пауза молодой сборки G1 / ZGC</td><td>~1–20 мс / &lt; 1 мс</td><td>JVM 13</td></tr>
+<tr><td>троттлинг CPU в контейнере</td><td>до десятков мс</td><td>15</td></tr>
+<tr><td>круг между континентами</td><td>~80–150 мс</td><td>сети</td></tr>
+<tr><td>старт JVM / прогрев до пиковой скорости</td><td>~50 мс / секунды – минуты</td><td>09, JVM 16</td></tr>
+</table></div>
+<div class="widget" id="budW">
+  <div class="widget-title">Если бы 1 нс была 1 секундой</div>
+  <div class="out" id="budOut"></div>
+</div>
+<script>
+(function () {
+  var R = [["сложение", 0.3], ["L1", 1], ["L3", 20], ["оперативная память", 100], ["системный вызов", 150], ["переключение потоков", 10000], ["NVMe 4 КБ", 50000], ["сеть в ДЦ", 300000], ["fsync", 2000000], ["Москва — Нью-Йорк и обратно", 120000000], ["старт JVM", 50000000]];
+  function h(s) { if (s < 60) return s.toFixed(1) + " с"; if (s < 3600) return (s / 60).toFixed(1) + " мин"; if (s < 86400) return (s / 3600).toFixed(1) + " ч"; if (s < 86400 * 365) return (s / 86400).toFixed(1) + " дн"; return (s / 86400 / 365).toFixed(1) + " лет"; }
+  document.getElementById("budOut").textContent = R.map(function (r) { return r[0].padEnd(30) + h(r[1]); }).join("\n") + "\n\nОдин промах в память — полторы минуты «работы впустую»; один запрос к соседнему сервису — три с половиной дня. Отсюда главное правило производительности: не считать быстрее, а реже ждать.";
+})();
+</script>
+
+<h2 id="map"><span class="h-num">18.5</span>Где искать проблему: слой за слоем</h2>
+<div class="table-wrap"><table>
+<tr><th>Симптом</th><th>Слой</th><th>Инструмент</th></tr>
+<tr><td>высокая загрузка CPU, горячий метод</td><td>процессор, JIT</td><td>async-profiler, JFR (флеймграф), <code>top -H</code></td></tr>
+<tr><td>CPU не загружен, но медленно</td><td>ожидание: ввод-вывод, блокировки, сеть, троттлинг</td><td>дамп потоков (SIGQUIT, <code>jcmd Thread.print</code>), <code>cpu.stat</code>, wall-clock профиль</td></tr>
+<tr><td>редкие длинные паузы</td><td>GC, safepoint, троттлинг, swap, major faults</td><td><code>-Xlog:gc*,safepoint</code>, <code>vmstat</code>, <code>cpu.stat</code></td></tr>
+<tr><td>растёт RSS при стабильной куче</td><td>нативная память: потоки, metaspace, буферы, malloc</td><td>NMT (<code>-XX:NativeMemoryTracking</code>), <code>/proc/&lt;pid&gt;/smaps</code></td></tr>
+<tr><td>код 137 / OOMKilled</td><td>лимит памяти cgroup</td><td>события Kubernetes, <code>memory.max</code>, расчёт всех областей JVM</td></tr>
+<tr><td>многопоточная версия медленнее однопоточной</td><td>кэш-когерентность, конкуренция</td><td><code>perf c2c</code>, JFR (contention), профиль блокировок</td></tr>
+<tr><td>медленный старт</td><td>загрузка классов, JIT, троттлинг на старте</td><td><code>-Xlog:startuptime</code>, <code>-Xlog:class+load</code>, CDS/AOT cache</td></tr>
+</table></div>
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">18.6</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Проходим трассу запуска Java-программы по настоящим системным вызовам с отметками времени и проверяем главный факт главы: Java-метод <code>main</code> исполняется не в изначальном потоке процесса. Лабы — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs18</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-18.1">
+<div class="lab-head"><span class="lab-num">Лаба 18.1</span><b>Хронология запуска java Hello</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть по времени ключевые вехи: execve, загрузку libjli и libjvm, создание потока main, отображение модулей и CDS, служебные потоки, загрузку Hello.class, write и exit_group.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Hello.java</code>:</div>
+<pre data-title="Hello.java"><code class="java">import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Hello {
+    public static void main(String[] args) throws Exception {
+        long pid = ProcessHandle.current().pid();
+        long tid = Long.parseLong(Files.readSymbolicLink(Path.of("/proc/thread-self")).getFileName().toString());
+        try (var tasks = Files.list(Path.of("/proc/self/task"))) {
+            System.out.println("PID процесса " + pid + ", поток main — TID " + tid + ", потоков ОС: " + tasks.count());
+        }
+        System.out.println("Привет!");
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp Hello.java &amp;&amp; strace -f -tt -e trace=execve,openat,clone,write,exit_group java -cp /tmp Hello 2&gt;&amp;1 | grep -E 'execve|libjli|libjvm|classes.jsa|lib/modules|Hello.class|clone|write.1|exit_group' | grep -v ENOENT"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">13:03:17.745023 execve("/opt/java/openjdk/bin/java", ["java", "-cp", "/tmp", "Hello"], 0x7fff0c486288 /* 11 vars */) = 0
+13:03:17.747945 openat(AT_FDCWD, "/opt/java/openjdk/bin/../lib/libjli.so", O_RDONLY|O_CLOEXEC) = 3
+13:03:17.761731 openat(AT_FDCWD, "/opt/java/openjdk/lib/server/libjvm.so", O_RDONLY|O_CLOEXEC) = 3
+13:03:17.773385 clone(child_stack=0x77faed886f70
+[pid    47] 13:03:17.786426 openat(AT_FDCWD, "/opt/java/openjdk/lib/modules", O_RDONLY) = 3
+[pid    47] 13:03:17.846167 clone(child_stack=0x77faec689f70
+[pid    47] 13:03:17.850211 clone(child_stack=0x77faec588f70
+[pid    47] 13:03:17.854269 clone(child_stack=0x77faec487f70
+[pid    47] 13:03:17.871278 clone(child_stack=0x77fac8bf4f70
+[pid    47] 13:03:17.873744 clone(child_stack=0x77fac8af3f70
+[pid    47] 13:03:17.878222 openat(AT_FDCWD, "/opt/java/openjdk/lib/server/classes.jsa", O_RDONLY|O_CLOEXEC) = 4
+[pid    47] 13:03:17.883856 clone(child_stack=0x77fac89f2f70
+[pid    53] 13:03:17.887935 clone(child_stack=0x77fac88f1f70
+[pid    53] 13:03:17.890687 clone(child_stack=0x77fac87f0f70
+[pid    54] 13:03:17.890963 clone(child_stack=0x77fac86eff70
+[pid    53] 13:03:17.891298 &lt;... clone resumed&gt;, parent_tid=[55], tls=0x77fac87f16c0, child_tidptr=0x77fac87f1ce8) = 55
+[pid    54] 13:03:17.891453 &lt;... clone resumed&gt;, parent_tid=[56], tls=0x77fac86f06c0, child_tidptr=0x77fac86f0ce8) = 56
+[pid    47] 13:03:17.905543 clone(child_stack=0x77fac87f0f70
+[pid    47] 13:03:17.914468 clone(child_stack=0x77fac89f2f70
+[pid    47] 13:03:17.933313 clone(child_stack=0x77fac88f1f70
+[pid    47] 13:03:17.935947 clone(child_stack=0x77fac86eff70
+[pid    47] 13:03:17.938903 clone(child_stack=0x77fac8301f70
+[pid    47] 13:03:17.941169 clone(child_stack=0x77fac8201f70
+[pid    47] 13:03:17.944340 clone(child_stack=0x77fac8101f70
+[pid    47] 13:03:17.948188 clone(child_stack=0x77faabffef70
+[pid    47] 13:03:17.951464 clone(child_stack=0x77faabefef70
+[pid    47] 13:03:17.962142 clone(child_stack=0x77faabdfef70
+[pid    47] 13:03:17.967625 openat(AT_FDCWD, "/tmp/Hello.class", O_RDONLY) = 4
+[pid    47] 13:03:17.968594 clone(child_stack=0x77faabcfef70
+[pid    47] 13:03:18.060028 write(1, "PID \320\277\321\200\320\276\321\206\320\265\321\201\321\201\320\260 46, \320\277\320\276\321\202\320"..., 77PID процесса 46, поток main — TID 47, потоков ОС: 18
+[pid    47] 13:03:18.064491 write(1, "\320\237\321\200\320\270\320\262\320\265\321\202!\n", 14Привет!
+[pid    46] 13:03:18.074154 exit_group(0) = ?</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Найдите в выводе: (1) какой поток загружает <code>libjvm.so</code> и создаёт следующий поток; (2) какой поток открывает <code>lib/modules</code>, <code>Hello.class</code> и выполняет <code>write(1, …)</code>; (3) кто вызывает <code>exit_group</code>. Сколько времени прошло от execve до первого write?</div>
+<div class="lab-ans" hidden><p>(1) Изначальный поток процесса (строки без <code>[pid N]</code> — это PID процесса): <code>execve</code>, <code>libjli.so</code>, <code>libjvm.so</code> и первый <code>clone</code> — создание потока, который станет Java-потоком <code>main</code>. (2) Всё остальное делает именно этот новый поток: отображает <code>lib/modules</code> и <code>classes.jsa</code>, создаёт полтора десятка служебных потоков (GC, JIT, VM Thread…), читает <code>Hello.class</code> и выполняет оба <code>write(1, …)</code> — в первом видно, что TID потока main не равен PID. (3) <code>exit_group(0)</code> вызывает снова изначальный поток: он всё это время ждал в <code>pthread_join</code>. От execve до первого write — порядка 200–300 мс под strace (без трассировки — 50–80 мс): трассировка каждого вызова замедляет запуск.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>-Xss4m</code> в команду запуска java и найдите первый <code>clone</code> с <code>mmap</code> перед ним (добавьте <code>mmap</code> в <code>-e trace=</code>).</summary><div>Перед первым <code>clone</code> — <code>mmap(NULL, 4198400, …, MAP_STACK)</code> или похожий размер: стек потока main берётся из <code>-Xss</code>, а не из <code>ulimit -s</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-18.2">
+<div class="lab-head"><span class="lab-num">Лаба 18.2</span><b>Потоки JVM глазами ядра</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Сопоставить потоки ОС процесса Java с их ролями.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Threads.java</code>:</div>
+<pre data-title="Threads.java"><code class="java">import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
+public class Threads {
+    public static void main(String[] args) throws Exception {
+        try (Stream&lt;Path&gt; tasks = Files.list(Path.of("/proc/self/task"))) {
+            tasks.sorted((a, b) -&gt; Integer.compare(Integer.parseInt(a.getFileName().toString()), Integer.parseInt(b.getFileName().toString())))
+                 .forEach(t -&gt; {
+                     try {
+                         String name = Files.readString(t.resolve("comm")).trim();       // имя потока в ядре (до 15 символов)
+                         String stat = Files.readString(t.resolve("stat"));
+                         String state = stat.substring(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
+                         System.out.printf("TID %-4s %-16s состояние %s%n", t.getFileName(), name, state);
+                     } catch (Exception e) { throw new RuntimeException(e); }
+                 });
+        }
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab java Threads.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">TID 1    java             состояние S
+TID 7    java             состояние R
+TID 8    GC Thread#0      состояние S
+TID 9    G1 Main Marker   состояние S
+TID 10   G1 Conc#0        состояние S
+TID 11   G1 Refine#0      состояние S
+TID 12   G1 Service       состояние S
+TID 17   VM Periodic Tas  состояние S
+TID 18   VM Thread        состояние S
+TID 19   Reference Handl  состояние S
+TID 20   Finalizer        состояние S
+TID 21   Signal Dispatch  состояние S
+TID 22   Service Thread   состояние S
+TID 23   Monitor Deflati  состояние S
+TID 24   C2 CompilerThre  состояние S
+TID 25   C1 CompilerThre  состояние R
+TID 26   C1 CompilerThre  состояние S
+TID 27   C1 CompilerThre  состояние R
+TID 28   C1 CompilerThre  состояние S
+TID 29   Notification Th  состояние S
+TID 30   Common-Cleaner   состояние S
+TID 31   C2 CompilerThre  состояние S
+TID 32   C2 CompilerThre  состояние S</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какой поток имеет TID, равный PID? Найдите поток, который сейчас выполняет этот код, и потоки GC и JIT.</div>
+<div class="lab-ans" hidden><p>TID = PID (здесь 1, java — PID 1 в контейнере) — изначальный поток с именем <code>java</code>, он в состоянии S: ждёт в <code>pthread_join</code>. Следующий — тоже <code>java</code>, но в состоянии R: это поток main, выполняющий наш код (ядро называет его по имени программы; имя «main» видно только внутри JVM). Дальше — <code>GC Thread#0</code> и другие потоки сборщика, <code>G1 Main Marker</code>, <code>G1 Conc#0</code>, <code>G1 Refine#0</code>, <code>G1 Service</code>, <code>VM Periodic Tas</code>, <code>VM Thread</code>, <code>Reference Handl</code>, <code>Finalizer</code>, <code>Signal Dispatch</code>, <code>Service Thread</code>, <code>Monitor Deflati</code>, <code>C2 CompilerThre</code>, <code>C1 CompilerThre</code>, <code>Common-Cleaner</code>, <code>Notification Th</code> — имена обрезаны ядром до 15 символов. Почти все спят (S): они ждут работы.</p></div>
+</li>
+</ol>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">18.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>В каком потоке исполняется Java-метод <code>main</code> при запуске <code>java Hello</code>?</p><ul><li>в изначальном потоке процесса, созданном execve</li><li>в потоке VM Thread</li><li>в новом потоке, который лаунчер создаёт со стеком размера -Xss</li><li>в виртуальном потоке</li></ul><div class="why">Так JVM контролирует размер стека и защитные зоны; изначальный поток ждёт в pthread_join и в конце вызывает exit_group. TID потока main ≠ PID процесса.</div></div>
+<div class="mcq" data-ok="0"><p>Где хранится ссылка <code>args</code> метода <code>main</code> и где — сам массив строк?</p><ul><li>ссылка — в слоте 0 кадра main на стеке потока; массив и строки — в куче</li><li>оба — в куче</li><li>оба — в metaspace</li><li>ссылка — в куче, массив — на стеке</li></ul><div class="why">Кадр хранит локальные переменные, включая ссылки; объекты всегда в куче (если JIT не устранил их).</div></div>
+<div class="mcq" data-ok="1"><p>Сервис отвечает медленно, CPU пода загружен на 30%, лимит <code>limits.cpu: 1</code>. Что проверить первым?</p><ul><li>утечку памяти</li><li>троттлинг cgroup (nr_throttled в cpu.stat) и ожидания в дампе потоков</li><li>предсказатель переходов</li><li>размер кэш-линии</li></ul><div class="why">Низкая средняя загрузка не исключает исчерпания квоты на всплесках; плюс ожидание БД и сети не видно в CPU.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Расскажите по шагам, что происходит от ввода java Hello до вывода на экран.</summary><div class="a"><p>Прерывание клавиатуры будит оболочку; она создаёт процесс (fork/spawn) и делает execve лаунчера java; ядро строит адресное пространство и стек главного потока, ld.so подключает libc и libjli; лаунчер dlopen-ит libjvm и создаёт новый поток со стеком -Xss, в котором стартует JVM: резервирует кучу и другие области, генерирует интерпретатор, создаёт служебные потоки, отображает CDS и модули, загружает Hello.class; интерпретатор строит кадр main и исполняет байткод; println превращает строку в UTF-8 и делает write(1); терминал получает байты, растеризует текст, композитор и GPU выводят кадр. При выходе — DestroyJavaVM, exit_group, wait оболочки.</p></div></details>
+<details class="q"><summary>Что такое поток, стек и кадр, и как они связаны?</summary><div class="a"><p>Поток — контекст исполнения, который планирует ядро: регистры (RIP, RSP…) и собственный стек. Стек — область памяти потока, выделенная при его создании (mmap + guard-страницы), где по дисциплине LIFO лежат кадры всех незавершённых вызовов. Кадр — участок стека одного вызова: адрес возврата, сохранённые регистры, локальные переменные (в Java — слоты, стек операндов, ссылка на метод). Объекты, на которые ссылаются локальные переменные, живут не в кадре, а в куче.</p></div></details>
+<details class="q"><summary>Почему «быстрее посчитать» почти никогда не главное в серверной производительности?</summary><div class="a"><p>Большая часть времени запроса — ожидание: сети, базы, диска, блокировок, памяти (промахи кэша), планировщика и квот контейнера. Операции процессора на порядки дешевле любого ожидания. Поэтому оптимизация начинается с измерения, где запрос ждёт, и сокращения числа и длительности ожиданий: кэши, пакетирование, параллелизм ожиданий, локальность данных.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,113 @@
+@chapter 14 | quiz
+@intro
+<p>Проходим цепочку сборки руками: препроцессор, ассемблер, объектный файл с неразрешёнными символами, компоновка, ELF изнутри, статическая и динамическая версии одной программы, загрузка библиотек JVM и вызов функции libc из Java без единой строки C. Все лабы — в Docker-образе <code>cs-lab</code>. Модуль IDEA — <code>cs14</code>.</p>
+@end
+
+@lab 14.1 | Объектный файл: символы и релокации | 20 мин
+@goal
+<p>Увидеть промежуточные результаты каждого шага сборки и «дыры» в объектном файле.</p>
+@end
+@file greet.c
+#include <stdio.h>
+
+#define TIMES 3
+
+extern int helper(int x);           // определена в другом файле
+static const char *message = "привет";
+
+int main(void) {
+    for (int i = 0; i < TIMES; i++)
+        printf("%s %d\n", message, helper(i));
+    return 0;
+}
+@end
+@file helper.c
+int helper(int x) { return x * 10; }
+@end
+@step Препроцессор: сколько строк получилось из 11?
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -E greet.c | wc -l; gcc -E greet.c | tail -6" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -E greet.c | wc -l; gcc -E greet.c | tail -6"
+@end
+@step Компиляция без компоновки и таблица символов:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O1 -c greet.c helper.c && nm greet.o && echo --- && nm helper.o && echo --- && readelf -r greet.o | grep -E 'Offset|helper|printf|rodata'" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -O1 -c greet.c helper.c && nm greet.o && echo --- && nm helper.o && echo --- && readelf -r greet.o | grep -E 'Offset|helper|printf|rodata'"
+@end
+@predict Какие символы <code>greet.o</code> определяет (T), а какие требует (U)? Что значат строки релокаций?
+@answer
+<p>Препроцессор превратил 11 строк в ~800: в начало вставлено содержимое <code>stdio.h</code> и всего, что он включает; в конце — ваш код, где <code>TIMES</code> уже заменено на 3. В <code>greet.o</code>: <code>T main</code> — определена; <code>U helper</code> и <code>U printf</code> — нужны извне (вместо <code>printf</code> компилятор мог подставить <code>U __printf_chk</code> или <code>puts</code> — оптимизация). Символа <code>message</code> нет: оптимизатор подставил вместо указателя саму строку, она лежит под локальной меткой <code>r .LC0</code> (строчная буква — локальный символ, <code>r</code> — секция только для чтения), строка формата — <code>.LC1</code>. <code>helper.o</code> определяет <code>T helper</code>. Релокации <code>R_X86_64_PLT32 helper</code> и <code>printf</code> — «в это место кода вставить адрес функции», Ссылки на <code>.LC0</code>/<code>.LC1</code> компилятор закодировал относительно RIP внутри секции — без внешних символов. Второй заголовок «Offset» — таблица релокаций для <code>.eh_frame</code> (тема 04).</p>
+@end
+@step Без <code>helper.o</code> компоновка не удастся:
+@run fail
+docker run --rm -v "${PWD}:/lab" cs-lab gcc greet.o -o greet ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab gcc greet.o -o greet
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc greet.o helper.o -o greet && ./greet" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc greet.o helper.o -o greet && ./greet"
+@end
+
+@lab 14.2 | ELF изнутри и статическая компоновка | 15 мин
+@goal
+<p>Посмотреть заголовок, сегменты и зависимости исполняемого файла и сравнить динамическую и статическую сборку.</p>
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "od -A x -t x1z -N 16 greet && readelf -h greet | grep -E 'Type|Machine|Entry' && readelf -lW greet | grep -E 'LOAD|INTERP|interpreter|DYNAMIC' && readelf -d greet | grep NEEDED" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "od -A x -t x1z -N 16 greet && readelf -h greet | grep -E 'Type|Machine|Entry' && readelf -lW greet | grep -E 'LOAD|INTERP|interpreter|DYNAMIC' && readelf -d greet | grep NEEDED"
+@end
+@predict Какое магическое число в начале файла? Сколько сегментов LOAD и с какими правами? Какие библиотеки нужны программе?
+@answer
+<p>Первые байты <code>7f 45 4c 46</code> — «.ELF». Тип <code>DYN</code> (позиционно-независимый исполняемый файл, PIE — его можно загрузить по любому адресу), машина — x86-64, точка входа — адрес <code>_start</code>. Сегментов LOAD четыре: заголовки (<code>R</code>), код (<code>R E</code>), константы (<code>R</code>), данные (<code>RW</code>). <code>INTERP</code> — <code>/lib64/ld-linux-x86-64.so.2</code>. Нужна одна библиотека: <code>libc.so.6</code>.</p>
+@end
+@step Та же программа, скомпонованная статически:
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -static greet.c helper.c -o greet-static && ls -l greet greet-static && file greet greet-static" ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab sh -c "gcc -static greet.c helper.c -o greet-static && ls -l greet greet-static | awk '{print \$5, \$9}' && file greet greet-static | cut -c1-120"
+@end
+@note Статическая версия в десятки раз больше (внутри — нужная часть libc) и помечена <code>statically linked</code>: ей не нужен ни <code>ld-linux</code>, ни <code>libc.so.6</code> — она запустится даже в пустом контейнере <code>FROM scratch</code>.
+
+@lab 14.3 | Как java загружает свои библиотеки | 15 мин
+@goal
+<p>Увидеть, что команда <code>java</code> — маленький C-лаунчер, а виртуальная машина подгружается как библиотека.</p>
+@end
+@run
+docker run --rm cs-lab sh -c "ls -l /opt/java/openjdk/bin/java /opt/java/openjdk/lib/server/libjvm.so; readelf -d /opt/java/openjdk/bin/java | grep -E 'NEEDED|RPATH'" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "ls -l /opt/java/openjdk/bin/java | awk '{print \$5, \$9}'; readelf -d /opt/java/openjdk/bin/java | grep -E 'NEEDED|RPATH'; ls -l /opt/java/openjdk/lib/server/libjvm.so | awk '{print \$5, \$9}'"
+@end
+@predict Каков размер файла <code>java</code> и <code>libjvm.so</code>? Есть ли <code>libjvm.so</code> в списке NEEDED лаунчера?
+@answer
+<p><code>java</code> — около 16 КБ, <code>libjvm.so</code> — около 30 МБ. В NEEDED лаунчера — только <code>libjli.so</code> (Java Launcher Infrastructure) и <code>libc.so.6</code>, а <code>RPATH</code> — <code>$ORIGIN:$ORIGIN/../lib</code>: искать библиотеки относительно каталога самого файла, поэтому JDK работает из любого места без установки. <code>libjvm.so</code> в NEEDED <b>нет</b>: лаунчер сам выбирает вариант VM (server, client) и загружает её во время работы через <code>dlopen</code> — следующий шаг это покажет.</p>
+@end
+@step Журнал динамического загрузчика: какие библиотеки и в каком порядке подгружаются:
+@run
+docker run --rm cs-lab sh -c "LD_DEBUG=libs java -version 2>&1 | grep 'calling init'" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "LD_DEBUG=libs java -version 2>&1 | grep 'calling init'" | sed -E 's/^ *[0-9]+: *//'
+@end
+@note <code>LD_DEBUG=libs</code> заставляет <code>ld-linux</code> рассказывать о своей работе. Порядок строк «calling init» — порядок загрузки: сначала <code>libc</code> и <code>libjli.so</code> (по NEEDED при старте), затем <code>libjvm.so</code> (это уже <code>dlopen</code> из лаунчера), затем <code>libjimage.so</code> (чтение <code>lib/modules</code>), <code>libjava.so</code> (нативные методы <code>java.base</code>) и <code>libsimdsort.so</code> — векторная сортировка AVX для <code>Arrays.sort</code> (тема 05): JVM подгружает её, увидев подходящий процессор. Переменная <code>LD_DEBUG</code> задана внутри <code>sh -c</code> только для <code>java</code>: иначе журнал засорили бы утилиты стартового скрипта образа.
+
+@lab 14.4 | Вызов libc из Java через FFM API | 15 мин
+@goal
+<p>Найти функцию в загруженной библиотеке по имени и вызвать её по ABI платформы — без JNI и без C-кода.</p>
+@end
+@file Ffm.java
+import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
+
+public class Ffm {
+    public static void main(String[] args) throws Throwable {
+        Linker linker = Linker.nativeLinker();                       // знает ABI текущей платформы (тема 04)
+        SymbolLookup libc = linker.defaultLookup();                  // как dlsym по уже загруженным библиотекам
+
+        MethodHandle getpid = linker.downcallHandle(libc.find("getpid").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        MethodHandle strlen = linker.downcallHandle(libc.find("strlen").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+        System.out.println("адрес функции getpid в памяти: " + libc.find("getpid").orElseThrow());
+        System.out.println("getpid() из libc = " + (int) getpid.invokeExact()
+                + ", ProcessHandle.pid() = " + ProcessHandle.current().pid());
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment s = arena.allocateFrom("привет");          // строка C в нативной памяти, UTF-8 + '\0'
+            System.out.println("strlen(\"привет\") = " + (long) strlen.invokeExact(s) + " байт");
+        }
+    }
+}
+@end
+@run
+docker run --rm -v "${PWD}:/lab" cs-lab java --enable-native-access=ALL-UNNAMED Ffm.java ||| MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/lab" cs-lab java --enable-native-access=ALL-UNNAMED Ffm.java
+@end
+@predict Совпадут ли PID от libc и от Java? Что вернёт <code>strlen("привет")</code>?
+@answer
+<p>PID совпадут — это один и тот же процесс; адрес <code>getpid</code> — где-то в области <code>libc.so.6</code> (тема 08, карта памяти). <code>strlen</code> вернёт 12: C-функция считает байты до нуля, а «привет» в UTF-8 — 12 байт (тема 01). Флаг <code>--enable-native-access</code> разрешает «ограниченные» операции FFM без предупреждения: вызов нативного кода может обрушить JVM, и это явный выбор приложения.</p>
+@end

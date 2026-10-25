@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Процессор: команды и цикл исполнения</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ПРОЦЕССОР</div>
+  <h1>Процессор: команды и цикл исполнения</h1>
+  <p class="lead">Процессор — это регистры, АЛУ и управляющая логика, которая бесконечно повторяет один цикл: взять команду по адресу из счётчика команд, понять, что она означает, выполнить и перейти к следующей. Программа — просто числа в памяти. Разберём устройство ядра, набор команд x86-64 и ARM64, как условия и циклы превращаются в сравнения и переходы, и как адресуются массивы и поля объектов. В симуляторе можно пошагово выполнить программу на учебном процессоре.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">фон Нейман</span><span class="tag">регистры</span><span class="tag">fetch-decode-execute</span><span class="tag">ISA: x86-64, ARM64</span><span class="tag">ассемблер</span><span class="tag">адресация</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="vonneumann"><span class="h-num">3.1</span>Архитектура фон Неймана</h2>
+<p>Схема, описанная в 1945 году и используемая до сих пор: <b>процессор</b>, <b>память</b>, в которой лежат и данные, и <b>сама программа</b>, и <b>устройства ввода-вывода</b>, связанные общими шинами. Главная идея — программа хранится в памяти как данные: её можно загрузить с диска, сгенерировать на лету (JIT-компилятор JVM пишет машинный код в память и передаёт на него управление), изменить.</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 270" role="img" aria-label="Процессор с регистрами, АЛУ и управляющим устройством связан шиной с памятью и устройствами">
+  <defs><marker id="cp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <rect x="20" y="20" width="400" height="230" rx="10" class="box-acc"/>
+  <text x="40" y="46" font-weight="700">Ядро процессора</text>
+  <g font-size="12.5">
+    <rect x="40" y="62" width="170" height="80" rx="7" class="box-info"/><text x="125" y="84" text-anchor="middle" font-weight="700">Управляющее устройство</text>
+    <text x="125" y="104" text-anchor="middle" class="muted">выборка и декодирование</text><text x="125" y="122" text-anchor="middle" class="mono">PC (RIP) · IR</text>
+    <rect x="230" y="62" width="170" height="80" rx="7" class="box-ok"/><text x="315" y="84" text-anchor="middle" font-weight="700">АЛУ, FPU, SIMD</text>
+    <text x="315" y="104" text-anchor="middle" class="muted">вычисления</text><text x="315" y="122" text-anchor="middle" class="mono">флаги ZNCV</text>
+    <rect x="40" y="158" width="360" height="74" rx="7" class="box"/><text x="220" y="180" text-anchor="middle" font-weight="700">Регистры</text>
+    <text x="220" y="200" text-anchor="middle" class="mono" font-size="11.5">RAX RBX RCX RDX RSI RDI RBP RSP R8…R15</text>
+    <text x="220" y="219" text-anchor="middle" class="mono" font-size="11.5">XMM0…XMM15 / YMM / ZMM · RFLAGS</text>
+  </g>
+  <line x1="420" y1="135" x2="520" y2="135" class="ln-acc" marker-end="url(#cp)"/><line x1="520" y1="150" x2="420" y2="150" class="ln-acc" marker-end="url(#cp)"/>
+  <text x="470" y="125" text-anchor="middle" font-size="12" class="muted">адрес, данные</text>
+  <rect x="525" y="20" width="275" height="140" rx="10" class="box-warn"/>
+  <text x="545" y="46" font-weight="700">Память (через кэши, тема 06)</text>
+  <g class="mono" font-size="12">
+    <text x="545" y="72">0x401000: 48 01 D8   ← команды</text>
+    <text x="545" y="92">0x401003: 48 FF C1</text>
+    <text x="545" y="112">0x401006: 75 F8</text>
+    <text x="545" y="138">0x7ffd20: 05 00 00 00 ← данные</text>
+  </g>
+  <rect x="525" y="180" width="275" height="70" rx="10" class="box"/>
+  <text x="662" y="208" text-anchor="middle" font-weight="700">Устройства</text>
+  <text x="662" y="230" text-anchor="middle" font-size="12" class="muted">диск, сеть, экран — через PCIe, тема 12</text>
+</svg>
+<figcaption>Одни и те же байты <code>48 01 D8</code> — это команда <code>add rax, rbx</code>, если на них смотрит счётчик команд, и просто число, если их прочитать как данные. Защита памяти (тема 08) помечает страницы как «исполняемые» или «записываемые», чтобы данные из сети нельзя было исполнить.</figcaption>
+</figure>
+<p><b>Узкое место фон Неймана</b>: процессор считает гораздо быстрее, чем память успевает отдавать команды и данные. Борьба с этим — главный сюжет архитектуры последних 40 лет: кэши, раздельные кэши команд и данных на первом уровне (элемент «гарвардской» архитектуры), предвыборка, конвейер.</p>
+
+<h2 id="registers"><span class="h-num">3.2</span>Регистры — рабочий стол процессора</h2>
+<p>Регистр — ячейка памяти внутри ядра (из триггеров, тема 02), доступ к которой занимает ноль лишних тактов. Регистров мало, поэтому компилятор тщательно решает, какие значения держать в них, а какие «выталкивать» в память (register allocation, spilling).</p>
+<div class="table-wrap"><table>
+<tr><th>Регистр x86-64</th><th>Назначение (по соглашению System V для Linux)</th><th>ARM64</th></tr>
+<tr><td><code>RAX</code></td><td>результат функции; накопитель</td><td><code>X0</code></td></tr>
+<tr><td><code>RDI, RSI, RDX, RCX, R8, R9</code></td><td>первые шесть целых аргументов функции</td><td><code>X0…X7</code></td></tr>
+<tr><td><code>RBX, RBP, R12…R15</code></td><td>«сохраняемые вызываемым»: функция обязана вернуть их прежними</td><td><code>X19…X28</code></td></tr>
+<tr><td><code>RSP</code></td><td>указатель стека — вершина стека потока (тема 04)</td><td><code>SP</code></td></tr>
+<tr><td><code>RIP</code></td><td>счётчик команд (program counter): адрес следующей команды</td><td><code>PC</code></td></tr>
+<tr><td><code>RFLAGS</code></td><td>флаги результата (ZF, SF, CF, OF) и управления</td><td><code>NZCV</code></td></tr>
+<tr><td><code>XMM0…15</code> (YMM, ZMM)</td><td>float/double и векторы SIMD, аргументы с плавающей точкой</td><td><code>V0…V31</code></td></tr>
+</table></div>
+<p>Имена несут историю: у 64-битного <code>RAX</code> младшие 32 бита — <code>EAX</code> (i386), младшие 16 — <code>AX</code> (8086, 1978), младший байт — <code>AL</code>. Запись в <code>EAX</code> обнуляет старшие 32 бита <code>RAX</code> — частая деталь при чтении дизассемблера JIT-кода.</p>
+<p><b>Сколько «регистров» на самом деле.</b> Архитектурных регистров в x86-64 16, а физических в современном ядре — около 200–300: механизм переименования (тема 05) отображает архитектурные имена на физические, чтобы независимые команды выполнялись параллельно.</p>
+
+<h2 id="cycle"><span class="h-num">3.3</span>Цикл выборка — декодирование — исполнение</h2>
+<ol class="steps">
+  <li><b>Fetch (выборка)</b>: прочитать байты команды по адресу в <code>PC</code> (из кэша команд L1i).</li>
+  <li><b>Decode (декодирование)</b>: определить операцию, регистры-операнды, режим адресации, длину команды. У x86 команда длиной 1–15 байт, и декодер — одна из самых сложных частей ядра; современные x86 разбивают команды на внутренние <b>микрооперации</b> (µops) и кэшируют уже декодированные.</li>
+  <li><b>Execute (исполнение)</b>: АЛУ считает, блок адресации вычисляет адрес, блок загрузки читает память.</li>
+  <li><b>Memory / Writeback</b>: записать результат в регистр или память, обновить флаги.</li>
+  <li><b>Обновить PC</b>: <code>PC += длина команды</code>, либо, если это переход, <code>PC = адрес перехода</code>.</li>
+</ol>
+<p>Всё, что умеет компьютер — циклы, вызовы функций, исключения, многозадачность, — сводится к тому, <b>какое значение окажется в PC</b> на следующем шаге. Цикл — это переход назад. Вызов функции — переход с запоминанием адреса возврата (тема 04). Прерывание — аппаратная подмена PC на адрес обработчика (тема 10).</p>
+
+<div class="widget" id="cpuW">
+  <div class="widget-title">Симулятор учебного процессора</div>
+  <p class="hint">Четыре регистра R0–R3, флаг Z, память из 16 ячеек, счётчик команд PC. Выберите программу или напишите свою и выполняйте по шагу: подсвечивается команда, на которую указывает PC. Команды: <code>LOAD r, [a]</code>, <code>STORE r, [a]</code>, <code>MOV r, n</code>, <code>ADD r, s</code>, <code>SUB r, s</code>, <code>ADDI r, n</code>, <code>CMP r, s</code>, <code>JMP L</code>, <code>JZ L</code>, <code>JNZ L</code>, <code>JN L</code> (переход, если результат отрицательный), <code>HALT</code>.</p>
+  <div class="controls">
+    <label>программа<select id="cpuPreset"><option value="sum">сумма 1..N (цикл)</option><option value="max">максимум из двух ячеек</option><option value="mul">умножение сложением</option></select></label>
+    <button class="btn primary" type="button" id="cpuStep">Шаг</button><button class="btn" type="button" id="cpuRun">До конца</button><button class="btn" type="button" id="cpuReset">Сброс</button>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px">
+    <textarea id="cpuSrc" spellcheck="false" style="font:13px var(--font-mono);min-height:250px;width:100%;background:var(--bg-sunk);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px"></textarea>
+    <div><div class="out" id="cpuState" style="margin-top:0"></div><div class="cells" id="cpuMem"></div></div>
+  </div>
+  <div class="out" id="cpuLog" style="max-height:180px;overflow:auto"></div>
+</div>
+<script>
+(function () {
+  var P = {
+    sum: "; сумма 1..N, N в ячейке [0], результат в [1]\n      LOAD R0, [0]    ; R0 = N\n      MOV  R1, 0      ; сумма\nloop: ADD  R1, R0     ; сумма += R0\n      ADDI R0, -1     ; R0--  (ставит Z)\n      JNZ  loop       ; пока R0 != 0\n      STORE R1, [1]\n      HALT\n.data 0: 5",
+    max: "; max([0], [1]) → [2]\n      LOAD R0, [0]\n      LOAD R1, [1]\n      CMP  R0, R1     ; R0 − R1: N=1, если R0 < R1\n      JN   takeB\n      STORE R0, [2]\n      HALT\ntakeB: STORE R1, [2]\n      HALT\n.data 0: 7, 12",
+    mul: "; [0] * [1] → [2] повторным сложением\n      LOAD R0, [0]\n      LOAD R1, [1]\n      MOV  R2, 0\nloop: CMP  R1, R3     ; R3 = 0\n      JZ   done\n      ADD  R2, R0\n      ADDI R1, -1\n      JMP  loop\ndone: STORE R2, [2]\n      HALT\n.data 0: 6, 7"
+  };
+  var src = document.getElementById("cpuSrc"), st = document.getElementById("cpuState"), memEl = document.getElementById("cpuMem"), log = document.getElementById("cpuLog"), preset = document.getElementById("cpuPreset");
+  var prog, labels, R, Z, N, PC, M, halted, steps, err;
+  function parse() {
+    prog = []; labels = {}; M = new Array(16).fill(0); err = null;
+    src.value.split("\n").forEach(function (raw, ln) {
+      var line = raw.replace(/;.*/, "").trim(); if (!line) return;
+      var d = line.match(/^\.data\s+(\d+)\s*:\s*(.*)$/i);
+      if (d) { d[2].split(",").forEach(function (v, k) { M[(+d[1] + k) & 15] = parseInt(v, 10) || 0; }); return; }
+      var m = line.match(/^(\w+):\s*(.*)$/); if (m) { labels[m[1]] = prog.length; line = m[2].trim(); if (!line) return; }
+      var parts = line.split(/[\s,]+/).filter(Boolean);
+      prog.push({ op: parts[0].toUpperCase(), a: parts.slice(1), text: line, ln: ln });
+    });
+  }
+  function reset() { parse(); R = [0, 0, 0, 0]; Z = 0; N = 0; PC = 0; halted = false; steps = 0; log.textContent = ""; draw(); }
+  function reg(t) { var m = /^R([0-3])$/i.exec(t); if (!m) throw "ожидался регистр R0..R3, а не «" + t + "»"; return +m[1]; }
+  function addr(t) { var m = /^\[(\d+)\]$/.exec(t); if (!m) throw "ожидался адрес [n], а не «" + t + "»"; return +m[1] & 15; }
+  function lab(t) { if (!(t in labels)) throw "нет метки «" + t + "»"; return labels[t]; }
+  function flags(v) { Z = v === 0 ? 1 : 0; N = v < 0 ? 1 : 0; }
+  function step() {
+    if (halted) return false;
+    if (PC >= prog.length) { halted = true; log.textContent += "PC вышел за конец программы — процессор исполнил бы мусор из памяти\n"; return false; }
+    var c = prog[PC], next = PC + 1, a = c.a, msg = "";
+    try {
+      switch (c.op) {
+        case "LOAD": R[reg(a[0])] = M[addr(a[1])]; msg = "R" + reg(a[0]) + " ← mem" + a[1] + " = " + R[reg(a[0])]; break;
+        case "STORE": M[addr(a[1])] = R[reg(a[0])]; msg = "mem" + a[1] + " ← R" + reg(a[0]) + " = " + R[reg(a[0])]; break;
+        case "MOV": R[reg(a[0])] = parseInt(a[1], 10); msg = "R" + reg(a[0]) + " ← " + a[1]; break;
+        case "ADD": R[reg(a[0])] += R[reg(a[1])]; flags(R[reg(a[0])]); msg = "R" + reg(a[0]) + " = " + R[reg(a[0])]; break;
+        case "SUB": R[reg(a[0])] -= R[reg(a[1])]; flags(R[reg(a[0])]); msg = "R" + reg(a[0]) + " = " + R[reg(a[0])]; break;
+        case "ADDI": R[reg(a[0])] += parseInt(a[1], 10); flags(R[reg(a[0])]); msg = "R" + reg(a[0]) + " = " + R[reg(a[0])] + ", Z=" + Z; break;
+        case "CMP": flags(R[reg(a[0])] - R[reg(a[1])]); msg = "R" + reg(a[0]) + " − R" + reg(a[1]) + " = " + (R[reg(a[0])] - R[reg(a[1])]) + " (не сохраняется) → Z=" + Z + " N=" + N; break;
+        case "JMP": next = lab(a[0]); msg = "PC ← " + a[0]; break;
+        case "JZ": if (Z) next = lab(a[0]); msg = Z ? "Z=1 → переход на " + a[0] : "Z=0 → дальше"; break;
+        case "JNZ": if (!Z) next = lab(a[0]); msg = !Z ? "Z=0 → переход на " + a[0] : "Z=1 → дальше"; break;
+        case "JN": if (N) next = lab(a[0]); msg = N ? "N=1 → переход на " + a[0] : "N=0 → дальше"; break;
+        case "HALT": halted = true; msg = "остановка"; next = PC; break;
+        default: throw "неизвестная команда " + c.op;
+      }
+    } catch (e) { halted = true; log.textContent += "ошибка в строке " + (c.ln + 1) + ": " + e + "\n"; draw(); return false; }
+    steps++;
+    log.textContent += ("#" + steps).padEnd(5) + ("PC=" + PC).padEnd(6) + c.text.padEnd(18) + " │ " + msg + "\n";
+    log.scrollTop = log.scrollHeight;
+    PC = next; draw(); return !halted;
+  }
+  function draw() {
+    var cur = prog[PC];
+    st.textContent = "PC = " + PC + (cur ? "   → " + cur.text : "") + (halted ? "   [HALT]" : "") + "\nR0 = " + R[0] + "   R1 = " + R[1] + "   R2 = " + R[2] + "   R3 = " + R[3] + "\nфлаги: Z = " + Z + "  N = " + N + "      выполнено команд: " + steps;
+    memEl.innerHTML = M.map(function (v, i) { return '<div' + (cur && cur.a.some(function (x) { return x === "[" + i + "]"; }) ? ' class="cur"' : "") + '><small>[' + i + ']</small>' + v + '</div>'; }).join("");
+    var lines = src.value.split("\n"); // подсветка текущей строки — через выделение
+    if (cur && document.activeElement !== src) {
+      var start = 0; for (var i = 0; i < cur.ln; i++) start += lines[i].length + 1;
+      try { src.setSelectionRange(start, start + lines[cur.ln].length); } catch (e) {}
+    }
+  }
+  document.getElementById("cpuStep").addEventListener("click", step);
+  document.getElementById("cpuRun").addEventListener("click", function () { var n = 0; while (step() && n++ < 500) {} if (n >= 500) log.textContent += "остановлено после 500 шагов — бесконечный цикл?\n"; });
+  document.getElementById("cpuReset").addEventListener("click", reset);
+  preset.addEventListener("change", function () { src.value = P[preset.value]; reset(); });
+  src.addEventListener("change", reset);
+  src.value = P.sum; reset();
+})();
+</script>
+
+<h2 id="isa"><span class="h-num">3.4</span>Набор команд (ISA): договор между железом и программами</h2>
+<p><b>Архитектура набора команд</b> (instruction set architecture) — это спецификация: какие есть регистры, команды, режимы адресации, как кодируются команды в байты, как устроены прерывания и защита памяти. Она отделяет программы от конкретной микросхемы: код, скомпилированный под x86-64 в 2005 году, исполняется на процессоре 2026 года с совершенно другим внутренним устройством.</p>
+<div class="table-wrap"><table>
+<tr><th></th><th>x86-64 (Intel, AMD)</th><th>ARM64 (AArch64: Apple M, AWS Graviton, телефоны)</th><th>RISC-V</th></tr>
+<tr><td>философия</td><td>CISC: сложные команды, операнды могут быть в памяти</td><td>RISC: простые команды, работа с памятью только через load/store</td><td>RISC, открытая спецификация</td></tr>
+<tr><td>длина команды</td><td>1–15 байт</td><td>ровно 4 байта</td><td>4 байта (2 — в сжатом расширении)</td></tr>
+<tr><td>регистров общего назначения</td><td>16</td><td>31</td><td>31 + нулевой</td></tr>
+<tr><td>модель памяти</td><td>строгая (TSO, тема 07)</td><td>слабая: нужны барьеры</td><td>слабая (RVWMO)</td></tr>
+<tr><td>пример: <code>a += b</code></td><td><code>add rax, rbx</code> → <code>48 01 D8</code></td><td><code>add x0, x0, x1</code> → <code>00 00 01 8B</code></td><td><code>add a0, a0, a1</code></td></tr>
+</table></div>
+<p>Различие CISC/RISC сегодня в основном снаружи: x86 декодирует свои сложные команды во внутренние RISC-подобные микрооперации. Практическое следствие для Java — <b>JVM прячет ISA</b>: один и тот же jar работает на x86 и ARM, а JIT генерирует код под конкретный процессор, включая его расширения (AVX-512, SVE). Но модель памяти процессора (x86 строже ARM) влияет на то, насколько заметны ошибки синхронизации — код с гонкой может «работать» на ноутбуке с x86 и падать на сервере ARM.</p>
+
+<h2 id="asm"><span class="h-num">3.5</span>Как конструкции языка становятся командами</h2>
+<p>Компилятор (gcc для C, C2/Graal для Java во время работы) превращает выражения в команды. Синтаксис Intel: <code>команда приёмник, источник</code>.</p>
+<pre data-title="C → x86-64 (gcc 15, -O1, синтаксис Intel)"><code class="c">long sum(long *a, long n) {      // a → RDI, n → RSI (соглашение о вызовах, тема 04)
+    long s = 0;
+    for (long i = 0; i &lt; n; i++)
+        s += a[i];
+    return s;                     // результат — в RAX
+}
+// sum:
+//     test  rsi, rsi                ; n &amp; n — выставить флаги по n
+//     jle   .L4                     ; n &lt;= 0 → сразу вернуть 0
+//     mov   rax, rdi                ; p = a  (индекс i превращён в указатель)
+//     lea   rcx, [rdi+rsi*8]        ; end = a + n*8 — адрес, без чтения памяти
+//     mov   edx, 0                  ; s = 0
+// .L3:
+//     add   rdx, QWORD PTR [rax]    ; s += *p  — операнд прямо в памяти (CISC)
+//     add   rax, 8                  ; p++ (long — 8 байт)
+//     cmp   rax, rcx                ; p == end ?
+//     jne   .L3                     ; нет → назад: это и есть цикл
+// .L1:
+//     mov   rax, rdx                ; результат в RAX
+//     ret
+// .L4:
+//     mov   edx, 0
+//     jmp   .L1</code></pre>
+<ul>
+  <li><b>Условие</b> <code>if (x &lt; y)</code> — это <code>cmp x, y</code> (вычитание, которое лишь ставит флаги) и условный переход: <code>jl</code> для знаковых, <code>jb</code> для беззнаковых (тема 02). Часто компилятор обходится вовсе без перехода — командой условной пересылки <code>cmov</code> (тема 05: так не страдает предсказатель ветвлений).</li>
+  <li><b>Цикл</b> — проверка и переход назад. Оптимизатор переписывает индексы в указатели, разворачивает тело (unrolling) и векторизует (тема 05).</li>
+  <li><b>Адресация</b> <code>[base + index*scale + disp]</code> вычисляется прямо в команде: элемент массива <code>a[i]</code> — <code>[rdi + rsi*8]</code>, поле объекта — <code>[reg + смещение поля]</code>. Поэтому в JIT-коде Java чтение <code>obj.field</code> — одна команда <code>mov</code> со смещением, известным из раскладки объекта (<a href="../jvm/10-object-layout.html">JVM, тема 10</a>), а <code>arr[i]</code> — сравнение с <code>length</code> (проверка границ) и одна команда чтения.</li>
+  <li><b>lea</b> (load effective address) вычисляет адрес, ничего не читая, — компиляторы используют её как быструю арифметику: <code>lea eax, [rdi+rdi*4]</code> — это <code>x * 5</code>.</li>
+  <li><b>Деление на константу</b> компилятор заменяет умножением на «магическое» обратное число и сдвигом: деление (<code>idiv</code>) стоит 20–90 тактов на старых и ~10–18 на новых ядрах, умножение — 3.</li>
+</ul>
+<div class="callout info"><span class="c-title">Посмотреть машинный код JIT</span>
+HotSpot умеет печатать сгенерированный код: <code>-XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly</code> (нужна библиотека-дизассемблер hsdis), а удобнее — JITWatch или <code>perfasm</code> в JMH (<a href="../jvm/17-jit-optimizations.html">JVM, тема 17</a>). В лабораторных этой главы мы смотрим на код C-компилятора: он статичен и короче, а принципы те же.
+</div>
+
+<h2 id="cost"><span class="h-num">3.6</span>Сколько стоит команда</h2>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Задержка (тактов, порядок)</th><th>Замечание</th></tr>
+<tr><td>сложение, логика, сдвиг, mov регистр→регистр</td><td>1</td><td>и несколько таких за такт на разных блоках</td></tr>
+<tr><td>умножение целых</td><td>3</td><td></td></tr>
+<tr><td>сложение/умножение double</td><td>4</td><td>FMA (a·b + c) — тоже 4</td></tr>
+<tr><td>деление целых 64 бит</td><td>~10–40</td><td>сильно зависит от поколения; не конвейеризуется полностью</td></tr>
+<tr><td>деление double, корень</td><td>~13–20</td><td></td></tr>
+<tr><td>чтение из кэша L1</td><td>4–5</td><td>тема 06</td></tr>
+<tr><td>чтение из оперативной памяти</td><td>~200–400 (≈ 80–100 нс)</td><td>за это время можно выполнить сотни сложений</td></tr>
+<tr><td>неверно предсказанный переход</td><td>~15–20</td><td>тема 05</td></tr>
+<tr><td>системный вызов</td><td>сотни – тысячи</td><td>тема 10</td></tr>
+</table></div>
+<p>Важно различать <b>задержку</b> (через сколько тактов готов результат) и <b>пропускную способность</b> (сколько таких операций можно начинать за такт). Цепочка зависимых сложений идёт со скоростью 1 за такт, а независимые сложения — 4 за такт на современном ядре. Об этом — тема 05.</p>
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">3.7</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Пишем эмулятор процессора на Java, смотрим настоящий машинный код, который gcc делает из C, и измеряем, сколько стоят разные команды. Модуль IDEA — <code>cs03</code>. Лабы 3.2 и 3.3 используют Docker-образ <code>cs-lab</code> с gcc и binutils — как его собрать, описано на <a href="index.html#lab-setup">странице курса</a> (одна команда <code>docker build</code>). В PowerShell <code>${PWD}</code> работает как есть; в cmd пишите <code>%cd%</code>.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="computer-science-3.1">
+<div class="lab-head"><span class="lab-num">Лаба 3.1</span><b>Эмулятор: программа — это данные</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Реализовать цикл fetch-decode-execute и убедиться, что команды и данные лежат в одной памяти.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ToyCpu.java</code>:</div>
+<pre data-title="ToyCpu.java"><code class="java">import java.util.Arrays;
+
+public class ToyCpu {
+    // формат команды: код операции * 100 + аргумент; память общая для кода и данных
+    static final int HALT = 0, LOAD = 1, ADDM = 2, STORE = 3, DEC = 4, JZ = 5, JMP = 6;
+    static final String[] NAMES = {"HALT", "LOAD", "ADDM", "STORE", "DEC", "JZ", "JMP"};
+
+    public static void main(String[] args) {
+        int[] mem = new int[32];
+        // while (n != 0) { sum += n; n--; }     n — в ячейке [20], sum — в [21]
+        int[] code = {
+            1_20,   // 0: LOAD  [20]   acc = n
+            5_08,   // 1: JZ    8      n == 0 → на HALT
+            2_21,   // 2: ADDM  [21]   acc = acc + sum
+            3_21,   // 3: STORE [21]   sum = acc
+            1_20,   // 4: LOAD  [20]
+            4_00,   // 5: DEC          acc--
+            3_20,   // 6: STORE [20]   n = acc
+            6_00,   // 7: JMP   0      в начало цикла
+            0_00    // 8: HALT
+        };
+        System.arraycopy(code, 0, mem, 0, code.length);
+        mem[20] = args.length &gt; 0 ? Integer.parseInt(args[0]) : 5;
+
+        int pc = 0, acc = 0, steps = 0;
+        while (true) {
+            int ir = mem[pc];                  // FETCH: команда — просто число из памяти
+            int op = ir / 100, arg = ir % 100; // DECODE
+            int next = pc + 1;
+            switch (op) {                      // EXECUTE
+                case LOAD -&gt; acc = mem[arg];
+                case ADDM -&gt; acc += mem[arg];
+                case STORE -&gt; mem[arg] = acc;
+                case DEC -&gt; acc--;
+                case JZ -&gt; { if (acc == 0) next = arg; }
+                case JMP -&gt; next = arg;
+                case HALT -&gt; { }
+                default -&gt; throw new IllegalStateException("неизвестная команда " + ir + " по адресу " + pc);
+            }
+            steps++;
+            if (steps &lt;= 9 || op == HALT)
+                System.out.printf("шаг %2d  pc=%d  %-5s %2d   acc=%d  n=%d  sum=%d%n", steps, pc, NAMES[op], arg, acc, mem[20], mem[21]);
+            if (op == HALT) break;
+            pc = next;                         // обновление PC
+        }
+        System.out.println("выполнено команд: " + steps);
+        System.out.println("память: " + Arrays.toString(Arrays.copyOf(mem, 22)));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Чему будет равна сумма в ячейке [21] и сколько команд выполнит эмулятор для n = 5? Где в дампе памяти программа, а где данные?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac ToyCpu.java
+java ToyCpu</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">шаг  1  pc=0  LOAD  20   acc=5  n=5  sum=0
+шаг  2  pc=1  JZ     8   acc=5  n=5  sum=0
+шаг  3  pc=2  ADDM  21   acc=5  n=5  sum=0
+шаг  4  pc=3  STORE 21   acc=5  n=5  sum=5
+шаг  5  pc=4  LOAD  20   acc=5  n=5  sum=5
+шаг  6  pc=5  DEC    0   acc=4  n=5  sum=5
+шаг  7  pc=6  STORE 20   acc=4  n=4  sum=5
+шаг  8  pc=7  JMP    0   acc=4  n=4  sum=5
+шаг  9  pc=0  LOAD  20   acc=4  n=4  sum=5
+шаг 43  pc=8  HALT   0   acc=0  n=0  sum=15
+выполнено команд: 43
+память: [120, 508, 221, 321, 120, 400, 320, 600, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15]</code></pre></details>
+<div class="lab-ans" hidden><p>Сумма 5 + 4 + 3 + 2 + 1 = 15. Тело цикла — 8 команд (адреса 0–7), 5 итераций = 40 команд, плюс финальные LOAD, JZ и HALT — 43. В дампе первые девять чисел (120, 508, 221…) — это программа, ячейка 20 — <code>n</code> (стала 0), 21 — сумма. Для процессора между ними нет разницы: если бы <code>STORE</code> записал в ячейку 0–8, программа изменила бы сама себя.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Запустите <code>java ToyCpu 0</code>.</summary><div>Три команды: LOAD, JZ (acc = 0 — переход на 8), HALT. Проверка условия в начале цикла — это <code>while</code>; если бы JZ стоял в конце, тело выполнилось бы хотя бы раз (<code>do-while</code>) и n ушло бы в −1, −2… почти навсегда.</div></details></li>
+<li><details><summary>Сделайте так, чтобы программа сама заменила свой HALT: добавьте перед циклом запись числа 6_00 (JMP 0) в ячейку 8.</summary><div>Программа станет самомодифицирующейся и никогда не остановится: на месте HALT окажется переход в начало. Именно поэтому ОС помечает страницы с кодом «только чтение и исполнение» (тема 08), а JIT JVM переключает права страниц code cache при записи нового кода.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-3.2">
+<div class="lab-head"><span class="lab-num">Лаба 3.2</span><b>Машинный код из C: gcc и objdump</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть, во что gcc компилирует цикл, сравнить уровни оптимизации и увидеть байты команд.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>sum.c</code>:</div>
+<pre data-title="sum.c"><code class="txt">long sum(long *a, long n) {
+    long s = 0;
+    for (long i = 0; i &lt; n; i++)
+        s += a[i];
+    return s;
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Без оптимизации (<code>-O0</code>) — переменные живут в памяти стека:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc -O0 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - sum.c</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">sum:
+	push	rbp
+	mov	rbp, rsp
+	mov	QWORD PTR -24[rbp], rdi
+	mov	QWORD PTR -32[rbp], rsi
+	mov	QWORD PTR -16[rbp], 0
+	mov	QWORD PTR -8[rbp], 0
+	jmp	.L2
+.L3:
+	mov	rax, QWORD PTR -8[rbp]
+	lea	rdx, 0[0+rax*8]
+	mov	rax, QWORD PTR -24[rbp]
+	add	rax, rdx
+	mov	rax, QWORD PTR [rax]
+	add	QWORD PTR -16[rbp], rax
+	add	QWORD PTR -8[rbp], 1
+.L2:
+	mov	rax, QWORD PTR -8[rbp]
+	cmp	rax, QWORD PTR -32[rbp]
+	jl	.L3
+	mov	rax, QWORD PTR -16[rbp]
+	pop	rbp
+	ret</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Теперь <code>-O1</code>. Что исчезнет из кода и где будут храниться <code>s</code> и <code>i</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc -O1 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - sum.c</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">sum:
+	test	rsi, rsi
+	jle	.L4
+	mov	rax, rdi
+	lea	rcx, [rdi+rsi*8]
+	mov	edx, 0
+	.p2align 4
+.L3:
+	add	rdx, QWORD PTR [rax]
+	add	rax, 8
+	cmp	rax, rcx
+	jne	.L3
+.L1:
+	mov	rax, rdx
+	ret
+.L4:
+	mov	edx, 0
+	jmp	.L1</code></pre></details>
+<div class="lab-ans" hidden><p>Исчезнут все обращения <code>QWORD PTR [rbp-…]</code>: переменные переедут в регистры (<code>s</code> — RDX, указатель — RAX), а индекс <code>i</code> пропадёт совсем — оптимизатор заменит его указателем, бегущим до <code>end = a + n*8</code>, вычисленного одной <code>lea</code>. Тело цикла — 4 команды вместо ~10.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Байты машинного кода: скомпилируйте в объектный файл и дизассемблируйте.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab sh -c "gcc -O1 -fcf-protection=none -c sum.c &amp;&amp; objdump -d -M intel sum.o"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">0000000000000000 &lt;sum&gt;:
+   0:	48 85 f6             	test   rsi,rsi
+   3:	7e 2b                	jle    30 &lt;sum+0x30&gt;
+   5:	48 89 f8             	mov    rax,rdi
+   8:	48 8d 0c f7          	lea    rcx,[rdi+rsi*8]
+   c:	ba 00 00 00 00       	mov    edx,0x0
+  11:	0f 1f 40 00          	nop    DWORD PTR [rax+0x0]
+  15:	66 66 2e 0f 1f 84 00 	data16 cs nop WORD PTR [rax+rax*1+0x0]
+  1c:	00 00 00 00 
+  20:	48 03 10             	add    rdx,QWORD PTR [rax]
+  23:	48 83 c0 08          	add    rax,0x8
+  27:	48 39 c8             	cmp    rax,rcx
+  2a:	75 f4                	jne    20 &lt;sum+0x20&gt;
+  2c:	48 89 d0             	mov    rax,rdx
+  2f:	c3                   	ret
+  30:	ba 00 00 00 00       	mov    edx,0x0
+  35:	eb f5                	jmp    2c &lt;sum+0x2c&gt;</code></pre></details>
+<p class="lab-note">Слева — смещение в функции, посередине — байты команды, справа — её запись. Длина команд разная: от 1 байта (<code>ret</code> = <code>c3</code>) до 5 и больше — это x86.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Скомпилируйте с <code>-O3</code>.</summary><div>Появятся векторные команды <code>paddq</code>/<code>movdqu</code> с регистрами XMM: компилятор складывает по два long за команду (SIMD, тема 05) и добавляет «хвост» для нечётного n.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="computer-science-3.3">
+<div class="lab-head"><span class="lab-num">Лаба 3.3</span><b>Флаги, знак и деление на константу</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть разные команды для знакового и беззнакового сравнения и как компилятор избавляется от деления.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>ops.c</code>:</div>
+<pre data-title="ops.c"><code class="txt">int lt_signed(long a, long b)                     { return a &lt; b; }
+int lt_unsigned(unsigned long a, unsigned long b) { return a &lt; b; }
+long div10(long x)                                { return x / 10; }
+long div_n(long x, long n)                        { return x / n; }
+long times5(long x)                               { return x * 5; }</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">docker run --rm -v "${PWD}:/lab" cs-lab gcc -O2 -S -masm=intel -fno-asynchronous-unwind-tables -fcf-protection=none -o - ops.c</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">lt_signed:
+	xor	eax, eax
+	cmp	rdi, rsi
+	setl	al
+	ret
+lt_unsigned:
+	xor	eax, eax
+	cmp	rdi, rsi
+	setb	al
+	ret
+div10:
+	movabs	rax, 7378697629483820647
+	imul	rdi
+	sar	rdi, 63
+	sar	rdx, 2
+	mov	rax, rdx
+	sub	rax, rdi
+	ret
+div_n:
+	mov	rax, rdi
+	cqo
+	idiv	rsi
+	ret
+times5:
+	lea	rax, [rdi+rdi*4]
+	ret</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Найдите в выводе: какой командой записан результат знакового и беззнакового сравнения? Есть ли команда деления в <code>div10</code>? Как умножается на 5?</div>
+<div class="lab-ans" hidden><p>Сравнение одно и то же — <code>cmp rdi, rsi</code>, а флаги читаются по-разному: <code>setl</code> (less — по SF и OF) и <code>setb</code> (below — по CF). В <code>div10</code> деления нет: умножение <code>imul</code> на магическую константу 7378697629483820647 (≈ 2⁶⁶/10), сдвиг <code>sar</code> и поправка на знак (вычитание <code>x &gt;&gt; 63</code>). В <code>div_n</code> делитель неизвестен — там настоящий <code>idiv</code> и подготовка <code>cqo</code> (знаковое расширение RAX в RDX:RAX). Умножение на 5 — <code>lea rax, [rdi+rdi*4]</code>.</p></div>
+</li>
+</ol>
+</div>
+<div class="lab" data-lab="computer-science-3.4">
+<div class="lab-head"><span class="lab-num">Лаба 3.4</span><b>Стоимость операций в Java</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Измерить цепочки зависимых операций: сложение, деление на неизвестное число и деление на константу, которое JIT заменяет умножением.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Cost.java</code>:</div>
+<pre data-title="Cost.java"><code class="java">public class Cost {
+    static long add(long x, int n)          { for (int i = 0; i &lt; n; i++) x = x + 7 ^ i; return x; }
+    static long divVar(long x, long d, int n) { for (int i = 0; i &lt; n; i++) x = x / d + 1_000_003 ^ i; return x; }
+    static long divConst(long x, int n)     { for (int i = 0; i &lt; n; i++) x = x / 7 + 1_000_003 ^ i; return x; }
+
+    public static void main(String[] args) {
+        long d = args.length &gt; 0 ? Long.parseLong(args[0]) : 7;   // делитель неизвестен JIT
+        int n = 50_000_000;
+        long sink = 0;
+        for (int round = 0; round &lt; 3; round++) {
+            long t0 = System.nanoTime(); sink += add(round, n);
+            long t1 = System.nanoTime(); sink += divVar(round + 1_000_000_000L, d, n);
+            long t2 = System.nanoTime(); sink += divConst(round + 1_000_000_000L, n);
+            long t3 = System.nanoTime();
+            System.out.printf("раунд %d: сложение %.2f нс/оп, деление на переменную %.2f нс/оп, деление на константу %.2f нс/оп%n",
+                    round, (t1 - t0) / (double) n, (t2 - t1) / (double) n, (t3 - t2) / (double) n);
+        }
+        System.out.println("(контрольная сумма " + (sink &amp; 0xFF) + ")");
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Во сколько раз деление на переменную медленнее сложения? А деление на константу?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Cost.java
+java Cost 7</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">раунд 0: сложение 0.67 нс/оп, деление на переменную 6.94 нс/оп, деление на константу 3.05 нс/оп
+раунд 1: сложение 0.72 нс/оп, деление на переменную 6.86 нс/оп, деление на константу 3.18 нс/оп
+раунд 2: сложение 0.57 нс/оп, деление на переменную 7.03 нс/оп, деление на константу 2.82 нс/оп
+(контрольная сумма 1)</code></pre></details>
+<div class="lab-ans" hidden><p>Порядок чисел (у вас будут свои): сложение с XOR — доли наносекунды (≈ 1–2 такта на итерацию), деление на переменную — примерно на порядок медленнее (команда <code>idiv</code> с задержкой в десятки тактов на этом поколении меньше, но цепочка зависимостей не даёт её спрятать), деление на константу — заметно быстрее деления на переменную: C2, как и gcc, заменил его умножением. Первый раунд часто медленнее — код ещё интерпретируется или работает на C1 (прогрев, <a href="../jvm/16-interpreter-jit.html">JVM, тема 16</a>).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Почему в цикле стоит <code>^ i</code>?</summary><div>Без него JIT мог бы вычислить цикл быстрее, чем по шагам (или вынести инвариант), — зависимость от i делает каждую итерацию настоящей. Измерять микрооперации вручную вообще ненадёжно; для серьёзных замеров — JMH.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">3.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает команда <code>cmp rax, rbx</code>?</p><ul><li>копирует rbx в rax</li><li>вычисляет rax − rbx, результат не сохраняет, но выставляет флаги</li><li>сравнивает и сразу переходит</li><li>обнуляет флаги</li></ul><div class="why">cmp — это sub без записи результата. Решение о переходе принимает следующая команда jcc по флагам.</div></div>
+<div class="mcq" data-ok="2"><p>Чем ARM64 отличается от x86-64 с точки зрения набора команд?</p><ul><li>ARM не умеет 64-битную арифметику</li><li>x86 не поддерживает SIMD</li><li>у ARM фиксированная длина команд 4 байта и доступ к памяти только load/store, у x86 — переменная длина и операнды в памяти</li><li>ничем, это один набор</li></ul><div class="why">Классическая пара RISC/CISC. Плюс разная модель памяти: x86 TSO, ARM слабая.</div></div>
+<div class="mcq" data-ok="0"><p>Как процессор выполняет цикл?</p><ul><li>условный переход назад: PC получает адрес начала тела</li><li>специальным блоком «цикл»</li><li>копирует тело N раз</li><li>прерыванием таймера</li></ul><div class="why">Любое управление — это запись нового значения в PC. Развёртывание цикла делает компилятор, не процессор.</div></div>
+<div class="mcq" data-ok="3"><p>Почему JIT-код для <code>obj.field</code> — одна команда?</p><ul><li>поля хранятся в регистрах</li><li>JVM кэширует все поля</li><li>JIT превращает поле в константу</li><li>смещение поля в объекте известно заранее, и адрес [ссылка + смещение] вычисляется в самой команде mov</li></ul><div class="why">Режим адресации base + displacement. Для массива — base + index·scale + заголовок.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите цикл исполнения команды.</summary><div class="a"><p>Выборка байтов команды по адресу в PC, декодирование (операция, операнды, длина), исполнение в АЛУ или блоке адресации, обращение к памяти, запись результата и флагов, обновление PC: следующая команда или адрес перехода. В современном ядре эти этапы разнесены по конвейеру, и одновременно в работе десятки команд.</p></div></details>
+<details class="q"><summary>Что такое ISA и почему Java-разработчику обычно не нужно о ней думать?</summary><div class="a"><p>Набор команд, регистров, режимов адресации и правил (модель памяти, прерывания), которые процессор гарантирует программам. JVM исполняет переносимый байткод, а JIT сам генерирует машинный код под текущую ISA. Думать о ней приходится при анализе производительности (векторизация, стоимость операций) и модели памяти (x86 прощает гонки, ARM — нет).</p></div></details>
+<details class="q"><summary>Почему компилятор заменяет деление на константу умножением?</summary><div class="a"><p>Деление — одна из самых медленных целочисленных операций (порядка десятков тактов), умножение — 3 такта. x / 10 равно старшей половине произведения x на заранее вычисленное число ≈ 2⁶⁴/10 со сдвигом и поправкой для отрицательных. Если делитель неизвестен при компиляции, остаётся настоящая команда деления.</p></div></details>
+<details class="q"><summary>Где в процессоре «живут» переменные Java-метода?</summary><div class="a"><p>В JIT-коде — в регистрах, пока их хватает; остальные «выталкиваются» в кадр на стеке потока. В интерпретаторе локальные переменные — слоты кадра в памяти стека (тема 04 и <a href="../jvm/03-bytecode.html#frame">JVM, тема 03</a>). Поля объектов — в куче, читаются командой mov со смещением.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

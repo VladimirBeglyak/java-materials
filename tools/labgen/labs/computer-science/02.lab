@@ -1,0 +1,145 @@
+@chapter 02 | quiz
+@intro
+<p>Собираем процессорную логику программно: вентили как функции, сумматор из вентилей, АЛУ с флагами и регистр, который обновляется по такту. Модуль IDEA — <code>cs02</code>. Это модели, но правила в них ровно те же, что в кремнии.</p>
+@end
+
+@lab 2.1 | Всё из NAND | 15 мин
+@goal
+<p>Построить NOT, AND, OR, XOR только из NAND и проверить таблицы истинности.</p>
+@end
+@file Gates.java
+public class Gates {
+    static int nandCount = 0;
+
+    static int nand(int a, int b) { nandCount++; return 1 - (a & b); }
+    static int not(int a)         { return nand(a, a); }
+    static int and(int a, int b)  { return not(nand(a, b)); }
+    static int or(int a, int b)   { return nand(not(a), not(b)); }
+    static int xor(int a, int b)  { int t = nand(a, b); return nand(nand(a, t), nand(b, t)); }
+
+    public static void main(String[] args) {
+        System.out.println(" A B | AND OR XOR | nand-вентилей на XOR");
+        for (int a = 0; a <= 1; a++)
+            for (int b = 0; b <= 1; b++) {
+                int x = and(a, b), y = or(a, b);
+                nandCount = 0;
+                int z = xor(a, b);
+                System.out.printf(" %d %d |  %d   %d   %d  | %d%n", a, b, x, y, z, nandCount);
+            }
+        // проверка законов де Моргана на всех входах
+        boolean ok = true;
+        for (int a = 0; a <= 1; a++)
+            for (int b = 0; b <= 1; b++)
+                ok &= not(and(a, b)) == or(not(a), not(b)) && not(or(a, b)) == and(not(a), not(b));
+        System.out.println("де Морган выполняется: " + ok);
+    }
+}
+@end
+@predict Сколько вентилей NAND понадобится на один XOR? Совпадут ли таблицы с таблицей из раздела 2.2?
+@answer
+<p>XOR — 4 вентиля NAND (<code>t</code> и ещё три). Таблицы AND/OR/XOR совпадают с классическими, законы де Моргана выполняются на всех четырёх наборах входов.</p>
+@end
+@run
+javac Gates.java
+java Gates
+@end
+@try
+Выразите NOR только через NAND и посчитайте вентили. ::: <code>not(or(a, b))</code> = 3 вентиля на OR + 1 на NOT = 4. Симметрично: из одних NOR тоже можно собрать всё.
+@end
+
+@lab 2.2 | Сумматор из вентилей и флаги | 20 мин
+@goal
+<p>Сложить и вычесть 8-битные числа цепочкой полных сумматоров и вычислить флаги C, V, Z, N, как это делает процессор.</p>
+@end
+@file Adder.java
+public class Adder {
+    static int xor(int a, int b) { return a ^ b; }
+
+    // полный сумматор: возвращает {сумма, перенос}
+    static int[] full(int a, int b, int cin) {
+        int s1 = xor(a, b);
+        return new int[] {xor(s1, cin), (a & b) | (cin & s1)};
+    }
+
+    static void addBits(String label, int a, int b, boolean subtract) {
+        int carry = subtract ? 1 : 0, result = 0, carryIntoTop = 0;
+        for (int i = 0; i < 8; i++) {
+            int ai = (a >> i) & 1, bi = (b >> i) & 1;
+            if (subtract) bi ^= 1;                // инверсия B
+            if (i == 7) carryIntoTop = carry;
+            int[] r = full(ai, bi, carry);
+            result |= r[0] << i;
+            carry = r[1];
+        }
+        int v = carryIntoTop ^ carry;
+        System.out.printf("%-12s %8s %s %8s = %8s | unsigned %3d, signed %4d | C=%d V=%d Z=%d N=%d%n",
+                label, bin(a), subtract ? "-" : "+", bin(b), bin(result),
+                result, (byte) result, carry, v, result == 0 ? 1 : 0, (result >> 7) & 1);
+    }
+
+    static String bin(int v) { return String.format("%8s", Integer.toBinaryString(v & 0xFF)).replace(' ', '0'); }
+
+    public static void main(String[] args) {
+        addBits("5 + 3", 5, 3, false);
+        addBits("200 + 100", 200, 100, false);
+        addBits("100 + 50", 100, 50, false);
+        addBits("-1 + 1", 0xFF, 1, false);
+        addBits("5 - 3", 5, 3, true);
+        addBits("3 - 5", 3, 5, true);
+        addBits("-128 - 1", 0x80, 1, true);
+        System.out.println("проверка Java: (byte)(200 + 100) = " + (byte) (200 + 100) + ", (byte)(100 + 50) = " + (byte) (100 + 50));
+    }
+}
+@end
+@predict Для каких строк будет C = 1, для каких V = 1? Что значат флаги для «200 + 100» и «100 + 50»?
+@answer
+<p>«200 + 100»: C = 1, V = 0 — беззнаково переполнилось (300 не влезает в байт, остаётся 44), а знаково это −56 + 100 = 44 — верно. «100 + 50»: C = 0, V = 1 — беззнаково 150 корректно, а знаково 100 + 50 = −106 — переполнение. «−1 + 1» даёт ноль: Z = 1, C = 1. При вычитании C = 1 означает «заёма не было» (5 − 3), C = 0 — заём (3 − 5, беззнаково 3 &lt; 5). «−128 − 1» — V = 1: результат 127. Процессор вычисляет все флаги сразу, а какой из них важен, решает следующая команда.</p>
+@end
+@run
+javac Adder.java
+java Adder
+@end
+
+@lab 2.3 | Регистр, такт и счётчик | 15 мин
+@goal
+<p>Смоделировать синхронную схему: регистры обновляются только по фронту такта, комбинационная логика между ними — чистая функция.</p>
+@end
+@file Clocked.java
+public class Clocked {
+    // «регистр»: выход q меняется только в tick()
+    static final class Register {
+        private int q, d;
+        int q() { return q; }
+        void d(int value) { d = value; }       // вход можно менять сколько угодно
+        void tick() { q = d; }                  // фронт такта
+    }
+
+    public static void main(String[] args) {
+        Register pc = new Register(), acc = new Register();
+        int[] program = {3, 3, 3, -2, 10};       // «команды»: прибавить число
+
+        for (int cycle = 0; cycle < program.length; cycle++) {
+            // комбинационная логика: счётчик команд +1 и АЛУ acc + operand
+            int operand = program[pc.q()];
+            pc.d(pc.q() + 1);
+            acc.d(acc.q() + operand);
+            System.out.printf("такт %d до фронта:  pc=%d acc=%3d | на входах: pc'=%d acc'=%3d%n",
+                    cycle, pc.q(), acc.q(), pc.q() + 1, acc.q() + operand);
+            pc.tick();
+            acc.tick();
+        }
+        System.out.println("итог: pc=" + pc.q() + " acc=" + acc.q());
+    }
+}
+@end
+@predict Почему внутри такта <code>pc.q()</code> ещё старое, хотя мы уже вызвали <code>pc.d(...)</code>? Чему будет равен <code>acc</code> в конце?
+@answer
+<p><code>d()</code> только подаёт значение на вход триггера; выход <code>q</code> меняется лишь по фронту (<code>tick()</code>), поэтому в пределах такта вся логика видит согласованные старые значения. Именно это позволяет в одном такте читать и писать регистр без гонок. <code>acc</code> = 3 + 3 + 3 − 2 + 10 = 17, <code>pc</code> = 5. Это уже почти процессор: счётчик команд выбирает команду, АЛУ её выполняет — следующая тема.</p>
+@end
+@run
+javac Clocked.java
+java Clocked
+@end
+@try
+Перенесите <code>pc.tick()</code> перед вычислением <code>acc.d(...)</code> в том же такте. ::: Ничего не сломается в этом примере, потому что операнд уже прочитан, — но в реальной схеме «регистр обновился посреди такта» означает гонку сигналов. Синхронный дизайн запрещает это: все регистры защёлкиваются одновременно.
+@end

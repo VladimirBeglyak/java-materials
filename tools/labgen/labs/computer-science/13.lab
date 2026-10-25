@@ -1,0 +1,196 @@
+@chapter 13 | quiz
+@intro
+<p>Смотрим на сетевой ввод-вывод Java по системным вызовам: блокирующий сервер, NIO <code>Selector</code> на <code>epoll</code>, виртуальный поток, который паркуется на сокете, и zero-copy через <code>sendfile</code>. Все лабы — в Docker-образе <code>cs-lab</code> под <code>strace</code>. Модуль IDEA — <code>cs13</code>.</p>
+@end
+
+@lab 13.1 | Блокирующий сервер | 15 мин
+@goal
+<p>Найти <code>socket</code>, <code>bind</code>, <code>listen</code>, <code>accept</code>, <code>read</code> и <code>write</code> в работе простейшего эхо-сервера.</p>
+@end
+@file BlockingEcho.java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class BlockingEcho {
+    public static void main(String[] args) throws Exception {
+        InetAddress lo = InetAddress.getLoopbackAddress();
+        try (ServerSocket server = new ServerSocket(9000, 50, lo)) {          // socket + bind + listen
+            Thread client = new Thread(() -> {
+                try (Socket s = new Socket(lo, 9000)) {                          // connect
+                    s.getOutputStream().write("ping\n".getBytes());
+                    s.getInputStream().read();
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            });
+            client.start();
+            try (Socket conn = server.accept()) {                                // accept — новый дескриптор
+                byte[] buf = new byte[16];
+                int n = conn.getInputStream().read(buf);                         // read — спим, пока нет данных
+                conn.getOutputStream().write(buf, 0, n);                         // write — в буфер отправки
+            }
+            client.join();
+        }
+    }
+}
+@end
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp BlockingEcho.java && strace -f -e trace=socket,bind,listen,accept,connect,read,write java -cp /tmp BlockingEcho 2>&1 | grep -E 'AF_INET.*SOCK_STREAM|bind\(|listen\(|accept\(|connect\(.*9000|ping'" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac -d /tmp BlockingEcho.java && strace -f -e trace=socket,bind,listen,accept,connect,read,write java -cp /tmp BlockingEcho 2>&1 | grep -E 'AF_INET.*SOCK_STREAM|bind\(|listen\(|accept\(|connect\(.*9000|ping'"
+@end
+@predict В каком порядке и от каких потоков ([pid N]) появятся вызовы? Что вернёт <code>accept</code>?
+@answer
+<p>Несколько первых <code>socket</code> — JDK при старте проверяет, поддерживает ли система IPv6 (и сразу закрывает пробные сокеты). Затем поток <code>main</code>: <code>socket(AF_INET6, SOCK_STREAM)</code> → <code>bind(… port 9000)</code> → <code>listen(…, 50)</code> → <code>accept(…</code> — и засыпает (у strace — <code>&lt;unfinished …&gt;</code>). Поток клиента: свой <code>socket</code> и <code>connect</code> к порту 9000, затем <code>write(…, "ping\n", 5)</code>. <code>accept</code> возвращает <b>новый</b> дескриптор — соединение с клиентом (и адрес клиента с его эфемерным портом). Дальше <code>read(…, "ping\n")</code> на этом дескрипторе и <code>write</code> обратно; клиент читает ответ. Адреса — IPv6 (<code>::1</code> или <code>::ffff:127.0.0.1</code>): Java по умолчанию использует двойной стек.</p>
+@end
+
+@lab 13.2 | NIO Selector — это epoll | 15 мин
+@goal
+<p>Убедиться, что <code>Selector</code> на Linux реализован через <code>epoll</code>, и увидеть цикл событий.</p>
+@end
+@file NioEcho.java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+
+public class NioEcho {
+    public static void main(String[] args) throws Exception {
+        InetSocketAddress addr = new InetSocketAddress(InetAddress.getLoopbackAddress(), 9001);
+        Selector selector = Selector.open();                                     // epoll_create
+        ServerSocketChannel server = ServerSocketChannel.open().bind(addr);
+        server.configureBlocking(false);
+        server.register(selector, SelectionKey.OP_ACCEPT);                       // epoll_ctl(ADD, слушающий сокет)
+
+        Thread client = new Thread(() -> {
+            try (SocketChannel s = SocketChannel.open(addr)) {
+                s.write(ByteBuffer.wrap("ping".getBytes()));
+                s.read(ByteBuffer.allocate(8));
+            } catch (IOException e) { throw new UncheckedIOException(e); }
+        });
+        client.start();
+
+        boolean done = false;
+        while (!done) {
+            selector.select();                                                   // epoll_wait — ждём любого события
+            for (SelectionKey key : selector.selectedKeys()) {
+                if (key.isAcceptable()) {
+                    SocketChannel ch = server.accept();
+                    ch.configureBlocking(false);
+                    ch.register(selector, SelectionKey.OP_READ);                 // epoll_ctl(ADD, новое соединение)
+                } else if (key.isReadable()) {
+                    SocketChannel ch = (SocketChannel) key.channel();
+                    ByteBuffer buf = ByteBuffer.allocate(8);
+                    ch.read(buf);
+                    buf.flip();
+                    ch.write(buf);
+                    ch.close();
+                    done = true;
+                }
+            }
+            selector.selectedKeys().clear();
+        }
+        client.join();
+    }
+}
+@end
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp NioEcho.java && strace -f -e trace=epoll_create1,epoll_ctl,epoll_wait,accept,read,write java -cp /tmp NioEcho 2>&1 | grep -E 'epoll|accept\(|ping' | grep -v resumed" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac -d /tmp NioEcho.java && strace -f -e trace=epoll_create1,epoll_ctl,epoll_wait,accept,read,write java -cp /tmp NioEcho 2>&1 | grep -E 'epoll|accept\(|ping' | grep -v resumed"
+@end
+@predict Сколько раз поток сервера вызовет <code>epoll_wait</code> и что будет между вызовами?
+@answer
+<p><code>epoll_create1</code> — создание селектора; <code>epoll_ctl(…, EPOLL_CTL_ADD, fd, {events=EPOLLIN…})</code> — регистрация слушающего сокета. Затем цикл: <code>epoll_wait</code> (ждём) → событие на слушающем сокете → <code>accept</code> → <code>epoll_ctl(ADD)</code> нового соединения → снова <code>epoll_wait</code> → событие чтения → <code>read(…, "ping")</code> и <code>write</code>. Один поток обслуживает любое число соединений: между ожиданиями он занят только теми сокетами, где что-то произошло.</p>
+@end
+
+@lab 13.3 | Виртуальный поток паркуется на сокете | 15 мин
+@goal
+<p>Увидеть, что блокирующий <code>read()</code> в виртуальном потоке на самом деле неблокирующий: <code>EAGAIN</code>, регистрация в poller и пробуждение.</p>
+@end
+@file VirtualRead.java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+
+public class VirtualRead {
+    public static void main(String[] args) throws Exception {
+        InetAddress lo = InetAddress.getLoopbackAddress();
+        try (ServerSocket server = new ServerSocket(9002, 50, lo)) {
+            Thread client = new Thread(() -> {
+                try (Socket s = new Socket(lo, 9002)) {
+                    Thread.sleep(300);                                           // данные придут не сразу
+                    s.getOutputStream().write("ping\n".getBytes());
+                    s.getInputStream().read();
+                } catch (Exception e) { throw new RuntimeException(e); }
+            });
+            client.start();
+            Socket conn = server.accept();
+            Thread vt = Thread.ofVirtual().start(() -> {
+                try {
+                    byte[] buf = new byte[16];
+                    int n = conn.getInputStream().read(buf);                     // обычный блокирующий код
+                    conn.getOutputStream().write(buf, 0, n);
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            });
+            vt.join();
+            client.join();
+            conn.close();
+        }
+    }
+}
+@end
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp VirtualRead.java && strace -f -e trace=read,epoll_ctl,epoll_wait java -cp /tmp VirtualRead 2>&1 | grep -E 'EAGAIN|CTL_ADD|ping' | grep -v unfinished" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac -d /tmp VirtualRead.java && strace -f -e trace=read,epoll_ctl,epoll_wait java -cp /tmp VirtualRead 2>&1 | grep -E 'EAGAIN|CTL_ADD|ping' | grep -v unfinished"
+@end
+@predict Какой результат вернёт первый <code>read</code> виртуального потока? Как он потом получит данные?
+@answer
+<p>Остальные строки <code>EPOLL_CTL_ADD</code> с другими номерами дескрипторов — служебные: потоки-poller JVM регистрируют свои внутренние каналы пробуждения. Нас интересует дескриптор соединения из строки с <code>EAGAIN</code>. Первый <code>read(fd, …)</code> возвращает <code>-1 EAGAIN (Resource temporarily unavailable)</code>: JVM перевела сокет в неблокирующий режим. Затем <code>epoll_ctl(…, EPOLL_CTL_ADD, fd, {events=EPOLLIN|EPOLLONESHOT…})</code> — сокет регистрируется в системном poller, а виртуальный поток паркуется: его носитель свободен для других. Когда клиент через 300 мс присылает данные, поток-poller в <code>epoll_wait</code> получает событие и снимает виртуальный поток с парковки; повторный <code>read</code> возвращает «ping». Посмотрите на номер в <code>[pid N]</code>: второй <code>read</code> часто выполняет <b>другой</b> поток ОС — виртуальный поток продолжил работу на другом носителе. Код при этом выглядит как обычный блокирующий.</p>
+@end
+
+@lab 13.4 | Zero-copy: transferTo превращается в sendfile | 10 мин
+@goal
+<p>Проверить, что отдача файла в сокет через <code>transferTo</code> не копирует данные через память Java.</p>
+@end
+@file ZeroCopy.java
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class ZeroCopy {
+    public static void main(String[] args) throws Exception {
+        Path file = Files.write(Path.of("/tmp/payload.bin"), new byte[1 << 20]);   // 1 МБ
+        InetSocketAddress addr = new InetSocketAddress(InetAddress.getLoopbackAddress(), 9003);
+        try (ServerSocketChannel server = ServerSocketChannel.open().bind(addr)) {
+            Thread client = new Thread(() -> {
+                try (SocketChannel s = SocketChannel.open(addr)) {
+                    ByteBuffer b = ByteBuffer.allocate(1 << 16);
+                    long total = 0;
+                    for (int n; (n = s.read(b)) > 0; b.clear()) total += n;
+                    System.out.println("клиент получил " + total + " байт");
+                } catch (IOException e) { throw new UncheckedIOException(e); }
+            });
+            client.start();
+            try (SocketChannel conn = server.accept(); FileChannel fc = FileChannel.open(file)) {
+                System.out.println("отправлено " + fc.transferTo(0, fc.size(), conn) + " байт");
+            }
+            client.join();
+        }
+    }
+}
+@end
+@run
+docker run --rm --cap-add=SYS_PTRACE -v "${PWD}:/lab" cs-lab sh -c "javac -d /tmp ZeroCopy.java && strace -f -e trace=sendfile,copy_file_range,splice java -cp /tmp ZeroCopy 2>&1 | grep -E 'sendfile|copy_file_range|splice|байт' | grep -v resumed" ||| MSYS_NO_PATHCONV=1 docker run --rm --cap-add=SYS_PTRACE -v "$(pwd -W):/lab" cs-lab sh -c "javac -d /tmp ZeroCopy.java && strace -f -e trace=sendfile,copy_file_range,splice java -cp /tmp ZeroCopy 2>&1 | grep -E 'sendfile|copy_file_range|splice|байт' | grep -v resumed"
+@end
+@predict Каким системным вызовом JDK отправит файл? Сколько вызовов понадобится на мегабайт?
+@answer
+<p>Сначала JDK пробует <code>copy_file_range</code> (он годится для «файл → файл», для сокета ядро отвечает <code>EINVAL</code>), затем — <code>sendfile(сокет, файл, [0], 1048576)</code>: данные идут из page cache в сокет внутри ядра. Один-два вызова на весь мегабайт (если буфер сокета заполнился, <code>sendfile</code> отправит часть, и JDK повторит). Через <code>read</code>/<code>write</code> было бы десятки вызовов и двойное копирование через память JVM.</p>
+@end

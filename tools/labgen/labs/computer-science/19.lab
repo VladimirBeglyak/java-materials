@@ -1,0 +1,62 @@
+@chapter 19 | quiz
+@intro
+<p>Финальная лаба собирает в одну программу всё, что курс рассказал о вашей машине: представление чисел, порядок байт, процессоры и их кэши, страницы памяти, лимиты, потоки и стек. Запустите её на своей машине и в контейнере — и объясните каждую строку вывода, ссылаясь на главы. Модуль IDEA — <code>cs19</code>.</p>
+@end
+
+@lab 19.1 | Паспорт машины глазами Java | 25 мин
+@goal
+<p>Написать программу, которая печатает характеристики компьютера и процесса, и объяснить каждую строку.</p>
+@end
+@file Passport.java
+import java.lang.management.ManagementFactory;
+import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Passport {
+    static String read(String p) {
+        try { return Files.readString(Path.of(p)).trim(); } catch (Exception e) { return "—"; }
+    }
+
+    static int depth;
+    static void dive() { depth++; dive(); }
+
+    public static void main(String[] args) throws Exception {
+        Runtime rt = Runtime.getRuntime();
+        System.out.println("ОС / архитектура:       " + System.getProperty("os.name") + " / " + System.getProperty("os.arch"));
+        System.out.println("JVM:                    " + System.getProperty("java.vm.name") + " " + Runtime.version());
+        System.out.println("порядок байт:           " + ByteOrder.nativeOrder() + "                         (тема 01)");
+        System.out.println("-1 >>> 28 = " + (-1 >>> 28) + ", (byte) 200 = " + (byte) 200 + ", 0.1 + 0.2 = " + (0.1 + 0.2) + "  (тема 01)");
+        System.out.println("логических процессоров: " + rt.availableProcessors() + "                                (темы 07, 15)");
+        System.out.println("кэш L1d / L2 / L3:      " + read("/sys/devices/system/cpu/cpu0/cache/index0/size") + " / "
+                + read("/sys/devices/system/cpu/cpu0/cache/index2/size") + " / " + read("/sys/devices/system/cpu/cpu0/cache/index3/size")
+                + "  кэш-линия " + read("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size") + " байт  (тема 06, только Linux)");
+        System.out.println("max heap / committed:   " + rt.maxMemory() / 1048576 + " МБ / " + rt.totalMemory() / 1048576 + " МБ                  (тема 08)");
+        System.out.println("лимит памяти cgroup:    " + read("/sys/fs/cgroup/memory.max") + ", квота CPU: " + read("/sys/fs/cgroup/cpu.max") + "  (тема 15)");
+        System.out.println("PID процесса:           " + ProcessHandle.current().pid() + ", потоков JVM (Java): " + ManagementFactory.getThreadMXBean().getThreadCount() + "  (темы 04, 11)");
+        System.out.println("сборщик мусора:         " + ManagementFactory.getGarbageCollectorMXBeans().get(0).getName() + "                     (JVM 13)");
+
+        Thread t = new Thread(null, () -> {
+            try { dive(); } catch (StackOverflowError e) { System.out.println("глубина рекурсии при стеке 512 КБ: " + depth + " кадров (тема 04)"); }
+        }, "probe", 512 * 1024);
+        t.start();
+        t.join();
+        long t0 = System.nanoTime();
+        for (int i = 0; i < 1_000_000; i++) System.nanoTime();
+        System.out.printf("System.nanoTime():      %.1f нс на вызов                (тема 10)%n", (System.nanoTime() - t0) / 1e6);
+    }
+}
+@end
+@step Запустите на своей машине:
+@run
+javac Passport.java
+java Passport
+@end
+@step И в контейнере с лимитами:
+@run
+docker run --rm -m 1g --cpus=2 -v "${PWD}:/lab" cs-lab java Passport.java ||| MSYS_NO_PATHCONV=1 docker run --rm -m 1g --cpus=2 -v "$(pwd -W):/lab" cs-lab java Passport.java
+@end
+@predict Объясните каждое различие между двумя запусками: процессоры, память, сборщик мусора, время <code>nanoTime</code>, кэш.
+@answer
+<p>На Windows: 18 логических процессоров, куча до ~8 ГБ (25% от 32 ГБ памяти), сборщик G1 («G1 Young Generation»), файлов <code>/sys</code> нет — кэши и cgroups не видны («—»), <code>nanoTime</code> ~25 нс (счётчик QueryPerformanceCounter). В контейнере: 2 процессора и лимит 1 ГБ из cgroups (<code>memory.max</code> = 1073741824, <code>cpu.max</code> = <code>200000 100000</code>), куча ~250 МБ (25% лимита), сборщик Serial («Copy» — его молодое поколение): при памяти меньше 1792 МБ машина по эргономике не «серверная». Кэши видны через <code>/sys</code>: L1d 48K, L2 2048K, L3 18432K, линия 64 байта. <code>nanoTime</code> ~40 нс — vDSO внутри виртуальной машины WSL. Java-потоков всего 6–7: GC и JIT — нативные потоки без объекта <code>Thread</code> (лаба 18.2). Порядок байт и арифметика одинаковы — это свойства процессора и языка, а не ОС. Глубина рекурсии — тысячи кадров и зависит от того, сколько вызовов прошло в интерпретаторе (тема 04). Если вы можете объяснить каждую строку — курс пройден.</p>
+@end

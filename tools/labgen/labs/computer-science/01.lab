@@ -1,0 +1,173 @@
+@chapter 01 | quiz
+@intro
+<p>Смотрим на биты настоящих значений: как Java хранит целые, float и текст, в каком порядке байты уходят в файл. Всё на чистой Java — модуль IDEA <code>cs01</code>.</p>
+@end
+
+@lab 1.1 | Целые числа изнутри | 15 мин
+@goal
+<p>Увидеть дополнительный код, переполнение и знаковое расширение на настоящих битах.</p>
+@end
+@file Ints.java
+public class Ints {
+    static String bits(int v, int n) {
+        String s = Integer.toBinaryString(v);
+        s = s.length() > n ? s.substring(s.length() - n) : "0".repeat(n - s.length()) + s;
+        return s.replaceAll("(.{4})(?!$)", "$1 ");
+    }
+
+    public static void main(String[] args) {
+        for (int v : new int[] {5, -5, -1, 127, -128}) {
+            System.out.printf("%5d  byte: %s   ~v+1 = %d%n", v, bits(v, 8), ~v + 1);
+        }
+        byte b = (byte) 0xF0;
+        System.out.println("byte 0xF0 как byte         = " + b);
+        System.out.println("расширение до int          = " + bits(b, 32) + " (" + (int) b + ")");
+        System.out.println("b & 0xFF (беззнаково)      = " + bits(b & 0xFF, 32) + " (" + (b & 0xFF) + ")");
+        System.out.println("Byte.toUnsignedInt(b)      = " + Byte.toUnsignedInt(b));
+        int max = Integer.MAX_VALUE;
+        System.out.println("MAX     = " + bits(max, 32));
+        System.out.println("MAX + 1 = " + bits(max + 1, 32) + " = " + (max + 1));
+        System.out.println("-1 как unsigned int        = " + Integer.toUnsignedString(-1));
+        System.out.println("-1 как unsigned long       = " + Long.toUnsignedString(-1L));
+        System.out.println("0xCAFEBABE                 = " + 0xCAFEBABE + " (unsigned " + Integer.toUnsignedString(0xCAFEBABE) + ")");
+        System.out.println("hex(255) = " + Integer.toHexString(255) + ", hex(-1) = " + Integer.toHexString(-1) + ", parse 'ff' = " + Integer.parseInt("ff", 16));
+    }
+}
+@end
+@predict Предскажите битовые строки для −5 и −128, чему равен <code>(int) (byte) 0xF0</code> и как будет выглядеть <code>MAX + 1</code>.
+@answer
+<p>−5 = <code>1111 1011</code> (инверсия 0000 0101 и +1), −128 = <code>1000 0000</code>, а <code>~v + 1</code> у −128 снова −128 — у него нет положительной пары в byte, но здесь вычисление идёт в int, поэтому печатается 128. <code>(byte) 0xF0</code> = −16: знаковое расширение до int заполняет старшие 24 бита единицами; маска <code>&amp; 0xFF</code> даёт 240. <code>MAX + 1</code> — <code>1000 0000 … 0000</code> = −2147483648. <code>0xCAFEBABE</code> печатается как −889275714.</p>
+@end
+@run
+javac Ints.java
+java Ints
+@end
+@try
+Как получить <code>Integer.MIN_VALUE</code> одним выражением из единицы? ::: <code>1 &lt;&lt; 31</code>: единица попадает в знаковый бит.
+@end
+
+@lab 1.2 | float и double по битам | 20 мин
+@goal
+<p>Разобрать float на знак, порядок и мантиссу, увидеть точное значение 0.1 и предел точности.</p>
+@end
+@file Floats.java
+import java.math.BigDecimal;
+
+public class Floats {
+    static void dump(float f) {
+        int b = Float.floatToRawIntBits(f);
+        int s = b >>> 31, e = (b >>> 23) & 0xFF, m = b & 0x7FFFFF;
+        String bin = String.format("%32s", Integer.toBinaryString(b)).replace(' ', '0');
+        String pow = e == 0 ? "денорм." : e == 255 ? "inf/NaN" : "2^" + (e - 127);
+        System.out.printf("%-14s %s %s %s  e=%3d (%s)  hex=%08X%n", f, bin.charAt(0), bin.substring(1, 9), bin.substring(9), e, pow, b);
+    }
+
+    public static void main(String[] args) {
+        for (float f : new float[] {1f, -6.25f, 0.1f, 16777216f, Float.MIN_VALUE, Float.POSITIVE_INFINITY, Float.NaN}) dump(f);
+        System.out.println();
+        System.out.println("0.1f точно  = " + new BigDecimal(0.1f));
+        System.out.println("0.1  точно  = " + new BigDecimal(0.1));
+        System.out.println("16777217f   = " + 16777217f);
+        System.out.println("2^53 + 1    = " + (double) ((1L << 53) + 1));
+        System.out.println("ulp(1f)     = " + Math.ulp(1f) + ", ulp(1e9f) = " + Math.ulp(1e9f));
+        System.out.println("1e9f + 1    = " + (1e9f + 1) + "  (== 1e9f? " + (1e9f + 1 == 1e9f) + ")");
+        double a = 0.1, b = 0.2, c = 0.3;
+        System.out.println("(a+b)+c = " + ((a + b) + c) + ",  a+(b+c) = " + (a + (b + c)));
+        System.out.println("1.0 / 0 = " + (1.0 / 0) + ",  0.0 / 0 = " + (0.0 / 0) + ",  1 / -0.0 = " + (1 / -0.0));
+        System.out.println("NaN == NaN: " + (Float.NaN == Float.NaN) + ",  Float.compare: " + Float.compare(Float.NaN, Float.NaN));
+    }
+}
+@end
+@predict Какой порядок (e) будет у 1.0 и у 0.1? Совпадёт ли <code>(a+b)+c</code> с <code>a+(b+c)</code>?
+@answer
+<p>У 1.0 порядок 127 (2⁰) и мантисса из нулей; у 0.1 — 123 (2⁻⁴: 0,1 = 1,6 × 2⁻⁴) и мантисса <code>100110011001100…1101</code> — повторяющийся узор «1100», последняя цифра округлена вверх (hex 3DCCCCCD). <code>Float.MIN_VALUE</code> — денормализованное число: порядок 0, единственная единица в младшем бите. Бесконечность — порядок 255 и нулевая мантисса, NaN — 255 и ненулевая. Суммы различаются в последнем знаке: 0.6000000000000001 и 0.6 — сложение не ассоциативно. <code>1e9f + 1 == 1e9f</code>: шаг float около 10⁹ — 64.</p>
+@end
+@run
+javac Floats.java
+java Floats
+@end
+@try
+Почему <code>new BigDecimal(0.1f)</code> короче, чем <code>new BigDecimal(0.1)</code>? ::: Точное значение — это дробь m/2ᵏ; у float меньше бит мантиссы и меньше k, поэтому меньше десятичных знаков (каждый двоичный разряд после запятой даёт ещё одну десятичную цифру).
+@end
+
+@lab 1.3 | Порядок байт | 10 мин
+@goal
+<p>Записать число в разных порядках и посмотреть байты; убедиться, что Java I/O пишет big-endian.</p>
+@end
+@file Endian.java
+import java.io.*;
+import java.nio.*;
+import java.util.HexFormat;
+
+public class Endian {
+    public static void main(String[] args) throws IOException {
+        HexFormat hex = HexFormat.ofDelimiter(" ");
+        System.out.println("порядок процессора: " + ByteOrder.nativeOrder());
+        ByteBuffer be = ByteBuffer.allocate(4).putInt(0x0A0B0C0D);
+        ByteBuffer le = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0x0A0B0C0D);
+        System.out.println("ByteBuffer по умолчанию: " + hex.formatHex(be.array()));
+        System.out.println("LITTLE_ENDIAN:           " + hex.formatHex(le.array()));
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        new DataOutputStream(bos).writeInt(0x0A0B0C0D);
+        System.out.println("DataOutputStream:        " + hex.formatHex(bos.toByteArray()));
+
+        byte[] abcd = {0x41, 0x42, 0x43, 0x44};
+        System.out.println("41 42 43 44 как текст:   " + new String(abcd, "US-ASCII"));
+        System.out.println("как int big-endian:      " + ByteBuffer.wrap(abcd).getInt());
+        System.out.println("как int little-endian:   " + ByteBuffer.wrap(abcd).order(ByteOrder.LITTLE_ENDIAN).getInt());
+        System.out.println("как float big-endian:    " + ByteBuffer.wrap(abcd).getFloat());
+        System.out.println("порт 8080 в сетевом порядке: " + hex.formatHex(ByteBuffer.allocate(2).putShort((short) 8080).array()));
+    }
+}
+@end
+@predict Что напечатает <code>ByteOrder.nativeOrder()</code> на вашем компьютере и какой порядок у <code>DataOutputStream</code>?
+@answer
+<p>На x86-64 и ARM — <code>LITTLE_ENDIAN</code>. Но <code>ByteBuffer</code> по умолчанию и <code>DataOutputStream</code> пишут <code>0a 0b 0c 0d</code> — big-endian, независимо от процессора: так формат файлов и сетевых протоколов одинаков везде. Одни и те же байты <code>41 42 43 44</code> — «ABCD», 1094861636, 1145258561 и 12.141422. Порт 8080 = 0x1F90 → <code>1f 90</code>.</p>
+@end
+@run
+javac Endian.java
+java Endian
+@end
+
+@lab 1.4 | Текст, кодировки и кракозябры | 15 мин
+@goal
+<p>Сосчитать символы, char и байты строки и воспроизвести кракозябры.</p>
+@end
+@file Text.java
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
+
+public class Text {
+    public static void main(String[] args) {
+        HexFormat hex = HexFormat.ofDelimiter(" ");
+        String s = "Aя€😀";
+        System.out.println("length() = " + s.length() + ", codePoints = " + s.codePointCount(0, s.length()));
+        s.codePoints().forEach(cp -> System.out.printf("U+%04X %s → UTF-8 %s%n",
+                cp, Character.toString(cp), hex.formatHex(Character.toString(cp).getBytes(StandardCharsets.UTF_8))));
+        System.out.println("UTF-16BE: " + hex.formatHex(s.getBytes(StandardCharsets.UTF_16BE)));
+
+        String hello = "Привет";
+        byte[] utf8 = hello.getBytes(StandardCharsets.UTF_8);
+        System.out.println("\n\"Привет\": " + utf8.length + " байт UTF-8, " + hello.getBytes(Charset.forName("windows-1251")).length + " байт windows-1251");
+        System.out.println("UTF-8 → прочитано как windows-1251: " + new String(utf8, Charset.forName("windows-1251")));
+        System.out.println("UTF-8 → прочитано как ISO-8859-1:   " + new String(utf8, StandardCharsets.ISO_8859_1));
+        byte[] cp1251 = hello.getBytes(Charset.forName("windows-1251"));
+        System.out.println("windows-1251 → прочитано как UTF-8: " + new String(cp1251, StandardCharsets.UTF_8));
+        System.out.println("'a' - 'A' = " + ('a' - 'A') + ", 'Q' | 0x20 = " + (char) ('Q' | 0x20));
+        System.out.println("кодировка по умолчанию: " + Charset.defaultCharset() + ", stdout.encoding = " + System.getProperty("stdout.encoding"));
+    }
+}
+@end
+@predict Сколько char и сколько кодовых точек в «Aя€😀»? Что получится при чтении байтов windows-1251 как UTF-8?
+@answer
+<p>5 char и 4 кодовые точки: эмодзи — суррогатная пара. Байты UTF-8: <code>41</code>, <code>d1 8f</code>, <code>e2 82 ac</code>, <code>f0 9f 98 80</code>. «Привет» — 12 байт в UTF-8 и 6 в windows-1251. UTF-8 как windows-1251 даёт «РџСЂРёРІРµС‚». Обратная ошибка — байты windows-1251 как UTF-8 — это некорректные последовательности, каждая заменяется символом <code>�</code> (U+FFFD): исходный текст из такой строки уже не восстановить. Буквы ASCII отличаются от строчных одним битом 0x20.</p>
+@end
+@run
+javac Text.java
+java Text
+@end
+@try
+Запустите <code>java -Dstdout.encoding=windows-1251 Text</code> в терминале IDEA. ::: Терминал IDEA ждёт UTF-8, а программа отдаёт байты windows-1251 — кириллица в выводе превратится в мусор. Кодировка консоли — такой же договор, как кодировка файла.
+@end

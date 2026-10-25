@@ -1,0 +1,99 @@
+@chapter 15 | quiz
+@intro
+<p>Разбираем контейнер на механизмы ядра: пространства имён, файлы cgroups с лимитами, что из этого видит JVM, троттлинг процессора и урезанные права. Все лабы — в Docker. Модуль IDEA — <code>cs15</code>.</p>
+@end
+
+@lab 15.1 | Пространства имён | 15 мин
+@goal
+<p>Убедиться, что два одновременно работающих контейнера — процессы одного ядра, но в разных пространствах имён.</p>
+@end
+@step Запустите первый контейнер в фоне и посмотрите на оба одновременно:
+@run
+docker run -d --name ns1 cs-lab sleep 60 ||| MSYS_NO_PATHCONV=1 docker run -d --name ns1 cs-lab sleep 60 >/dev/null; echo запущен ns1
+docker exec ns1 sh -c "uname -r; hostname; ls -l /proc/self/ns" ||| MSYS_NO_PATHCONV=1 docker exec ns1 sh -c "uname -r; hostname; ls -l /proc/self/ns | awk '{print \$9, \$11}' | grep -E '^(pid|net|mnt|uts) '"
+docker run --rm cs-lab sh -c "uname -r; hostname; ls -l /proc/self/ns" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "uname -r; hostname; ls -l /proc/self/ns | awk '{print \$9, \$11}' | grep -E '^(pid|net|mnt|uts) '"
+docker rm -f ns1 ||| docker rm -f ns1 >/dev/null; echo удалён ns1
+@end
+@predict Совпадут ли версия ядра, имя хоста и идентификаторы пространств имён у двух контейнеров?
+@answer
+<p>Версия ядра одинаковая — ядро одно на всех. Имя хоста разное (по умолчанию — короткий ID контейнера: пространство <code>uts</code>). Номера в <code>pid:[…]</code>, <code>net:[…]</code>, <code>mnt:[…]</code>, <code>uts:[…]</code> — разные: это идентификаторы объектов пространств имён в ядре. Процессы с одинаковым номером видят одно и то же; <code>docker run --pid=host</code> или <code>--network=host</code> сажает контейнер в пространство хоста. Если запускать контейнеры по очереди, номера могут совпасть: ядро переиспользует идентификатор, когда предыдущее пространство уже уничтожено.</p>
+@end
+@step Сеть в чужом пространстве имён:
+@run
+docker run --rm cs-lab cat /proc/net/dev ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab cat /proc/net/dev | awk 'NR>2 {print $1}'
+docker run --rm --network=host cs-lab cat /proc/net/dev ||| MSYS_NO_PATHCONV=1 docker run --rm --network=host cs-lab cat /proc/net/dev | awk 'NR>2 {print $1}' | head -8
+@end
+@note В своём сетевом пространстве у контейнера только <code>lo</code> и <code>eth0</code> (виртуальная пара, второй конец которой подключён к мосту Docker). С <code>--network=host</code> — все интерфейсы машины (здесь — ВМ WSL).
+
+@lab 15.2 | Лимиты cgroups и что видит JVM | 15 мин
+@goal
+<p>Найти лимиты контейнера в файлах cgroups и сравнить с тем, что сообщает JVM.</p>
+@end
+@run
+docker run --rm -m 512m --cpus=1.5 cs-lab sh -c "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max; grep MemTotal /proc/meminfo; nproc" ||| MSYS_NO_PATHCONV=1 docker run --rm -m 512m --cpus=1.5 cs-lab sh -c "cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max /sys/fs/cgroup/pids.max; grep MemTotal /proc/meminfo; nproc"
+docker run --rm -m 512m --cpus=1.5 cs-lab java -XshowSettings:system -version ||| MSYS_NO_PATHCONV=1 docker run --rm -m 512m --cpus=1.5 cs-lab java -XshowSettings:system -version 2>&1 | grep -E 'Provider|CPU|Memory Limit|Effective'
+docker run --rm -m 512m --cpus=1.5 cs-lab java -XX:+PrintFlagsFinal -version ||| MSYS_NO_PATHCONV=1 docker run --rm -m 512m --cpus=1.5 cs-lab java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E ' (MaxHeapSize|UseSerialGC|UseG1GC|ActiveProcessorCount) '
+@end
+@predict Что покажут <code>/proc/meminfo</code> и <code>nproc</code> по сравнению с файлами cgroups? Какой сборщик и какой размер кучи выберет JVM?
+@answer
+<p><code>memory.max</code> = 536870912 (512 МБ), <code>cpu.max</code> = <code>150000 100000</code> (1,5 CPU), <code>pids.max</code> — <code>max</code>. Но <code>/proc/meminfo</code> показывает всю память ВМ (~16 ГБ): этот интерфейс о cgroups не знает. <code>nproc</code> показал 2 — новые версии coreutils, как и JVM, читают квоту из <code>cpu.max</code>; старые показали бы 18. А «List of Effective Processors, 18 total» — <code>--cpus</code> не ограничивает, на каких ядрах работать (это делает <code>--cpuset-cpus</code>), только сколько времени. JVM читает cgroups: «Effective CPU Count: 2» (⌈1,5⌉), лимит памяти 512 МБ, куча <code>MaxHeapSize</code> — 128 МБ (25%). Сборщик — Serial: машина с &lt; 2 процессоров или &lt; 1792 МБ памяти по эргономике не считается «серверной».</p>
+@end
+
+@lab 15.3 | Троттлинг процессора | 15 мин
+@goal
+<p>Нагрузить контейнер с лимитом 0,5 CPU четырьмя потоками и измерить, как опаздывает главный поток.</p>
+@end
+@file Burn.java
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Burn {
+    static String stat() throws Exception {
+        StringBuilder b = new StringBuilder();
+        for (String l : Files.readAllLines(Path.of("/sys/fs/cgroup/cpu.stat")))
+            if (l.startsWith("nr_periods") || l.startsWith("nr_throttled") || l.startsWith("throttled_usec")) b.append(l).append("  ");
+        return b.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("cpu.max = " + Files.readString(Path.of("/sys/fs/cgroup/cpu.max")).trim()
+                + ", availableProcessors = " + Runtime.getRuntime().availableProcessors());
+        System.out.println("до нагрузки:    " + stat());
+        Thread[] burners = new Thread[4];
+        for (int i = 0; i < burners.length; i++) {
+            burners[i] = new Thread(() -> { long x = 0, end = System.nanoTime() + 2_000_000_000L; while (System.nanoTime() < end) x++; });
+            burners[i].start();
+        }
+        long worst = 0;                                  // главный поток просыпается каждые 10 мс
+        for (int i = 0; i < 150; i++) {
+            long s = System.nanoTime();
+            Thread.sleep(10);
+            worst = Math.max(worst, (System.nanoTime() - s) / 1_000_000 - 10);
+        }
+        for (Thread t : burners) t.join();
+        System.out.println("после нагрузки: " + stat());
+        System.out.println("максимальное опоздание пробуждения из sleep(10): " + worst + " мс");
+    }
+}
+@end
+@run
+docker run --rm --cpus=0.5 -v "${PWD}:/lab" cs-lab java Burn.java ||| MSYS_NO_PATHCONV=1 docker run --rm --cpus=0.5 -v "$(pwd -W):/lab" cs-lab java Burn.java
+docker run --rm --cpus=8 -v "${PWD}:/lab" cs-lab java Burn.java ||| MSYS_NO_PATHCONV=1 docker run --rm --cpus=8 -v "$(pwd -W):/lab" cs-lab java Burn.java
+@end
+@predict Каким будет максимальное опоздание при 0,5 CPU и при 8 CPU? Почему <code>nr_throttled</code> уже не ноль «до нагрузки»?
+@answer
+<p>При 0,5 CPU — десятки миллисекунд (здесь ~90 мс): четыре потока выжигают 50 мс квоты за ~12 мс, и вся группа, включая главный поток, стоит до конца периода. При 8 CPU квоты хватает — опоздание 1–3 мс. «До нагрузки» троттлинг уже был: однофайловый запуск компилирует <code>Burn.java</code> в памяти, а JIT и служебные потоки JVM на старте работают параллельно — квота выгорает на прогреве. Именно так проявляется слишком тесный <code>limits.cpu</code> у Java-сервисов: медленный старт и всплески p99.</p>
+@end
+
+@lab 15.4 | Права: capabilities и seccomp | 10 мин
+@goal
+<p>Увидеть, чем root в контейнере отличается от root на хосте.</p>
+@end
+@run
+docker run --rm cs-lab sh -c "id -u; grep -E 'CapEff|Seccomp:' /proc/self/status; mount -t tmpfs none /mnt 2>&1 | head -1" ||| MSYS_NO_PATHCONV=1 docker run --rm cs-lab sh -c "id -u; grep -E 'CapEff|Seccomp:' /proc/self/status; mount -t tmpfs none /mnt 2>&1 | head -1"
+docker run --rm --privileged cs-lab sh -c "id -u; grep -E 'CapEff|Seccomp:' /proc/self/status; mount -t tmpfs none /mnt && echo смонтировано" ||| MSYS_NO_PATHCONV=1 docker run --rm --privileged cs-lab sh -c "id -u; grep -E 'CapEff|Seccomp:' /proc/self/status; mount -t tmpfs none /mnt && echo смонтировано"
+@end
+@predict Сможет ли root (uid 0) в обычном контейнере смонтировать файловую систему? Чем отличаются маски CapEff?
+@answer
+<p>В обычном контейнере uid 0, но <code>CapEff</code> — урезанная маска (около 14 прав из 41: нет <code>SYS_ADMIN</code>, <code>SYS_PTRACE</code>, <code>NET_ADMIN</code>…), <code>Seccomp: 2</code> — включён фильтр системных вызовов; <code>mount</code> отказывает: «permission denied». С <code>--privileged</code> — все права (<code>000001ffffffffff</code>), и монтирование работает (фильтр seccomp на этой версии Docker Desktop остался включён — проверяйте, а не предполагайте): такой контейнер почти не отличается от root на машине. Поэтому <code>--privileged</code> в продакшене — тревожный сигнал, а для отладки лучше добавлять одно нужное право (<code>--cap-add=SYS_PTRACE</code>).</p>
+@end
