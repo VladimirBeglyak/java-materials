@@ -171,3 +171,59 @@ java Text
 @try
 Запустите <code>java -Dstdout.encoding=windows-1251 Text</code> в терминале IDEA. ::: Терминал IDEA ждёт UTF-8, а программа отдаёт байты windows-1251 — кириллица в выводе превратится в мусор. Кодировка консоли — такой же договор, как кодировка файла.
 @end
+
+@lab 1.5 | Отрицательные числа: одометр и ловушки знака | 20 мин
+@goal
+<p>Своими глазами увидеть «счётчик, который откручивается назад», правило «переверни и прибавь 1» и три ловушки дополнительного кода, которые встречаются в реальном коде.</p>
+@end
+@file Negative.java
+public class Negative {
+    static String bits(int v) {                       // младшие 8 бит, по 4
+        String s = String.format("%8s", Integer.toBinaryString(v & 0xFF)).replace(' ', '0');
+        return s.substring(0, 4) + " " + s.substring(4);
+    }
+
+    public static void main(String[] args) {
+        System.out.println("1) крутим байт назад от 2:");
+        for (byte b = 2; b >= -3; b--) System.out.println("   " + bits(b) + " = " + b);
+
+        System.out.println("2) переверни и прибавь 1:");
+        int x = 5;
+        System.out.println("   x      = " + bits(x) + " = " + x);
+        System.out.println("   ~x     = " + bits(~x) + " = " + (byte) ~x);
+        System.out.println("   ~x + 1 = " + bits(~x + 1) + " = " + (byte) (~x + 1));
+
+        System.out.println("3) 5 + (-5) и 7 - 3 одной схемой сложения:");
+        System.out.println("   " + bits(5) + " + " + bits(-5) + " = " + bits(5 + -5) + " = " + (5 + -5));
+        System.out.println("   " + bits(7) + " + " + bits(-3) + " = " + bits(7 + -3) + " = " + (7 + -3));
+
+        System.out.println("4) по кругу:");
+        byte top = 127;
+        top++;
+        System.out.println("   byte 127 + 1 = " + top + ",  Integer.MAX_VALUE + 1 = " + (Integer.MAX_VALUE + 1));
+
+        System.out.println("5) ловушка Math.abs и хэша:");
+        int hash = Integer.MIN_VALUE;                  // такой hashCode вполне возможен
+        System.out.println("   Math.abs(hash) = " + Math.abs(hash));
+        System.out.println("   Math.abs(hash) % 10 = " + Math.abs(hash) % 10 + "   ← годится как индекс массива из 10 ячеек?");
+        System.out.println("   Math.floorMod(hash, 10) = " + Math.floorMod(hash, 10) + ",  (hash & 0x7fffffff) % 10 = " + (hash & 0x7fffffff) % 10);
+
+        System.out.println("6) один байт — два прочтения:");
+        byte fromFile = (byte) 0xC8;                   // байт 200 из файла
+        System.out.println("   как byte: " + fromFile + ",  как беззнаковый: " + (fromFile & 0xFF) + " = " + Byte.toUnsignedInt(fromFile));
+        System.out.println("   int -1 беззнаково: " + Integer.toUnsignedString(-1));
+    }
+}
+@end
+@predict До запуска: какие биты у −1, −2, −3? Чему равны <code>~5</code> и <code>~5 + 1</code>? Что напечатает <code>Math.abs(hash) % 10</code> для <code>hash = Integer.MIN_VALUE</code>?
+@answer
+<p>−1 = <code>1111 1111</code>, −2 = <code>1111 1110</code>, −3 = <code>1111 1101</code> — счётчик откручивается назад от нуля. <code>~5</code> = <code>1111 1010</code> = −6, <code>~5 + 1</code> = <code>1111 1011</code> = −5. Сложение 5 + (−5) и 7 + (−3) столбиком даёт 0 и 4: девятый бит переноса выпадает. <code>byte 127 + 1</code> = −128, <code>MAX_VALUE + 1</code> = −2147483648. <code>Math.abs(MIN_VALUE)</code> остаётся −2147483648, и <code>% 10</code> даёт <b>−8</b> — отрицательный «индекс», на котором <code>array[index]</code> упадёт с <code>ArrayIndexOutOfBoundsException</code>. <code>floorMod</code> (2) и маска (0) дают корректный неотрицательный индекс. Байт <code>0xC8</code> как <code>byte</code> — −56, беззнаково — 200.</p>
+@end
+@run
+javac Negative.java
+java Negative
+@end
+@try
+Поменяйте <code>% 10</code> на <code>% 16</code>. ::: Получится 0 — ловушка спряталась: −2³¹ делится на 16 нацело. Поэтому такая ошибка годами живёт в коде: она срабатывает только для одного значения хэша из четырёх миллиардов и только при «неудобном» делителе — то есть в продакшене, а не в тестах.
+Сколько будет <code>-Integer.MIN_VALUE</code>? ::: Снова <code>Integer.MIN_VALUE</code>: «переверни и прибавь 1» для <code>1000…0</code> даёт <code>0111…1 + 1 = 1000…0</code>. У самого маленького числа нет положительной пары.
+@end
