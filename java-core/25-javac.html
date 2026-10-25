@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>25 · Компилятор javac изнутри</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="25">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 25 · ПЛАТФОРМА ИЗНУТРИ</div>
+  <h1>Компилятор javac изнутри</h1>
+  <p class="lead">Между текстом программы и байткодом стоит компилятор, который делает гораздо больше, чем перевод: проверяет типы и потоки управления, сворачивает константы, разворачивает синтаксический сахар (for-each, enum, внутренние классы, records, try-with-resources), стирает generics и добавляет мостовые методы, запускает процессоры аннотаций. Многое из того, что кажется «свойством языка», на самом деле существует только в javac — JVM об этом не знает.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">фазы компиляции</span><span class="tag">константы</span><span class="tag">checked-исключения</span><span class="tag">рассахаривание</span><span class="tag">мостовые методы</span><span class="tag">annotation processing</span><span class="tag">Compiler API</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="phases"><span class="h-num">25.1</span>Фазы компиляции</h2>
+<p><code>javac</code> — программа на Java (модуль <code>jdk.compiler</code>), её можно вызвать из кода (раздел 25.7). Внутри она проводит исходник через цепочку преобразований дерева разбора (AST):</p>
+<figure class="diagram">
+<svg viewBox="0 0 820 230" role="img" aria-label="Фазы javac: разбор, вход в таблицу символов, процессоры аннотаций, атрибуция, анализ потока, рассахаривание, генерация">
+  <defs><marker id="jc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <g font-size="12.5">
+    <rect x="10" y="30" width="100" height="62" rx="8" class="box-info"/><text x="60" y="56" text-anchor="middle" font-weight="700">Parse</text><text x="60" y="76" text-anchor="middle" class="muted" font-size="11">текст → AST</text>
+    <rect x="125" y="30" width="100" height="62" rx="8" class="box-info"/><text x="175" y="56" text-anchor="middle" font-weight="700">Enter</text><text x="175" y="76" text-anchor="middle" class="muted" font-size="11">символы классов</text>
+    <rect x="240" y="30" width="120" height="62" rx="8" class="box-warn"/><text x="300" y="56" text-anchor="middle" font-weight="700">Processors</text><text x="300" y="76" text-anchor="middle" class="muted" font-size="11">раунды, новые файлы</text>
+    <rect x="375" y="30" width="100" height="62" rx="8" class="box-acc"/><text x="425" y="56" text-anchor="middle" font-weight="700">Attribute</text><text x="425" y="76" text-anchor="middle" class="muted" font-size="11">типы, перегрузки</text>
+    <rect x="490" y="30" width="95" height="62" rx="8" class="box-acc"/><text x="537" y="56" text-anchor="middle" font-weight="700">Flow</text><text x="537" y="76" text-anchor="middle" class="muted" font-size="11">присваивание, throws</text>
+    <rect x="600" y="30" width="100" height="62" rx="8" class="box-ok"/><text x="650" y="56" text-anchor="middle" font-weight="700">Desugar</text><text x="650" y="76" text-anchor="middle" class="muted" font-size="11">erasure, Lower</text>
+    <rect x="715" y="30" width="95" height="62" rx="8" class="box-ok"/><text x="762" y="56" text-anchor="middle" font-weight="700">Generate</text><text x="762" y="76" text-anchor="middle" class="muted" font-size="11">.class</text>
+    <path d="M110 61 L123 61" class="ln-acc" marker-end="url(#jc)"/><path d="M225 61 L238 61" class="ln-acc" marker-end="url(#jc)"/><path d="M360 61 L373 61" class="ln-acc" marker-end="url(#jc)"/><path d="M475 61 L488 61" class="ln-acc" marker-end="url(#jc)"/><path d="M585 61 L598 61" class="ln-acc" marker-end="url(#jc)"/><path d="M700 61 L713 61" class="ln-acc" marker-end="url(#jc)"/>
+    <path d="M300 92 C 300 130, 120 130, 70 96" class="ln-dash" marker-end="url(#jc)"/>
+    <text x="190" y="140" text-anchor="middle" class="muted" font-size="11">сгенерированные исходники — снова на разбор</text>
+  </g>
+  <g font-size="12">
+    <text x="10" y="178" font-weight="700">Ошибки, которые рождаются на каждой фазе:</text>
+    <text x="10" y="200" class="muted">Parse: «';' expected» · Attribute: «cannot find symbol», «incompatible types», «ambiguous» · Flow: «might not have been</text>
+    <text x="10" y="218" class="muted">initialized», «unreachable statement», «unreported exception» · Generate: «code too large» (метод больше 64 КБ байткода)</text>
+  </g>
+</svg>
+<figcaption>Атрибуция (Attr) вычисляет тип каждого выражения и выбирает перегрузки (<a href="24-syntax.html#methods">тема 24</a>). Flow проверяет definite assignment, достижимость и checked-исключения. Desugar сначала стирает generics (TransTypes), затем «опускает» сахар до простых конструкций (Lower). Только после этого Gen пишет байткод.</figcaption>
+</figure>
+<p>Важное следствие: <b>правила языка и правила JVM — разные</b>. Checked-исключения, generics, <code>final</code> у локальных переменных, области видимости, definite assignment, вложенность классов — проверяет javac. JVM проверяет свою, более низкоуровневую модель (верификатор байткода, <a href="../jvm/06-linking-init.html">JVM, тема 06</a>). Kotlin, Scala и Groovy компилируются в тот же байткод по своим правилам.</p>
+
+<h2 id="constants"><span class="h-num">25.2</span>Константы времени компиляции</h2>
+<p><b>Константная переменная</b> (JLS §4.12.4) — <code>final</code>-переменная примитивного типа или <code>String</code>, инициализированная <b>константным выражением</b>: литералами, другими константами, арифметикой, конкатенацией, приведениями — без вызовов методов и <code>new</code>. javac вычисляет такие выражения сам (constant folding) и <b>подставляет значение</b> на место использования.</p>
+<pre><code class="java">static final int SECONDS = 24 * 60 * 60;   // константа: в байткоде будет ldc 86400
+static final String GREETING = "Hi, " + "all"; // константа: одна строка "Hi, all" в пуле
+static final Integer BOXED = 42;           // НЕ константа: Integer — не примитив и не String
+static final int RANDOM = new Random().nextInt(); // НЕ константа: вызов метода
+static final long NOW = System.currentTimeMillis(); // НЕ константа
+
+String a = "ab", b = "a" + "b";            // a == b → true: "a" + "b" свёрнуто при компиляции
+final String x = "a";  String c = x + "b"; // c == a → true: x — константная переменная
+String y = "a";        String d = y + "b"; // d == a → false: склейка в рантайме, новый объект</code></pre>
+<p>Константы нужны языку: только ими можно размечать <code>case</code> в switch, задавать значения элементов аннотаций и условную компиляцию (<code>if (DEBUG)</code> — ветка с константой <code>false</code> не попадёт в байткод). Обращение к константе другого класса <b>не вызывает его инициализацию</b> (<a href="../jvm/06-linking-init.html">JVM, тема 06</a>): класса в этом месте байткода просто нет.</p>
+<div class="callout bad"><span class="c-title">Ловушка: «застывшая» константа</span>
+Класс <code>App</code> использует <code>Config.TIMEOUT = 10</code>. Вы меняете значение на 20 и пересобираете только <code>Config</code> (например, обновили библиотеку без перекомпиляции зависимых модулей). <code>App</code> продолжит видеть 10: значение было вклеено в его байткод. Отсюда правило для публичных API: <b>меняющиеся значения не делают <code>public static final</code>-константами</b> — отдают через метод или инициализируют не константным выражением (<code>static final int TIMEOUT = Integer.parseInt("10")</code> уже не константа). Инкрементальные сборщики (Gradle, Maven) знают об этой проблеме и пересобирают зависимых при изменении констант.
+</div>
+
+<h2 id="checks"><span class="h-num">25.3</span>Проверки, которых нет в JVM: checked-исключения</h2>
+<p>Требование «поймай или объяви в <code>throws</code>» — чисто компиляторное. В class-файле список <code>throws</code> хранится лишь как атрибут <code>Exceptions</code> для документации и рефлексии; инструкция <code>athrow</code> бросает любой <code>Throwable</code>, и верификатор не проверяет, объявлен ли он. Это можно увидеть, обманув компилятор через generics (приём «sneaky throw», им пользуются Lombok <code>@SneakyThrows</code> и некоторые библиотеки):</p>
+<pre><code class="java">@SuppressWarnings("unchecked")
+static &lt;E extends Throwable&gt; void sneakyThrow(Throwable t) throws E {
+    throw (E) t;                    // приведение к стёртому E — это приведение к Throwable, проверки нет
+}
+
+static void read() {                // никакого throws IOException!
+    Sneaky.&lt;RuntimeException&gt;sneakyThrow(new IOException("disk"));
+}</code></pre>
+<p>Компилятор считает, что вызов бросает <code>RuntimeException</code>, а летит настоящий <code>IOException</code>. Побочный эффект: поймать его по типу нельзя — <code>catch (IOException e)</code> вокруг <code>read()</code> не скомпилируется («exception is never thrown in body of try»), ловить придётся <code>Exception</code>. То же происходит с исключениями, проброшенными из кода на Kotlin, где checked-исключений нет вовсе.</p>
+<p>Другие проверки фазы Flow: definite assignment (<a href="24-syntax.html#scope">тема 24</a>), недостижимый код, effectively final для захвата в лямбдах, исчерпываемость switch по sealed-типам (<a href="12-modern-java.html">тема 12</a>). Исчерпываемость — тоже обещание компилятора: если после компиляции switch в sealed-иерархию добавят новый подкласс, в рантайме прилетит <code>MatchException</code>.</p>
+
+<h2 id="desugar"><span class="h-num">25.4</span>Синтаксический сахар: во что javac разворачивает код</h2>
+<p>Фаза Lower переписывает высокоуровневые конструкции через более простые. Результат почти всегда можно выразить обычной Java — так удобнее понять, что реально исполняется. Уровнем ниже, в байткоде, эти же конструкции разобраны в <a href="../jvm/03-bytecode.html#javac">JVM, тема 03</a>.</p>
+<div class="widget" id="dsW">
+  <div class="widget-title">Рассахариватель: что пишете → что компилируется</div>
+  <div class="controls" id="dsBtns"></div>
+  <div class="grid-2" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+    <div><div class="hint"><b>Вы пишете</b></div><pre><code class="java" id="dsSrc"></code></pre></div>
+    <div><div class="hint"><b>javac фактически генерирует</b> (эквивалент на Java)</div><pre><code class="java" id="dsOut"></code></pre></div>
+  </div>
+  <div class="out" id="dsWhy"></div>
+</div>
+<script>
+(function () {
+  var D = [
+    ["for-each по массиву", "for (String s : arr) {\n    use(s);\n}",
+     "String[] arr$ = arr;          // ссылка копируется один раз\nint len$ = arr$.length;\nfor (int i$ = 0; i$ < len$; i$++) {\n    String s = arr$[i$];\n    use(s);\n}",
+     "По массиву — обычный цикл по индексу, без объектов. Присваивание arr внутри цикла не влияет на обход: перебирается копия ссылки."],
+    ["for-each по Iterable", "for (String s : list) {\n    use(s);\n}",
+     "for (Iterator<String> i$ = list.iterator(); i$.hasNext(); ) {\n    String s = (String) i$.next();   // каст после стирания\n    use(s);\n}",
+     "По коллекции — Iterator. Отсюда ConcurrentModificationException при list.remove внутри цикла (тема 08) и NPE, если list == null."],
+    ["автоупаковка", "Integer total = 0;\ntotal += n;\nint k = map.get(key);",
+     "Integer total = Integer.valueOf(0);\ntotal = Integer.valueOf(total.intValue() + n);\nint k = ((Integer) map.get(key)).intValue();   // NPE при null",
+     "Упаковка — Integer.valueOf (кэш −128..127), распаковка — xxxValue(). total += n создаёт новый объект на каждой итерации."],
+    ["switch по строке", "switch (cmd) {\n    case \"GET\" -> get();\n    case \"PUT\" -> put();\n    default -> other();\n}",
+     "int tmp$ = -1;\nswitch (cmd.hashCode()) {           // NPE при cmd == null\n    case 70454: if (cmd.equals(\"GET\")) tmp$ = 0; break;\n    case 79599: if (cmd.equals(\"PUT\")) tmp$ = 1; break;\n}\nswitch (tmp$) {\n    case 0 -> get();\n    case 1 -> put();\n    default -> other();\n}",
+     "Два switch: по хэшу (lookupswitch) с equals для защиты от коллизий, затем по номеру ветки."],
+    ["enum", "enum Color { RED, GREEN }",
+     "final class Color extends Enum<Color> {\n    public static final Color RED = new Color(\"RED\", 0);\n    public static final Color GREEN = new Color(\"GREEN\", 1);\n    private static final Color[] $VALUES = {RED, GREEN};\n\n    public static Color[] values() { return $VALUES.clone(); } // копия при каждом вызове!\n    public static Color valueOf(String n) { return Enum.valueOf(Color.class, n); }\n    private Color(String name, int ordinal) { super(name, ordinal); }\n}",
+     "Enum — обычный final-класс с синглтонами в static-полях. values() каждый раз клонирует массив: в горячем коде кэшируйте результат. Защиту от рефлексии и сериализации обеспечивают JVM и ObjectInputStream."],
+    ["внутренний класс", "class Outer {\n    int x;\n    class Inner {\n        int get() { return x; }\n    }\n}",
+     "class Outer$Inner {                  // отдельный class-файл\n    final Outer this$0;              // скрытая ссылка на внешний объект\n    Outer$Inner(Outer outer) { this.this$0 = outer; }\n    int get() { return this$0.x; }\n}\n// new Inner() внутри Outer → new Outer$Inner(this)",
+     "Нестатический вложенный класс держит ссылку на внешний объект — классическая утечка памяти (слушатель живёт дольше активности). С Java 18 javac не добавляет this$0, если внешний объект не используется. С Java 11 (nestmates) доступ к private-членам друг друга — напрямую, без синтетических access$000."],
+    ["захват в анонимном классе", "int limit = 10;\nRunnable r = new Runnable() {\n    public void run() { System.out.println(limit); }\n};",
+     "final class Main$1 implements Runnable {\n    final int val$limit;           // копия значения!\n    Main$1(int limit) { this.val$limit = limit; }\n    public void run() { System.out.println(val$limit); }\n}\nRunnable r = new Main$1(limit);",
+     "Захватывается копия значения, поэтому переменная обязана быть effectively final: иначе копия и оригинал разошлись бы. Лямбда захватывает так же, но устроена через invokedynamic (тема 10)."],
+    ["try-with-resources", "try (var in = open()) {\n    work(in);\n}",
+     "var in = open();\nThrowable primary = null;\ntry {\n    work(in);\n} catch (Throwable t) {\n    primary = t;\n    throw t;\n} finally {\n    if (in != null) {\n        if (primary != null) {\n            try { in.close(); }\n            catch (Throwable s) { primary.addSuppressed(s); }\n        } else {\n            in.close();\n        }\n    }\n}",
+     "Эквивалент по JLS §14.20.3.1. Исключение из close() не затирает основное, а прикрепляется к нему как suppressed. Ресурсы закрываются в обратном порядке объявления. Реальный байткод javac компактнее, но поведение то же."],
+    ["assert", "assert n > 0 : \"n=\" + n;",
+     "static final boolean $assertionsDisabled =\n        !Main.class.desiredAssertionStatus();\n...\nif (!$assertionsDisabled && !(n > 0))\n    throw new AssertionError(\"n=\" + n);",
+     "Проверка выключена по умолчанию (включается -ea). Поле static final, поэтому JIT после включения/выключения просто выкидывает мёртвую ветку — выключенный assert ничего не стоит."],
+    ["record", "record Point(int x, int y) {}",
+     "final class Point extends Record {\n    private final int x, y;\n    Point(int x, int y) { this.x = x; this.y = y; }\n    public int x() { return x; }\n    public int y() { return y; }\n    public String toString() { /* invokedynamic ObjectMethods.bootstrap */ }\n    public int hashCode()    { /* invokedynamic ObjectMethods.bootstrap */ }\n    public boolean equals(Object o) { /* invokedynamic ObjectMethods.bootstrap */ }\n}",
+     "toString, equals и hashCode не генерируются текстом — их собирает рантайм (java.lang.runtime.ObjectMethods) при первом вызове. Компонентные поля дополнительно описаны атрибутом Record — по нему работает рефлексия getRecordComponents()."],
+    ["лямбда", "Function<String, Integer> f = s -> s.length() + k;",
+     "private static Integer lambda$main$0(int k, String s) { // тело — в метод того же класса\n    return s.length() + k;\n}\nFunction<String, Integer> f = /* invokedynamic LambdaMetafactory.metafactory(\n    ..., lambda$main$0, ...) */ (k);",
+     "Анонимного класса в исходнике нет: класс-реализацию создаёт рантайм при первом выполнении invokedynamic (скрытый класс). Захваченные переменные становятся первыми параметрами метода (тема 10)."],
+    ["switch по образцам", "return switch (shape) {\n    case Circle c -> c.r() * c.r() * PI;\n    case Square s -> s.a() * s.a();\n};",
+     "int idx = /* invokedynamic SwitchBootstraps.typeSwitch(Circle.class, Square.class) */ (shape, 0);\nreturn switch (idx) {\n    case 0 -> { Circle c = (Circle) shape; yield c.r() * c.r() * PI; }\n    case 1 -> { Square s = (Square) shape; yield s.a() * s.a(); }\n    case -1 -> throw new NullPointerException();\n    default -> throw new MatchException(null, null);\n};",
+     "Проверку типов выполняет рантайм-бутстрап (может оптимизировать порядок проверок), javac лишь превращает результат в номер ветки. default с MatchException — страховка на случай нового подтипа, появившегося после компиляции."]
+  ];
+  var btns = document.getElementById("dsBtns"), src = document.getElementById("dsSrc"), out = document.getElementById("dsOut"), why = document.getElementById("dsWhy");
+  function show(i) {
+    btns.querySelectorAll("button").forEach(function (b, k) { b.classList.toggle("primary", k === i); });
+    src.textContent = D[i][1]; out.textContent = D[i][2]; why.textContent = D[i][3];
+  }
+  D.forEach(function (d, i) { var b = document.createElement("button"); b.type = "button"; b.className = "btn"; b.textContent = d[0]; b.addEventListener("click", function () { show(i); }); btns.appendChild(b); });
+  show(0);
+})();
+</script>
+
+<h2 id="bridges"><span class="h-num">25.5</span>Стирание типов и мостовые методы</h2>
+<p>После атрибуции javac <b>стирает</b> параметры типов: <code>List&lt;String&gt;</code> становится <code>List</code>, <code>T</code> — своей верхней границей (<code>Object</code> или <code>Comparable</code> при <code>T extends Comparable&lt;T&gt;</code>), а в местах чтения добавляются приведения (<a href="07-generics.html#erasure">тема 07</a>). Сами generic-сигнатуры сохраняются в атрибуте <code>Signature</code> — для компиляции против библиотеки и для рефлексии (<code>getGenericReturnType()</code>), но JVM при исполнении их не читает.</p>
+<p>Стирание ломает переопределение. Пусть класс реализует <code>Comparable&lt;Money&gt;</code>:</p>
+<pre><code class="java">final class Money implements Comparable&lt;Money&gt; {
+    public int compareTo(Money o) { ... }        // сигнатура compareTo(Money)
+}
+// а интерфейс после стирания объявляет compareTo(Object) — сигнатуры разные!
+// javac добавляет МОСТОВОЙ метод (флаги ACC_BRIDGE | ACC_SYNTHETIC):
+public int compareTo(Object o) { return compareTo((Money) o); }</code></pre>
+<p>Именно мост делает вызов <code>Collections.sort(list)</code> полиморфным, а заодно объясняет <code>ClassCastException</code> «из ниоткуда»: если через сырой тип подсунуть в мост чужой объект, каст внутри моста упадёт. Мосты появляются также при <b>ковариантном возвращаемом типе</b>: <code>Child clone()</code> поверх <code>Object clone()</code> — в байткоде два метода с одной сигнатурой параметров и разными типами результата (JVM это разрешает, язык — нет). Рефлексия видит мосты: <code>Method.isBridge()</code>, и фреймворки (Spring, Jackson) их отфильтровывают.</p>
+<div class="callout info"><span class="c-title">Синтетические элементы</span>
+Всё, что javac добавил сам и чего нет в исходнике, помечено флагом <code>ACC_SYNTHETIC</code>: мосты, <code>this$0</code>, <code>val$x</code>, <code>$VALUES</code>, <code>$assertionsDisabled</code>, <code>lambda$main$0</code>. Увидеть их — <code>javap -p -v</code>. Рефлексия — <code>isSynthetic()</code>. Код, перебирающий поля через рефлексию (сериализаторы, маперы), должен их пропускать.
+</div>
+
+<h2 id="processors"><span class="h-num">25.6</span>Процессоры аннотаций</h2>
+<p><b>Annotation processing</b> (JSR 269) — плагин к компилятору: класс, реализующий <code>javax.annotation.processing.Processor</code>, получает от javac модель исходников (элементы: классы, методы, поля и их аннотации — пакет <code>javax.lang.model</code>) и может:</p>
+<ul>
+  <li><b>генерировать новые исходники</b> и ресурсы через <code>Filer</code> — они компилируются в следующем <b>раунде</b>, вместе с остальным кодом: так работают MapStruct, Dagger, AutoValue, Micronaut, JPA metamodel (<code>User_</code>), <code>spring-boot-configuration-processor</code>;</li>
+  <li><b>выдавать ошибки и предупреждения</b> через <code>Messager</code> — проверки на этапе компиляции (Error Prone, NullAway — чуть иначе, через javac plugin API);</li>
+  <li><b>не может</b> изменять существующие классы — это ограничение API.</li>
+</ul>
+<div class="callout warn"><span class="c-title">Как работает Lombok</span>
+Lombok формально — процессор аннотаций, но он нарушает правило «только генерировать»: через внутренние API javac (<code>com.sun.tools.javac.tree</code>) он <b>меняет AST</b> вашего класса, дописывая геттеры, конструкторы и <code>equals</code>. Поэтому Lombok ломается на новых версиях JDK, пока не выйдет совместимая версия, а для работы в IDE ему нужен отдельный плагин. MapStruct и records — штатные альтернативы.
+</div>
+<p>Раунды: javac вызывает процессоры для исходников; если они сгенерировали новые файлы — разбирает их и вызывает процессоры снова, пока новых файлов не станет; последний раунд помечен <code>processingOver()</code>. Только после этого идут атрибуция и генерация. Поэтому код может ссылаться на ещё не существующий класс, который сгенерирует процессор.</p>
+<div class="callout bad"><span class="c-title">Java 23+: процессоры не запускаются «сами»</span>
+Раньше javac находил процессоры на classpath через <code>META-INF/services</code> и молча их выполнял. С JDK 23 по умолчанию действует <code>-proc:none</code>, если процессоры не указаны явно: <code>-processor</code>, <code>--processor-path</code>/<code>-processorpath</code>, <code>--processor-module-path</code> или <code>-proc:full</code>. В Maven и Gradle процессоры подключают через <code>annotationProcessorPaths</code> / конфигурацию <code>annotationProcessor</code>. Симптом забытой настройки при переходе на новый JDK — «cannot find symbol» для генерируемых классов.
+</div>
+
+<h2 id="options"><span class="h-num">25.7</span>Управление компилятором и Compiler API</h2>
+<div class="table-wrap"><table>
+<tr><th>Опция</th><th>Что делает</th></tr>
+<tr><td><code>--release 17</code></td><td>компилирует под версию 17: синтаксис, версия class-файла (61) <b>и API платформы</b> — использование метода из JDK 21 будет ошибкой. Предпочтительнее пары <code>-source</code>/<code>-target</code>, которые API не проверяют (собранный код упадёт с <code>NoSuchMethodError</code> на старой JVM)</td></tr>
+<tr><td><code>-Xlint:all</code>, <code>-Werror</code></td><td>все предупреждения (deprecation, unchecked, rawtypes, cast, fallthrough, static, this-escape…) и превращение их в ошибки</td></tr>
+<tr><td><code>-parameters</code></td><td>сохранить имена параметров (атрибут <code>MethodParameters</code>) — нужно Spring MVC, Jackson без аннотаций <code>@Param</code>; Spring Boot включает его по умолчанию</td></tr>
+<tr><td><code>-g</code>, <code>-g:none</code></td><td>отладочная информация: номера строк (для стек-трейсов), имена локальных переменных (для отладчика)</td></tr>
+<tr><td><code>--enable-preview</code></td><td>предварительные возможности языка; такой class-файл запустится только с тем же флагом и той же версией JDK</td></tr>
+<tr><td><code>-implicit:none</code>, <code>-sourcepath</code></td><td>javac сам находит и компилирует исходники используемых классов; эти опции этим управляют</td></tr>
+<tr><td><code>-XDrawDiagnostics</code></td><td>диагностика в машиночитаемом виде (так IDE и тесты javac сравнивают ошибки)</td></tr>
+</table></div>
+<p><b>Compiler API</b> (<code>javax.tools.ToolProvider.getSystemJavaCompiler()</code>) запускает javac из программы: так работают jshell, движки шаблонов, «скриптовые» правила в продакшене, тестовые фреймворки для процессоров аннотаций. А <code>java Hello.java</code> (однофайловый и, с Java 22, многофайловый запуск исходников) — это лаунчер, который вызывает тот же компилятор в памяти и загружает результат своим загрузчиком.</p>
+
+
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">25.8</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Смотрим, что компилятор делает с кодом: подстановку констант, сахар в <code>javap</code>, мостовые методы, исключения без <code>throws</code>, собственный процессор аннотаций и компиляцию из программы. Модуль IDEA — <code>ch25</code>. Для <code>javap</code> удобнее встроенный терминал (Alt+F12).</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-25.1">
+<div class="lab-head"><span class="lab-num">Лаба 25.1</span><b>Застывшая константа</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Воспроизвести ситуацию, когда изменённая константа не видна зависимому классу.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Config.java</code>:</div>
+<pre data-title="Config.java"><code class="java">public class Config {
+    public static final int TIMEOUT = 10;
+    public static final Integer BOXED = 10;
+    static { System.out.println("Config инициализирован"); }
+}</code></pre>
+<pre data-title="App.java"><code class="java">public class App {
+    public static void main(String[] args) {
+        System.out.println("TIMEOUT = " + Config.TIMEOUT);
+        System.out.println("---");
+        System.out.println("BOXED   = " + Config.BOXED);
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Скомпилируйте оба класса и запустите <code>App</code>:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Config.java App.java
+java App</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">TIMEOUT = 10
+---
+Config инициализирован
+BOXED   = 10</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Теперь поменяйте в <code>Config</code> оба значения на 20 и перекомпилируйте <b>только</b> <code>Config.java</code>. Что напечатает <code>App</code>? Когда появится строка «Config инициализирован»?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Config.java
+java App</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">TIMEOUT = 10
+---
+Config инициализирован
+BOXED   = 20</code></pre></details>
+<div class="lab-ans" hidden><p><code>TIMEOUT = 10</code> — значение константы было вклеено в байткод <code>App</code>, а <code>BOXED = 20</code> — <code>Integer</code> не константа, его читают из класса <code>Config</code> в рантайме. «Config инициализирован» печатается только после «---»: обращение к константе класс не трогает, а чтение <code>BOXED</code> (getstatic) запускает инициализацию.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Посмотрите байткод <code>App</code>: ссылки на <code>Config.TIMEOUT</code> в нём нет.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -c App</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">         3: ldc           #15                 // String TIMEOUT = 10
+        11: ldc           #23                 // String ---
+        19: getstatic     #25                 // Field Config.BOXED:Ljava/lang/Integer;</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте <code>TIMEOUT = Integer.parseInt("10")</code>.</summary><div>Это уже не константное выражение: <code>App</code> будет читать поле через <code>getstatic</code>, и изменения станут видны без перекомпиляции. Плата — поле нельзя использовать в <code>case</code> и в аннотациях.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-25.2">
+<div class="lab-head"><span class="lab-num">Лаба 25.2</span><b>Сахар под javap</b><span class="lab-time">20 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Найти в байткоде то, чего нет в исходнике: <code>$VALUES</code>, <code>this$0</code>, <code>val$</code>-поля, <code>$assertionsDisabled</code>, invokedynamic у record.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Sugar.java</code>:</div>
+<pre data-title="Sugar.java"><code class="java">public class Sugar {
+    enum Color { RED, GREEN }
+
+    int base = 100;
+
+    class Inner {                       // использует внешний объект
+        int get() { return base; }
+    }
+
+    class Lonely {                      // не использует внешний объект
+        int one() { return 1; }
+    }
+
+    record Point(int x, int y) {}
+
+    Runnable make(int limit) {
+        return new Runnable() {
+            public void run() { System.out.println(limit); }
+        };
+    }
+
+    static int check(int n) {
+        assert n &gt; 0 : "n=" + n;
+        return n;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(Color.values() == Color.values());
+        System.out.println(new Point(1, 2));
+        System.out.println(check(-5));
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Sugar.java
+java Sugar
+java -ea Sugar</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">false
+Point[x=1, y=2]
+-5
+false
+Point[x=1, y=2]
+Exception in thread "main" java.lang.AssertionError: n=-5
+	at Sugar.check(Sugar.java:23)
+	at Sugar.main(Sugar.java:30)</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие class-файлы появятся? Какие скрытые поля будут у <code>Sugar$Inner</code>, <code>Sugar$Lonely</code>, у анонимного класса и у <code>Sugar</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">ls *.class
+javap -p 'Sugar$Inner.class' 'Sugar$Lonely.class' 'Sugar$1.class'
+javap -p 'Sugar$Color.class'
+javap -p Sugar.class</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">App.class
+Config.class
+Sugar$1.class
+Sugar$Color.class
+Sugar$Inner.class
+Sugar$Lonely.class
+Sugar$Point.class
+Sugar.class
+Compiled from "Sugar.java"
+class Sugar$Inner {
+  final Sugar this$0;
+  Sugar$Inner(Sugar);
+  int get();
+}
+Compiled from "Sugar.java"
+class Sugar$Lonely {
+  Sugar$Lonely(Sugar);
+  int one();
+}
+Compiled from "Sugar.java"
+class Sugar$1 implements java.lang.Runnable {
+  final int val$limit;
+  Sugar$1();
+  public void run();
+}
+Compiled from "Sugar.java"
+final class Sugar$Color extends java.lang.Enum&lt;Sugar$Color&gt; {
+  public static final Sugar$Color RED;
+  public static final Sugar$Color GREEN;
+  private static final Sugar$Color[] $VALUES;
+  public static Sugar$Color[] values();
+  public static Sugar$Color valueOf(java.lang.String);
+  private Sugar$Color();
+  private static Sugar$Color[] $values();
+  static {};
+}
+Compiled from "Sugar.java"
+public class Sugar {
+  int base;
+  static final boolean $assertionsDisabled;
+  public Sugar();
+  java.lang.Runnable make(int);
+  static int check(int);
+  public static void main(java.lang.String[]);
+  static {};
+}</code></pre></details>
+<div class="lab-ans" hidden><p>Файлы: <code>Sugar</code>, <code>Sugar$Color</code>, <code>Sugar$Inner</code>, <code>Sugar$Lonely</code>, <code>Sugar$Point</code>, <code>Sugar$1</code> (анонимный). У <code>Inner</code> — <code>final Sugar this$0</code>; у <code>Lonely</code> его нет: с Java 18 javac не хранит внешний объект, если он не нужен (но конструктор всё равно принимает <code>Sugar</code>). У анонимного <code>Sugar$1</code> — только <code>val$limit</code>, копия захваченного параметра: внешний объект он не использует, и <code>this$0</code> тоже не нужен. У <code>Sugar</code> — <code>static final boolean $assertionsDisabled</code>. У enum — <code>private static final Color[] $VALUES</code> и синтетический <code>$values()</code>. <code>values() == values()</code> — false: каждый раз клон. Без <code>-ea</code> assert не сработал, с <code>-ea</code> — <code>AssertionError: n=-5</code>.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Как устроены методы record:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javap -c -p 'Sugar$Point.class'</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">final class Sugar$Point extends java.lang.Record {
+         1: invokespecial #1                  // Method java/lang/Record."&lt;init&gt;":()V
+         1: invokedynamic #16,  0             // InvokeDynamic #0:toString:(LSugar$Point;)Ljava/lang/String;
+         1: invokedynamic #20,  0             // InvokeDynamic #0:hashCode:(LSugar$Point;)I
+         2: invokedynamic #24,  0             // InvokeDynamic #0:equals:(LSugar$Point;Ljava/lang/Object;)Z</code></pre></details>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сделайте <code>Inner</code> статическим (<code>static class Inner</code>).</summary><div>Ошибка компиляции «non-static variable base cannot be referenced from a static context» — у статического вложенного класса нет внешнего объекта. Если <code>base</code> не нужен, <code>static</code> — правильный выбор по умолчанию: никакой скрытой ссылки и утечек.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-25.3">
+<div class="lab-head"><span class="lab-num">Лаба 25.3</span><b>Мостовые методы</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть мосты, которые javac добавляет для generic-интерфейса и ковариантного возвращаемого типа.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Money.java</code>:</div>
+<pre data-title="Money.java"><code class="java">import java.lang.reflect.Method;
+import java.util.function.Supplier;
+
+public class Money implements Comparable&lt;Money&gt;, Supplier&lt;Money&gt; {
+    final long cents;
+    Money(long cents) { this.cents = cents; }
+
+    @Override public int compareTo(Money o) { return Long.compare(cents, o.cents); }
+    @Override public Money get() { return this; }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static void main(String[] args) {
+        for (Method m : Money.class.getDeclaredMethods()) {
+            if (m.getName().equals("main")) continue;
+            System.out.printf("%-60s bridge=%s synthetic=%s%n", m, m.isBridge(), m.isSynthetic());
+        }
+        Comparable raw = new Money(1);
+        try {
+            raw.compareTo("строка");
+        } catch (ClassCastException e) {
+            System.out.println("CCE: " + e.getMessage());
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Сколько методов <code>compareTo</code> и <code>get</code> покажет рефлексия? Откуда возьмётся <code>ClassCastException</code>, если в коде нет ни одного каста?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Money.java
+java Money</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">public java.lang.Object Money.get()                          bridge=true synthetic=true
+public Money Money.get()                                     bridge=false synthetic=false
+public int Money.compareTo(Money)                            bridge=false synthetic=false
+public int Money.compareTo(java.lang.Object)                 bridge=true synthetic=true
+CCE: class java.lang.String cannot be cast to class Money (java.lang.String is in module java.base of loader 'bootstrap'; Money is in unnamed module of loader 'app')</code></pre></details>
+<div class="lab-ans" hidden><p>По два: <code>compareTo(Money)</code> и мост <code>compareTo(Object)</code>, <code>get()</code> с результатом <code>Money</code> и мост <code>get()</code> с результатом <code>Object</code> — два метода с одинаковыми параметрами, которые язык запрещает, а JVM разрешает. У мостов <code>bridge=true synthetic=true</code>. Каст есть в мосте: <code>compareTo(Object o)</code> вызывает <code>compareTo((Money) o)</code>, и строка падает на нём.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Выполните <code>javap -c -p Money</code> и найдите тело моста <code>compareTo(java.lang.Object)</code>.</summary><div><code>aload_0; aload_1; checkcast Money; invokevirtual compareTo:(LMoney;)I; ireturn</code> — каст и делегирование.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-25.4">
+<div class="lab-head"><span class="lab-num">Лаба 25.4</span><b>Checked-исключение без throws</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Доказать, что проверку checked-исключений выполняет только компилятор.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Sneaky.java</code>:</div>
+<pre data-title="Sneaky.java"><code class="java">import java.io.IOException;
+
+public class Sneaky {
+    @SuppressWarnings("unchecked")
+    static &lt;E extends Throwable&gt; void sneakyThrow(Throwable t) throws E {
+        throw (E) t;
+    }
+
+    static void read() {   // throws не объявлен
+        Sneaky.&lt;RuntimeException&gt;sneakyThrow(new IOException("диск недоступен"));
+    }
+
+    public static void main(String[] args) {
+        try {
+            read();
+        } catch (Exception e) {
+            System.out.println("поймали " + e.getClass().getName() + ": " + e.getMessage());
+            System.out.println("это RuntimeException? " + (e instanceof RuntimeException));
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Скомпилируется ли код? Какое исключение поймает <code>catch</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Sneaky.java
+java Sneaky</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">поймали java.io.IOException: диск недоступен
+это RuntimeException? false</code></pre></details>
+<div class="lab-ans" hidden><p>Компилируется: javac считает, что <code>sneakyThrow</code> бросает <code>RuntimeException</code>. В рантайме летит настоящий <code>java.io.IOException</code> — <code>instanceof RuntimeException</code> даёт false. JVM не знает про «checked».</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>catch (Exception e)</code> на <code>catch (java.io.IOException e)</code>.</summary><div>Ошибка компиляции «exception java.io.IOException is never thrown in body of corresponding try statement»: по мнению компилятора, такого исключения тут быть не может.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-25.5">
+<div class="lab-head"><span class="lab-num">Лаба 25.5</span><b>Свой процессор аннотаций</b><span class="lab-time">25 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Написать процессор, который во время компиляции генерирует класс, и использовать этот класс в коде, который без процессора не скомпилировался бы.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>proc/Describe.java</code>:</div>
+<pre data-title="proc/Describe.java"><code class="java">import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.SOURCE)
+@Target(ElementType.TYPE)
+public @interface Describe {}</code></pre>
+<pre data-title="proc/DescribeProcessor.java"><code class="java">import java.io.IOException;
+import java.io.Writer;
+import java.util.Set;
+import java.util.stream.Collectors;
+import javax.annotation.processing.*;
+import javax.lang.model.SourceVersion;
+import javax.lang.model.element.*;
+import javax.tools.Diagnostic;
+
+@SupportedAnnotationTypes("Describe")
+public class DescribeProcessor extends AbstractProcessor {
+    int round = 0;
+
+    @Override
+    public SourceVersion getSupportedSourceVersion() { return SourceVersion.latestSupported(); }
+
+    @Override
+    public boolean process(Set&lt;? extends TypeElement&gt; annotations, RoundEnvironment env) {
+        round++;
+        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
+                "раунд " + round + ", processingOver=" + env.processingOver());
+        for (Element e : env.getElementsAnnotatedWith(Describe.class)) {
+            if (e.getKind() != ElementKind.RECORD &amp;&amp; e.getKind() != ElementKind.CLASS) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "@Describe только для классов", e);
+                continue;
+            }
+            String name = e.getSimpleName() + "Info";
+            String fields = e.getEnclosedElements().stream()
+                    .filter(m -&gt; m.getKind() == ElementKind.FIELD)
+                    .map(m -&gt; "\"" + m.getSimpleName() + ": " + m.asType() + "\"")
+                    .collect(Collectors.joining(", "));
+            try (Writer w = processingEnv.getFiler().createSourceFile(name, e).openWriter()) {
+                w.write("public final class " + name + " {\n"
+                        + "    public static java.util.List&lt;String&gt; fields() {\n"
+                        + "        return java.util.List.of(" + fields + ");\n"
+                        + "    }\n}\n");
+            } catch (IOException ex) {
+                throw new RuntimeException(ex);
+            }
+        }
+        return true;
+    }
+}</code></pre>
+<pre data-title="app/Person.java"><code class="java">@Describe
+public record Person(String name, int age, java.time.LocalDate born) {}</code></pre>
+<pre data-title="app/Main.java"><code class="java">public class Main {
+    public static void main(String[] args) {
+        System.out.println(PersonInfo.fields());   // класса PersonInfo нет в исходниках!
+    }
+}</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Соберите процессор отдельно — это обычные классы:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -d proc-out proc/Describe.java proc/DescribeProcessor.java</code></pre>
+</li>
+<li class="lab-step"><div class="lab-text">Попробуйте собрать приложение без процессора:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -cp proc-out -d app-out app/Person.java app/Main.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">app\Main.java:3: error: cannot find symbol
+        System.out.println(PersonInfo.fields());   // класса PersonInfo нет в исходниках!
+                           ^
+  symbol:   variable PersonInfo
+  location: class Main
+1 error</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Теперь соберите с процессором. Сколько будет раундов? Что напечатает <code>Main</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -cp proc-out -processorpath proc-out -processor DescribeProcessor -s gen -d app-out app/Person.java app/Main.java
+java -cp app-out Main</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">Note: раунд 1, processingOver=false
+Note: раунд 2, processingOver=false
+Note: раунд 3, processingOver=true
+[name: java.lang.String, age: int, born: java.time.LocalDate]</code></pre></details>
+<div class="lab-ans" hidden><p>Три раунда: в первом процессор видит <code>Person</code> и генерирует <code>PersonInfo.java</code>; во втором разбирается новый файл (аннотаций в нём нет, генерировать нечего); третий — финальный, <code>processingOver=true</code>. После этого <code>Main</code> компилируется, потому что <code>PersonInfo</code> уже существует. Вывод — <code>[name: java.lang.String, age: int, born: java.time.LocalDate]</code>: поля record видны процессору как элементы FIELD.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Сгенерированный исходник лежит в каталоге, заданном <code>-s</code>:</div>
+<pre class="cmd" data-title="терминал"><code class="txt">cat gen/PersonInfo.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">public final class PersonInfo {
+    public static java.util.List&lt;String&gt; fields() {
+        return java.util.List.of("name: java.lang.String", "age: int", "born: java.time.LocalDate");
+    }
+}</code></pre></details>
+<p class="lab-ide"><span>IDEA</span>В IDEA: Settings → Build, Execution, Deployment → Compiler → Annotation Processors → Enable annotation processing, Processor path — каталог proc-out. В Maven — <code>annotationProcessorPaths</code> у maven-compiler-plugin, в Gradle — конфигурация <code>annotationProcessor</code>.</p>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Повесьте <code>@Describe</code> на интерфейс.</summary><div>Процессор выдаст ошибку компиляции с указанием на элемент: <code>error: @Describe только для классов</code> — так библиотеки проверяют правила использования своих аннотаций.</div></details></li>
+<li><details><summary>Уберите <code>-processor DescribeProcessor</code>, но оставьте <code>-processorpath</code> и положите в <code>proc-out/META-INF/services/javax.annotation.processing.Processor</code> строку <code>DescribeProcessor</code>.</summary><div>Сработает: явный processorpath включает обнаружение через ServiceLoader. А если процессор лежит только на <code>-cp</code>, с JDK 23 он не запустится без <code>-proc:full</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-25.6">
+<div class="lab-head"><span class="lab-num">Лаба 25.6</span><b>Компиляция из программы и --release</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Скомпилировать и выполнить код, собранный строкой во время работы, и увидеть разницу <code>--release</code> и <code>-target</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Dyn.java</code>:</div>
+<pre data-title="Dyn.java"><code class="java">import java.net.URLClassLoader;
+import java.nio.file.*;
+import javax.tools.*;
+
+public class Dyn {
+    public static void main(String[] args) throws Exception {
+        String src = """
+                public class Generated {
+                    public static String hello(String who) {
+                        return "Привет, " + who + "! Скомпилировано в " + Runtime.version();
+                    }
+                }
+                """;
+        Path dir = Files.createTempDirectory("gen");
+        Path file = dir.resolve("Generated.java");
+        Files.writeString(file, src);
+
+        JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
+        int code = javac.run(null, null, null, "-d", dir.toString(), file.toString());
+        System.out.println("javac вернул " + code);
+
+        try (var loader = new URLClassLoader(new java.net.URL[] {dir.toUri().toURL()})) {
+            Class&lt;?&gt; c = loader.loadClass("Generated");
+            System.out.println(c.getMethod("hello", String.class).invoke(null, "мир"));
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что вернёт <code>javac.run</code> и что напечатает загруженный класс?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Dyn.java
+java Dyn</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">javac вернул 0
+Привет, мир! Скомпилировано в 25.0.2+10-69</code></pre></details>
+<div class="lab-ans" hidden><p><code>javac вернул 0</code> (0 — успех, как код возврата команды <code>javac</code>), затем строка с версией JDK: класс, которого не было при запуске программы, скомпилирован, загружен новым загрузчиком и вызван через рефлексию. Так устроены jshell и <code>java Hello.java</code>.</p></div>
+</li>
+<li class="lab-step"><div class="lab-text">Файл, использующий API Java 21, собираем под Java 17 двумя способами:</div>
+<pre data-title="NewApi.java"><code class="java">import java.util.List;
+
+public class NewApi {
+    public static void main(String[] args) {
+        System.out.println(List.of(1, 2, 3).getFirst());   // SequencedCollection — Java 21
+    }
+}</code></pre>
+<pre class="cmd" data-title="терминал"><code class="txt">javac --release 17 NewApi.java</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">NewApi.java:5: error: cannot find symbol
+        System.out.println(List.of(1, 2, 3).getFirst());   // SequencedCollection — Java 21
+                                           ^
+  symbol:   method getFirst()
+  location: interface List&lt;Integer&gt;
+1 error</code></pre></details>
+<pre class="cmd" data-title="терминал"><code class="txt">javac -source 17 -target 17 NewApi.java
+javap -v NewApi | grep "major version"</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">warning: [options] location of system modules is not set in conjunction with -source 17
+  not setting the location of system modules may lead to class files that cannot run on JDK 17
+    --release 17 is recommended instead of -source 17 -target 17 because it sets the location of system modules automatically
+1 warning
+  major version: 61</code></pre></details>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что разрешит каждый из двух способов?</div>
+<div class="lab-ans" hidden><p><code>--release 17</code> отказывается: «cannot find symbol: method getFirst()» — компилятор проверяет API платформы 17. <code>-source 17 -target 17</code> собирает файл версии 61 (Java 17), только предупреждает про bootstrap classpath. На Java 17 такой класс упадёт с <code>NoSuchMethodError</code>. Вывод: всегда <code>--release</code> (в Maven — <code>maven.compiler.release</code>).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Переименуйте класс <code>Dyn</code> в <code>Runtime</code> (и файл тоже) и запустите снова.</summary><div>Сгенерированный код не скомпилируется: «cannot find symbol: method version(), location: class Runtime». Компилятор по умолчанию ищет классы в текущем каталоге (classpath «.»), находит там наш <code>Runtime.class</code>, а тип текущего (безымянного) пакета затеняет <code>java.lang.Runtime</code>. Надёжно — писать в генерируемом коде полные имена: <code>java.lang.Runtime.version()</code>.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">25.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что из этого — константа времени компиляции?</p><ul><li><code>static final Integer A = 1;</code></li><li><code>static final int B = Integer.parseInt("1");</code></li><li><code>static final String C = "x" + 1;</code></li><li><code>static final long D = System.nanoTime();</code></li></ul><div class="why">Константа — final примитив или String с константным выражением. Конкатенация литералов константна; Integer не примитив, вызовы методов константами не являются.</div></div>
+<div class="mcq" data-ok="1"><p>Почему checked-исключение можно бросить из метода без <code>throws</code>, обманув компилятор generics?</p><ul><li>это баг JVM</li><li>проверка checked-исключений существует только в javac, JVM её не делает</li><li>generics отключают проверку исключений в JVM</li><li>так нельзя — верификатор отклонит класс</li></ul><div class="why">Атрибут Exceptions носит справочный характер, athrow принимает любой Throwable. Правило «поймай или объяви» — это фаза Flow компилятора.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем javac генерирует мостовой метод <code>compareTo(Object)</code> в классе <code>Money implements Comparable&lt;Money&gt;</code>?</p><ul><li>после стирания интерфейс объявляет compareTo(Object), и без моста метод класса его не переопределял бы</li><li>для ускорения сравнения</li><li>для сериализации</li><li>чтобы поддержать null</li></ul><div class="why">Переопределение в JVM — по совпадению имени и дескриптора. compareTo(LMoney;)I не совпадает с compareTo(Ljava/lang/Object;)I, и мост связывает их кастом.</div></div>
+<div class="mcq" data-ok="3"><p>Перешли на JDK 25, и сборка падает с «cannot find symbol: UserMapperImpl» (генерирует MapStruct). Вероятная причина?</p><ul><li>MapStruct не поддерживает records</li><li>JDK 25 удалил javax.annotation.processing</li><li>сломался classpath</li><li>с JDK 23 процессоры с classpath не запускаются неявно — их надо указать через processorpath/annotationProcessorPaths</li></ul><div class="why">Политика по умолчанию стала -proc:none без явной конфигурации процессоров. Исправление — явный путь процессоров или -proc:full.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему изменение <code>public static final int</code>-константы в библиотеке может «не подействовать»?</summary><div class="a"><p>javac подставляет значение константной переменной прямо в байткод использующего класса, ссылки на класс-владелец не остаётся. Пока зависимый код не перекомпилирован, он видит старое значение. Значения, которые могут меняться, публикуют через методы или не константные выражения.</p></div></details>
+<details class="q"><summary>Во что компилируется for-each по массиву и по списку? Почему по списку бывает ConcurrentModificationException?</summary><div class="a"><p>По массиву — в цикл по индексу с копией ссылки и длины. По Iterable — в цикл с Iterator: hasNext/next. Итератор коллекций fail-fast: сравнивает modCount с ожидаемым и бросает CME, если коллекцию изменили в обход итератора.</p></div></details>
+<details class="q"><summary>Что такое синтетические члены и где они встречаются?</summary><div class="a"><p>Поля и методы, добавленные компилятором и отсутствующие в исходнике: мостовые методы, this$0 во внутренних классах, val$x для захваченных переменных, $VALUES в enum, $assertionsDisabled, lambda$…. Помечены ACC_SYNTHETIC; рефлексия возвращает их наравне с обычными, и библиотеки должны их фильтровать.</p></div></details>
+<details class="q"><summary>Чем процессор аннотаций отличается от того, что делает Lombok?</summary><div class="a"><p>Штатный процессор (JSR 269) может читать модель исходников, генерировать новые файлы и выдавать диагностику, но не менять существующие классы. Lombok через внутренние API javac модифицирует AST компилируемого класса — это мощно, но хрупко: зависит от внутренностей конкретной версии компилятора.</p></div></details>
+<details class="q"><summary>Чем <code>--release</code> лучше <code>-source</code>/<code>-target</code>?</summary><div class="a"><p><code>--release N</code> проверяет не только синтаксис и версию class-файла, но и использование API: компилятор подставляет описание API платформы N. С <code>-target</code> код можно собрать новым JDK с вызовом метода, которого нет в старой версии, и получить NoSuchMethodError уже в продакшене.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

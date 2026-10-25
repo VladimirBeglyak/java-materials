@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>24 · Операторы, управление, массивы, методы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="24">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 24 · ОСНОВА ЯЗЫКА</div>
+  <h1>Операторы, управление, массивы, методы</h1>
+  <p class="lead">Синтаксис кажется очевидным, пока не встретится <code>i = i++</code>, <code>1 &lt;&lt; 32 == 1</code>, <code>ArrayStoreException</code> или вызов «не той» перегрузки. Здесь — точные правила языка (Java Language Specification), по которым компилятор и JVM вычисляют выражения, выбирают ветки, хранят массивы и находят метод для вызова. Это фундамент, на который опираются все остальные темы.</p>
+  <div class="meta"><span class="tag">~2,5 часа</span><span class="tag">литералы</span><span class="tag">порядок вычисления</span><span class="tag">битовые операции</span><span class="tag">метки</span><span class="tag">массивы</span><span class="tag">перегрузка</span><span class="tag">области видимости</span><span class="tag">интерактив</span><span class="tag">тест</span><span class="tag">практикум</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="lexical"><span class="h-num">24.1</span>Из чего состоит исходник: лексика и литералы</h2>
+<p>Компилятор сначала режет текст на <b>лексемы</b>: идентификаторы, ключевые слова, литералы, операторы, разделители. Исходник — это Юникод (по умолчанию в UTF-8 с Java 18), поэтому <code>int длина = 5;</code> — корректный код, хотя так писать не принято.</p>
+<div class="table-wrap"><table>
+<tr><th>Литерал</th><th>Пример</th><th>Тип и замечания</th></tr>
+<tr><td>десятичный</td><td><code>1_000_000</code></td><td><code>int</code>; подчёркивания только между цифрами, для читаемости</td></tr>
+<tr><td>шестнадцатеричный</td><td><code>0xFF</code>, <code>0xCAFE_BABE</code></td><td><code>0xCAFEBABE</code> — это <code>int</code> −889275714: литерал занимает все 32 бита, старший бит стал знаковым</td></tr>
+<tr><td>двоичный</td><td><code>0b1010</code></td><td>с Java 7</td></tr>
+<tr><td>восьмеричный</td><td><code>017</code></td><td><b>15</b>, а не 17 — ведущий ноль включает восьмеричную систему. Ловушка при выравнивании чисел нулями</td></tr>
+<tr><td>long</td><td><code>10L</code></td><td>суффикс обязателен, если значение не помещается в <code>int</code>: <code>3_000_000_000</code> без <code>L</code> — ошибка компиляции</td></tr>
+<tr><td>float / double</td><td><code>1.5f</code>, <code>1e-3</code>, <code>0x1p-3</code></td><td>без суффикса — <code>double</code>; <code>float f = 1.5;</code> не компилируется</td></tr>
+<tr><td>char</td><td><code>'a'</code>, <code>'\n'</code>, <code>'\u0041'</code></td><td>одна кодовая единица UTF-16</td></tr>
+<tr><td>строка / text block</td><td><code>"abc"</code>, <code>"""…"""</code></td><td>см. <a href="03-strings.html">тему 03</a></td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">\u обрабатывается раньше всего</span>
+Юникод-последовательности <code>\uXXXX</code> заменяются на символы <b>до</b> лексического разбора, в том числе в комментариях. Комментарий <code>// путь C:\users</code> не компилируется: <code>\users</code> — некорректная последовательность <code>\u</code>. А строка <code>// \u000a System.out.println("hi");</code> — это перевод строки и затем исполняемый код.
+</div>
+<p><b>Ключевые слова.</b> 51 зарезервированное слово (<code>class</code>, <code>goto</code> и <code>const</code> — зарезервированы, но не используются) и <b>контекстные</b> слова, которые ключевыми становятся только в своём месте: <code>var</code>, <code>record</code>, <code>yield</code>, <code>sealed</code>, <code>permits</code>, <code>non-sealed</code>, <code>module</code>, <code>exports</code>, <code>when</code>. Поэтому старый код с переменной <code>record</code> по-прежнему компилируется, а класс с именем <code>var</code> — уже нет.</p>
+
+<h2 id="operators"><span class="h-num">24.2</span>Операторы, приоритет и порядок вычисления</h2>
+<p>Две разные вещи часто путают. <b>Приоритет и ассоциативность</b> определяют, как расставить скобки: <code>a + b * c</code> — это <code>a + (b * c)</code>. <b>Порядок вычисления</b> определяет, в какой последовательности выполняются операнды. В Java он строго задан: <b>слева направо, каждый операнд полностью вычисляется до выполнения операции</b> (JLS §15.7). В C и C++ порядок для многих операторов не определён, в Java — определён всегда.</p>
+<div class="table-wrap"><table>
+<tr><th>Приоритет (сверху выше)</th><th>Операторы</th><th>Ассоциативность</th></tr>
+<tr><td>постфиксные</td><td><code>x++ x--</code>, вызов, <code>[]</code>, <code>.</code></td><td>слева</td></tr>
+<tr><td>унарные</td><td><code>++x --x +x -x ~ !</code>, приведение <code>(T)</code></td><td>справа</td></tr>
+<tr><td>мультипликативные</td><td><code>* / %</code></td><td>слева</td></tr>
+<tr><td>аддитивные</td><td><code>+ -</code> (и конкатенация строк)</td><td>слева</td></tr>
+<tr><td>сдвиги</td><td><code>&lt;&lt; &gt;&gt; &gt;&gt;&gt;</code></td><td>слева</td></tr>
+<tr><td>сравнение</td><td><code>&lt; &gt; &lt;= &gt;= instanceof</code></td><td>—</td></tr>
+<tr><td>равенство</td><td><code>== !=</code></td><td>слева</td></tr>
+<tr><td>побитовые / логические без сокращения</td><td><code>&amp;</code>, затем <code>^</code>, затем <code>|</code></td><td>слева</td></tr>
+<tr><td>логические с сокращением</td><td><code>&amp;&amp;</code>, затем <code>||</code></td><td>слева</td></tr>
+<tr><td>условный</td><td><code>? :</code></td><td>справа</td></tr>
+<tr><td>присваивания</td><td><code>= += -= *= /= %= &amp;= |= ^= &lt;&lt;= &gt;&gt;= &gt;&gt;&gt;=</code>, лямбда <code>-&gt;</code></td><td>справа</td></tr>
+</table></div>
+<pre data-title="что здесь происходит"><code class="java">int i = 1;
+i = i++ + ++i;          // 1 + 3 = 4: левый операнд (старое 1, i стало 2), затем ++i (i=3)
+int x = 5;
+x = x++;                // 5: x++ вернул 5 и увеличил x до 6, затем присваивание записало 5
+int[] a = {0, 0};
+int k = 0;
+a[k] = k = 1;           // a[0] = 1: индекс вычислен ДО правой части
+System.out.println("" + 1 + 2);  // "12": слева направо, строка + 1 = "1", "1" + 2 = "12"
+System.out.println(1 + 2 + "");  // "3"
+System.out.println(1 &amp; 2 == 2);  // не компилируется: == связывает сильнее &amp;, получается 1 &amp; true</code></pre>
+<ul>
+  <li><b><code>&amp;&amp;</code> и <code>||</code> вычисляют правый операнд только при необходимости</b>: <code>s != null &amp;&amp; s.isEmpty()</code> безопасно. <code>&amp;</code> и <code>|</code> на <code>boolean</code> вычисляют оба операнда всегда — иногда это нужно (оба вызова с побочными эффектами), чаще это ошибка.</li>
+  <li><b>Составное присваивание содержит приведение</b>: <code>b += 1</code> для <code>byte b</code> — это <code>b = (byte) (b + 1)</code> (<a href="02-types.html#conversion">тема 02</a>). Поэтому <code>int x = 0; x += 3.7;</code> компилируется и даёт 3.</li>
+  <li><b>Целочисленное деление на ноль</b> — <code>ArithmeticException</code>; деление <code>double</code> на ноль — <code>Infinity</code> или <code>NaN</code>.</li>
+  <li><b><code>Math.abs(Integer.MIN_VALUE)</code></b> отрицателен: у −2³¹ нет положительной пары в <code>int</code>. Безопасный вариант — <code>Math.absExact</code>.</li>
+</ul>
+<h3>Тип тернарного оператора</h3>
+<p>Тип выражения <code>c ? a : b</code> выводится из обоих операндов, а не из той ветки, что сработала. Отсюда NPE при распаковке (<a href="02-types.html#boxing">тема 02</a>) и неожиданные символы:</p>
+<pre><code class="java">char ch = 'X';
+int zero = 0;
+System.out.println(true ? ch : 0);     // X  — 0 константа, помещается в char → тип char
+System.out.println(true ? ch : zero);  // 88 — zero переменная int → двоичное повышение до int
+Object o = true ? 1 : "s";             // Integer: операнды разных видов → ссылочный тип</code></pre>
+
+<h2 id="bits"><span class="h-num">24.3</span>Биты: побитовые операции и сдвиги</h2>
+<p>Целые в Java хранятся в <b>дополнительном коде</b>: старший бит — знак, <code>-x == ~x + 1</code>. Почему именно так и как это устроено в процессоре — в пособии <a href="../computer-science/01-data.html">«Как устроен компьютер», тема 01</a>. Здесь — что с этим делает язык.</p>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Смысл</th><th>Пример (8 младших бит)</th></tr>
+<tr><td><code>a &amp; b</code></td><td>И: бит 1, если в обоих 1. Маскирование, проверка флага</td><td><code>1100 &amp; 1010 = 1000</code></td></tr>
+<tr><td><code>a | b</code></td><td>ИЛИ: установить флаги</td><td><code>1100 | 1010 = 1110</code></td></tr>
+<tr><td><code>a ^ b</code></td><td>исключающее ИЛИ: переключить биты; <code>x ^ x == 0</code></td><td><code>1100 ^ 1010 = 0110</code></td></tr>
+<tr><td><code>~a</code></td><td>инверсия всех бит; <code>~x == -x - 1</code></td><td><code>~0 == -1</code></td></tr>
+<tr><td><code>a &lt;&lt; n</code></td><td>сдвиг влево, справа нули: умножение на 2ⁿ (с переполнением)</td><td><code>1 &lt;&lt; 4 == 16</code></td></tr>
+<tr><td><code>a &gt;&gt; n</code></td><td>арифметический сдвиг вправо: слева копируется знаковый бит. Деление на 2ⁿ с округлением вниз</td><td><code>-8 &gt;&gt; 1 == -4</code>, <code>-7 &gt;&gt; 1 == -4</code></td></tr>
+<tr><td><code>a &gt;&gt;&gt; n</code></td><td>логический сдвиг вправо: слева нули. Для отрицательных даёт большое положительное</td><td><code>-8 &gt;&gt;&gt; 1 == 2147483644</code></td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Три ловушки сдвигов</span>
+<ol>
+<li><b>Дистанция берётся по модулю</b>: для <code>int</code> используются только 5 младших бит (<code>n &amp; 31</code>), для <code>long</code> — 6 (<code>n &amp; 63</code>). Поэтому <code>1 &lt;&lt; 32 == 1</code>, а не 0, и <code>1 &lt;&lt; -1 == Integer.MIN_VALUE</code>. Нужен 64-битный результат — <code>1L &lt;&lt; 32</code>.</li>
+<li><b>byte и short повышаются до int</b> перед сдвигом. <code>byte b = -1; b &gt;&gt;&gt;= 4;</code> оставит −1: <code>-1</code> расширился до 32 единиц, сдвиг дал <code>0x0FFFFFFF</code>, приведение к byte отрезало младшие 8 единиц. Правильно — <code>(b &amp; 0xFF) &gt;&gt;&gt; 4</code>.</li>
+<li><b>Приоритет ниже арифметики</b>: <code>1 &lt;&lt; n - 1</code> — это <code>1 &lt;&lt; (n - 1)</code>; <code>x &amp; 1 == 0</code> не компилируется (<code>==</code> связывает сильнее).</li>
+</ol>
+</div>
+<pre data-title="идиомы, которые встречаются в JDK"><code class="java">boolean isOdd = (x &amp; 1) != 0;              // быстрее и вернее, чем x % 2 == 1 (для отрицательных % даёт -1)
+boolean pow2 = x &gt; 0 &amp;&amp; (x &amp; (x - 1)) == 0; // степень двойки: у неё ровно один единичный бит
+int unsignedByte = b &amp; 0xFF;               // байт 0..255 из byte -128..127 (чтение бинарных форматов)
+int mid = (lo + hi) &gt;&gt;&gt; 1;                 // середина без переполнения — так в Arrays.binarySearch
+int h = key.hashCode(); h ^= (h &gt;&gt;&gt; 16);   // «размешивание» хэша в HashMap (тема 09)
+int idx = h &amp; (table.length - 1);          // остаток от деления на степень двойки
+
+Integer.bitCount(0b1011);          // 3 — число единиц (одна инструкция POPCNT на x86)
+Integer.numberOfLeadingZeros(1);   // 31
+Integer.highestOneBit(100);        // 64
+Integer.toBinaryString(-1);        // 32 единицы
+Integer.toUnsignedString(-1);      // "4294967295" — беззнаковая интерпретация
+Integer.compareUnsigned(-1, 1);    // 1: как беззнаковое -1 больше</code></pre>
+<p><b>Флаги в одном числе</b> — по-прежнему распространённый приём (модификаторы в <code>java.lang.reflect.Modifier</code>, флаги доступа в class-файле), но в прикладном коде вместо битовых масок лучше <code>EnumSet</code>: он внутри устроен как <code>long</code>-маска, но типобезопасен.</p>
+<p><b>Числа больше long</b> — <code>BigInteger</code>: произвольная длина, неизменяемый, все операции — методы (<code>a.multiply(b)</code>, <code>pow</code>, <code>mod</code>, <code>modPow</code>, <code>isProbablePrime</code>). <code>BigInteger.TWO.pow(100)</code> посчитается точно, а <code>Math.pow(2, 100)</code> вернёт приблизительный <code>double</code>.</p>
+
+<div class="widget" id="bitW">
+  <div class="widget-title">Битовая лаборатория (int, 32 бита)</div>
+  <p class="hint">Введите два целых и выберите операцию: видно каждое состояние бит, десятичное и шестнадцатеричное значение. Попробуйте сдвиг на 32 и на 33, <code>&gt;&gt;</code> и <code>&gt;&gt;&gt;</code> для отрицательного числа.</p>
+  <div class="controls">
+    <label>a<input type="text" id="bitA" value="-8" style="width:120px"></label>
+    <label>операция<select id="bitOp"><option value="and">a &amp; b</option><option value="or">a | b</option><option value="xor">a ^ b</option><option value="not">~a</option><option value="shl">a &lt;&lt; b</option><option value="sar" selected>a &gt;&gt; b</option><option value="shr">a &gt;&gt;&gt; b</option><option value="neg">-a (= ~a + 1)</option></select></label>
+    <label>b<input type="text" id="bitB" value="1" style="width:120px"></label>
+  </div>
+  <div class="out" id="bitOut"></div>
+</div>
+<script>
+(function () {
+  var A = document.getElementById("bitA"), B = document.getElementById("bitB"), op = document.getElementById("bitOp"), out = document.getElementById("bitOut");
+  function p(v) { var s = (v >>> 0).toString(2); while (s.length < 32) s = "0" + s; return s.replace(/(.{4})(?=.)/g, "$1 "); }
+  function hx(v) { var s = (v >>> 0).toString(16).toUpperCase(); while (s.length < 8) s = "0" + s; return "0x" + s; }
+  function rd(el) { var t = el.value.trim().replace(/_/g, ""); var n = /^-?0x/i.test(t) ? parseInt(t, 16) : (/^-?0b/i.test(t) ? parseInt(t.replace(/0b/i, ""), 2) : parseInt(t, 10)); return isNaN(n) ? null : n | 0; }
+  function line(name, v) { return (name + "          ").slice(0, 10) + p(v) + "   " + ("" + v).padStart(11) + "   " + hx(v); }
+  function run() {
+    var a = rd(A), b = rd(B), o = op.value;
+    if (a === null || (b === null && o !== "not" && o !== "neg")) { out.textContent = "Введите целые числа (можно 0x… или 0b…)"; return; }
+    var L = [line("a", a)], r, note = "";
+    if (o === "not" || o === "neg") { r = o === "not" ? ~a : -a; if (o === "neg") { L.push(line("~a", ~a)); note = "Отрицание в дополнительном коде: инвертировать все биты и прибавить 1." + (a === -2147483648 ? "\n-MIN_VALUE == MIN_VALUE: результат не помещается в int и «заворачивается»." : ""); } }
+    else {
+      L.push(line("b", b));
+      if (o === "and") r = a & b; else if (o === "or") r = a | b; else if (o === "xor") r = a ^ b;
+      else {
+        var d = b & 31;
+        if (o === "shl") r = a << d; else if (o === "sar") r = a >> d; else r = a >>> d;
+        note = "Дистанция сдвига: b & 31 = " + d + (d !== b ? "   ← Java использует только 5 младших бит дистанции для int!" : "");
+        if (o === "sar") note += "\n>> копирует знаковый бит: для отрицательного a слева приходят единицы (деление с округлением вниз).";
+        if (o === "shr") note += "\n>>> всегда вдвигает нули: отрицательное число становится большим положительным.";
+      }
+    }
+    L.push("".padEnd(10) + "─".repeat(39));
+    L.push(line("результат", r));
+    out.textContent = L.join("\n") + (note ? "\n\n" + note : "");
+  }
+  [A, B].forEach(function (e) { e.addEventListener("input", run); }); op.addEventListener("change", run); run();
+})();
+</script>
+
+<h2 id="control"><span class="h-num">24.4</span>Управление потоком: ветвления, циклы, метки</h2>
+<h3>switch: оператор и выражение</h3>
+<p>Классический <code>switch</code> с двоеточием — это <b>таблица переходов с проваливанием</b>: управление прыгает на подходящую метку <code>case</code> и идёт дальше, пока не встретит <code>break</code>. Стрелочная форма (Java 14+) не проваливается, а как выражение обязана быть исчерпывающей (<a href="12-modern-java.html">тема 12</a>).</p>
+<pre><code class="java">switch (day) {                 // старая форма: забытый break — классическая ошибка
+    case SATURDAY:
+    case SUNDAY:
+        weekend = true;        // провалились из SATURDAY специально
+        break;
+    default:
+        weekend = false;
+}
+boolean weekend2 = switch (day) {  // выражение: проваливания нет, все варианты обязаны быть покрыты
+    case SATURDAY, SUNDAY -&gt; true;
+    default -&gt; false;
+};</code></pre>
+<ul>
+  <li><b>Что можно в <code>switch</code></b>: <code>char</code>, <code>byte</code>, <code>short</code>, <code>int</code>, их обёртки, <code>String</code>, <code>enum</code>, а с Java 21 — любой ссылочный тип в образцах (<code>case Circle c -&gt;</code>). <code>long</code>, <code>float</code>, <code>double</code>, <code>boolean</code> — нет (примитивы в образцах — предварительная возможность Java 23–25).</li>
+  <li><b>null в switch</b> без <code>case null</code> даёт NPE: switch по строке начинается с вызова <code>hashCode()</code> (<a href="../jvm/03-bytecode.html#javac">JVM, тема 03</a>).</li>
+  <li><b>Плотные значения</b> компилируются в <code>tableswitch</code> (переход по индексу), редкие — в <code>lookupswitch</code> (двоичный поиск).</li>
+</ul>
+<h3>Циклы и метки</h3>
+<p><code>while</code> проверяет условие до тела, <code>do … while</code> — после (тело выполнится хотя бы раз). Классический <code>for (init; cond; update)</code> — сокращение для <code>while</code>. Улучшенный <code>for (T x : src)</code> работает для массивов (компилируется в цикл по индексу) и для всего, что реализует <code>Iterable</code> (компилируется в <code>Iterator</code> — отсюда <code>ConcurrentModificationException</code>, <a href="08-collections.html">тема 08</a>).</p>
+<pre data-title="break и continue с меткой"><code class="java">outer:
+for (int[] row : grid) {
+    for (int v : row) {
+        if (v &lt; 0) continue outer;   // перейти к следующей строке
+        if (v == target) break outer; // выйти из обоих циклов сразу
+    }
+}</code></pre>
+<p>Метка ставится перед любым оператором; <code>break label</code> выходит из помеченного оператора, <code>continue label</code> — переходит к следующей итерации помеченного цикла. Это не <code>goto</code>: прыгнуть можно только наружу. Часто вложенный цикл с меткой лучше вынести в метод с <code>return</code> — читается проще.</p>
+<div class="callout info"><span class="c-title">Недостижимый код — ошибка компиляции</span>
+Компилятор проводит анализ потока (JLS §14.22): оператор после <code>return</code>, <code>break</code>, <code>throw</code> или бесконечного <code>while (true)</code> без <code>break</code> не компилируется. Но <code>if (false) { … }</code> разрешён специально — для условной компиляции: <code>if (DEBUG) log(...)</code> с <code>static final boolean DEBUG = false</code> javac просто выбросит из байткода.
+</div>
+
+<h2 id="arrays"><span class="h-num">24.5</span>Массивы</h2>
+<p>Массив — <b>объект в куче</b> фиксированной длины с заголовком, полем длины и элементами подряд (<a href="../jvm/10-object-layout.html">JVM, тема 10</a>). Его класс создаёт сама JVM: <code>int[].class.getName()</code> — <code>"[I"</code>, <code>String[]</code> — <code>"[Ljava.lang.String;"</code>. Элементы инициализируются значениями по умолчанию: <code>0</code>, <code>false</code>, <code>null</code>.</p>
+<pre><code class="java">int[] a = new int[3];               // [0, 0, 0]
+int[] b = {1, 2, 3};                // инициализатор — только при объявлении
+b = new int[] {4, 5};               // в выражении — с new
+int[][] grid = new int[3][];        // «рваный» массив: массив ссылок на массивы
+grid[0] = new int[5]; grid[1] = new int[1];
+a.length;                           // поле, не метод; a[3] → ArrayIndexOutOfBoundsException
+int[] c = b.clone();                // копия массива; для массива объектов — поверхностная!</code></pre>
+<figure class="diagram">
+<svg viewBox="0 0 800 210" role="img" aria-label="Двумерный массив — массив ссылок на отдельные одномерные массивы">
+  <defs><marker id="arA" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
+  <text x="20" y="24" font-weight="700">int[][] grid = new int[3][]</text>
+  <rect x="20" y="40" width="150" height="40" rx="6" class="box-info"/><text x="95" y="65" text-anchor="middle" class="mono" font-size="13">grid (ссылка)</text>
+  <path d="M170 60 L238 60" class="ln-acc" marker-end="url(#arA)"/>
+  <rect x="240" y="36" width="120" height="150" rx="6" class="box-acc"/>
+  <text x="300" y="56" text-anchor="middle" font-size="12" class="muted">int[][], length 3</text>
+  <rect x="252" y="66" width="96" height="30" rx="4" class="box"/><text x="300" y="86" text-anchor="middle" class="mono" font-size="12">[0] ref</text>
+  <rect x="252" y="102" width="96" height="30" rx="4" class="box"/><text x="300" y="122" text-anchor="middle" class="mono" font-size="12">[1] ref</text>
+  <rect x="252" y="138" width="96" height="30" rx="4" class="box"/><text x="300" y="158" text-anchor="middle" class="mono" font-size="12">[2] null</text>
+  <path d="M348 81 L438 70" class="ln-acc" marker-end="url(#arA)"/>
+  <path d="M348 117 L438 128" class="ln-acc" marker-end="url(#arA)"/>
+  <rect x="440" y="50" width="330" height="40" rx="6" class="box-ok"/><text x="455" y="75" class="mono" font-size="13">int[5]: 0 | 0 | 0 | 0 | 0</text>
+  <rect x="440" y="110" width="140" height="40" rx="6" class="box-ok"/><text x="455" y="135" class="mono" font-size="13">int[1]: 0</text>
+  <text x="440" y="180" class="muted" font-size="12">Строки — отдельные объекты в разных местах кучи; их длины не обязаны совпадать</text>
+</svg>
+<figcaption>Многомерных массивов в Java нет — есть массивы массивов. Обход по строкам (<code>grid[i][j]</code> с внутренним циклом по <code>j</code>) идёт по памяти подряд и в разы быстрее обхода по столбцам: так работают кэши процессора (<a href="../computer-science/06-cache.html">«Как устроен компьютер», тема 06</a>).</figcaption>
+</figure>
+<h3>Ковариантность и ArrayStoreException</h3>
+<p>Массивы <b>ковариантны</b>: <code>String[]</code> является подтипом <code>Object[]</code>. Это решение из Java 1.0 (generics ещё не было, а <code>Arrays.sort(Object[])</code> хотелось вызывать для любых массивов) пробивает дыру в типизации, которую JVM закрывает проверкой при каждой записи:</p>
+<pre><code class="java">Object[] objs = new String[2];  // компилируется
+objs[0] = "ok";
+objs[1] = 42;                   // ArrayStoreException: java.lang.Integer — проверка в рантайме (инструкция aastore)</code></pre>
+<p>Generics сделаны <b>инвариантными</b> именно чтобы такая ошибка ловилась при компиляции (<a href="07-generics.html#invariance">тема 07</a>), и поэтому же нельзя создать <code>new T[]</code> или <code>new List&lt;String&gt;[10]</code>.</p>
+<h3>java.util.Arrays и копирование</h3>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Метод</th><th>Замечание</th></tr>
+<tr><td>напечатать</td><td><code>Arrays.toString(a)</code>, <code>deepToString(grid)</code></td><td><code>System.out.println(a)</code> печатает <code>[I@1b6d3586</code> — тип и хэш</td></tr>
+<tr><td>сравнить содержимое</td><td><code>Arrays.equals</code>, <code>deepEquals</code></td><td><code>a.equals(b)</code> у массива — это <code>==</code></td></tr>
+<tr><td>хэш содержимого</td><td><code>Arrays.hashCode</code></td><td>массив как ключ <code>HashMap</code> — ошибка: ключ по ссылке</td></tr>
+<tr><td>сортировка</td><td><code>Arrays.sort</code>, <code>parallelSort</code></td><td>примитивы — dual-pivot quicksort (не стабильна, стабильность и не нужна), объекты — TimSort (стабильна)</td></tr>
+<tr><td>поиск</td><td><code>Arrays.binarySearch</code></td><td>только по отсортированному; нет элемента → <code>-(точка вставки) - 1</code></td></tr>
+<tr><td>заполнить</td><td><code>Arrays.fill</code>, <code>setAll(a, i -&gt; i * i)</code></td><td></td></tr>
+<tr><td>копировать</td><td><code>Arrays.copyOf</code>, <code>copyOfRange</code>, <code>System.arraycopy</code></td><td><code>arraycopy</code> — интринсик JVM, корректно работает при перекрытии</td></tr>
+<tr><td>в список</td><td><code>Arrays.asList</code>, <code>List.of</code></td><td><code>asList</code> — представление фиксированного размера поверх массива (<a href="16-practice.html">тема 16</a>)</td></tr>
+<tr><td>стрим</td><td><code>Arrays.stream(a)</code></td><td>для <code>int[]</code> — <code>IntStream</code> без упаковки</td></tr>
+</table></div>
+
+<h2 id="methods"><span class="h-num">24.6</span>Методы: сигнатура, varargs, выбор перегрузки</h2>
+<p><b>Сигнатура метода</b> — имя и типы параметров (после стирания generics). Тип результата, имена параметров и <code>throws</code> в сигнатуру не входят: два метода, отличающиеся только типом результата, в одном классе объявить нельзя (а в байткоде — можно, этим пользуются мостовые методы, <a href="25-javac.html#bridges">тема 25</a>).</p>
+<h3>Varargs</h3>
+<p><code>void log(String fmt, Object... args)</code> — синтаксический сахар: параметр имеет тип <code>Object[]</code>, а компилятор на месте вызова сам создаёт массив. Последствия:</p>
+<ul>
+  <li>каждый вызов выделяет массив — поэтому в <code>List.of</code> и в логгерах SLF4J есть перегрузки на 1, 2, 3… аргумента;</li>
+  <li><code>log("x", (Object[]) null)</code> передаст <code>null</code> вместо массива, а <code>log("x", null)</code> — тоже (с предупреждением), но <code>log("x", (Object) null)</code> — массив из одного <code>null</code>;</li>
+  <li>передача <code>int[]</code> в <code>Object...</code> даёт массив из <b>одного</b> элемента — самого <code>int[]</code>: <code>Arrays.asList(new int[]{1,2}).size() == 1</code>;</li>
+  <li>varargs с generic-типом (<code>T...</code>) создаёт массив стёртого типа — отсюда предупреждение о загрязнении кучи и <code>@SafeVarargs</code> (<a href="07-generics.html">тема 07</a>).</li>
+</ul>
+<h3>Как компилятор выбирает перегрузку</h3>
+<p>Выбор делается <b>при компиляции</b> по статическим типам аргументов (в отличие от переопределения, которое решается в рантайме по фактическому классу объекта — <a href="04-oop.html#polymorphism">тема 04</a>). Алгоритм JLS §15.12.2 идёт <b>фазами</b> и останавливается на первой, где нашёлся хоть один подходящий метод:</p>
+<ol class="steps">
+  <li><b>Фаза 1 — строгий вызов</b>: только тождество, расширение примитивов (<code>int → long → float → double</code>) и подтипы ссылок. <b>Без упаковки и без varargs.</b></li>
+  <li><b>Фаза 2 — свободный вызов</b>: разрешены упаковка и распаковка (<code>int ↔ Integer</code>), всё ещё без varargs.</li>
+  <li><b>Фаза 3 — переменная арность</b>: varargs-методы как varargs.</li>
+</ol>
+<p>Внутри фазы из подходящих выбирается <b>наиболее специфичный</b> (тот, чьи параметры подходят и для другого). Если такого нет — ошибка «reference to m is ambiguous».</p>
+<pre><code class="java">static void m(long x)    { System.out.println("long"); }
+static void m(Integer x) { System.out.println("Integer"); }
+static void m(int... x)  { System.out.println("varargs"); }
+
+m(5);         // long     — фаза 1: расширение int → long побеждает упаковку
+m(Integer.valueOf(5)); // Integer
+static void n(Object o)  {}   static void n(String s) {}
+n(null);      // n(String): оба подходят, String специфичнее Object
+static void k(String s)  {}   static void k(Integer i) {}
+k(null);      // ошибка компиляции: ambiguous — ни один не специфичнее</code></pre>
+<p>Правило фаз существует ради <b>обратной совместимости</b>: до Java 5 автоупаковки и varargs не было, и добавление их не должно было изменить выбор метода в старом коде. Поэтому старый «расширяющий» вариант всегда выигрывает у нового «упаковывающего».</p>
+
+<div class="widget" id="ovW">
+  <div class="widget-title">Симулятор выбора перегрузки</div>
+  <p class="hint">Отметьте, какие перегрузки <code>m(...)</code> объявлены в классе, и выберите аргумент. Симулятор проходит фазы JLS §15.12.2 и показывает, какой метод выберет javac.</p>
+  <div class="controls" id="ovC"></div>
+  <div class="controls"><label>вызов<select id="ovArg">
+    <option value="byte">m(b) — byte b</option><option value="short">m(s) — short s</option><option value="char">m('a') — char</option><option value="int" selected>m(5) — int</option><option value="long">m(5L) — long</option><option value="double">m(1.5) — double</option><option value="Integer">m(boxed) — Integer boxed</option><option value="null">m(null)</option></select></label></div>
+  <div class="out" id="ovOut"></div>
+</div>
+<script>
+(function () {
+  var C = ["int", "long", "double", "Integer", "Object", "String", "int..."], ON = { "long": 1, "Integer": 1, "int...": 1 };
+  var box = document.getElementById("ovC"), arg = document.getElementById("ovArg"), out = document.getElementById("ovOut");
+  C.forEach(function (c) { var l = document.createElement("label"); l.innerHTML = '<input type="checkbox"' + (ON[c] ? " checked" : "") + '> m(' + c + ')'; l.querySelector("input").value = c; box.appendChild(l); });
+  var W = { "byte": ["short", "int", "long", "float", "double"], "short": ["int", "long", "float", "double"], "char": ["int", "long", "float", "double"], "int": ["long", "float", "double"], "long": ["float", "double"], "float": ["double"], "double": [] };
+  var BOX = { "byte": "Byte", "short": "Short", "char": "Character", "int": "Integer", "long": "Long", "double": "Double" };
+  var PRIM = { "int": 1, "long": 1, "double": 1 };
+  function widen(a, p) { return a === p || (W[a] || []).indexOf(p) >= 0; }
+  function refSub(a, p) { return a === p || p === "Object"; }
+  function strict(a, p) { // фаза 1: p — тип параметра; varargs-метод здесь — с параметром int[]
+    if (p === "int...") p = "int[]";
+    if (a === "null") return !PRIM[p];
+    if (BOX[a] || a === "double") return PRIM[p] ? widen(a, p) : false;
+    return !PRIM[p] && refSub(a, p);
+  }
+  function loose(a, p) {
+    if (strict(a, p)) return true;
+    if (p === "int...") return false;
+    if (a === "null") return false;
+    if (W[a] && !PRIM[p]) return BOX[a] === p || p === "Object";       // упаковка + расширение ссылки
+    if (a === "Integer" && PRIM[p]) return widen("int", p);             // распаковка + расширение
+    return false;
+  }
+  function vararg(a) { if (a === "null") return false; if (W[a]) return widen(a, "int"); return a === "Integer"; }
+  function sub(x, y) { // x специфичнее y?
+    if (x === y) return true;
+    var X = x === "int..." ? "int[]" : x, Y = y === "int..." ? "int[]" : y;
+    if (PRIM[X] && PRIM[Y]) return widen(X, Y);
+    if (!PRIM[X] && !PRIM[Y]) return Y === "Object";
+    return false;
+  }
+  function run() {
+    var a = arg.value, decl = [].slice.call(box.querySelectorAll("input:checked")).map(function (i) { return i.value; });
+    var L = ["Объявлены: " + (decl.length ? decl.map(function (d) { return "m(" + d + ")"; }).join(", ") : "ничего"), "Аргумент: " + a, ""];
+    if (!decl.length) { out.textContent = L.join("\n") + "Нет ни одного метода m — ошибка компиляции: cannot find symbol."; return; }
+    var phases = [["Фаза 1 (строгая: расширение примитивов, подтипы; varargs — как массив int[])", function (p) { return strict(a, p); }],
+                  ["Фаза 2 (свободная: + упаковка/распаковка)", function (p) { return loose(a, p); }],
+                  ["Фаза 3 (переменная арность)", function (p) { return p === "int..." && vararg(a); }]];
+    for (var k = 0; k < phases.length; k++) {
+      var app = decl.filter(phases[k][1]);
+      L.push(phases[k][0] + ": " + (app.length ? app.map(function (d) { return "m(" + d + ")"; }).join(", ") : "подходящих нет"));
+      if (app.length) {
+        var best = app.filter(function (x) { return app.every(function (y) { return sub(x, y); }); });
+        if (best.length === 1) L.push("\n→ вызовется m(" + best[0] + ")" + (app.length > 1 ? " — наиболее специфичный из подходящих" : "") + (k === 0 && best[0] === "int..." ? "\n  null подходит к параметру int[] уже в фазе 1, и int[] специфичнее Object!" : ""));
+        else L.push("\n→ ошибка компиляции: reference to m is ambiguous — ни один из " + app.map(function (d) { return "m(" + d + ")"; }).join(" и ") + " не специфичнее другого");
+        out.textContent = L.join("\n"); return;
+      }
+    }
+    L.push("\n→ ошибка компиляции: no suitable method found for m(" + a + ")");
+    out.textContent = L.join("\n");
+  }
+  box.addEventListener("change", run); arg.addEventListener("change", run); run();
+})();
+</script>
+<h3>Рекурсия и стек</h3>
+<p>Каждый вызов создаёт кадр в стеке потока (<a href="../jvm/03-bytecode.html#frame">JVM, тема 03</a>); глубокая рекурсия кончается <code>StackOverflowError</code> — обычно на нескольких тысячах–десятках тысяч уровней при стеке по умолчанию 1 МБ (<code>-Xss</code>). Оптимизации хвостовой рекурсии в Java нет: глубокую рекурсию переписывают на цикл с явным стеком (<code>ArrayDeque</code>).</p>
+
+<h2 id="scope"><span class="h-num">24.7</span>Переменные: виды, области видимости, затенение</h2>
+<div class="table-wrap"><table>
+<tr><th>Вид</th><th>Где живёт</th><th>Значение по умолчанию</th><th>Область видимости</th></tr>
+<tr><td>локальная переменная, параметр</td><td>кадр метода (слот локальных переменных)</td><td>нет — компилятор требует присвоить до чтения</td><td>от объявления до конца блока <code>{}</code></td></tr>
+<tr><td>поле экземпляра</td><td>объект в куче</td><td>0 / false / null</td><td>весь класс; снаружи — по модификатору доступа</td></tr>
+<tr><td>статическое поле</td><td>объект <code>Class</code> (в куче; в HotSpot с Java 7)</td><td>0 / false / null</td><td>весь класс</td></tr>
+<tr><td>элемент массива</td><td>массив в куче</td><td>0 / false / null</td><td>—</td></tr>
+</table></div>
+<p><b>Definite assignment</b> (JLS гл. 16): компилятор доказывает, что локальная переменная присвоена на <b>каждом</b> пути до чтения, и что <code>final</code>-переменная присвоена ровно один раз. Поэтому так можно:</p>
+<pre><code class="java">final String label;
+if (score &gt; 90) label = "A";
+else if (score &gt; 70) label = "B";
+else label = "C";            // без этой ветки — ошибка «variable label might not have been initialized»
+System.out.println(label);</code></pre>
+<p><b>Effectively final</b> — переменная, которой после инициализации ничего не присваивают. Только такие можно захватывать в лямбдах и анонимных классах (<a href="10-lambdas.html">тема 10</a>), потому что захватывается копия значения.</p>
+<h3>Затенение и сокрытие</h3>
+<ul>
+  <li><b>Затенение (shadowing)</b>: локальная переменная или параметр с именем поля скрывают поле внутри метода — классическое <code>this.name = name</code>. Локальную переменную с именем другой локальной в том же методе объявить нельзя (в отличие от C++ и JavaScript).</li>
+  <li><b>Сокрытие полей (hiding)</b>: поле в подклассе с тем же именем не переопределяет, а <b>прячет</b> поле родителя. Какое поле прочитается — решает статический тип ссылки: <code>Parent p = new Child(); p.name</code> — поле <code>Parent</code>.</li>
+  <li><b>Сокрытие статических методов</b>: статический метод с той же сигнатурой в подклассе тоже не полиморфен — вызов <code>p.staticMethod()</code> через ссылку компилируется в вызов метода статического типа. Поэтому статические методы вызывают через имя класса (<a href="04-oop.html#polymorphism">тема 04</a>).</li>
+</ul>
+
+<h2 id="packages"><span class="h-num">24.8</span>Пакеты, импорт и точка входа</h2>
+<p><b>Пакет</b> — пространство имён и единица доступа: без модификатора (package-private) член виден только внутри пакета. Полное имя класса — <code>java.util.ArrayList</code>; <code>import</code> лишь разрешает писать короткое имя и <b>ничего не загружает</b> — в байткоде всегда полные имена.</p>
+<pre><code class="java">package com.shop.order;          // первая инструкция файла; каталоги: com/shop/order/
+
+import java.util.List;           // один тип
+import java.util.*;              // все типы пакета (но не подпакетов!)
+import static java.lang.Math.max; // статический член
+import module java.sql;          // Java 25 (JEP 511): все пакеты, экспортируемые модулем java.sql
+
+// java.lang.* импортирован всегда; при конфликте имён (java.util.Date и java.sql.Date)
+// одиночный импорт побеждает импорт «*», а два одинаковых имени через «*» — ошибка при использовании</code></pre>
+<p><b>Точка входа.</b> Классически — <code>public static void main(String[] args)</code>. С Java 25 (JEP 512, финальная версия) есть <b>компактные исходные файлы</b>: класс можно не объявлять, а <code>main</code> может быть экземплярным и без параметров:</p>
+<pre data-title="Hello.java, Java 25"><code class="java">void main() {
+    IO.println("Привет");   // java.lang.IO — простой ввод-вывод для учебных программ
+}</code></pre>
+<p>Запуск <code>java Hello.java</code>. Компилятор оборачивает такой файл в неявный класс; при выборе метода запуска лаунчер предпочитает <code>main(String[])</code>, а затем <code>main()</code>, статический или экземплярный (тогда он создаёт объект конструктором без параметров).</p>
+
+<!-- hands-on:start -->
+<h2 id="hands-on"><span class="h-num">24.9</span>Практикум: пишем и запускаем</h2>
+<div class="lab-intro"><p>Правила вычисления выражений, сдвигов, массивов и выбора перегрузки проверяем на живом компиляторе. Модуль IDEA — <code>ch24</code>. Половина прогнозов в этой главе не сходится с интуицией — в этом и смысл.</p><p class="lab-how">Код набирайте руками — так он запоминается. Перед запуском запишите предсказание в поле «Ваш прогноз», затем сверьтесь с реальным выводом (снят на JDK 25.0.2; адреса, времена и хэши у вас будут другими). Как подготовить окружение — на <a href="index.html#lab-setup">странице курса</a>.</p></div>
+<div class="lab" data-lab="java-core-24.1">
+<div class="lab-head"><span class="lab-num">Лаба 24.1</span><b>Порядок вычисления и тернарный оператор</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Убедиться, что Java вычисляет операнды строго слева направо, и увидеть, как тип тернарного выражения меняет результат.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Order.java</code>:</div>
+<pre data-title="Order.java"><code class="java">public class Order {
+    static int f(String name, int v) {
+        System.out.print(name + " ");
+        return v;
+    }
+
+    public static void main(String[] args) {
+        int r = f("a", 1) + f("b", 2) * f("c", 3);
+        System.out.println("→ " + r);
+
+        int i = 1;
+        i = i++ + ++i;
+        System.out.println("i = " + i);
+
+        int x = 5;
+        x = x++;
+        System.out.println("x = " + x);
+
+        int[] arr = {0, 0};
+        int k = 0;
+        arr[k] = k = 1;
+        System.out.println("arr = [" + arr[0] + ", " + arr[1] + "], k = " + k);
+
+        System.out.println("" + 1 + 2);
+        System.out.println(1 + 2 + "");
+        System.out.println('a' + 'b' + "c");
+
+        char ch = 'X';
+        int zero = 0;
+        System.out.println(true ? ch : 0);
+        System.out.println(true ? ch : zero);
+
+        int y = 0;
+        y += 3.7;
+        System.out.println("y = " + y);
+        System.out.println("017 = " + 017);
+        System.out.println("abs(MIN) = " + Math.abs(Integer.MIN_VALUE));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запишите все строки вывода. В каком порядке вызовутся <code>f("a")</code>, <code>f("b")</code>, <code>f("c")</code>? Что напечатают <code>'a' + 'b' + "c"</code> и два тернарных оператора?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Order.java
+java Order</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">a b c → 7
+i = 4
+x = 5
+arr = [1, 0], k = 1
+12
+3
+195c
+X
+88
+y = 3
+017 = 15
+abs(MIN) = -2147483648</code></pre></details>
+<div class="lab-ans" hidden><p>Сначала печатается <code>a b c → 7</code>: умножение имеет приоритет, но операнды вычисляются слева направо. <code>i = 4</code> (1 + 3), <code>x = 5</code> (присваивание затирает инкремент), <code>arr = [1, 0]</code> — индекс вычислен до правой части. <code>"12"</code> и <code>"3"</code>. <code>'a' + 'b' + "c"</code> — <code>195c</code>: два char сложились как числа (97 + 98) до появления строки. Тернарные: <code>X</code> (константа 0 помещается в char) и <code>88</code> (переменная int → тип int). <code>y = 3</code> — в составном присваивании скрытое приведение. <code>017 = 15</code>. <code>Math.abs(MIN_VALUE)</code> отрицателен: −2147483648.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>Math.abs</code> на <code>Math.absExact</code>.</summary><div><code>ArithmeticException: Overflow to represent absolute value of Integer.MIN_VALUE</code> — у −2³¹ нет положительной пары в int.</div></details></li>
+<li><details><summary>Посмотрите байткод строки <code>x = x++</code> через <code>javap -c Order</code>.</summary><div><code>iload</code> (старое значение на стек), <code>iinc</code> (увеличить слот), <code>istore</code> (записать старое значение обратно) — инкремент затёрт.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-24.2">
+<div class="lab-head"><span class="lab-num">Лаба 24.2</span><b>Биты и сдвиги</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить маскирование дистанции сдвига, разницу <code>&gt;&gt;</code> и <code>&gt;&gt;&gt;</code> и повышение byte до int.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Bits.java</code>:</div>
+<pre data-title="Bits.java"><code class="java">import java.math.BigInteger;
+
+public class Bits {
+    static String bin(int v) {
+        return String.format("%32s", Integer.toBinaryString(v)).replace(' ', '0');
+    }
+
+    public static void main(String[] args) {
+        System.out.println("1 &lt;&lt; 31 = " + (1 &lt;&lt; 31));
+        System.out.println("1 &lt;&lt; 32 = " + (1 &lt;&lt; 32));
+        System.out.println("1 &lt;&lt; 33 = " + (1 &lt;&lt; 33));
+        System.out.println("1L &lt;&lt; 32 = " + (1L &lt;&lt; 32));
+        System.out.println("-8 &gt;&gt; 1  = " + (-8 &gt;&gt; 1) + "   " + bin(-8 &gt;&gt; 1));
+        System.out.println("-8 &gt;&gt;&gt; 1 = " + (-8 &gt;&gt;&gt; 1) + "   " + bin(-8 &gt;&gt;&gt; 1));
+        System.out.println("-7 &gt;&gt; 1  = " + (-7 &gt;&gt; 1) + ",  -7 / 2 = " + (-7 / 2));
+        System.out.println("~5 = " + ~5 + ",  -5 = " + bin(-5));
+
+        byte b = -1;
+        b &gt;&gt;&gt;= 4;
+        System.out.println("byte -1 &gt;&gt;&gt;= 4 → " + b);
+        byte c = -1;
+        System.out.println("(c &amp; 0xFF) &gt;&gt;&gt; 4 → " + ((c &amp; 0xFF) &gt;&gt;&gt; 4));
+
+        int x = -3;
+        System.out.println("-3 % 2 == 1 ? " + (x % 2 == 1) + ",  (-3 &amp; 1) != 0 ? " + ((x &amp; 1) != 0));
+        System.out.println("bitCount(255) = " + Integer.bitCount(255) + ", highestOneBit(100) = " + Integer.highestOneBit(100));
+        System.out.println("toUnsignedString(-1) = " + Integer.toUnsignedString(-1));
+        System.out.println("2^100 double     = " + Math.pow(2, 100));
+        System.out.println("2^100 BigInteger = " + BigInteger.TWO.pow(100));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Предскажите <code>1 &lt;&lt; 32</code>, <code>1 &lt;&lt; 33</code>, результат <code>byte -1 &gt;&gt;&gt;= 4</code> и проверку нечётности для −3.</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Bits.java
+java Bits</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1 &lt;&lt; 31 = -2147483648
+1 &lt;&lt; 32 = 1
+1 &lt;&lt; 33 = 2
+1L &lt;&lt; 32 = 4294967296
+-8 &gt;&gt; 1  = -4   11111111111111111111111111111100
+-8 &gt;&gt;&gt; 1 = 2147483644   01111111111111111111111111111100
+-7 &gt;&gt; 1  = -4,  -7 / 2 = -3
+~5 = -6,  -5 = 11111111111111111111111111111011
+byte -1 &gt;&gt;&gt;= 4 → -1
+(c &amp; 0xFF) &gt;&gt;&gt; 4 → 15
+-3 % 2 == 1 ? false,  (-3 &amp; 1) != 0 ? true
+bitCount(255) = 8, highestOneBit(100) = 64
+toUnsignedString(-1) = 4294967295
+2^100 double     = 1.2676506002282294E30
+2^100 BigInteger = 1267650600228229401496703205376</code></pre></details>
+<div class="lab-ans" hidden><p><code>1 &lt;&lt; 32 = 1</code> и <code>1 &lt;&lt; 33 = 2</code>: дистанция берётся по модулю 32. <code>-8 &gt;&gt; 1 = -4</code>, <code>-8 &gt;&gt;&gt; 1 = 2147483644</code> — слева пришёл ноль. <code>-7 &gt;&gt; 1 = -4</code>, а <code>-7 / 2 = -3</code>: сдвиг округляет вниз, деление — к нулю. <code>byte -1 &gt;&gt;&gt;= 4</code> оставляет <b>−1</b>: байт расширился до 32 единиц, после сдвига младшие 8 бит всё равно единицы. С маской <code>0xFF</code> — 15. <code>-3 % 2</code> равно −1, поэтому проверка <code>== 1</code> ошибочно говорит «чётное»; битовая проверка верна. <code>Math.pow</code> печатает <code>1.2676506002282294E30</code>, BigInteger — точные 31 цифру.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Сколько будет <code>1 &lt;&lt; -1</code>?</summary><div><code>Integer.MIN_VALUE</code> (−2147483648): −1 &amp; 31 = 31, то есть сдвиг на 31.</div></details></li>
+<li><details><summary>Найдите в исходниках JDK <code>HashMap.hash</code> (Ctrl+N → HashMap, Ctrl+F12 → hash).</summary><div><code>(h = key.hashCode()) ^ (h &gt;&gt;&gt; 16)</code> — старшие биты хэша подмешиваются в младшие, потому что индекс бакета берётся маской <code>h &amp; (n - 1)</code>.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-24.3">
+<div class="lab-head"><span class="lab-num">Лаба 24.3</span><b>Метки, switch и проваливание</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, как работают <code>break</code>/<code>continue</code> с меткой и проваливание в старом switch.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Flow.java</code>:</div>
+<pre data-title="Flow.java"><code class="java">public class Flow {
+    public static void main(String[] args) {
+        int[][] grid = {{1, 2, 3}, {4, -1, 6}, {7, 8, 9}};
+        outer:
+        for (int i = 0; i &lt; grid.length; i++) {
+            for (int j = 0; j &lt; grid[i].length; j++) {
+                if (grid[i][j] &lt; 0) {
+                    System.out.println("отрицательное в строке " + i + " — к следующей строке");
+                    continue outer;
+                }
+                if (grid[i][j] == 8) {
+                    System.out.println("нашли 8 в [" + i + "][" + j + "] — выходим из обоих циклов");
+                    break outer;
+                }
+                System.out.print(grid[i][j] + " ");
+            }
+            System.out.println("| конец строки " + i);
+        }
+
+        for (int code = 1; code &lt;= 4; code++) {
+            System.out.print("code " + code + ": ");
+            switch (code) {
+                case 1:
+                    System.out.print("один ");
+                case 2:
+                    System.out.print("два ");
+                    break;
+                case 3:
+                    System.out.print("три ");
+                default:
+                    System.out.print("по умолчанию ");
+            }
+            System.out.println();
+        }
+
+        String s = null;
+        try {
+            switch (s) {
+                case "a" -&gt; System.out.println("a");
+                default -&gt; System.out.println("other");
+            }
+        } catch (NullPointerException e) {
+            System.out.println("switch(null): NPE");
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатает обход сетки и что выведет switch для code = 1, 3 и 4?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Flow.java
+java Flow</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">1 2 3 | конец строки 0
+4 отрицательное в строке 1 — к следующей строке
+7 нашли 8 в [2][1] — выходим из обоих циклов
+code 1: один два 
+code 2: два 
+code 3: три по умолчанию 
+code 4: по умолчанию 
+switch(null): NPE</code></pre></details>
+<div class="lab-ans" hidden><p>Строка 0: <code>1 2 3 | конец строки 0</code>. Строка 1: печатается <code>4</code>, затем «отрицательное…» — <code>continue outer</code> пропускает и остаток строки, и «конец строки 1». Строка 2: <code>7</code>, затем «нашли 8…», и программа выходит из обоих циклов (конца строки 2 нет). Switch: <code>code 1: один два</code> (провалились в case 2 до break), <code>code 2: два</code>, <code>code 3: три по умолчанию</code>, <code>code 4: по умолчанию</code>. <code>switch(null)</code> без <code>case null</code> — NPE.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>case null -&gt; System.out.println("null");</code> в стрелочный switch.</summary><div>Компилируется (Java 21+) и печатает «null»: с <code>case null</code> switch не бросает NPE.</div></details></li>
+<li><details><summary>Поставьте строку кода сразу после <code>break outer;</code> внутри того же блока.</summary><div>Ошибка компиляции <code>unreachable statement</code> — анализ потока JLS §14.22.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-24.4">
+<div class="lab-head"><span class="lab-num">Лаба 24.4</span><b>Массивы: ковариантность, копии, печать</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Посмотреть на массив как на объект: имя его класса, сравнение, поверхностное копирование и <code>ArrayStoreException</code>.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Arr.java</code>:</div>
+<pre data-title="Arr.java"><code class="java">import java.util.Arrays;
+import java.util.List;
+
+public class Arr {
+    public static void main(String[] args) {
+        int[] a = {3, 1, 2};
+        int[] b = {3, 1, 2};
+        System.out.println("класс int[]:      " + a.getClass().getName());
+        System.out.println("класс String[][]: " + String[][].class.getName());
+        System.out.println("a == b: " + (a == b) + ", a.equals(b): " + a.equals(b) + ", Arrays.equals: " + Arrays.equals(a, b));
+        System.out.println("println(a) печатает: " + (a.toString().startsWith("[I@") ? "[I@&lt;hash&gt;" : a.toString()));
+        System.out.println("Arrays.toString: " + Arrays.toString(a));
+
+        int[][] grid = new int[3][];
+        grid[0] = new int[2];
+        grid[1] = new int[] {7};
+        System.out.println("рваный массив: " + Arrays.deepToString(grid));
+
+        StringBuilder[] src = {new StringBuilder("x")};
+        StringBuilder[] copy = src.clone();
+        copy[0].append("!");
+        System.out.println("clone поверхностный: src[0] = " + src[0] + ", тот же объект: " + (src[0] == copy[0]));
+
+        Arrays.sort(a);
+        System.out.println("binarySearch(2) = " + Arrays.binarySearch(a, 2) + ", binarySearch(5) = " + Arrays.binarySearch(a, 5));
+
+        List&lt;int[]&gt; wrong = Arrays.asList(new int[] {1, 2, 3});
+        System.out.println("Arrays.asList(int[]).size() = " + wrong.size());
+
+        Object[] objs = new String[2];
+        objs[0] = "ok";
+        try {
+            objs[1] = 42;
+        } catch (ArrayStoreException e) {
+            System.out.println("ArrayStoreException: " + e.getMessage());
+        }
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Какие имена классов у массивов? Что вернёт <code>binarySearch(5)</code> и чему равен размер <code>Arrays.asList(new int[]{1,2,3})</code>?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Arr.java
+java Arr</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">класс int[]:      [I
+класс String[][]: [[Ljava.lang.String;
+a == b: false, a.equals(b): false, Arrays.equals: true
+println(a) печатает: [I@&lt;hash&gt;
+Arrays.toString: [3, 1, 2]
+рваный массив: [[0, 0], [7], null]
+clone поверхностный: src[0] = x!, тот же объект: true
+binarySearch(2) = 1, binarySearch(5) = -4
+Arrays.asList(int[]).size() = 1
+ArrayStoreException: java.lang.Integer</code></pre></details>
+<div class="lab-ans" hidden><p><code>[I</code> и <code>[[Ljava.lang.String;</code> — дескрипторы из class-файла. <code>a == b</code> и <code>a.equals(b)</code> — false (equals у массива не переопределён), <code>Arrays.equals</code> — true. Рваный массив: <code>[[0, 0], [7], null]</code>. <code>clone</code> скопировал ссылку: <code>src[0] = x!</code>, объект тот же. После сортировки <code>[1, 2, 3]</code>: <code>binarySearch(2) = 1</code>, <code>binarySearch(5) = -4</code> — точка вставки 3, ответ −3 − 1. <code>asList(int[])</code> — список из одного элемента: сам массив. Запись числа в <code>String[]</code> через ссылку <code>Object[]</code> — <code>ArrayStoreException: java.lang.Integer</code>.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Замените <code>new int[] {1, 2, 3}</code> на <code>new Integer[] {1, 2, 3}</code>.</summary><div>Размер станет 3: varargs <code>T...</code> принимает массив объектов как сам массив аргументов, а <code>int[]</code> — это один объект.</div></details></li>
+<li><details><summary>Попробуйте <code>List&lt;String&gt;[] arr = new List&lt;String&gt;[10];</code></summary><div>Ошибка <code>generic array creation</code>: массив должен знать тип элементов в рантайме, а у generic-типа он стёрт — проверка ArrayStoreException была бы невозможна.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-24.5">
+<div class="lab-head"><span class="lab-num">Лаба 24.5</span><b>Выбор перегрузки</b><span class="lab-time">15 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Проверить три фазы выбора перегрузки и случаи неоднозначности.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Overload.java</code>:</div>
+<pre data-title="Overload.java"><code class="java">public class Overload {
+    static void m(long x)    { System.out.println("  m(long)"); }
+    static void m(Integer x) { System.out.println("  m(Integer)"); }
+    static void m(Object x)  { System.out.println("  m(Object)"); }
+    static void m(int... x)  { System.out.println("  m(int...)"); }
+
+    static void n(Object o)  { System.out.println("  n(Object)"); }
+    static void n(int... a)  { System.out.println("  n(int...)"); }
+
+    static void p(double d)  { System.out.println("  p(double)"); }
+    static void p(Object o)  { System.out.println("  p(Object)"); }
+
+    public static void main(String[] args) {
+        byte b = 1;
+        System.out.println("m(5):");             m(5);
+        System.out.println("m(b) — byte:");      m(b);
+        System.out.println("m(Integer.valueOf(5)):"); m(Integer.valueOf(5));
+        System.out.println("m(5, 6):");          m(5, 6);
+        System.out.println("m(\"s\"):");         m("s");
+        System.out.println("n(null):");          n(null);
+        System.out.println("n(5):");             n(5);
+        System.out.println("p('a'):");           p('a');
+        System.out.println("p(Character.valueOf('a')):"); p(Character.valueOf('a'));
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Запишите, какой метод вызовется в каждой из девяти строк. Где выиграет varargs?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Overload.java
+java Overload</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">m(5):
+  m(long)
+m(b) — byte:
+  m(long)
+m(Integer.valueOf(5)):
+  m(Integer)
+m(5, 6):
+  m(int...)
+m("s"):
+  m(Object)
+n(null):
+  n(int...)
+n(5):
+  n(Object)
+p('a'):
+  p(double)
+p(Character.valueOf('a')):
+  p(Object)</code></pre></details>
+<div class="lab-ans" hidden><p><code>m(5)</code> → long (фаза 1: расширение). <code>m(b)</code> → long (byte расширяется до long; упаковка в Byte — только фаза 2). <code>m(Integer)</code> → Integer. <code>m(5, 6)</code> → int... (единственный метод на два аргумента). <code>m("s")</code> → Object. <code>n(null)</code> → <b>int...</b>: null подходит к параметру <code>int[]</code> уже в фазе 1, а <code>int[]</code> специфичнее Object. <code>n(5)</code> → Object: фаза 2 (упаковка в Integer) находит кандидата раньше фазы 3. <code>p('a')</code> → double (char расширяется), <code>p(Character)</code> → Object (подтип, фаза 1).</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Добавьте <code>static void n(String s)</code> и вызовите <code>n(null)</code>.</summary><div>Ошибка компиляции <code>reference to n is ambiguous</code>: и <code>String</code>, и <code>int[]</code> подходят, ни один не подтип другого.</div></details></li>
+<li><details><summary>Перенесите <code>m(long)</code> в комментарий. Что вызовет <code>m(5)</code>?</summary><div><code>m(Integer)</code>: в фазе 1 кандидатов не осталось (Object для int требует упаковки), фаза 2 находит Integer и Object, Integer специфичнее.</div></details></li>
+</ul></div>
+</div>
+<div class="lab" data-lab="java-core-24.6">
+<div class="lab-head"><span class="lab-num">Лаба 24.6</span><b>Сокрытие полей и статических методов</b><span class="lab-time">10 мин</span><span class="lab-prog"></span></div>
+<div class="lab-goal"><p>Увидеть, что поля и статические методы выбираются по статическому типу ссылки, а экземплярные методы — по объекту.</p></div>
+<ol class="lab-steps">
+<li class="lab-step"><div class="lab-text">Создайте файл <code>Hiding.java</code>:</div>
+<pre data-title="Hiding.java"><code class="java">public class Hiding {
+    static class Parent {
+        String name = "parent-field";
+        static String kind() { return "Parent.kind()"; }
+        String who() { return "Parent.who()"; }
+    }
+
+    static class Child extends Parent {
+        String name = "child-field";
+        static String kind() { return "Child.kind()"; }
+        @Override String who() { return "Child.who()"; }
+    }
+
+    public static void main(String[] args) {
+        Parent p = new Child();
+        Child c = (Child) p;
+        System.out.println("p.name   = " + p.name);
+        System.out.println("c.name   = " + c.name);
+        System.out.println("p.kind() = " + p.kind());
+        System.out.println("p.who()  = " + p.who());
+        System.out.println("((Parent) c).name = " + ((Parent) c).name);
+    }
+}</code></pre>
+</li>
+<li class="lab-step predict"><div class="lab-text">Что напечатают пять строк? Где сработает полиморфизм?</div>
+<pre class="cmd" data-title="терминал"><code class="txt">javac Hiding.java
+java Hiding</code></pre>
+<details class="lab-out"><summary>Вывод (JDK 25.0.2)</summary><pre><code class="txt">p.name   = parent-field
+c.name   = child-field
+p.kind() = Parent.kind()
+p.who()  = Child.who()
+((Parent) c).name = parent-field</code></pre></details>
+<div class="lab-ans" hidden><p><code>p.name = parent-field</code>, <code>c.name = child-field</code> — у объекта два поля, выбор по типу ссылки. <code>p.kind() = Parent.kind()</code> — статический метод скрыт, а не переопределён (javac предупреждает про вызов через экземпляр только с <code>-Xlint:static</code>). <code>p.who() = Child.who()</code> — единственный полиморфный вызов. <code>((Parent) c).name = parent-field</code>.</p></div>
+</li>
+</ol>
+<div class="lab-try"><b>Поэкспериментируйте</b><ul>
+<li><details><summary>Скомпилируйте с <code>javac -Xlint:all Hiding.java</code>.</summary><div>Предупреждение <code>[static] static method should be qualified by type name, Parent, instead of by an expression</code>.</div></details></li>
+</ul></div>
+</div>
+<!-- hands-on:end -->
+
+<h2 id="quiz"><span class="h-num">24.10</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чему равно <code>1 &lt;&lt; 32</code> для <code>int</code>?</p><ul><li>0</li><li>1</li><li>4294967296</li><li>ошибка компиляции</li></ul><div class="why">Дистанция сдвига для int берётся по модулю 32 (используются 5 младших бит): 32 &amp; 31 = 0, сдвиг на 0 оставляет 1. Для 64-битного результата нужен <code>1L &lt;&lt; 32</code>.</div></div>
+<div class="mcq" data-ok="2"><p><code>int x = 5; x = x++;</code> Чему равно x?</p><ul><li>6</li><li>неопределённое поведение</li><li>5</li><li>ошибка компиляции</li></ul><div class="why">В Java порядок вычисления определён: <code>x++</code> возвращает 5 и увеличивает x до 6, затем присваивание записывает 5. В байткоде это iload, iinc, istore.</div></div>
+<div class="mcq" data-ok="0"><p>Объявлены <code>m(long)</code> и <code>m(Integer)</code>. Что вызовет <code>m(5)</code>?</p><ul><li>m(long)</li><li>m(Integer)</li><li>ошибка: ambiguous</li><li>зависит от JVM</li></ul><div class="why">Фаза 1 разрешения перегрузки не допускает упаковку; расширение int → long допустимо, поэтому m(long) найден в фазе 1, и до упаковки дело не доходит.</div></div>
+<div class="mcq" data-ok="3"><p>Что произойдёт: <code>Object[] a = new String[1]; a[0] = 1;</code>?</p><ul><li>ошибка компиляции</li><li>a[0] станет "1"</li><li>ClassCastException</li><li>ArrayStoreException во время выполнения</li></ul><div class="why">Массивы ковариантны, поэтому код компилируется, но JVM знает настоящий тип элементов (String) и проверяет каждую запись инструкцией aastore.</div></div>
+<div class="mcq" data-ok="1"><p>Что напечатает <code>System.out.println(017 + 1);</code>?</p><ul><li>18</li><li>16</li><li>0171</li><li>ошибка компиляции</li></ul><div class="why">Ведущий ноль делает литерал восьмеричным: 017 = 15, плюс 1 = 16.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем приоритет операторов отличается от порядка вычисления?</summary><div class="a"><p>Приоритет и ассоциативность говорят, как сгруппировать выражение (где мысленные скобки). Порядок вычисления говорит, когда выполняется каждый операнд. В Java операнды вычисляются строго слева направо и полностью до операции, поэтому <code>f() + g() * h()</code> вызовет f, g, h именно в этом порядке, хотя умножение «выполняется первым».</p></div></details>
+<details class="q"><summary>Чем <code>&gt;&gt;</code> отличается от <code>&gt;&gt;&gt;</code>? Где нужен второй?</summary><div class="a"><p><code>&gt;&gt;</code> — арифметический сдвиг: слева дублируется знаковый бит, отрицательное число остаётся отрицательным (деление на 2ⁿ с округлением вниз). <code>&gt;&gt;&gt;</code> — логический: слева нули. Нужен, когда число трактуется как набор бит или беззнаковое: хэши (<code>h ^ (h &gt;&gt;&gt; 16)</code>), середина <code>(lo + hi) &gt;&gt;&gt; 1</code> без переполнения, разбор бинарных форматов.</p></div></details>
+<details class="q"><summary>Почему массивы ковариантны, а generics — нет?</summary><div class="a"><p>Ковариантность массивов появилась в Java 1.0, чтобы писать общие методы вроде <code>sort(Object[])</code> без generics. Плата — проверка типа при каждой записи и <code>ArrayStoreException</code> в рантайме. Generics спроектированы инвариантными, чтобы ошибка ловилась компилятором; гибкость возвращают wildcard-типы (<code>? extends</code>, <code>? super</code>).</p></div></details>
+<details class="q"><summary>Как javac выбирает перегруженный метод? Почему расширение побеждает упаковку?</summary><div class="a"><p>По статическим типам аргументов, в три фазы: строгая (расширение и подтипы), свободная (+ упаковка/распаковка), переменная арность (varargs). Останавливается на первой фазе, где есть кандидаты, и выбирает наиболее специфичный. Порядок фаз сохраняет поведение кода, написанного до Java 5: появление автоупаковки и varargs не должно было менять выбор метода.</p></div></details>
+<details class="q"><summary>Что такое definite assignment и зачем он нужен?</summary><div class="a"><p>Набор правил JLS, по которым компилятор доказывает, что локальная переменная получила значение на каждом пути выполнения до чтения, а <code>final</code> — ровно один раз. Благодаря этому в Java нет «мусора» в неинициализированных локальных переменных (как в C), а у локальных переменных нет значений по умолчанию — они и не нужны.</p></div></details>
+<details class="q"><summary>Поле в подклассе с тем же именем, что у родителя: что прочитает <code>Parent p = new Child(); p.name</code>?</summary><div class="a"><p>Поле родителя. Поля не полиморфны: подкласс прячет (hides) поле, а выбор делается при компиляции по статическому типу ссылки. Полиморфны только экземплярные методы. Отсюда правило: поля — private, доступ через методы.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

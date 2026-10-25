@@ -1,0 +1,349 @@
+@chapter 25 | quiz
+@intro
+<p>Смотрим, что компилятор делает с кодом: подстановку констант, сахар в <code>javap</code>, мостовые методы, исключения без <code>throws</code>, собственный процессор аннотаций и компиляцию из программы. Модуль IDEA — <code>ch25</code>. Для <code>javap</code> удобнее встроенный терминал (Alt+F12).</p>
+@end
+
+@lab 25.1 | Застывшая константа | 15 мин
+@goal
+<p>Воспроизвести ситуацию, когда изменённая константа не видна зависимому классу.</p>
+@end
+@file Config.java
+public class Config {
+    public static final int TIMEOUT = 10;
+    public static final Integer BOXED = 10;
+    static { System.out.println("Config инициализирован"); }
+}
+@end
+@file App.java
+public class App {
+    public static void main(String[] args) {
+        System.out.println("TIMEOUT = " + Config.TIMEOUT);
+        System.out.println("---");
+        System.out.println("BOXED   = " + Config.BOXED);
+    }
+}
+@end
+@step Скомпилируйте оба класса и запустите <code>App</code>:
+@run
+javac Config.java App.java
+java App
+@end
+@predict Теперь поменяйте в <code>Config</code> оба значения на 20 и перекомпилируйте <b>только</b> <code>Config.java</code>. Что напечатает <code>App</code>? Когда появится строка «Config инициализирован»?
+@answer
+<p><code>TIMEOUT = 10</code> — значение константы было вклеено в байткод <code>App</code>, а <code>BOXED = 20</code> — <code>Integer</code> не константа, его читают из класса <code>Config</code> в рантайме. «Config инициализирован» печатается только после «---»: обращение к константе класс не трогает, а чтение <code>BOXED</code> (getstatic) запускает инициализацию.</p>
+@end
+@run
+#!sed -i 's/= 10;/= 20;/' Config.java
+javac Config.java
+java App
+@end
+@step Посмотрите байткод <code>App</code>: ссылки на <code>Config.TIMEOUT</code> в нём нет.
+@run grep="bipush|getstatic.*Config|ldc"
+javap -c App
+@end
+@try
+Сделайте <code>TIMEOUT = Integer.parseInt("10")</code>. ::: Это уже не константное выражение: <code>App</code> будет читать поле через <code>getstatic</code>, и изменения станут видны без перекомпиляции. Плата — поле нельзя использовать в <code>case</code> и в аннотациях.
+@end
+
+@lab 25.2 | Сахар под javap | 20 мин
+@goal
+<p>Найти в байткоде то, чего нет в исходнике: <code>$VALUES</code>, <code>this$0</code>, <code>val$</code>-поля, <code>$assertionsDisabled</code>, invokedynamic у record.</p>
+@end
+@file Sugar.java
+public class Sugar {
+    enum Color { RED, GREEN }
+
+    int base = 100;
+
+    class Inner {                       // использует внешний объект
+        int get() { return base; }
+    }
+
+    class Lonely {                      // не использует внешний объект
+        int one() { return 1; }
+    }
+
+    record Point(int x, int y) {}
+
+    Runnable make(int limit) {
+        return new Runnable() {
+            public void run() { System.out.println(limit); }
+        };
+    }
+
+    static int check(int n) {
+        assert n > 0 : "n=" + n;
+        return n;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(Color.values() == Color.values());
+        System.out.println(new Point(1, 2));
+        System.out.println(check(-5));
+    }
+}
+@end
+@run fail
+javac Sugar.java
+java Sugar
+java -ea Sugar
+@end
+@predict Какие class-файлы появятся? Какие скрытые поля будут у <code>Sugar$Inner</code>, <code>Sugar$Lonely</code>, у анонимного класса и у <code>Sugar</code>?
+@answer
+<p>Файлы: <code>Sugar</code>, <code>Sugar$Color</code>, <code>Sugar$Inner</code>, <code>Sugar$Lonely</code>, <code>Sugar$Point</code>, <code>Sugar$1</code> (анонимный). У <code>Inner</code> — <code>final Sugar this$0</code>; у <code>Lonely</code> его нет: с Java 18 javac не хранит внешний объект, если он не нужен (но конструктор всё равно принимает <code>Sugar</code>). У анонимного <code>Sugar$1</code> — только <code>val$limit</code>, копия захваченного параметра: внешний объект он не использует, и <code>this$0</code> тоже не нужен. У <code>Sugar</code> — <code>static final boolean $assertionsDisabled</code>. У enum — <code>private static final Color[] $VALUES</code> и синтетический <code>$values()</code>. <code>values() == values()</code> — false: каждый раз клон. Без <code>-ea</code> assert не сработал, с <code>-ea</code> — <code>AssertionError: n=-5</code>.</p>
+@end
+@run
+ls *.class
+javap -p 'Sugar$Inner.class' 'Sugar$Lonely.class' 'Sugar$1.class'
+javap -p 'Sugar$Color.class'
+javap -p Sugar.class
+@end
+@step Как устроены методы record:
+@run grep="invokedynamic|Record"
+javap -c -p 'Sugar$Point.class'
+@end
+@try
+Сделайте <code>Inner</code> статическим (<code>static class Inner</code>). ::: Ошибка компиляции «non-static variable base cannot be referenced from a static context» — у статического вложенного класса нет внешнего объекта. Если <code>base</code> не нужен, <code>static</code> — правильный выбор по умолчанию: никакой скрытой ссылки и утечек.
+@end
+
+@lab 25.3 | Мостовые методы | 10 мин
+@goal
+<p>Увидеть мосты, которые javac добавляет для generic-интерфейса и ковариантного возвращаемого типа.</p>
+@end
+@file Money.java
+import java.lang.reflect.Method;
+import java.util.function.Supplier;
+
+public class Money implements Comparable<Money>, Supplier<Money> {
+    final long cents;
+    Money(long cents) { this.cents = cents; }
+
+    @Override public int compareTo(Money o) { return Long.compare(cents, o.cents); }
+    @Override public Money get() { return this; }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static void main(String[] args) {
+        for (Method m : Money.class.getDeclaredMethods()) {
+            if (m.getName().equals("main")) continue;
+            System.out.printf("%-60s bridge=%s synthetic=%s%n", m, m.isBridge(), m.isSynthetic());
+        }
+        Comparable raw = new Money(1);
+        try {
+            raw.compareTo("строка");
+        } catch (ClassCastException e) {
+            System.out.println("CCE: " + e.getMessage());
+        }
+    }
+}
+@end
+@predict Сколько методов <code>compareTo</code> и <code>get</code> покажет рефлексия? Откуда возьмётся <code>ClassCastException</code>, если в коде нет ни одного каста?
+@answer
+<p>По два: <code>compareTo(Money)</code> и мост <code>compareTo(Object)</code>, <code>get()</code> с результатом <code>Money</code> и мост <code>get()</code> с результатом <code>Object</code> — два метода с одинаковыми параметрами, которые язык запрещает, а JVM разрешает. У мостов <code>bridge=true synthetic=true</code>. Каст есть в мосте: <code>compareTo(Object o)</code> вызывает <code>compareTo((Money) o)</code>, и строка падает на нём.</p>
+@end
+@run
+javac Money.java
+java Money
+@end
+@try
+Выполните <code>javap -c -p Money</code> и найдите тело моста <code>compareTo(java.lang.Object)</code>. ::: <code>aload_0; aload_1; checkcast Money; invokevirtual compareTo:(LMoney;)I; ireturn</code> — каст и делегирование.
+@end
+
+@lab 25.4 | Checked-исключение без throws | 10 мин
+@goal
+<p>Доказать, что проверку checked-исключений выполняет только компилятор.</p>
+@end
+@file Sneaky.java
+import java.io.IOException;
+
+public class Sneaky {
+    @SuppressWarnings("unchecked")
+    static <E extends Throwable> void sneakyThrow(Throwable t) throws E {
+        throw (E) t;
+    }
+
+    static void read() {   // throws не объявлен
+        Sneaky.<RuntimeException>sneakyThrow(new IOException("диск недоступен"));
+    }
+
+    public static void main(String[] args) {
+        try {
+            read();
+        } catch (Exception e) {
+            System.out.println("поймали " + e.getClass().getName() + ": " + e.getMessage());
+            System.out.println("это RuntimeException? " + (e instanceof RuntimeException));
+        }
+    }
+}
+@end
+@predict Скомпилируется ли код? Какое исключение поймает <code>catch</code>?
+@answer
+<p>Компилируется: javac считает, что <code>sneakyThrow</code> бросает <code>RuntimeException</code>. В рантайме летит настоящий <code>java.io.IOException</code> — <code>instanceof RuntimeException</code> даёт false. JVM не знает про «checked».</p>
+@end
+@run
+javac Sneaky.java
+java Sneaky
+@end
+@try
+Замените <code>catch (Exception e)</code> на <code>catch (java.io.IOException e)</code>. ::: Ошибка компиляции «exception java.io.IOException is never thrown in body of corresponding try statement»: по мнению компилятора, такого исключения тут быть не может.
+@end
+
+@lab 25.5 | Свой процессор аннотаций | 25 мин
+@goal
+<p>Написать процессор, который во время компиляции генерирует класс, и использовать этот класс в коде, который без процессора не скомпилировался бы.</p>
+@end
+@file proc/Describe.java
+import java.lang.annotation.*;
+
+@Retention(RetentionPolicy.SOURCE)
+@Target(ElementType.TYPE)
+public @interface Describe {}
+@end
+@file proc/DescribeProcessor.java
+import java.io.IOException;
+import java.io.Writer;
+import java.util.Set;
+import java.util.stream.Collectors;
+import javax.annotation.processing.*;
+import javax.lang.model.SourceVersion;
+import javax.lang.model.element.*;
+import javax.tools.Diagnostic;
+
+@SupportedAnnotationTypes("Describe")
+public class DescribeProcessor extends AbstractProcessor {
+    int round = 0;
+
+    @Override
+    public SourceVersion getSupportedSourceVersion() { return SourceVersion.latestSupported(); }
+
+    @Override
+    public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment env) {
+        round++;
+        processingEnv.getMessager().printMessage(Diagnostic.Kind.NOTE,
+                "раунд " + round + ", processingOver=" + env.processingOver());
+        for (Element e : env.getElementsAnnotatedWith(Describe.class)) {
+            if (e.getKind() != ElementKind.RECORD && e.getKind() != ElementKind.CLASS) {
+                processingEnv.getMessager().printMessage(Diagnostic.Kind.ERROR, "@Describe только для классов", e);
+                continue;
+            }
+            String name = e.getSimpleName() + "Info";
+            String fields = e.getEnclosedElements().stream()
+                    .filter(m -> m.getKind() == ElementKind.FIELD)
+                    .map(m -> "\"" + m.getSimpleName() + ": " + m.asType() + "\"")
+                    .collect(Collectors.joining(", "));
+            try (Writer w = processingEnv.getFiler().createSourceFile(name, e).openWriter()) {
+                w.write("public final class " + name + " {\n"
+                        + "    public static java.util.List<String> fields() {\n"
+                        + "        return java.util.List.of(" + fields + ");\n"
+                        + "    }\n}\n");
+            } catch (IOException ex) {
+                throw new RuntimeException(ex);
+            }
+        }
+        return true;
+    }
+}
+@end
+@file app/Person.java
+@Describe
+public record Person(String name, int age, java.time.LocalDate born) {}
+@end
+@file app/Main.java
+public class Main {
+    public static void main(String[] args) {
+        System.out.println(PersonInfo.fields());   // класса PersonInfo нет в исходниках!
+    }
+}
+@end
+@step Соберите процессор отдельно — это обычные классы:
+@run
+javac -d proc-out proc/Describe.java proc/DescribeProcessor.java
+@end
+@step Попробуйте собрать приложение без процессора:
+@run fail
+javac -cp proc-out -d app-out app/Person.java app/Main.java ||| javac -J-Dstdout.encoding=UTF-8 -J-Dstderr.encoding=UTF-8 -cp proc-out -d app-out app/Person.java app/Main.java
+@end
+@predict Теперь соберите с процессором. Сколько будет раундов? Что напечатает <code>Main</code>?
+@answer
+<p>Три раунда: в первом процессор видит <code>Person</code> и генерирует <code>PersonInfo.java</code>; во втором разбирается новый файл (аннотаций в нём нет, генерировать нечего); третий — финальный, <code>processingOver=true</code>. После этого <code>Main</code> компилируется, потому что <code>PersonInfo</code> уже существует. Вывод — <code>[name: java.lang.String, age: int, born: java.time.LocalDate]</code>: поля record видны процессору как элементы FIELD.</p>
+@end
+@run
+javac -cp proc-out -processorpath proc-out -processor DescribeProcessor -s gen -d app-out app/Person.java app/Main.java ||| javac -J-Dstdout.encoding=UTF-8 -J-Dstderr.encoding=UTF-8 -cp proc-out -processorpath proc-out -processor DescribeProcessor -s gen -d app-out app/Person.java app/Main.java
+java -cp app-out Main
+@end
+@step Сгенерированный исходник лежит в каталоге, заданном <code>-s</code>:
+@run
+cat gen/PersonInfo.java
+@end
+@ide В IDEA: Settings → Build, Execution, Deployment → Compiler → Annotation Processors → Enable annotation processing, Processor path — каталог proc-out. В Maven — <code>annotationProcessorPaths</code> у maven-compiler-plugin, в Gradle — конфигурация <code>annotationProcessor</code>.
+@try
+Повесьте <code>@Describe</code> на интерфейс. ::: Процессор выдаст ошибку компиляции с указанием на элемент: <code>error: @Describe только для классов</code> — так библиотеки проверяют правила использования своих аннотаций.
+Уберите <code>-processor DescribeProcessor</code>, но оставьте <code>-processorpath</code> и положите в <code>proc-out/META-INF/services/javax.annotation.processing.Processor</code> строку <code>DescribeProcessor</code>. ::: Сработает: явный processorpath включает обнаружение через ServiceLoader. А если процессор лежит только на <code>-cp</code>, с JDK 23 он не запустится без <code>-proc:full</code>.
+@end
+
+@lab 25.6 | Компиляция из программы и --release | 15 мин
+@goal
+<p>Скомпилировать и выполнить код, собранный строкой во время работы, и увидеть разницу <code>--release</code> и <code>-target</code>.</p>
+@end
+@file Dyn.java
+import java.net.URLClassLoader;
+import java.nio.file.*;
+import javax.tools.*;
+
+public class Dyn {
+    public static void main(String[] args) throws Exception {
+        String src = """
+                public class Generated {
+                    public static String hello(String who) {
+                        return "Привет, " + who + "! Скомпилировано в " + Runtime.version();
+                    }
+                }
+                """;
+        Path dir = Files.createTempDirectory("gen");
+        Path file = dir.resolve("Generated.java");
+        Files.writeString(file, src);
+
+        JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
+        int code = javac.run(null, null, null, "-d", dir.toString(), file.toString());
+        System.out.println("javac вернул " + code);
+
+        try (var loader = new URLClassLoader(new java.net.URL[] {dir.toUri().toURL()})) {
+            Class<?> c = loader.loadClass("Generated");
+            System.out.println(c.getMethod("hello", String.class).invoke(null, "мир"));
+        }
+    }
+}
+@end
+@predict Что вернёт <code>javac.run</code> и что напечатает загруженный класс?
+@answer
+<p><code>javac вернул 0</code> (0 — успех, как код возврата команды <code>javac</code>), затем строка с версией JDK: класс, которого не было при запуске программы, скомпилирован, загружен новым загрузчиком и вызван через рефлексию. Так устроены jshell и <code>java Hello.java</code>.</p>
+@end
+@run
+javac Dyn.java
+java Dyn
+@end
+@try
+Переименуйте класс <code>Dyn</code> в <code>Runtime</code> (и файл тоже) и запустите снова. ::: Сгенерированный код не скомпилируется: «cannot find symbol: method version(), location: class Runtime». Компилятор по умолчанию ищет классы в текущем каталоге (classpath «.»), находит там наш <code>Runtime.class</code>, а тип текущего (безымянного) пакета затеняет <code>java.lang.Runtime</code>. Надёжно — писать в генерируемом коде полные имена: <code>java.lang.Runtime.version()</code>.
+@end
+
+@step Файл, использующий API Java 21, собираем под Java 17 двумя способами:
+@file NewApi.java
+import java.util.List;
+
+public class NewApi {
+    public static void main(String[] args) {
+        System.out.println(List.of(1, 2, 3).getFirst());   // SequencedCollection — Java 21
+    }
+}
+@end
+@run fail
+javac --release 17 NewApi.java ||| javac -J-Dstdout.encoding=UTF-8 -J-Dstderr.encoding=UTF-8 --release 17 NewApi.java
+@end
+@run fail
+javac -source 17 -target 17 NewApi.java
+javap -v NewApi | grep "major version"
+@end
+@predict Что разрешит каждый из двух способов?
+@answer
+<p><code>--release 17</code> отказывается: «cannot find symbol: method getFirst()» — компилятор проверяет API платформы 17. <code>-source 17 -target 17</code> собирает файл версии 61 (Java 17), только предупреждает про bootstrap classpath. На Java 17 такой класс упадёт с <code>NoSuchMethodError</code>. Вывод: всегда <code>--release</code> (в Maven — <code>maven.compiler.release</code>).</p>
+@end
+@end
