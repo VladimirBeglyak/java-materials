@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · WHERE: фильтрация и NULL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · ОСНОВЫ ЗАПРОСОВ</div>
+  <h1>WHERE: фильтрация и NULL</h1>
+  <p class="lead"><code>WHERE</code> оставляет в результате только те строки, для которых условие <b>истинно</b>. Сложность не в синтаксисе, а в одном факте: сравнение с <code>NULL</code> даёт не true и не false, а третье значение — <b>unknown</b>. Большинство «странных» результатов запросов объясняется именно этим.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">WHERE</span><span class="tag">NULL</span><span class="tag">трёхзначная логика</span><span class="tag">LIKE</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="operators"><span class="h-num">2.1</span>Операторы сравнения и логики</h2>
+<p>Условие в <code>WHERE</code> собирается из сравнений и логических связок. Каждое сравнение вычисляется для каждой строки и даёт true, false или unknown.</p>
+<div class="grid-2">
+<div class="table-wrap"><table>
+<tr><th>Оператор</th><th>Смысл</th></tr>
+<tr><td><code>=</code>, <code>&lt;&gt;</code> / <code>!=</code></td><td>равно / не равно</td></tr>
+<tr><td><code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td><td>сравнения</td></tr>
+<tr><td><code>AND</code>, <code>OR</code>, <code>NOT</code></td><td>логика (AND приоритетнее OR)</td></tr>
+<tr><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td>проверка на NULL</td></tr>
+<tr><td><code>IN</code>, <code>BETWEEN</code>, <code>LIKE</code></td><td>сокращения условий</td></tr>
+</table></div>
+<div class="card"><h4>Приоритет</h4><p><code>NOT</code> &gt; <code>AND</code> &gt; <code>OR</code>. Поэтому <code>a OR b AND c</code> — это <code>a OR (b AND c)</code>. Когда сомневаетесь — ставьте скобки: читаемость важнее.</p></div>
+</div>
+<pre><code class="sql">SELECT name, city FROM customers
+WHERE city = 'Минск';                          -- точное равенство
+
+SELECT name FROM products
+WHERE price &gt; 1000 AND category = 'электроника';  -- оба условия
+
+SELECT name, city FROM customers
+WHERE city = 'Минск' OR city = 'Москва';       -- эквивалентно IN ('Минск','Москва')</code></pre>
+
+<h2 id="shortcuts"><span class="h-num">2.2</span>IN, BETWEEN, LIKE</h2>
+<p>Три сокращения, которые делают условия короче и читаемее:</p>
+<pre><code class="sql">-- IN: равенство любому из списка
+SELECT * FROM orders WHERE status IN ('paid', 'shipped');
+
+-- BETWEEN: включительно, эквивалентно price &gt;= 1000 AND price &lt;= 5000
+SELECT name, price FROM products WHERE price BETWEEN 1000 AND 5000;
+
+-- LIKE: шаблон; % — любая последовательность, _ — один символ
+SELECT name FROM customers WHERE email LIKE '%@ex.com';   -- заканчивается на @ex.com
+SELECT name FROM customers WHERE name LIKE 'А___';        -- имя из 4 букв на «А»</code></pre>
+<div class="callout info"><span class="c-title">LIKE чувствителен к регистру</span>
+В PostgreSQL <code>LIKE</code> различает регистр, <code>ILIKE</code> — нет. В MySQL <code>LIKE</code> по умолчанию нечувствителен. Для поиска подстроки <code>'%</code>текст<code>%'</code>; ведущий <code>%</code> не даёт использовать обычный индекс (тема 17).</div>
+
+<h2 id="null"><span class="h-num">2.3</span>NULL и трёхзначная логика</h2>
+<p><code>NULL</code> означает «значение неизвестно или отсутствует». Любое сравнение с неизвестным даёт <b>unknown</b>, и <code>WHERE</code> отбрасывает такие строки (оставляет только true).</p>
+<div class="grid-2">
+<div class="table-wrap"><table>
+<tr><th>Выражение</th><th>Результат</th></tr>
+<tr><td><code>NULL = NULL</code></td><td>unknown</td></tr>
+<tr><td><code>NULL &lt;&gt; 1</code></td><td>unknown</td></tr>
+<tr><td><code>NULL IS NULL</code></td><td>true</td></tr>
+<tr><td><code>true AND unknown</code></td><td>unknown</td></tr>
+<tr><td><code>false AND unknown</code></td><td>false</td></tr>
+<tr><td><code>true OR unknown</code></td><td>true</td></tr>
+<tr><td><code>NOT unknown</code></td><td>unknown</td></tr>
+</table></div>
+<div class="table-wrap"><table>
+<tr><th>Ловушка</th><th>Причина</th></tr>
+<tr><td><code>city &lt;&gt; 'Минск'</code> не вернёт клиентов без города</td><td><code>NULL &lt;&gt; 'Минск'</code> → unknown</td></tr>
+<tr><td><code>NOT IN (1, NULL)</code> вернёт пустоту</td><td><code>x&lt;&gt;1 AND x&lt;&gt;NULL</code> никогда не true</td></tr>
+<tr><td><code>city NOT BETWEEN 'А' AND 'Я'</code> пропускает NULL</td><td>то же правило unknown</td></tr>
+</table></div>
+</div>
+<div class="callout warn"><span class="c-title">«Равно, включая NULL»</span>
+Чтобы сравнить два значения, считая NULL равным NULL, используйте <code>a IS NOT DISTINCT FROM b</code> (PostgreSQL; в MySQL — <code>&lt;=&gt;</code>). Это нужно при сверке данных.</div>
+
+<h2 id="safe"><span class="h-num">2.4</span>Безопасная работа с NULL</h2>
+<pre><code class="sql">-- явная проверка вместо сравнения
+SELECT name FROM customers WHERE city IS NULL;
+
+-- COALESCE: первое не-NULL значение (подробнее — тема 04)
+SELECT name, COALESCE(city, '—') AS city FROM customers;
+
+-- антисоединение без ловушки NOT IN: NOT EXISTS (тема 07)
+SELECT name FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);</code></pre>
+
+<h2 id="sandbox"><span class="h-num">2.5</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: фильтрация</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT name, city FROM customers WHERE city = 'Минск';">клиенты из Минска</button>
+    <button data-sql="SELECT name, city FROM customers WHERE city &lt;&gt; 'Минск';">ловушка: &lt;&gt; и NULL</button>
+    <button data-sql="SELECT name, city FROM customers WHERE city IS NULL;">клиенты без города</button>
+    <button data-sql="SELECT name, city FROM customers WHERE city NOT IN ('Минск','Москва');">ловушка: NOT IN с NULL</button>
+    <button data-sql="SELECT name, price FROM products WHERE price BETWEEN 1000 AND 5000 AND category = 'электроника';">электроника 1000–5000</button>
+    <button data-sql="SELECT name, email FROM customers WHERE email LIKE '%@ex.com';">LIKE по email</button>
+  </div>
+  <textarea>SELECT name, city, email FROM customers WHERE city = 'Минск';</textarea>
+</div>
+<p><b>Задания:</b> (1) найдите клиентов, у которых нет email; (2) выведите всех, кто живёт не в Минске, <b>включая</b> тех, у кого город неизвестен — двумя способами (<code>OR city IS NULL</code> и <code>COALESCE</code>); (3) найдите товары дороже 5000 в категории «электроника».</p>
+
+<h2 id="quiz"><span class="h-num">2.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что вернёт <code>SELECT * FROM t WHERE x NOT IN (1, 2, NULL)</code>?</p><ul><li>Все строки, кроме x = 1 и x = 2</li><li>Ошибку</li><li>Ни одной строки</li><li>Только строки с x = NULL</li></ul><div class="why"><code>x NOT IN (1,2,NULL)</code> = <code>x&lt;&gt;1 AND x&lt;&gt;2 AND x&lt;&gt;NULL</code>, а <code>x&lt;&gt;NULL</code> всегда unknown → условие никогда не true.</div></div>
+<div class="mcq" data-ok="1"><p>Строка с <code>city = NULL</code> попадёт в результат <code>WHERE city &lt;&gt; 'Минск'</code>?</p><ul><li>Да, всегда</li><li>Нет — сравнение с NULL даёт unknown</li><li>Да, если есть индекс</li><li>Зависит от версии СУБД</li></ul><div class="why">unknown отбрасывается в WHERE. Нужно писать <code>city &lt;&gt; 'Минск' OR city IS NULL</code>.</div></div>
+<div class="mcq" data-ok="0"><p>Чем <code>LIKE</code> отличается от <code>ILIKE</code> в PostgreSQL?</p><ul><li>LIKE чувствителен к регистру, ILIKE — нет</li><li>Ничем</li><li>ILIKE работает только с числами</li><li>LIKE быстрее всегда</li></ul><div class="why">ILIKE удобен для поиска без учёта регистра, но не использует обычный индекс по тексту.</div></div>
+<div class="mcq" data-ok="3"><p>Как правильно проверить, что значение не равно NULL?</p><ul><li><code>x = NULL</code></li><li><code>x &lt;&gt; NULL</code></li><li><code>x != NULL</code></li><li><code>x IS NOT NULL</code></li></ul><div class="why">Сравнения с NULL дают unknown; для проверки на NULL существуют только IS NULL / IS NOT NULL.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему AND приоритетнее OR и как не запутаться?</summary><div class="a"><p>По аналогии с умножением и сложением: <code>a OR b AND c</code> = <code>a OR (b AND c)</code>. Чтобы не помнить, всегда ставьте скобки, когда в условии больше одной связки.</p></div></details>
+<details class="q"><summary>Как переписать NOT IN, чтобы не попасть в ловушку с NULL?</summary><div class="a"><p>Использовать <code>NOT EXISTS</code> с коррелированным подзапросом (тема 07) либо гарантировать отсутствие NULL в списке через подзапрос с <code>IS NOT NULL</code>. <code>NOT EXISTS</code> надёжнее.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

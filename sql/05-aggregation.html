@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Агрегация: GROUP BY и HAVING</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · ОСНОВЫ ЗАПРОСОВ</div>
+  <h1>Агрегация: GROUP BY и HAVING</h1>
+  <p class="lead">Агрегаты сворачивают много строк в одну: сколько заказов у клиента, средний чек, максимум по группе. Ключевое правило — после <code>GROUP BY</code> в SELECT можно использовать только столбцы группировки и агрегаты, а фильтр по агрегатам ставится не в <code>WHERE</code>, а в <code>HAVING</code>. Понимание логического порядка SELECT снимает здесь все вопросы.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">COUNT/SUM/AVG</span><span class="tag">GROUP BY</span><span class="tag">HAVING</span><span class="tag">FILTER</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="agg"><span class="h-num">5.1</span>Агрегатные функции</h2>
+<div class="table-wrap"><table>
+<tr><th>Функция</th><th>Что делает</th><th>Замечание</th></tr>
+<tr><td><code>COUNT(*)</code></td><td>число строк</td><td>считает и строки с NULL</td></tr>
+<tr><td><code>COUNT(col)</code></td><td>число не-NULL значений</td><td>пропускает NULL</td></tr>
+<tr><td><code>COUNT(DISTINCT col)</code></td><td>число уникальных не-NULL</td><td>дороже обычного COUNT</td></tr>
+<tr><td><code>SUM / AVG</code></td><td>сумма / среднее</td><td>пропускают NULL; по пустому множеству — NULL</td></tr>
+<tr><td><code>MIN / MAX</code></td><td>минимум / максимум</td><td>работают и с текстом, и с датами</td></tr>
+</table></div>
+<pre><code class="sql">SELECT COUNT(*) AS all_rows, COUNT(city) AS with_city,
+       COUNT(DISTINCT city) AS cities
+FROM customers;                         -- 6, 5, 3
+
+SELECT SUM(qty * price) AS revenue FROM order_items;   -- выручка по всем позициям</code></pre>
+<div class="callout warn"><span class="c-title">SUM по пустому множеству — NULL</span>
+<code>SELECT SUM(x) FROM t WHERE 1 = 0</code> вернёт NULL, а не 0. В отчётах оборачивайте: <code>COALESCE(SUM(x), 0)</code>.</div>
+
+<h2 id="groupby"><span class="h-num">5.2</span>GROUP BY</h2>
+<p><code>GROUP BY</code> собирает строки в группы по значениям перечисленных столбцов, и агрегаты считаются отдельно для каждой группы.</p>
+<pre><code class="sql">SELECT category, COUNT(*) AS cnt, SUM(price) AS total
+FROM products
+GROUP BY category;
+
+SELECT c.name, COUNT(o.id) AS orders_cnt
+FROM customers c LEFT JOIN orders o ON o.customer_id = c.id
+GROUP BY c.id, c.name                  -- группируем по id и name клиента
+ORDER BY orders_cnt DESC;</code></pre>
+<div class="callout info"><span class="c-title">Правило группировки</span>
+В PostgreSQL (и в стандарте) в списке выборки при GROUP BY можно использовать только столбцы группировки и выражения над агрегатами. MySQL по умолчанию это разрешает (ANY_VALUE), что скрывает ошибки — лучше включить <code>ONLY_FULL_GROUP_BY</code>.</div>
+
+<h2 id="having"><span class="h-num">5.3</span>HAVING</h2>
+<p><code>HAVING</code> фильтрует <b>группы</b> по агрегатам — выполняется после группировки. <code>WHERE</code> фильтрует строки <b>до</b> группировки.</p>
+<pre><code class="sql">-- города, где минимум 2 оплаченных/отправленных заказа
+SELECT c.city, COUNT(*) AS cnt
+FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE o.status IN ('paid', 'shipped')   -- строки до группировки
+GROUP BY c.city
+HAVING COUNT(*) &gt;= 2                    -- группы после агрегации
+ORDER BY cnt DESC;</code></pre>
+<div class="table-wrap"><table>
+<tr><th>WHERE</th><th>HAVING</th></tr>
+<tr><td>фильтрует строки до GROUP BY</td><td>фильтрует группы после GROUP BY</td></tr>
+<tr><td>не видит агрегаты</td><td>видит агрегаты и столбцы группировки</td></tr>
+<tr><td>дешевле: отбрасывает строки раньше</td><td>применяется к уже посчитанным группам</td></tr>
+</table></div>
+
+<h2 id="filter"><span class="h-num">5.4</span>DISTINCT в агрегатах и FILTER</h2>
+<pre><code class="sql">-- несколько агрегатов с разными условиями за один проход (PostgreSQL)
+SELECT customer_id,
+       COUNT(*)                          AS orders_all,
+       COUNT(*) FILTER (WHERE status = 'paid') AS orders_paid,
+       SUM(qty * price)                  AS total
+FROM orders o JOIN order_items i ON i.order_id = o.id
+GROUP BY customer_id;</code></pre>
+<p><code>FILTER (WHERE …)</code> — PostgreSQL-расширение; в других СУБД то же самое пишут через <code>SUM(CASE WHEN … THEN 1 ELSE 0 END)</code>.</p>
+<pre><code class="sql">SELECT customer_id,
+       COUNT(*) AS all_cnt,
+       SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END) AS paid_cnt
+FROM orders GROUP BY customer_id;</code></pre>
+
+<h2 id="sandbox"><span class="h-num">5.5</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: агрегация</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT COUNT(*) AS rows_cnt, COUNT(city) AS with_city, COUNT(DISTINCT city) AS cities FROM customers;">COUNT-ы</button>
+    <button data-sql="SELECT category, COUNT(*) AS cnt, SUM(price) AS total FROM products GROUP BY category;">по категориям</button>
+    <button data-sql="SELECT c.city, COUNT(*) AS cnt&#10;FROM customers c JOIN orders o ON o.customer_id = c.id&#10;WHERE o.status IN ('paid','shipped')&#10;GROUP BY c.city HAVING COUNT(*) &gt;= 2;">HAVING</button>
+    <button data-sql="SELECT SUM(qty * price) AS revenue FROM order_items;">выручка</button>
+    <button data-sql="SELECT customer_id, COUNT(*) FILTER (WHERE status = 'paid') AS paid&#10;FROM orders GROUP BY customer_id;">FILTER</button>
+  </div>
+  <textarea>SELECT category, COUNT(*) AS cnt, SUM(price) AS total FROM products GROUP BY category;</textarea>
+</div>
+<p><b>Задания:</b> (1) посчитайте выручку по категориям товаров только по оплаченным и отправленным заказам; (2) найдите клиентов, у которых больше одного заказа; (3) найдите категорию с наибольшей суммарной ценой товаров.</p>
+
+<h2 id="quiz"><span class="h-num">5.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем <code>COUNT(*)</code> отличается от <code>COUNT(col)</code>?</p><ul><li>Ничем</li><li>COUNT(*) считает все строки, COUNT(col) — только не-NULL значения столбца</li><li>COUNT(*) работает только с GROUP BY</li><li>COUNT(col) быстрее всегда</li></ul><div class="why">COUNT(col) пропускает NULL, поэтому COUNT(*) может быть больше COUNT(col).</div></div>
+<div class="mcq" data-ok="2"><p>Где фильтровать по агрегату <code>COUNT(*) &gt; 1</code>?</p><ul><li>В WHERE</li><li>В ORDER BY</li><li>В HAVING</li><li>Нигде — это невозможно</li></ul><div class="why">Агрегаты считаются после WHERE (на этапе GROUP BY), поэтому фильтр по ним — в HAVING.</div></div>
+<div class="mcq" data-ok="0"><p>Что вернёт <code>SELECT SUM(x) FROM t WHERE 1 = 0</code>?</p><ul><li>NULL</li><li>0</li><li>Ошибку</li><li>Пустую таблицу</li></ul><div class="why">SUM по пустому множеству строк — NULL. Для нуля используйте COALESCE(SUM(x), 0).</div></div>
+<div class="mcq" data-ok="3"><p>После <code>GROUP BY category</code> можно ли написать <code>SELECT category, name</code>?</p><ul><li>Да, всегда</li><li>Да, если name уникален</li><li>Да, в MySQL</li><li>Нет — name не входит в группировку и не агрегат</li></ul><div class="why">У группы нет «одного» значения name. В PostgreSQL это ошибка; MySQL при ONLY_FULL_GROUP_BY тоже.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните логический порядок WHERE → GROUP BY → HAVING → SELECT.</summary><div class="a"><p>Сначала WHERE отбирает строки. Затем GROUP BY собирает их в группы. HAVING фильтрует группы по агрегатам. И только потом SELECT вычисляет выражения и назначает псевдонимы. Поэтому WHERE не видит агрегаты и псевдонимы, а HAVING видит агрегаты, но не псевдонимы из SELECT.</p></div></details>
+<details class="q"><summary>Как посчитать число строк, удовлетворяющих условию, вместе с общим числом за один проход?</summary><div class="a"><p>Через <code>COUNT(*) FILTER (WHERE cond)</code> в PostgreSQL, либо <code>SUM(CASE WHEN cond THEN 1 ELSE 0 END)</code> в любой СУБД.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

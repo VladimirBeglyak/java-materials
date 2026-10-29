@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Оконные функции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · СОЕДИНЕНИЯ И ПОДЗАПРОСЫ</div>
+  <h1>Оконные функции</h1>
+  <p class="lead">Обычные агрегаты сворачивают строки в одну; оконные функции, наоборот, <b>сохраняют все строки</b> и добавляют к каждой вычисленное значение по «окну» — набору строк, заданному <code>OVER</code>. Это инструмент для задач «последний заказ в группе», «нарастающий итог», «место в рейтинге», «разница с предыдущей строкой».</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">OVER</span><span class="tag">PARTITION BY</span><span class="tag">ROW_NUMBER/RANK</span><span class="tag">SUM OVER</span><span class="tag">LAG/LEAD</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="over"><span class="h-num">10.1</span>Синтаксис: OVER и окно</h2>
+<p>Оконная функция вызывается как <code>функция(…) OVER (…)</code>. <code>PARTITION BY</code> разбивает строки на группы (как GROUP BY, но без схлопывания), <code>ORDER BY</code> задаёт порядок внутри группы, а <code>ROWS/RANGE</code> — рамку окна.</p>
+<pre><code class="sql">-- номер строки внутри каждой категории по убыванию цены
+SELECT name, category, price,
+       ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rn
+FROM products;</code></pre>
+<div class="callout warn"><span class="c-title">Окна в логическом порядке</span>
+Оконные функции вычисляются после GROUP BY/HAVING, на этапе SELECT. Поэтому их нельзя использовать в WHERE: для фильтра по оконному значению нужен подзапрос или CTE.</div>
+
+<h2 id="rank"><span class="h-num">10.2</span>Ранжирование: ROW_NUMBER, RANK, DENSE_RANK</h2>
+<div class="table-wrap"><table>
+<tr><th>Функция</th><th>Поведение при равных значениях</th></tr>
+<tr><td><code>ROW_NUMBER()</code></td><td>уникальный номер 1,2,3… (порядок среди равных произволен без доп. ключа)</td></tr>
+<tr><td><code>RANK()</code></td><td>равные значения получают один ранг, следующий — с пропуском (1,1,3)</td></tr>
+<tr><td><code>DENSE_RANK()</code></td><td>равные — один ранг, без пропусков (1,1,2)</td></tr>
+</table></div>
+<pre><code class="sql">SELECT name, price,
+       ROW_NUMBER() OVER (ORDER BY price DESC) AS rn,
+       RANK()       OVER (ORDER BY price DESC) AS rk,
+       DENSE_RANK() OVER (ORDER BY price DESC) AS drk
+FROM products ORDER BY price DESC;</code></pre>
+
+<h2 id="aggs"><span class="h-num">10.3</span>Агрегаты как окна</h2>
+<p>Агрегатные функции с <code>OVER</code> не схлопывают строки. Без <code>ORDER BY</code> они дают значение по всей партиции, с <code>ORDER BY</code> — нарастающий итог.</p>
+<pre><code class="sql">-- доля цены товара в своей категории
+SELECT name, category, price,
+       SUM(price) OVER (PARTITION BY category) AS cat_total,
+       round(price * 100.0 / SUM(price) OVER (PARTITION BY category), 1) AS pct
+FROM products;
+
+-- нарастающий итог выручки по датам
+SELECT o.created_at, SUM(i.qty * i.price) OVER (ORDER BY o.created_at) AS running_total
+FROM orders o JOIN order_items i ON i.order_id = o.id;</code></pre>
+
+<h2 id="lag"><span class="h-num">10.4</span>LAG и LEAD</h2>
+<p><code>LAG(expr)</code> берёт значение из предыдущей строки окна, <code>LEAD(expr)</code> — из следующей. Классика — «разница с прошлым периодом».</p>
+<pre><code class="sql">SELECT o.created_at,
+       SUM(i.qty * i.price) AS daily,
+       LAG(SUM(i.qty * i.price)) OVER (ORDER BY o.created_at) AS prev,
+       SUM(i.qty * i.price) - LAG(SUM(i.qty * i.price)) OVER (ORDER BY o.created_at) AS diff
+FROM orders o JOIN order_items i ON i.order_id = o.id
+GROUP BY o.created_at;</code></pre>
+
+<h2 id="vs"><span class="h-num">10.5</span>Окна против GROUP BY</h2>
+<div class="table-wrap"><table>
+<tr><th>GROUP BY</th><th>Оконные функции</th></tr>
+<tr><td>схлопывает строки в группы</td><td>сохраняет все строки</td></tr>
+<tr><td>одна строка на группу</td><td>строка остаётся, к ней добавляется значение</td></tr>
+<tr><td>фильтр — HAVING</td><td>фильтр — через подзапрос/CTE</td></tr>
+</table></div>
+<p>Классический паттерн «последняя строка в группе»: <code>ROW_NUMBER()</code> + <code>PARTITION BY</code>, затем фильтр <code>WHERE rn = 1</code> во внешнем запросе.</p>
+<pre><code class="sql">-- последний заказ каждого клиента
+WITH ranked AS (
+    SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn
+    FROM orders o
+)
+SELECT customer_id, id, status FROM ranked WHERE rn = 1;</code></pre>
+
+<h2 id="sandbox"><span class="h-num">10.6</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: окна</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT name, category, price, ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rn FROM products;">номер в категории</button>
+    <button data-sql="SELECT name, price, RANK() OVER (ORDER BY price DESC) AS rk, DENSE_RANK() OVER (ORDER BY price DESC) AS drk FROM products ORDER BY price DESC;">ранги</button>
+    <button data-sql="SELECT name, category, price, round(price * 100.0 / SUM(price) OVER (PARTITION BY category), 1) AS pct FROM products;">доля в категории</button>
+    <button data-sql="SELECT name, price, LAG(price) OVER (ORDER BY price) AS prev FROM products ORDER BY price;">LAG</button>
+    <button data-sql="WITH r AS (SELECT o.*, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn FROM orders o) SELECT customer_id, id, status FROM r WHERE rn = 1;">последний заказ клиента</button>
+  </div>
+  <textarea>SELECT name, category, price, ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rn FROM products;</textarea>
+</div>
+<p><b>Задания:</b> (1) выведите для каждого товара его место по цене внутри категории (RANK); (2) найдите для каждого клиента его самый ранний заказ; (3) посчитайте нарастающую сумму цены товаров, отсортировав их по цене.</p>
+
+<h2 id="quiz"><span class="h-num">10.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем оконная функция отличается от агрегата с GROUP BY?</p><ul><li>Ничем</li><li>Оконная сохраняет все строки, агрегат схлопывает их в группы</li><li>Оконная быстрее</li><li>Оконная не поддерживает ORDER BY</li></ul><div class="why">Агрегат с GROUP BY возвращает одну строку на группу; оконная функция добавляет вычисленное значение к каждой строке, не удаляя их.</div></div>
+<div class="mcq" data-ok="0"><p>Почему нельзя использовать оконную функцию в WHERE?</p><ul><li>Она вычисляется после WHERE (на этапе SELECT)</li><li>Она всегда медленная</li><li>Она не возвращает значение</li><li>Можно — это работает</li></ul><div class="why">Логический порядок: WHERE выполняется до SELECT, где считаются окна. Фильтр по окну — через подзапрос/CTE.</div></div>
+<div class="mcq" data-ok="2"><p>Чем RANK отличается от DENSE_RANK при равных значениях?</p><ul><li>Ничем</li><li>RANK без пропусков, DENSE_RANK с пропусками</li><li>RANK даёт пропуски (1,1,3), DENSE_RANK — нет (1,1,2)</li><li>RANK работает только с числами</li></ul><div class="why">RANK пропускает номера после совпадений, DENSE_RANK идёт подряд.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает LAG(x) OVER (ORDER BY …)?</p><ul><li>Берёт x из следующей строки</li><li>Суммирует x по всем строкам</li><li>Удаляет дубликаты x</li><li>Берёт x из предыдущей строки окна</li></ul><div class="why">LAG — предыдущая строка, LEAD — следующая. Удобно для разниц между периодами.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как найти «последнюю строку в каждой группе»?</summary><div class="a"><p>Через <code>ROW_NUMBER() OVER (PARTITION BY group_key ORDER BY sort_key DESC)</code> в подзапросе/CTE, затем отфильтровать <code>WHERE rn = 1</code> во внешнем запросе.</p></div></details>
+<details class="q"><summary>Что делает SUM(x) OVER (PARTITION BY g ORDER BY d)?</summary><div class="a"><p>Нарастающий итог: для каждой строки — сумма x по всем строкам той же группы g с датой не позже текущей (по порядку d). Без ORDER BY это была бы просто сумма по всей группе.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

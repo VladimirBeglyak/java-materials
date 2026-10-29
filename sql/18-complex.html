@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Сложные запросы: разбор задач</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · ПРАКТИКА</div>
+  <h1>Сложные запросы: разбор задач</h1>
+  <p class="lead">Реальные задачи почти всегда — комбинация уже изученных приёмов: JOIN + агрегация + окна + подзапросы. Здесь разберём несколько типовых задач «от вопроса к запросу», показывая сам ход мысли: как разложить формулировку на шаги SQL.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">разбор задач</span><span class="tag">топ-N</span><span class="tag">проценты</span><span class="tag">отчёты</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="method"><span class="h-num">18.1</span>Как подходить к сложному запросу</h2>
+<ol class="steps">
+  <li><b>Сформулируйте результат одной фразой.</b> Что должно быть в каждой строке результата?</li>
+  <li><b>Найдите источники.</b> Из каких таблиц берутся данные, как они связаны (JOIN).</li>
+  <li><b>Разбейте на подзадачи.</b> Каждую подзадачу — отдельным CTE.</li>
+  <li><b>Соберите и проверьте на малых данных.</b> Прогоните в песочнице, сверьте числа вручную.</li>
+</ol>
+
+<h2 id="topn"><span class="h-num">18.2</span>Задача: топ-N в каждой группе</h2>
+<p><b>Вопрос:</b> выведите по 2 самых дорогих товара в каждой категории.</p>
+<pre><code class="sql">WITH ranked AS (
+    SELECT name, category, price,
+           ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rn
+    FROM products
+)
+SELECT category, name, price
+FROM ranked WHERE rn &lt;= 2
+ORDER BY category, price DESC;</code></pre>
+<div class="callout info"><span class="c-title">Разбор</span>
+Окно <code>PARTITION BY category</code> нумерует товары внутри категории по убыванию цены; внешний фильтр <code>rn &lt;= 2</code> оставляет два лучших. Это универсальный паттерн «топ-N в группе».</div>
+
+<h2 id="pct"><span class="h-num">18.3</span>Задача: доли и проценты</h2>
+<p><b>Вопрос:</b> какую долю выручки приносит каждая категория товаров?</p>
+<pre><code class="sql">WITH cat_revenue AS (
+    SELECT p.category, SUM(i.qty * i.price) AS revenue
+    FROM order_items i JOIN products p ON p.id = i.product_id
+    GROUP BY p.category
+)
+SELECT category, revenue,
+       round(revenue * 100.0 / SUM(revenue) OVER (), 1) AS share_pct
+FROM cat_revenue
+ORDER BY revenue DESC;</code></pre>
+<div class="callout info"><span class="c-title">Разбор</span>
+Сначала агрегируем по категориям (CTE). Затем оконная <code>SUM(revenue) OVER ()</code> без PARTITION BY считает общую сумму по всем строкам, и доля — это <code>revenue / общая_сумма</code>.</div>
+
+<h2 id="report"><span class="h-num">18.4</span>Задача: отчёт по клиентам</h2>
+<p><b>Вопрос:</b> для каждого клиента — число заказов, сумма выручки и дата последнего заказа (включая клиентов без заказов).</p>
+<pre><code class="sql">SELECT c.name,
+       COUNT(o.id) AS orders_cnt,
+       COALESCE(SUM(i.qty * i.price), 0) AS revenue,
+       MAX(o.created_at) AS last_order
+FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+LEFT JOIN order_items i ON i.order_id = o.id
+GROUP BY c.id, c.name
+ORDER BY revenue DESC;</code></pre>
+<div class="callout warn"><span class="c-title">Осторожно с JOIN перед агрегацией</span>
+Соединение заказов с позициями размножает строки: <code>COUNT(o.id)</code> тогда посчитает позиции, а не заказы. В этой задаче <code>COUNT(o.id)</code> считает заказы с хотя бы одной позицией; для точного числа заказов агрегируйте заказы отдельным CTE.</div>
+
+<h2 id="worked"><span class="h-num">18.5</span>Задача: нарастающий итог по дням</h2>
+<p><b>Вопрос:</b> нарастающая сумма выручки по датам заказов.</p>
+<pre><code class="sql">WITH daily AS (
+    SELECT o.created_at, SUM(i.qty * i.price) AS day_revenue
+    FROM orders o JOIN order_items i ON i.order_id = o.id
+    GROUP BY o.created_at
+)
+SELECT created_at, day_revenue,
+       SUM(day_revenue) OVER (ORDER BY created_at) AS running_total
+FROM daily
+ORDER BY created_at;</code></pre>
+
+<h2 id="sandbox"><span class="h-num">18.6</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: задачи</div>
+  <div class="sql-presets">
+    <button data-sql="WITH ranked AS (SELECT name, category, price, ROW_NUMBER() OVER (PARTITION BY category ORDER BY price DESC) AS rn FROM products) SELECT category, name, price FROM ranked WHERE rn &lt;= 2 ORDER BY category, price DESC;">топ-2 в категории</button>
+    <button data-sql="WITH cr AS (SELECT p.category, SUM(i.qty*i.price) AS revenue FROM order_items i JOIN products p ON p.id=i.product_id GROUP BY p.category) SELECT category, revenue, round(revenue * 100.0 / SUM(revenue) OVER (), 1) AS share_pct FROM cr ORDER BY revenue DESC;">доля категорий</button>
+    <button data-sql="SELECT c.name, COUNT(o.id) AS orders_cnt, COALESCE(SUM(i.qty*i.price),0) AS revenue, MAX(o.created_at) AS last_order FROM customers c LEFT JOIN orders o ON o.customer_id=c.id LEFT JOIN order_items i ON i.order_id=o.id GROUP BY c.id, c.name ORDER BY revenue DESC;">отчёт по клиентам</button>
+    <button data-sql="WITH daily AS (SELECT o.created_at, SUM(i.qty*i.price) AS day_revenue FROM orders o JOIN order_items i ON i.order_id=o.id GROUP BY o.created_at) SELECT created_at, day_revenue, SUM(day_revenue) OVER (ORDER BY created_at) AS running_total FROM daily ORDER BY created_at;">нарастающий итог</button>
+  </div>
+  <textarea>SELECT c.name, COUNT(o.id) AS orders_cnt, COALESCE(SUM(i.qty*i.price),0) AS revenue
+FROM customers c LEFT JOIN orders o ON o.customer_id=c.id
+LEFT JOIN order_items i ON i.order_id=o.id
+GROUP BY c.id, c.name ORDER BY revenue DESC;</textarea>
+</div>
+<p><b>Задания:</b> (1) найдите клиента с максимальной суммой выручки; (2) выведите топ-1 товар по выручке в каждой категории; (3) посчитайте средний чек (выручка / число заказов) по всем оплаченным и отправленным заказам.</p>
+
+<h2 id="quiz"><span class="h-num">18.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой универсальный паттерн решает «топ-N в каждой группе»?</p><ul><li>ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) + фильтр rn &lt;= N</li><li>GROUP BY + LIMIT</li><li>DISTINCT</li><li>UNION ALL</li></ul><div class="why">Окно нумерует строки внутри группы, а внешний запрос отбирает нужное число по номеру.</div></div>
+<div class="mcq" data-ok="0"><p>Как посчитать долю категории в общей сумме?</p><ul><li>revenue / SUM(revenue) OVER () — оконная сумма по всем строкам</li><li>revenue / COUNT(*)</li><li>SUM(revenue)</li><li>AVG(revenue)</li></ul><div class="why">SUM(x) OVER () без PARTITION BY считает общий итог по всему результату, на него и делим.</div></div>
+<div class="mcq" data-ok="2"><p>Почему JOIN перед COUNT(o.id) может исказить число заказов?</p><ul><li>JOIN всегда медленный</li><li>COUNT не работает с JOIN</li><li>Соединение с позициями размножает строки заказа</li><li>JOIN удаляет строки</li></ul><div class="why">Один заказ с тремя позициями даст три строки в соединении — COUNT(o.id) посчитает три, а не один.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Сформулируйте алгоритм написания сложного запроса.</summary><div class="a"><p>1) Опишите результат одной фразой; 2) определите таблицы-источники и связи; 3) разбейте на подзадачи через CTE; 4) соберите и проверьте на малых данных, сверяя числа вручную.</p></div></details>
+<details class="q"><summary>Чем «топ-N в группе» через ROW_NUMBER лучше, чем через GROUP BY + LIMIT?</summary><div class="a"><p>GROUP BY + LIMIT даёт топ-N только по всей таблице, а не внутри каждой группы. ROW_NUMBER с PARTITION BY позволяет взять N лучших отдельно для каждой группы.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

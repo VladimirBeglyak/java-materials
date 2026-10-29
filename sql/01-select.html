@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · SELECT: выборка и реляционная модель</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · ОСНОВЫ ЗАПРОСОВ</div>
+  <h1>SELECT: выборка и реляционная модель</h1>
+  <p class="lead">Любой запрос к данным начинается с <code>SELECT</code>. Он описывает, <b>какие</b> данные получить, а не <b>как</b> их искать — способ выбирает сама СУБД. Чтобы писать запросы осознанно, нужно понимать три вещи: таблица — это множество строк без гарантированного порядка, список выборки — это выражения, а <code>SELECT *</code> — почти всегда плохая идея в приложении.</p>
+  <div class="meta"><span class="tag">~1.5 часа</span><span class="tag">SELECT</span><span class="tag">выражения</span><span class="tag">псевдонимы</span><span class="tag">SQL-песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="relation"><span class="h-num">1.1</span>Таблица как отношение</h2>
+<p>В реляционной модели данные хранятся в <b>таблицах</b> (отношениях): у таблицы фиксированный набор <b>столбцов</b> (атрибутов), а строки — это <b>кортежи</b> значений. Два свойства, которые чаще всего всплывают на практике:</p>
+<div class="grid-2">
+  <div class="card"><h4>У строк нет порядка</h4><p>Таблица — <b>множество</b> строк. Без <code>ORDER BY</code> СУБД может вернуть строки в любом порядке, и этот порядок может меняться между запусками.</p></div>
+  <div class="card"><h4>Строки могут повторяться</h4><p>В теории у отношения нет дубликатов, но SQL это не гарантирует: <code>SELECT city FROM customers</code> вернёт «Минск» столько раз, сколько клиентов из Минска. Повторения убирают явно — <code>DISTINCT</code> (тема 03).</p></div>
+</div>
+<div class="table-wrap"><table>
+<tr><th>Термин теории</th><th>Термин SQL</th><th>Нюанс</th></tr>
+<tr><td>отношение</td><td>таблица</td><td>могут быть строки-дубликаты</td></tr>
+<tr><td>кортеж</td><td>строка</td><td>порядок не определён без ORDER BY</td></tr>
+<tr><td>атрибут</td><td>столбец</td><td>значение может быть NULL (тема 02)</td></tr>
+</table></div>
+
+<h2 id="basic"><span class="h-num">1.2</span>Базовый SELECT</h2>
+<p>Минимальная форма запроса — <code>SELECT список FROM таблица</code>. Список выборки — это <b>выражения</b>, а не только имена столбцов: в нём можно складывать, вызывать функции, писать литералы.</p>
+<pre data-title="SELECT: столбцы и выражения"><code class="sql">SELECT name, city                          -- два столбца как есть
+FROM customers;
+
+SELECT name, 'город: ' || city AS where    -- выражение + псевдоним
+FROM customers;
+
+SELECT price, price * 1.2 AS price_vat,    -- арифметика
+       round(price * 1.2, 2) AS rounded    -- и функции
+FROM products;</code></pre>
+<p>Здесь <code>||</code> — конкатенация строк (в MySQL используйте <code>CONCAT</code>). Выражение вычисляется <b>для каждой строки</b>: если в таблице 8 товаров, <code>price * 1.2</code> посчитается 8 раз.</p>
+<div class="callout info"><span class="c-title">Что можно в списке выборки</span>
+Столбец, литерал (<code>'abc'</code>, <code>42</code>), арифметика, вызов функции, <code>CASE</code> (тема 04), подзапрос, возвращающий одно значение (тема 07), оконная функция (тема 10). Но нельзя сослаться на псевдоним из того же списка — псевдонимы видны только в <code>ORDER BY</code> и снаружи (в подзапросе).</div>
+
+<h2 id="alias"><span class="h-num">1.3</span>Псевдонимы и квалификация имён</h2>
+<p>Псевдоним задаётся через <code>AS</code> (необязательно) и переименовывает столбец в результате. Псевдоним таблицы — через <code>FROM customers AS c</code> — сокращает запись и обязателен, когда в запросе несколько таблиц (тема 06).</p>
+<pre><code class="sql">SELECT c.name, c.city          -- c — псевдоним таблицы customers
+FROM customers AS c;
+
+SELECT name AS customer_name   -- AS можно опустить: SELECT name customer_name
+FROM customers;</code></pre>
+<div class="callout warn"><span class="c-title">Кавычки и регистр</span>
+Имена столбцов и таблиц в PostgreSQL без кавычек приводятся к нижнему регистру. Двойные кавычки <code>"Name"</code> сохраняют регистр и разрешают пробелы — но так делать почти никогда не нужно. Строковые литералы — только одинарные кавычки: <code>'Минск'</code>, а <code>"Минск"</code> — это идентификатор.</div>
+
+<h2 id="star"><span class="h-num">1.4</span>SELECT * и его цена</h2>
+<p><code>SELECT *</code> возвращает все столбцы. В песочнице и при отладке это удобно, но в приложении — антипаттерн:</p>
+<div class="vs">
+  <div class="card"><h4>Явный список столбцов</h4><p><code>SELECT id, name, price FROM products</code> — забираем ровно то, что нужно. Добавление столбца в таблицу не ломает код.</p></div>
+  <div class="card"><h4>SELECT *</h4><p>Тащит ненужные тяжёлые столбцы (TEXT, JSON), ломает код, который читает столбцы «по позиции», и мешает оптимизатору использовать покрывающие индексы (тема 17).</p></div>
+</div>
+
+<h2 id="sandbox"><span class="h-num">1.5</span>Песочница</h2>
+<p>Ниже — настоящая SQLite-база в браузере с таблицами учебного магазина. Пробуйте запросы, база пересоздаётся кнопкой «Сбросить».</p>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: учебный магазин</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT * FROM customers;">все клиенты</button>
+    <button data-sql="SELECT name, city FROM customers;">два столбца</button>
+    <button data-sql="SELECT name, 'город: ' || city AS where&#10;FROM customers;">выражение + псевдоним</button>
+    <button data-sql="SELECT name, price, round(price * 1.2, 2) AS price_vat&#10;FROM products ORDER BY price DESC;">цена с НДС</button>
+  </div>
+  <textarea>SELECT name, city, email FROM customers;</textarea>
+</div>
+<p><b>Задания:</b> (1) выведите имя каждого товара и его цену со скидкой 10% с псевдонимом <code>sale_price</code>; (2) выведите столбец <code>name</code> и выражение, которое склеивает город и email через « / », с псевдонимом <code>contact</code>.</p>
+
+<h2 id="quiz"><span class="h-num">1.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Гарантирован ли порядок строк в <code>SELECT * FROM products</code>?</p><ul><li>Да, по первичному ключу</li><li>Нет — без ORDER BY порядок не определён</li><li>Да, по порядку вставки</li><li>Да, если есть индекс</li></ul><div class="why">Таблица — множество строк. Порядок зависит от плана, физического расположения и конкурентного доступа; единственный способ гарантировать порядок — ORDER BY.</div></div>
+<div class="mcq" data-ok="2"><p>Что вычисляется для каждой строки в <code>SELECT price * 1.2 FROM products</code>?</p><ul><li>Значение посчитается один раз и скопируется</li><li>Ничего — это ошибка синтаксиса</li><li>Выражение <code>price * 1.2</code> — для каждой строки таблицы</li><li>Только для строк с непустой ценой</li></ul><div class="why">Список выборки применяется к каждой строке результата независимо.</div></div>
+<div class="mcq" data-ok="0"><p>Почему в приложении лучше не использовать <code>SELECT *</code>?</p><ul><li>Тащит лишние данные, ломается при изменении схемы и мешает оптимизатору</li><li>Он медленнее сам по себе</li><li>Он запрещён стандартом SQL</li><li>Он не поддерживает псевдонимы</li></ul><div class="why">Лишние тяжёлые столбцы увеличивают сетевой трафик; код, читающий столбцы по индексу позиции, ломается, если схема изменилась; оптимизатор не может использовать index-only scan.</div></div>
+<div class="mcq" data-ok="3"><p>Как в PostgreSQL указать строковый литерал <code>Минск</code>?</p><ul><li><code>"Минск"</code></li><li><code>[Минск]</code></li><li><code>{Минск}</code></li><li><code>'Минск'</code></li></ul><div class="why">Строки — одинарные кавычки. Двойные кавычки обозначают идентификаторы (имена столбцов/таблиц), квадратные скобки — идентификаторы в SQL Server.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем список выборки отличается от простого перечисления столбцов?</summary><div class="a"><p>Это список <b>выражений</b>: столбец — частный случай выражения. Можно писать литералы, арифметику, вызовы функций, CASE и подзапросы; каждое выражение вычисляется для каждой строки.</p></div></details>
+<details class="q"><summary>Когда псевдоним столбца можно использовать в том же запросе?</summary><div class="a"><p>Только в <code>ORDER BY</code> (и в <code>HAVING</code>/окнах в некоторых СУБД по расширению). В <code>WHERE</code>, <code>GROUP BY</code> и в списке выборки псевдоним ещё не существует из-за логического порядка выполнения.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · CTE и рекурсивные запросы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · СОЕДИНЕНИЯ И ПОДЗАПРОСЫ</div>
+  <h1>CTE и рекурсивные запросы</h1>
+  <p class="lead">CTE (<code>WITH</code>) позволяет разбить сложный запрос на именованные шаги, которые читаются сверху вниз. Рекурсивный CTE (<code>WITH RECURSIVE</code>) даёт то, чего нет у обычного SQL, — итерации: обход дерева, генерацию последовательностей, раскрутку графов.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">WITH</span><span class="tag">MATERIALIZED</span><span class="tag">RECURSIVE</span><span class="tag">деревья</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="with"><span class="h-num">9.1</span>WITH как читаемые шаги</h2>
+<p>Каждый CTE — именованный подзапрос, на который можно ссылаться ниже. Сложная логика раскладывается на шаги, которые читаются как параграфы.</p>
+<pre><code class="sql">WITH paid AS (
+    SELECT o.customer_id, SUM(i.qty * i.price) AS total
+    FROM orders o JOIN order_items i ON i.order_id = o.id
+    WHERE o.status IN ('paid', 'shipped')
+    GROUP BY o.customer_id
+),
+big_spenders AS (
+    SELECT customer_id, total FROM paid WHERE total &gt; 10000
+)
+SELECT c.name, b.total
+FROM big_spenders b JOIN customers c ON c.id = b.customer_id
+ORDER BY b.total DESC;</code></pre>
+
+<h2 id="materialized"><span class="h-num">9.2</span>MATERIALIZED и встраивание</h2>
+<p>С PostgreSQL 12 нерекурсивный CTE, на который ссылаются один раз, <b>встраивается</b> в основной запрос (как обычный подзапрос) — оптимизатор видит его целиком. <code>MATERIALIZED</code> заставляет вычислить шаг отдельно и зафиксировать результат, что полезно, когда подзапрос дорогой и используется многократно.</p>
+<pre><code class="sql">WITH heavy AS MATERIALIZED (   -- вычислить один раз, зафиксировать
+    SELECT customer_id, SUM(qty * price) AS total
+    FROM order_items GROUP BY customer_id
+)
+SELECT * FROM heavy WHERE total &gt; 1000
+UNION ALL
+SELECT * FROM heavy WHERE total &lt;= 1000;</code></pre>
+
+<h2 id="recursive"><span class="h-num">9.3</span>Рекурсивный CTE: анатомия</h2>
+<p>Рекурсивный CTE состоит из двух частей, объединённых <code>UNION ALL</code>: <b>база</b> (начальные строки) и <b>шаг</b> (как из текущих строк получить следующие), который ссылается на сам CTE.</p>
+<pre><code class="sql">WITH RECURSIVE t(n) AS (
+    SELECT 1                       -- база: старт с 1
+    UNION ALL
+    SELECT n + 1 FROM t WHERE n &lt; 10   -- шаг: +1, пока меньше 10
+)
+SELECT n FROM t;                   -- 1..10</code></pre>
+<div class="callout warn"><span class="c-title">Защита от бесконечного цикла</span>
+Шаг должен иметь условие остановки (WHERE), иначе запрос зациклится. Некоторые СУБД ограничивают глубину рекурсии параметром (в PostgreSQL — <code>max_recursive_iterations</code>).</div>
+
+<h2 id="tree"><span class="h-num">9.4</span>Обход дерева категорий</h2>
+<p>Таблица <code>categories(id, name, parent_id)</code> задаёт дерево. Рекурсивный CTE раскручивает его от корня к листьям.</p>
+<pre><code class="sql">WITH RECURSIVE tree AS (
+    SELECT id, name, parent_id, 1 AS depth, name AS path
+    FROM categories WHERE parent_id IS NULL          -- корни
+    UNION ALL
+    SELECT c.id, c.name, c.parent_id, t.depth + 1,
+           t.path || ' → ' || c.name                 -- накапливаем путь
+    FROM categories c JOIN tree t ON c.parent_id = t.id
+)
+SELECT path, depth FROM tree ORDER BY path;</code></pre>
+<p>Этот приём решает: «все подкатегории категории», «путь до корня», «все потомки узла», «иерархия сотрудников». Направление обхода меняется перестановкой условия соединения (от корня вниз или от узла вверх).</p>
+
+<h2 id="sandbox"><span class="h-num">9.5</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: CTE и рекурсия</div>
+  <div class="sql-presets">
+    <button data-sql="WITH paid AS (SELECT o.customer_id, SUM(i.qty*i.price) AS total FROM orders o JOIN order_items i ON i.order_id=o.id WHERE o.status IN ('paid','shipped') GROUP BY o.customer_id) SELECT c.name, paid.total FROM paid JOIN customers c ON c.id=paid.customer_id ORDER BY paid.total DESC;">CTE выручки</button>
+    <button data-sql="WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n &lt; 10) SELECT n FROM t;">числа 1..10</button>
+    <button data-sql="WITH RECURSIVE tree AS (SELECT id, name, parent_id, 1 AS depth, name AS path FROM categories WHERE parent_id IS NULL UNION ALL SELECT c.id, c.name, c.parent_id, t.depth+1, t.path || ' → ' || c.name FROM categories c JOIN tree t ON c.parent_id = t.id) SELECT path, depth FROM tree ORDER BY path;">дерево категорий</button>
+    <button data-sql="WITH RECURSIVE tree AS (SELECT id, name, parent_id, 0 AS depth FROM categories WHERE id = 1 UNION ALL SELECT c.id, c.name, c.parent_id, t.depth+1 FROM categories c JOIN tree t ON c.parent_id = t.id) SELECT * FROM tree;">поддерево категории 1</button>
+  </div>
+  <textarea>WITH RECURSIVE tree AS (SELECT id, name, parent_id, 1 AS depth, name AS path FROM categories WHERE parent_id IS NULL UNION ALL SELECT c.id, c.name, c.parent_id, t.depth+1, t.path || ' → ' || c.name FROM categories c JOIN tree t ON c.parent_id = t.id) SELECT path, depth FROM tree ORDER BY path;</textarea>
+</div>
+<p><b>Задания:</b> (1) выведите все подкатегории категории «Электроника» с глубиной; (2) сгенерируйте даты с 1 по 10 января 2026 года (используйте <code>date()</code>); (3) посчитайте выручку по каждому клиенту через CTE и оставьте только тех, у кого она выше средней.</p>
+
+<h2 id="quiz"><span class="h-num">9.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Из чего состоит рекурсивный CTE?</p><ul><li>Только из одного SELECT</li><li>Из базы и шага, объединённых UNION ALL</li><li>Из базы и шага, объединённых UNION</li><li>Из двух независимых SELECT</li></ul><div class="why">База задаёт стартовые строки, шаг (ссылающийся на сам CTE) — как получить следующие; они объединяются UNION ALL.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает MATERIALIZED у CTE?</p><ul><li>Заставляет вычислить шаг отдельно и зафиксировать результат</li><li>Ускоряет любой запрос</li><li>Запрещает ссылаться на CTE дважды</li><li>Превращает CTE в таблицу навсегда</li></ul><div class="why">MATERIALIZED вычисляет и сохраняет результат шага; полезно, когда шаг дорогой и используется многократно.</div></div>
+<div class="mcq" data-ok="2"><p>Что произойдёт, если рекурсивный шаг не имеет условия остановки?</p><ul><li>Ничего, запрос завершится</li><li>CTE выполнится один раз</li><li>Бесконечный цикл (пока не сработает лимит глубины)</li><li>Ошибка синтаксиса</li></ul><div class="why">Рекурсия итерирует, пока шаг добавляет строки. Без условия WHERE она не остановится — СУБД прерывает по лимиту глубины.</div></div>
+<div class="mcq" data-ok="3"><p>Какую задачу решает рекурсивный CTE по таблице с parent_id?</p><ul><li>Поиск дубликатов</li><li>Сортировку</li><li>Дедупликацию строк</li><li>Обход дерева/иерархии (потомки, путь, глубина)</li></ul><div class="why">Рекурсия по parent_id раскручивает иерархию: поддеревья, пути, уровни вложенности.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем CTE отличается от обычного подзапроса?</summary><div class="a"><p>Семантически почти то же, но CTE именован и может использоваться многократно, а читается сверху вниз как последовательность шагов. Нерекурсивный CTE в PostgreSQL 12+ обычно встраивается в основной запрос.</p></div></details>
+<details class="q"><summary>Как вывести путь от корня до каждого узла дерева?</summary><div class="a"><p>Накапливать путь в шаге: база берёт корни с <code>path = name</code>, шаг добавляет <code>t.path || ' → ' || c.name</code>. Так в каждой строке окажется полный путь от корня.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

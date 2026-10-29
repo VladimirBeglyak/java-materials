@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · INSERT, UPDATE, DELETE, RETURNING</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ИЗМЕНЕНИЕ ДАННЫХ</div>
+  <h1>INSERT, UPDATE, DELETE, RETURNING</h1>
+  <p class="lead">Запросы не только читают данные, но и меняют их. Три оператора — <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code> — покрывают все изменения, а <code>RETURNING</code> возвращает изменённые строки сразу, без отдельного SELECT. Главное правило безопасности: прежде чем менять или удалять, проверьте условие через SELECT.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">INSERT</span><span class="tag">UPDATE</span><span class="tag">DELETE</span><span class="tag">RETURNING</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="insert"><span class="h-num">11.1</span>INSERT</h2>
+<pre><code class="sql">-- одна строка
+INSERT INTO customers (name, city, email) VALUES ('Жанна', 'Минск', 'zh@ex.com');
+
+-- несколько строк
+INSERT INTO products (name, category, price) VALUES
+  ('Флешка', 'электроника', 1200),
+  ('Подставка', 'посуда', 700);
+
+-- вставка из SELECT
+INSERT INTO archived_orders (id, customer_id, status)
+SELECT id, customer_id, status FROM orders WHERE status = 'cancelled';</code></pre>
+<div class="callout info"><span class="c-title">Порядок столбцов</span>
+Перечисляйте столбцы явно — так INSERT не сломается, если в таблице изменят порядок или добавят столбец со значением по умолчанию.</div>
+
+<h2 id="update"><span class="h-num">11.2</span>UPDATE</h2>
+<p><code>UPDATE</code> меняет существующие строки. Без <code>WHERE</code> он меняет <b>всю таблицу</b>.</p>
+<pre><code class="sql">UPDATE orders SET status = 'paid' WHERE id = 105 AND status = 'new';
+
+-- обновление с подзапросом
+UPDATE products SET price = price * 1.05 WHERE category = 'электроника';
+
+-- обновление по данным другой таблицы (PostgreSQL)
+UPDATE products p SET category = c.name
+FROM categories c WHERE p.category_id = c.id;</code></pre>
+<div class="callout warn"><span class="c-title">UPDATE и DELETE без WHERE</span>
+меняют или удаляют все строки. Привычка для ручной работы: <code>BEGIN; UPDATE …; проверить; COMMIT;</code> — внутри транзакции ошибку можно откатить (тема 16).</div>
+
+<h2 id="delete"><span class="h-num">11.3</span>DELETE</h2>
+<pre><code class="sql">DELETE FROM orders WHERE status = 'cancelled' AND created_at &lt; date('now', '-1 year');
+
+-- удалить все строки (быстро, без перебора) — TRUNCATE
+TRUNCATE TABLE staging_orders;</code></pre>
+<div class="callout ok"><span class="c-title">Мягкое удаление против жёсткого</span>
+Во многих системах строки не удаляют физически, а помечают <code>deleted_at</code>. Это позволяет восстановление и аудит, но усложняет запросы (фильтр <code>WHERE deleted_at IS NULL</code>). Физическое DELETE оставьте для данных, которые действительно не нужны.</div>
+
+<h2 id="returning"><span class="h-num">11.4</span>RETURNING</h2>
+<p><code>RETURNING</code> возвращает изменённые строки — так вы получаете сгенерированные id, значения по умолчанию или подтверждение изменений одним запросом.</p>
+<pre><code class="sql">INSERT INTO customers (name, city) VALUES ('Иван', 'Минск')
+RETURNING id, created_at;                     -- сгенерированный id и дату
+
+UPDATE orders SET status = 'paid' WHERE id = 105
+RETURNING id, status;                         -- пусто, если ничего не изменилось
+
+DELETE FROM orders WHERE id = 104
+RETURNING id;                                 -- какие строки реально удалены</code></pre>
+<div class="callout info"><span class="c-title">RETURNING — расширение PostgreSQL</span>
+MySQL и SQL Server не поддерживают RETURNING (в SQL Server есть OUTPUT). Проверьте поддержку в своей СУБД.</div>
+
+<h2 id="sandbox"><span class="h-num">11.5</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: изменение данных</div>
+  <div class="sql-presets">
+    <button data-sql="INSERT INTO customers (name, city, email) VALUES ('Жанна', 'Минск', 'zh@ex.com'); SELECT * FROM customers WHERE name = 'Жанна';">INSERT</button>
+    <button data-sql="UPDATE products SET price = price * 1.05 WHERE category = 'электроника'; SELECT name, price FROM products;">UPDATE</button>
+    <button data-sql="DELETE FROM orders WHERE status = 'cancelled'; SELECT * FROM orders;">DELETE</button>
+    <button data-sql="INSERT INTO products (name, category, price) VALUES ('Флешка', 'электроника', 1200) RETURNING id, price;">RETURNING</button>
+  </div>
+  <textarea>INSERT INTO customers (name, city, email) VALUES ('Жанна', 'Минск', 'zh@ex.com'); SELECT * FROM customers;</textarea>
+</div>
+<p><b>Задания:</b> (1) добавьте товар и получите его id через RETURNING; (2) поднимите цену всем товарам категории «продукты» на 10%; (3) удалите заказ 104 и убедитесь, что он исчез.</p>
+
+<h2 id="quiz"><span class="h-num">11.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что сделает <code>UPDATE products SET price = 0</code> без WHERE?</p><ul><li>Ничего</li><li>Обнулит цену у всех строк таблицы</li><li>Ошибку</li><li>Обнулит только первую строку</li></ul><div class="why">Без WHERE оператор применяется ко всем строкам. Это частый источник катастроф при ручной работе.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужен RETURNING?</p><ul><li>Получить изменённые строки (id, значения по умолчанию) одним запросом</li><li>Откатить изменения</li><li>Ускорить UPDATE</li><li>Заблокировать строки</li></ul><div class="why">RETURNING возвращает изменённые строки, избавляя от отдельного SELECT после вставки.</div></div>
+<div class="mcq" data-ok="2"><p>Чем TRUNCATE отличается от DELETE без WHERE?</p><ul><li>Ничем</li><li>TRUNCATE удаляет только часть строк</li><li>TRUNCATE обычно быстрее и не порождает многострочный журнал, но грубее</li><li>TRUNCATE — то же, что DELETE с WHERE</li></ul><div class="why">TRUNCATE освобождает хранилище целиком и быстрее, но без возможности фильтрации и (в некоторых СУБД) без отката.</div></div>
+<div class="mcq" data-ok="3"><p>Почему стоит перечислять столбцы в INSERT явно?</p><ul><li>Это единственный допустимый синтаксис</li><li>Так быстрее</li><li>Так запрещены дубликаты</li><li>Запрос не сломается при изменении схемы таблицы</li></ul><div class="why">Явный список столбцов делает INSERT устойчивым к изменению порядка/добавлению столбцов.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как безопасно выполнить опасный UPDATE/DELETE?</summary><div class="a"><p>Сначала SELECT с тем же условием, чтобы увидеть затронутые строки. Затем обернуть в транзакцию: BEGIN; UPDATE/DELETE …; проверить через RETURNING или SELECT; COMMIT или ROLLBACK.</p></div></details>
+<details class="q"><summary>Что такое мягкое удаление и когда оно уместно?</summary><div class="a"><p>Вместо DELETE ставится флаг/дата deleted_at. Уместно, когда нужны аудит, восстановление или «корзина». Цена — во всех запросах нужен фильтр WHERE deleted_at IS NULL.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

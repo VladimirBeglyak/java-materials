@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Транзакции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · ТРАНЗАКЦИИ И ПРОИЗВОДИТЕЛЬНОСТЬ</div>
+  <h1>Транзакции: BEGIN, COMMIT, ROLLBACK</h1>
+  <p class="lead">Транзакция объединяет несколько операций в одну атомарную единицу: либо все изменения применяются, либо ни одно. Это защищает данные от частичного состояния — когда из двух связанных UPDATE выполнился только один. Понимание транзакций отделяет надёжный код от кода, который «иногда портит данные».</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">ACID</span><span class="tag">BEGIN/COMMIT/ROLLBACK</span><span class="tag">SAVEPOINT</span><span class="tag">изоляция</span><span class="tag">FOR UPDATE</span><span class="tag">блокировки</span><span class="tag">psql</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="acid"><span class="h-num">16.1</span>ACID</h2>
+<div class="grid-2">
+  <div class="card"><h4>A — Атомарность</h4><p>Либо все операции транзакции применяются, либо ни одна. Нет «наполовину выполненной» транзакции.</p></div>
+  <div class="card"><h4>C — Согласованность</h4><p>Транзакция переводит базу из одного согласованного состояния в другое (соблюдая ограничения).</p></div>
+  <div class="card"><h4>I — Изоляция</h4><p>Параллельные транзакции не видят «сырые» промежуточные состояния друг друга.</p></div>
+  <div class="card"><h4>D — Долговечность</h4><p>После COMMIT данные переживают сбой (журнал предзаписи, тема 10 соседнего пособия).</p></div>
+</div>
+
+<h2 id="begin"><span class="h-num">16.2</span>BEGIN, COMMIT, ROLLBACK</h2>
+<pre data-title="Перевод денег: две операции, одна транзакция"><code class="sql">BEGIN;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+
+-- если всё хорошо:
+COMMIT;
+
+-- если что-то пошло не так:
+-- ROLLBACK;</code></pre>
+<div class="callout bad"><span class="c-title">Без транзакции</span>
+Если первый UPDATE выполнится, а второй упадёт с ошибкой, деньги «испарятся»: у одного сняли, другому не начислили. Транзакция гарантирует, что такого не случится — ошибка откатит всё.</div>
+<div class="callout info"><span class="c-title">Неявные транзакции</span>
+Одиночный INSERT/UPDATE/DELETE вне явной транзакции всё равно выполняется в своей (автоматической) транзакции. Явные BEGIN…COMMIT нужны, когда операций несколько и они должны быть атомарны.</div>
+
+<h2 id="savepoint"><span class="h-num">16.3</span>SAVEPOINT</h2>
+<p>SAVEPOINT позволяет откатить только часть транзакции, не теряя всё.</p>
+<pre><code class="sql">BEGIN;
+INSERT INTO orders (customer_id, status) VALUES (1, 'new');
+
+SAVEPOINT after_order;
+UPDATE products SET price = price * 2;     -- ошиблись
+
+ROLLBACK TO after_order;                   -- откатили только UPDATE
+COMMIT;                                    -- вставка заказа сохранилась</code></pre>
+
+<h2 id="isolation"><span class="h-num">16.4</span>Уровни изоляции</h2>
+<p>Уровень изоляции определяет, какие «аномалии» параллельного доступа допустимы. По умолчанию в PostgreSQL — <code>READ COMMITTED</code>.</p>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Суть</th><th>Когда</th></tr>
+<tr><td><code>READ COMMITTED</code></td><td>видишь только закоммиченные данные (по умолчанию)</td><td>обычные операции</td></tr>
+<tr><td><code>REPEATABLE READ</code></td><td>снимок данных стабилен на всю транзакцию</td><td>отчёты, несколько согласованных чтений</td></tr>
+<tr><td><code>SERIALIZABLE</code></td><td>полная изоляция, как последовательное выполнение</td><td>строгие инварианты (например, бронирование)</td></tr>
+</table></div>
+<pre><code class="sql">BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT * FROM orders;      -- все последующие SELECT видят один и тот же снимок
+COMMIT;</code></pre>
+<div class="callout ok"><span class="c-title">Глубже — в соседнем пособии</span>
+Аномалии (потерянное обновление, фантомное чтение, write skew), MVCC и блокировки подробно разобраны в темах 11–13 пособия <a href="../relational-db/index.html">«Реляционные базы данных изнутри»</a>.</div>
+
+<h2 id="pessimistic"><span class="h-num">16.5</span>Пессимистичные и оптимистичные блокировки</h2>
+<p>Когда несколько транзакций меняют одни и те же данные, есть два подхода к защите от конфликтов: блокировать заранее или проверять в момент записи.</p>
+<div class="vs">
+  <div class="card"><h4>Пессимистичная блокировка</h4><p>Предполагаем, что конфликт случится, и <b>заранее</b> блокируем строки (<code>SELECT … FOR UPDATE</code>). Другие транзакции ждут. Гарантия сильная, рассуждать просто, но блокировки удерживаются дольше и создают конкуренцию.</p></div>
+  <div class="card"><h4>Оптимистичная блокировка</h4><p>Предполагаем, что конфликт редок, и <b>ничего не блокируем</b>, а в момент UPDATE проверяем, не изменилась ли строка (по полю <code>version</code> или <code>updated_at</code>). Изменилась — повторяем или откатываем. Блокировок нет, но нужна логика повтора.</p></div>
+</div>
+<pre><code class="sql">-- оптимистичная блокировка по версии: обновляем только если версия не изменилась
+UPDATE products SET price = 950, version = version + 1
+WHERE id = 1 AND version = 5;
+-- вернуло 0 строк? значит, строку уже изменили — прочитайте заново и повторите</code></pre>
+<div class="callout info"><span class="c-title">Что выбрать</span>
+Оптимистичная — для редких конфликтов и длинных операций (форма, редактирование в UI), пессимистичная — когда конфликты вероятны или операция короткая и критична (перевод денег, списание остатков). В JPA/Hibernate оптимистичная — <code>@Version</code>, пессимистичная — <code>@Lock(PESSIMISTIC_WRITE)</code>.</div>
+
+<h2 id="rowlocks"><span class="h-num">16.6</span>Блокировки строк: FOR UPDATE, FOR SHARE, SKIP LOCKED</h2>
+<p>В PostgreSQL строка блокируется на уровне строки через <code>SELECT … FOR …</code>. Разные режимы блокируют разное и под разные сценарии.</p>
+<div class="table-wrap"><table>
+<tr><th>Режим</th><th>Что блокирует</th><th>Типовой сценарий</th></tr>
+<tr><td><code>FOR UPDATE</code></td><td>изменение/удаление строки и другие FOR UPDATE</td><td>прочитал-изменил-записал: баланс счёта, остаток на складе</td></tr>
+<tr><td><code>FOR NO KEY UPDATE</code></td><td>то же, но не мешает FOR KEY SHARE (вставка дочерних строк по FK)</td><td>обновить неключевые поля, не блокируя вставку ссылающихся строк</td></tr>
+<tr><td><code>FOR SHARE</code></td><td>UPDATE/DELETE, но разрешает другим FOR SHARE</td><td>зафиксировать строку для чтения: выставить счёт, не дав заказу измениться</td></tr>
+<tr><td><code>FOR KEY SHARE</code></td><td>только удаление/смену ключа</td><td>удерживать родителя, пока вставляются дочерние строки</td></tr>
+</table></div>
+<pre><code class="sql">-- пессимистичная блокировка: забрать строку на изменение
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;   -- строка заблокирована до COMMIT
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- SKIP LOCKED: взять первую НЕзаблокированную задачу из очереди
+BEGIN;
+SELECT * FROM jobs WHERE status = 'new'
+ORDER BY id
+FOR UPDATE SKIP LOCKED
+LIMIT 1;                                    -- другие worker'ы пропустят эту строку
+-- … обработать, затем UPDATE jobs SET status = 'done'
+COMMIT;
+
+-- NOWAIT: не ждать, а сразу получить ошибку, если строка занята
+SELECT * FROM orders WHERE id = 105 FOR UPDATE NOWAIT;
+
+-- FOR SHARE: строка не изменится до конца нашей транзакции
+BEGIN;
+SELECT * FROM orders WHERE id = 101 FOR SHARE;   -- другой UPDATE будет ждать
+-- … сформировать счёт на основе неизменных данных
+COMMIT;</code></pre>
+<div class="callout ok"><span class="c-title">Сценарии по шаблону</span>
+<code>FOR UPDATE</code> — read-modify-write; <code>FOR UPDATE SKIP LOCKED</code> — очередь задач, несколько worker'ов без дублей; <code>FOR SHARE</code> — согласованное чтение, пока готовите производные данные; <code>NOWAIT</code> — когда лучше быстро ответить «занято», чем ждать.</div>
+
+<h2 id="deadlock"><span class="h-num">16.7</span>Deadlock</h2>
+<p>Deadlock (взаимная блокировка) возникает, когда две транзакции ждут друг друга; СУБД сама прерывает одну из них.</p>
+<pre><code class="sql">-- транзакция A:            -- транзакция B:
+UPDATE t SET x = 1 WHERE id = 1;   UPDATE t SET x = 2 WHERE id = 2;
+UPDATE t SET x = 2 WHERE id = 2;   UPDATE t SET x = 1 WHERE id = 1;  -- deadlock</code></pre>
+<div class="callout warn"><span class="c-title">Правила против deadlock</span>
+Блокируйте ресурсы всегда в одном и том же порядке и держите транзакции короткими. Повтор при ошибке deadlock — нормальная практика (в Spring это <code>@Retryable</code>).</div>
+
+<h2 id="practice"><span class="h-num">16.8</span>Практика</h2>
+<p>Транзакции и блокировки нужно наблюдать на настоящей СУБД — в браузерной SQLite-песочнице параллельные сессии недоступны. Поднимите PostgreSQL и выполните в двух окнах psql:</p>
+<pre><code class="sql">-- окно 1: пессимистичная блокировка строки
+BEGIN;
+SELECT * FROM products WHERE id = 1 FOR UPDATE;   -- строка заблокирована, НЕ COMMIT
+
+-- окно 2: попытка изменить ту же строку
+UPDATE products SET price = 2 WHERE id = 1;       -- ждёт блокировку окна 1</code></pre>
+<p>Затем в окне 1 выполните <code>COMMIT</code> — окно 2 сразу продолжит.</p>
+<pre data-title="SKIP LOCKED: очередь задач без дублей (два окна psql)"><code class="sql">-- окно 1                          -- окно 2
+BEGIN;                             BEGIN;
+SELECT * FROM jobs                  SELECT * FROM jobs
+WHERE status = 'new'               WHERE status = 'new'
+ORDER BY id                        ORDER BY id
+FOR UPDATE SKIP LOCKED             FOR UPDATE SKIP LOCKED
+LIMIT 1;                           LIMIT 1;
+-- взяли задачу 1                  -- взяли задачу 2 (не ждали 1)</code></pre>
+<p>Оба окна получают <b>разные</b> строки, никто не ждёт — это стандартный паттерн параллельной обработки очереди.</p>
+
+<h2 id="quiz"><span class="h-num">16.9</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что гарантирует атомарность транзакции?</p><ul><li>Быстрое выполнение</li><li>Либо все операции применятся, либо ни одна</li><li>Только одна операция за раз</li><li>Отсутствие блокировок</li></ul><div class="why">Атомарность — «всё или ничего»: частичное состояние невозможно.</div></div>
+<div class="mcq" data-ok="0"><p>Чем ROLLBACK TO savepoint отличается от ROLLBACK?</p><ul><li>Откатывает только часть транзакции до метки, а не всю</li><li>Ничем</li><li>Откатывает другую транзакцию</li><li>Сохраняет изменения навсегда</li></ul><div class="why">SAVEPOINT ставит метку, до которой можно откатиться, сохранив остальное.</div></div>
+<div class="mcq" data-ok="2"><p>Какой уровень изоляции в PostgreSQL по умолчанию?</p><ul><li>SERIALIZABLE</li><li>READ UNCOMMITTED</li><li>READ COMMITTED</li><li>REPEATABLE READ</li></ul><div class="why">По умолчанию READ COMMITTED: транзакция видит только закоммиченные данные.</div></div>
+<div class="mcq" data-ok="3"><p>Что происходит при deadlock?</p><ul><li>Обе транзакции ждут вечно</li><li>База перезапускается</li><li>Одна из транзакций теряет данные</li><li>СУБД прерывает одну из транзакций</li></ul><div class="why">СУБД обнаруживает цикл ожидания и откатывает одну транзакцию, чтобы разблокировать другую.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает <code>SELECT … FOR UPDATE</code>?</p><ul><li>Блокирует выбранные строки для изменения до конца транзакции</li><li>Только читает строки без блокировок</li><li>Удаляет строки</li><li>Сортирует результат</li></ul><div class="why">FOR UPDATE ставит исключительную блокировку строк до COMMIT/ROLLBACK — другие транзакции не могут их изменить.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужен <code>SKIP LOCKED</code>?</p><ul><li>Пропускать уже заблокированные строки — паттерн очереди задач без дублей</li><li>Ускорять сортировку</li><li>Пропускать NULL</li><li>Отменять транзакцию</li></ul><div class="why">SKIP LOCKED выбирает только незаблокированные строки, поэтому параллельные worker'ы забирают разные задачи и не ждут друг друга.</div></div>
+<div class="mcq" data-ok="0"><p>Чем оптимистичная блокировка отличается от пессимистичной?</p><ul><li>Пессимистичная блокирует заранее, оптимистичная проверяет версию при записи</li><li>Ничем</li><li>Оптимистичная всегда быстрее</li><li>Оптимистичная использует FOR UPDATE</li></ul><div class="why">Пессимистичная — SELECT FOR UPDATE заранее; оптимистичная — UPDATE … WHERE version = X с повтором при конфликте.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему одиночный UPDATE не требует явного BEGIN?</summary><div class="a"><p>Каждый одиночный оператор выполняется в своей неявной транзакции — СУБД сама оборачивает его. Явные BEGIN…COMMIT нужны, когда атомарными должны быть несколько операторов.</p></div></details>
+<details class="q"><summary>Как избежать deadlock?</summary><div class="a"><p>Блокировать ресурсы в едином порядке во всех транзакциях, держать транзакции короткими и обрабатывать ошибку deadlock повторным выполнением.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

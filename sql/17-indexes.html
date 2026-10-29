@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Индексы и скорость: EXPLAIN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · ТРАНЗАКЦИИ И ПРОИЗВОДИТЕЛЬНОСТЬ</div>
+  <h1>Индексы и скорость: EXPLAIN</h1>
+  <p class="lead">Написать запрос — половина дела; вторая половина — сделать его быстрым. Индекс — это структура, позволяющая найти строки без полного просмотра таблицы. <code>EXPLAIN</code> показывает, как СУБД собирается (или как выполнила) запрос, — это главный инструмент диагностики «почему медленно».</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">B-tree</span><span class="tag">составные индексы</span><span class="tag">EXPLAIN</span><span class="tag">covering</span><span class="tag">psql</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">17.1</span>Зачем нужны индексы</h2>
+<p>Без индекса поиск по условию читает таблицу целиком (Seq Scan — последовательное сканирование). Индекс позволяет найти нужные строки по ключу за логарифмическое время, как оглавление в книге.</p>
+<div class="vs">
+  <div class="card"><h4>Без индекса</h4><p><code>WHERE email = 'anna@ex.com'</code> — просмотр всех строк таблицы, O(n). На миллионах строк — секунды.</p></div>
+  <div class="card"><h4>С индексом</h4><p>Поиск по B-tree, O(log n) + чтение найденных строк. Миллисекунды.</p></div>
+</div>
+<div class="callout warn"><span class="c-title">Индекс — не бесплатно</span>
+Каждый индекс ускоряет чтение, но замедляет INSERT/UPDATE/DELETE (его нужно поддерживать) и занимает место. Индексов должно быть ровно столько, сколько нужно запросам.</div>
+
+<h2 id="btree"><span class="h-num">17.2</span>B-tree и составные индексы</h2>
+<pre><code class="sql">CREATE INDEX customers_city_idx ON customers (city);           -- по одному столбцу
+
+CREATE INDEX orders_customer_status_idx                          -- составной
+    ON orders (customer_id, status);</code></pre>
+<div class="callout ok"><span class="c-title">Порядок столбцов в составном индексе</span>
+Индекс (a, b) ускоряет фильтры по a, по a+b, но <b>не</b> по одному b. Ставьте первым столбец с условием равенства, затем — сортировки/диапазона. «Правило левого префикса».</div>
+
+<h2 id="explain"><span class="h-num">17.3</span>EXPLAIN</h2>
+<p><code>EXPLAIN</code> показывает план без выполнения, <code>EXPLAIN ANALYZE</code> — выполняет и добавляет реальные времена и число строк.</p>
+<pre><code class="sql">EXPLAIN SELECT * FROM orders WHERE customer_id = 1;
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT c.name, o.id FROM customers c JOIN orders o ON o.customer_id = c.id
+WHERE c.city = 'Минск';</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Узел плана</th><th>Смысл</th></tr>
+<tr><td><code>Seq Scan</code></td><td>полный просмотр таблицы</td></tr>
+<tr><td><code>Index Scan</code></td><td>поиск по индексу + чтение строк</td></tr>
+<tr><td><code>Index Only Scan</code></td><td>все данные в индексе, таблица не нужна</td></tr>
+<tr><td><code>Nested Loop / Hash Join</code></td><td>способы соединения таблиц</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Что смотреть в плане</span>
+Сначала ищите Seq Scan на большой таблице при условии, которое могло бы использовать индекс; большие разрывы между rows (оценкой) и actual rows (фактом); дорогие сортировки. Детальный разбор — в теме 08 соседнего пособия «Реляционные базы данных изнутри».</div>
+
+<h2 id="covering"><span class="h-num">17.4</span>Покрывающие индексы</h2>
+<p>Если индекс содержит все нужные запросу столбцы, СУБД читает только индекс, не заглядывая в таблицу (Index Only Scan).</p>
+<pre><code class="sql">-- запросу нужны только id и email → индекс их покрывает
+SELECT id, email FROM customers WHERE email = 'anna@ex.com';
+CREATE INDEX customers_email_idx ON customers (email);   -- id уже в индексе (первичный ключ)
+
+-- расширить индекс столбцами, которые не участвуют в поиске (INCLUDE)
+CREATE INDEX orders_customer_idx ON orders (customer_id) INCLUDE (status, created_at);</code></pre>
+
+<h2 id="checklist"><span class="h-num">17.5</span>Почему запрос медленный: чек-лист</h2>
+<ol class="steps">
+  <li><b>Посмотрите EXPLAIN (ANALYZE, BUFFERS).</b> Где тратится время — Seq Scan, сортировка, соединение?</li>
+  <li><b>Нет индекса под условием WHERE/JOIN.</b> Добавьте индекс по столбцам фильтра.</li>
+  <li><b>Индекс есть, но не используется.</b> Проверьте функции/преобразования над столбцом (<code>lower(email)</code> нужен индекс по выражению), ведущий <code>%</code> в LIKE.</li>
+  <li><b>Запрос тащит лишнее.</b> SELECT * вместо нужных столбцов, нет LIMIT, нет покрывающего индекса.</li>
+  <li><b>N+1.</b> Запрос выполняется в цикле по строкам — объедините в один JOIN или batch.</li>
+</ol>
+
+<h2 id="sandbox"><span class="h-num">17.6</span>Песочница: план SQLite</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">EXPLAIN QUERY PLAN (SQLite)</div>
+  <div class="sql-presets">
+    <button data-sql="EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 1;">план без индекса</button>
+    <button data-sql="CREATE INDEX IF NOT EXISTS oci ON orders(customer_id); EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 1;">план с индексом</button>
+    <button data-sql="EXPLAIN QUERY PLAN SELECT c.name, o.id FROM customers c JOIN orders o ON o.customer_id = c.id;">план JOIN</button>
+  </div>
+  <textarea>EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 1;</textarea>
+</div>
+<p>В SQLite план смотрится через <code>EXPLAIN QUERY PLAN</code>; в PostgreSQL — через <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Сравните планы «до» и «после» создания индекса — увидите, как Seq Scan сменяется поиском по индексу.</p>
+
+<h2 id="quiz"><span class="h-num">17.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает Seq Scan?</p><ul><li>Ищет по индексу</li><li>Читает таблицу строку за строкой целиком</li><li>Сортирует строки</li><li>Соединяет две таблицы</li></ul><div class="why">Seq Scan — последовательное сканирование всей таблицы; на больших таблицах это основная причина медленных запросов.</div></div>
+<div class="mcq" data-ok="0"><p>Ускорит ли индекс (a, b) запрос с фильтром только по b?</p><ul><li>Нет — индекс работает по левому префиксу, нужен a первым</li><li>Да, всегда</li><li>Только если b уникален</li><li>Только в MySQL</li></ul><div class="why">Составной индекс (a, b) использует столбцы слева направо; фильтр по одному b не сможет использовать его эффективно.</div></div>
+<div class="mcq" data-ok="2"><p>Чем EXPLAIN ANALYZE отличается от EXPLAIN?</p><ul><li>Ничем</li><li>EXPLAIN ANALYZE не выполняет запрос</li><li>EXPLAIN ANALYZE выполняет запрос и показывает реальные времена и число строк</li><li>EXPLAIN ANALYZE только для INSERT</li></ul><div class="why">ANALYZE запускает запрос и добавляет фактические данные (actual time, rows) к плану.</div></div>
+<div class="mcq" data-ok="3"><p>Что такое покрывающий индекс?</p><ul><li>Индекс по всем столбцам таблицы</li><li>Индекс только по первичному ключу</li><li>Индекс, который не используется</li><li>Индекс, содержащий все столбцы запроса — таблицу читать не нужно</li></ul><div class="why">Если все нужные столбцы есть в индексе, СУБД делает Index Only Scan, не читая таблицу.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему lower(email) = 'x' может не использовать индекс на email?</summary><div class="a"><p>Индекс хранит исходные значения, а не lower(email). Нужен индекс по выражению: CREATE INDEX … ON t (lower(email)).</p></div></details>
+<details class="q"><summary>Что такое N+1 и как его лечить?</summary><div class="a"><p>N+1 — когда для каждой из N строк выполняется ещё один запрос (например, в цикле за заказами клиентов). Лечится одним JOIN или пакетной выборкой.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

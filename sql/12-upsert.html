@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · UPSERT, MERGE и массовые операции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ИЗМЕНЕНИЕ ДАННЫХ</div>
+  <h1>UPSERT, MERGE и массовые операции</h1>
+  <p class="lead">Частая задача — «вставить, а если такая строка уже есть, обновить» (UPSERT) или синхронизировать таблицу с пришедшим набором данных (MERGE). Обе операции атомарны — в отличие от наивного «сначала SELECT, потом INSERT/UPDATE», который гоняет гонку при параллельных запросах.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">ON CONFLICT</span><span class="tag">ON DUPLICATE KEY</span><span class="tag">MERGE</span><span class="tag">COPY</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="idea"><span class="h-num">12.1</span>Зачем нужен UPSERT</h2>
+<p>Классический пример — счётчик остатков на складе: если запись о товаре есть, увеличить количество, если нет — создать. Сделать это через два запроса нельзя надёжно: между SELECT и INSERT другая транзакция может вставить ту же строку, и получится дубликат или потерянное обновление. UPSERT решает это одной атомарной командой.</p>
+
+<h2 id="pg"><span class="h-num">12.2</span>ON CONFLICT (PostgreSQL / SQLite)</h2>
+<pre><code class="sql">-- вставить или обновить по конфликту с уникальным ключом
+INSERT INTO product_stock (product_id, qty) VALUES (7, 5)
+ON CONFLICT (product_id) DO UPDATE SET qty = product_stock.qty + EXCLUDED.qty;
+
+-- или просто пропустить, если строка есть
+INSERT INTO customers (email, name) VALUES ('anna@ex.com', 'Анна-2')
+ON CONFLICT (email) DO NOTHING;</code></pre>
+<p><code>EXCLUDED</code> — псевдотаблица со значениями, которые пытались вставить. Так «взять новое значение» пишется как <code>EXCLUDED.col</code>, а текущее — просто <code>col</code>.</p>
+
+<h2 id="mysql"><span class="h-num">12.3</span>ON DUPLICATE KEY UPDATE (MySQL)</h2>
+<pre><code class="sql">INSERT INTO product_stock (product_id, qty) VALUES (7, 5)
+ON DUPLICATE KEY UPDATE qty = qty + VALUES(qty);   -- MySQL-синтаксис</code></pre>
+<div class="callout warn"><span class="c-title">Диалекты различаются</span>
+PostgreSQL — <code>ON CONFLICT</code>, MySQL — <code>ON DUPLICATE KEY UPDATE</code>, стандарт SQL — <code>MERGE</code>. Смысл один, синтаксис разный — сверяйтесь с документацией своей СУБД.</div>
+
+<h2 id="merge"><span class="h-num">12.4</span>MERGE (стандарт SQL)</h2>
+<p><code>MERGE</code> — более общий UPSERT: синхронизирует целевую таблицу с источником, выполняя INSERT, UPDATE или DELETE по условию совпадения.</p>
+<pre><code class="sql">MERGE INTO product_stock t
+USING (VALUES (7, 5), (8, 3)) AS s(product_id, qty)
+ON t.product_id = s.product_id
+WHEN MATCHED THEN UPDATE SET qty = t.qty + s.qty
+WHEN NOT MATCHED THEN INSERT (product_id, qty) VALUES (s.product_id, s.qty);</code></pre>
+<p>MERGE поддерживается в PostgreSQL 15+, SQL Server, Oracle; MySQL использует свой синтаксис ON DUPLICATE KEY.</p>
+
+<h2 id="bulk"><span class="h-num">12.5</span>Массовые операции</h2>
+<p>Для загрузки миллионов строк INSERT по одной слишком медленный (каждая строка — отдельная операция). Способы ускорить:</p>
+<pre><code class="sql">-- 1) многострочный INSERT: меньше накладных расходов
+INSERT INTO products (name, category, price) VALUES
+  ('A', 'электроника', 10), ('B', 'посуда', 20), ('C', 'продукты', 30);
+
+-- 2) COPY (PostgreSQL): пакетная загрузка из файла/потока
+COPY products (name, category, price) FROM '/data/products.csv' CSV HEADER;
+
+-- 3) в одной транзакции — COMMIT один раз, а не на каждую строку
+BEGIN;
+INSERT …; INSERT …; INSERT …;
+COMMIT;</code></pre>
+<div class="callout info"><span class="c-title">Правило для больших вставок</span>
+Объединяйте строки в многострочный INSERT или COPY и держите всё в одной транзакции. Не делайте COMMIT на каждую строку — это превращает пакетную вставку в тысячи медленных транзакций.</div>
+
+<h2 id="sandbox"><span class="h-num">12.6</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: UPSERT</div>
+  <div class="sql-presets">
+    <button data-sql="CREATE TABLE IF NOT EXISTS stock (product_id INTEGER PRIMARY KEY, qty INTEGER NOT NULL); INSERT INTO stock VALUES (7, 5); INSERT INTO stock (product_id, qty) VALUES (7, 3) ON CONFLICT (product_id) DO UPDATE SET qty = stock.qty + EXCLUDED.qty; SELECT * FROM stock;">UPSERT-счётчик</button>
+    <button data-sql="CREATE TABLE IF NOT EXISTS stock (product_id INTEGER PRIMARY KEY, qty INTEGER NOT NULL); INSERT INTO stock VALUES (7, 5); INSERT INTO stock (product_id, qty) VALUES (7, 3) ON CONFLICT (product_id) DO NOTHING; SELECT * FROM stock;">DO NOTHING</button>
+    <button data-sql="INSERT INTO customers (name, city, email) VALUES ('Борис','Минск','boris@ex.com') ON CONFLICT (email) DO NOTHING; SELECT * FROM customers;">конфликт email</button>
+  </div>
+  <textarea>CREATE TABLE IF NOT EXISTS stock (product_id INTEGER PRIMARY KEY, qty INTEGER NOT NULL);
+INSERT INTO stock VALUES (7, 5);
+INSERT INTO stock (product_id, qty) VALUES (7, 3)
+ON CONFLICT (product_id) DO UPDATE SET qty = stock.qty + EXCLUDED.qty;
+SELECT * FROM stock;</textarea>
+</div>
+<p><b>Задания:</b> (1) создайте таблицу счётчиков и добейтесь, чтобы два UPSERT увеличивали количество; (2) попробуйте вставить существующий email с DO NOTHING и проверьте, что дубликата не появилось.</p>
+
+<h2 id="quiz"><span class="h-num">12.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему «SELECT потом INSERT/UPDATE» ненадёжен для UPSERT?</p><ul><li>SELECT слишком медленный</li><li>Между SELECT и INSERT другая транзакция может вставить ту же строку (гонка)</li><li>SELECT не работает в транзакции</li><li>Это запрещено стандартом</li></ul><div class="why">Между проверкой и вставкой — окно гонки. UPSERT атомарен и решает конфликт внутри одной операции.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое EXCLUDED в <code>ON CONFLICT … DO UPDATE</code>?</p><ul><li>Значения, которые пытались вставить</li><li>Существующие значения строки</li><li>Удалённые строки</li><li>Заблокированные строки</li></ul><div class="why">EXCLUDED — псевдотаблица с предлагаемыми значениями; текущие значения доступны по обычному имени столбца.</div></div>
+<div class="mcq" data-ok="2"><p>Чем MERGE отличается от простого UPSERT?</p><ul><li>Ничем</li><li>MERGE только удаляет</li><li>MERGE может выполнять INSERT, UPDATE и DELETE по условию совпадения с источником</li><li>MERGE работает только в MySQL</li></ul><div class="why">MERGE — обобщённая синхронизация: совпало — обновить/удалить, не совпало — вставить.</div></div>
+<div class="mcq" data-ok="3"><p>Как ускорить массовую вставку тысяч строк?</p><ul><li>Многострочный INSERT/COPY и одна транзакция на пакет</li><li>COMMIT после каждой строки</li><li>Вставлять только по одной строке</li><li>Отключить первичные ключи</li></ul><div class="why">Пакетная вставка и один COMMIT на пакет резко снижают накладные расходы. COMMIT на строку — антипаттерн.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>В чём разница между DO UPDATE и DO NOTHING в ON CONFLICT?</summary><div class="a"><p>DO UPDATE обновляет существующую строку (например, увеличивает счётчик); DO NOTHING просто пропускает вставку, если строка с таким ключом уже есть.</p></div></details>
+<details class="q"><summary>Когда выбирать MERGE вместо ON CONFLICT?</summary><div class="a"><p>Когда нужно синхронизировать таблицу с целым набором данных и возможны разные действия (вставить/обновить/удалить) в зависимости от совпадения. Для простого «вставить или обновить одну строку» ON CONFLICT короче.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

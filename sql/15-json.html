@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · JSON и полуструктурированные данные</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · ТИПЫ ДАННЫХ</div>
+  <h1>JSON и полуструктурированные данные</h1>
+  <p class="lead">Когда структура данных меняется или вложена (настройки, события, ответы внешних API), реляционные столбцы неудобны — выручает JSON. В PostgreSQL тип <code>jsonb</code> даёт быстрые операторы извлечения, проверку структуры и индексы GIN, так что JSON можно не только хранить, но и запрашивать.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">jsonb</span><span class="tag">-&gt; -&gt;&gt;</span><span class="tag">#&gt;</span><span class="tag">GIN</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="jsonb"><span class="h-num">15.1</span>json против jsonb</h2>
+<div class="table-wrap"><table>
+<tr><th>Тип</th><th>Хранение</th><th>Когда</th></tr>
+<tr><td><code>json</code></td><td>текст «как есть» (с пробелами и порядком ключей)</td><td>нужен точный исходный текст</td></tr>
+<tr><td><code>jsonb</code></td><td>разобранный бинарный формат (ключи отсортированы)</td><td>нужен запрос/индексация — почти всегда</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Выбирайте jsonb</span>
+Если вы планируете читать поля, фильтровать по ним или строить индексы — только jsonb. Тип json оставьте для случаев, когда важен байт-в-байт исходный текст.</div>
+
+<h2 id="operators"><span class="h-num">15.2</span>Операторы извлечения</h2>
+<div class="table-wrap"><table>
+<tr><th>Оператор</th><th>Возвращает</th><th>Пример</th></tr>
+<tr><td><code>-&gt;</code> 'key'</td><td>JSON-объект/массив</td><td><code>data -&gt; 'user'</code></td></tr>
+<tr><td><code>-&gt;&gt;</code> 'key'</td><td>текст</td><td><code>data -&gt;&gt; 'name'</code></td></tr>
+<tr><td><code>#&gt;</code> '{a,b}'</td><td>JSON по пути</td><td><code>data #&gt; '{address,city}'</code></td></tr>
+<tr><td><code>#&gt;&gt;</code> '{a,b}'</td><td>текст по пути</td><td><code>data #&gt;&gt; '{address,city}'</code></td></tr>
+</table></div>
+<pre><code class="sql">-- таблица с jsonb-столбцом
+CREATE TABLE events (id bigint GENERATED ALWAYS AS IDENTITY, payload jsonb NOT NULL);
+
+INSERT INTO events (payload) VALUES
+  ('{"type":"order","user":"anna","total":95000,"tags":["vip","mobile"]}');
+
+SELECT payload -&gt;&gt; 'type' AS type,
+       payload -&gt;&gt; 'user' AS user,
+       payload #&gt;&gt; '{tags,0}' AS first_tag
+FROM events;
+
+-- фильтр по JSON-полю
+SELECT * FROM events WHERE payload -&gt;&gt; 'user' = 'anna';
+
+-- проверка существования ключа
+SELECT * FROM events WHERE payload ? 'total';</code></pre>
+
+<h2 id="aggregate"><span class="h-num">15.3</span>Агрегация в JSON</h2>
+<p>Можно собрать строки в JSON-массив или объект прямо в базе:</p>
+<pre><code class="sql">-- все товары категории в один JSON-массив
+SELECT json_agg(json_build_object('id', id, 'name', name, 'price', price)) AS items
+FROM products WHERE category = 'электроника';
+
+-- развернуть JSON-массив в строки
+SELECT * FROM json_array_elements('[1,2,3]'::jsonb) AS n;</code></pre>
+
+<h2 id="gin"><span class="h-num">15.4</span>Индексы GIN на jsonb</h2>
+<p>Поиск <code>payload -&gt;&gt; 'user' = 'anna'</code> без индекса просматривает все строки. GIN-индекс ускоряет проверки <code>?</code>, <code>@&gt;</code> и <code>-&gt;&gt;</code>.</p>
+<pre><code class="sql">CREATE INDEX events_payload_gin ON events USING GIN (payload);          -- универсальный
+CREATE INDEX events_user_btree ON events ((payload -&gt;&gt; 'user'));      -- выражение → B-tree
+
+-- вхождение подструктуры
+SELECT * FROM events WHERE payload @&gt; '{"type":"order"}';</code></pre>
+<div class="callout info"><span class="c-title">Диалекты</span>
+MySQL хранит JSON в типе JSON и использует <code>JSON_EXTRACT()</code>, <code>-&gt;</code>, <code>-&gt;&gt;</code>; SQLite — функции <code>json_extract()</code>/<code>json_each()</code> (расширение JSON1). Идея одинакова: хранить документ и доставать из него поля.</div>
+
+<h2 id="sandbox"><span class="h-num">15.5</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: JSON (SQLite JSON1)</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT payload, json_extract(payload, '$.type') AS type, json_extract(payload, '$.total') AS total FROM events;">извлечение полей</button>
+    <button data-sql="SELECT * FROM events WHERE json_extract(payload, '$.user') = 'anna';">фильтр по JSON</button>
+    <button data-sql="SELECT payload FROM events, json_each(payload) WHERE json_each.key = 'type';">json_each</button>
+    <button data-sql="SELECT json_object('id', id, 'name', name) FROM products LIMIT 3;">json_object</button>
+  </div>
+  <textarea>SELECT payload, json_extract(payload, '$.type') AS type FROM events;</textarea>
+</div>
+<p>SQLite использует <code>json_extract()</code>/<code>json_each()</code>, а не операторы PostgreSQL <code>-&gt;</code>/<code>-&gt;&gt;</code>. Сами операторы <code>-&gt;</code>, <code>#&gt;</code>, <code>@&gt;</code>, <code>?</code> и GIN-индексы проверяются на настоящем PostgreSQL.</p>
+<p><b>Задания:</b> (1) извлеките из событий поле total и отсортируйте по нему; (2) найдите события типа 'order'; (3) соберите объект JSON из id и name товаров.</p>
+
+<h2 id="quiz"><span class="h-num">15.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем jsonb отличается от json в PostgreSQL?</p><ul><li>Ничем</li><li>jsonb хранится в разобранном бинарном виде и поддерживает индексы, json — текстом</li><li>json быстрее для запросов</li><li>jsonb не поддерживает вложенность</li></ul><div class="why">jsonb разбирается при вставке, хранит ключи отсортированными и индексируется GIN; json — просто текст.</div></div>
+<div class="mcq" data-ok="0"><p>Что возвращает <code>data -&gt;&gt; 'name'</code>?</p><ul><li>Значение ключа name как текст</li><li>JSON-объект</li><li>Булево значение</li><li>Ошибку</li></ul><div class="why">-&gt;&gt; извлекает значение как текст; -&gt; вернул бы JSON-объект/массив.</div></div>
+<div class="mcq" data-ok="2"><p>Какой оператор проверяет вхождение подструктуры в jsonb?</p><ul><li><code>=</code></li><li><code>LIKE</code></li><li><code>@&gt;</code></li><li><code>&lt;-</code></li></ul><div class="why">@&gt; — «содержит»: payload @&gt; '{"type":"order"}' истинно, если в документе есть такой ключ со значением.</div></div>
+<div class="mcq" data-ok="3"><p>Какой индекс ускоряет запросы по jsonb в PostgreSQL?</p><ul><li>B-tree</li><li>Hash</li><li>BRIN</li><li>GIN</li></ul><div class="why">GIN индексирует ключи и значения jsonb; B-tree — по конкретному выражению извлечения (payload -&gt;&gt; 'user').</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда хранить данные в JSON, а когда — в реляционных столбцах?</summary><div class="a"><p>Реляционные столбцы — для данных с фиксированной структурой, по которым нужны JOIN и ограничения. JSON — для вложенных/меняющихся структур, которые запрашиваются как целое или по отдельным полям без строгих связей.</p></div></details>
+<details class="q"><summary>Как развернуть JSON-массив в строки таблицы?</summary><div class="a"><p>Через json_array_elements() (PostgreSQL) или json_each() (SQLite): каждая функция возвращает по строке на элемент массива, после чего элементы можно фильтровать и агрегировать.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+INSERT INTO events VALUES
+  (1,'{"type":"order","user":"anna","total":95000,"tags":["vip","mobile"]}'),
+  (2,'{"type":"order","user":"boris","total":32000,"tags":["web"]}'),
+  (3,'{"type":"visit","user":"anna","page":"/catalog"}'),
+  (4,'{"type":"visit","user":"egor","page":"/about"}');
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

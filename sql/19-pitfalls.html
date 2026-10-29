@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>19 · Ловушки и антипаттерны SQL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="19">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 19 · ПРАКТИКА</div>
+  <h1>Ловушки и антипаттерны SQL</h1>
+  <p class="lead">Большинство «непонятных» результатов и медленных запросов происходит из небольшого набора повторяющихся ошибок. Зная их в лицо, вы перестанете наступать на одни и те же грабли и быстрее найдёте чужую ошибку на ревью.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">антипаттерны</span><span class="tag">NOT IN</span><span class="tag">N+1</span><span class="tag">OR vs UNION</span><span class="tag">чек-лист</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="notin"><span class="h-num">19.1</span>NOT IN с NULL</h2>
+<p>Классическая ловушка: <code>x NOT IN (подзапрос)</code> возвращает пустоту, если в подзапросе есть NULL (тема 02).</p>
+<pre><code class="sql">-- ОШИБОЧНО: вернёт пусто, если в городах клиентов есть NULL
+SELECT * FROM customers c
+WHERE c.city NOT IN (SELECT city FROM customers WHERE id IN (1, 4));   -- подзапрос содержит NULL
+
+-- ПРАВИЛЬНО: NOT EXISTS
+SELECT * FROM customers c
+WHERE NOT EXISTS (SELECT 1 FROM customers x WHERE x.city = c.city AND x.id IN (1, 4));</code></pre>
+
+<h2 id="nplus1"><span class="h-num">19.2</span>SELECT в цикле (N+1)</h2>
+<p>Выполнять запрос внутри цикла по результатам другого запроса — N+1 обращений вместо одного.</p>
+<pre><code class="sql">-- ПЛОХО (псевдокод): для каждого клиента — отдельный запрос
+for customer in (SELECT id FROM customers):
+    SELECT * FROM orders WHERE customer_id = customer.id;
+
+-- ХОРОШО: один JOIN
+SELECT c.id, o.* FROM customers c JOIN orders o ON o.customer_id = c.id;</code></pre>
+
+<h2 id="or"><span class="h-num">19.3</span>OR против UNION</h2>
+<p><code>OR</code> в WHERE может мешать оптимизатору использовать индексы; иногда то же условие через <code>UNION ALL</code> работает быстрее.</p>
+<pre><code class="sql">-- может не использовать индексы на обоих столбцах
+SELECT * FROM t WHERE a = 1 OR b = 2;
+
+-- альтернатива: два поиска по индексам, объединённые
+SELECT * FROM t WHERE a = 1
+UNION
+SELECT * FROM t WHERE b = 2;</code></pre>
+<div class="callout info"><span class="c-title">Не всегда нужно</span>
+Современные оптимизаторы часто справляются с OR. Применяйте UNION, когда EXPLAIN показывает плохой план для OR.</div>
+
+<h2 id="cast"><span class="h-num">19.4</span>Неявные преобразования типов</h2>
+<p>Сравнение числа со строкой заставляет СУБД приводить типы, что ломает индексы и порождает сюрпризы.</p>
+<pre><code class="sql">-- ПЛОХО: '1' приводится к числу, индекс по числовому столбцу может не использоваться
+SELECT * FROM orders WHERE id = '101';
+
+-- ХОРОШО: явный тип
+SELECT * FROM orders WHERE id = 101;</code></pre>
+
+<h2 id="star"><span class="h-num">19.5</span>SELECT * и ORDER BY по позиции</h2>
+<pre><code class="sql">-- ПЛОХО: код зависит от порядка столбцов
+SELECT * FROM products ORDER BY 3;   -- сортировка по третьему столбцу
+
+-- ХОРОШО: явные столбцы и имена
+SELECT id, name, price FROM products ORDER BY price;</code></pre>
+
+<h2 id="checklist"><span class="h-num">19.6</span>Чек-лист ревью запроса</h2>
+<ol class="steps">
+  <li>Есть ли <code>WHERE</code> у UPDATE/DELETE? Не заденет ли запрос больше строк, чем нужно?</li>
+  <li>Нет ли <code>NOT IN</code> с потенциальным NULL? Замените на NOT EXISTS.</li>
+  <li>Нет ли SELECT * вместо нужных столбцов?</li>
+  <li>Нет ли запросов в цикле (N+1)?</li>
+  <li>Нет ли функций/преобразований над индексируемым столбцом в WHERE?</li>
+  <li>Есть ли ORDER BY, где порядок важен? Есть ли LIMIT на больших выборах?</li>
+  <li>Не искажаются ли агрегаты размножением строк при JOIN?</li>
+</ol>
+
+<h2 id="quiz"><span class="h-num">19.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему NOT IN опасен?</p><ul><li>Он медленный</li><li>При NULL в списке он никогда не истинен</li><li>Он не поддерживается</li><li>Он работает только с числами</li></ul><div class="why">NOT IN превращается в цепочку x&lt;&gt;… с AND; NULL в списке делает результат пустым. Используйте NOT EXISTS.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое N+1?</p><ul><li>N+1 запросов для каждой из N строк — запрос в цикле</li><li>Число индексов</li><li>Число столбцов</li><li>Уровень изоляции</li></ul><div class="why">Для N строк выполняется ещё по одному запросу; лечится одним JOIN или пакетной выборкой.</div></div>
+<div class="mcq" data-ok="2"><p>Почему сравнение <code>id = '101'</code> (строка с числовым столбцом) — плохо?</p><ul><li>Это синтаксическая ошибка</li><li>Оно всегда false</li><li>Неявное преобразование может сломать использование индекса</li><li>Оно запрещено стандартом</li></ul><div class="why">СУБД приводит строку к числу; из-за преобразования индекс по столбцу может не использоваться.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает запрос с SELECT * и ORDER BY 3?</p><ul><li>Сортирует по третьему столбцу — хрупко при изменении схемы</li><li>Сортирует по 3 первым столбцам</li><li>Возвращает 3 строки</li><li>Ошибку</li></ul><div class="why">ORDER BY по позиции хрупок: при изменении порядка столбцов сортировка незаметно ломается. Именуйте столбцы явно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как быстро проверить запрос перед продакшеном?</summary><div class="a"><p>Прогнать EXPLAIN, проверить WHERE у UPDATE/DELETE, поискать N+1, SELECT *, NOT IN и функции над индексируемыми столбцами, и сверить агрегаты на малых данных.</p></div></details>
+<details class="q"><summary>Когда OR стоит переписывать на UNION?</summary><div class="a"><p>Когда EXPLAIN показывает, что из-за OR не используются индексы и запрос делает Seq Scan. Тогда два отдельных поиска с UNION могут быть быстрее.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

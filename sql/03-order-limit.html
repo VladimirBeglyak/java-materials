@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Сортировка, DISTINCT, LIMIT</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ОСНОВЫ ЗАПРОСОВ</div>
+  <h1>Сортировка, DISTINCT, LIMIT</h1>
+  <p class="lead">Три инструмента доводят выборку до готового ответа: <code>ORDER BY</code> задаёт порядок, <code>DISTINCT</code> убирает повторы, <code>LIMIT</code>/<code>OFFSET</code> отсекает страницу. Здесь же главный приём постраничной выдачи — <b>keyset-пагинация</b>, которая не замедляется на больших смещениях.</p>
+  <div class="meta"><span class="tag">~1.5 часа</span><span class="tag">ORDER BY</span><span class="tag">DISTINCT</span><span class="tag">LIMIT/OFFSET</span><span class="tag">keyset</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="order"><span class="h-num">3.1</span>ORDER BY и NULLS</h2>
+<p>Сортировка задаётся списком выражений с направлением <code>ASC</code> (по возрастанию, по умолчанию) или <code>DESC</code>. Здесь псевдонимы из SELECT уже доступны — <code>ORDER BY</code> выполняется после SELECT в логическом порядке.</p>
+<pre><code class="sql">SELECT name, price FROM products ORDER BY price DESC;           -- дорогие первыми
+SELECT name, price FROM products ORDER BY category, price DESC;  -- по категории, внутри — по цене
+SELECT name, price FROM products ORDER BY price DESC LIMIT 5;    -- топ-5 по цене</code></pre>
+<p>Где оказывается NULL при сортировке — зависит от СУБД. В PostgreSQL NULL считается «больше» всего: в <code>ASC</code> он в конце, в <code>DESC</code> — в начале. Управлять явно можно <code>NULLS FIRST</code> / <code>NULLS LAST</code>.</p>
+<pre><code class="sql">SELECT name, city FROM customers ORDER BY city ASC NULLS FIRST;  -- NULL первыми</code></pre>
+<div class="callout warn"><span class="c-title">Порядок не сохраняется</span>
+Если запрос без ORDER BY «всегда возвращает по порядку вставки» — это совпадение физического хранения. Добавление индекса, конкурентный доступ или смена плана могут изменить порядок. Сортировка — только через ORDER BY.</div>
+
+<h2 id="distinct"><span class="h-num">3.2</span>DISTINCT</h2>
+<p><code>SELECT DISTINCT</code> возвращает уникальные <b>комбинации</b> всех выбранных столбцов. Он применяется ко всей строке, а не к одному столбцу.</p>
+<pre><code class="sql">SELECT DISTINCT city FROM customers;           -- уникальные города (без NULL-ов-дублей)
+SELECT DISTINCT city, status FROM ...;         -- уникальные пары</code></pre>
+<div class="table-wrap"><table>
+<tr><th>DISTINCT</th><th>GROUP BY</th></tr>
+<tr><td>убирает дубликаты строк результата</td><td>группирует и позволяет агрегировать (тема 05)</td></tr>
+<tr><td>не даёт агрегаты</td><td><code>SELECT city FROM t GROUP BY city</code> ≈ DISTINCT</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">DISTINCT — сигнал к размышлению</span>
+Часто DISTINCT «лечит» размножение строк из-за JOIN (тема 06). Вместо <code>SELECT DISTINCT</code> по большой выборке обычно правильнее исправить соединение или использовать EXISTS.</div>
+
+<h2 id="limit"><span class="h-num">3.3</span>LIMIT, OFFSET и keyset-пагинация</h2>
+<p><code>LIMIT n</code> возвращает не больше n строк, <code>OFFSET m</code> пропускает первые m. Классическая пагинация <code>LIMIT 20 OFFSET 40</code> проста, но на глубоких страницах замедляется: СУБД всё равно читает и отбрасывает первые m строк.</p>
+<pre><code class="sql">SELECT id, name FROM products ORDER BY id LIMIT 20 OFFSET 40;   -- 3-я страница по 20</code></pre>
+<p><b>Keyset-пагинация</b> — вместо смещения передаём «последний ключ» прошлой страницы и берём строки после него. Она стабильна и быстра при любом номере страницы, но требует сортировки по уникальному ключу.</p>
+<pre><code class="sql">-- страница 1
+SELECT id, name FROM products ORDER BY id LIMIT 20;
+-- страница 2: помним последний id = 20
+SELECT id, name FROM products WHERE id &gt; 20 ORDER BY id LIMIT 20;</code></pre>
+<div class="callout ok"><span class="c-title">Правило для продакшена</span>
+Офсетную пагинацию оставьте для маленьких списков и админок. Для лент и больших таблиц проектируйте keyset: сортировка по столбцу с уникальным суффиксом (обычно id) и фильтр <code>&gt;</code>/<code>&lt;</code> по нему.</div>
+
+<h2 id="sandbox"><span class="h-num">3.4</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: сортировка и лимиты</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT name, price FROM products ORDER BY price DESC;">товары по цене</button>
+    <button data-sql="SELECT name, price FROM products ORDER BY category, price DESC;">по категории и цене</button>
+    <button data-sql="SELECT DISTINCT city FROM customers;">уникальные города</button>
+    <button data-sql="SELECT name, price FROM products ORDER BY price DESC LIMIT 3;">топ-3 по цене</button>
+    <button data-sql="SELECT name, price FROM products ORDER BY price LIMIT 3 OFFSET 3;">офсетная страница</button>
+  </div>
+  <textarea>SELECT name, price FROM products ORDER BY price DESC;</textarea>
+</div>
+<p><b>Задания:</b> (1) выведите три самых дешёвых товара; (2) выведите уникальные города клиентов, отсортированные по алфавиту; (3) выведите товары категории «электроника», отсортированные по цене по убыванию, начиная со второго (OFFSET 1).</p>
+
+<h2 id="quiz"><span class="h-num">3.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Где окажется NULL при <code>ORDER BY city ASC</code> в PostgreSQL?</p><ul><li>В начале</li><li>В конце (NULL считается больше всех значений)</li><li>Зависит от случайности</li><li>Строки с NULL не попадают в результат</li></ul><div class="why">В PostgreSQL NULL больше любого значения: ASC — в конце, DESC — в начале. Управляется NULLS FIRST / NULLS LAST.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает <code>SELECT DISTINCT a, b FROM t</code>?</p><ul><li>Убирает дубликаты только столбца a</li><li>Убирает дубликаты только столбца b</li><li>Убирает дубликаты комбинаций (a, b)</li><li>Возвращает только строки с уникальным a</li></ul><div class="why">DISTINCT применяется ко всей строке результата — уникальными должны быть пары значений.</div></div>
+<div class="mcq" data-ok="0"><p>Почему офсетная пагинация <code>LIMIT 20 OFFSET 1000000</code> медленная?</p><ul><li>СУБД читает и отбрасывает миллион строк перед выдачей</li><li>Она не поддерживается</li><li>Она возвращает миллион строк</li><li>OFFSET не может быть больше LIMIT</li></ul><div class="why">OFFSET не «перепрыгивает» строки — база должна пройти их, чтобы выбросить. Keyset-пагинация через WHERE id &gt; … использует индекс и не зависит от глубины.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему ORDER BY может использовать псевдоним из SELECT, а WHERE — нет?</summary><div class="a"><p>Логический порядок: FROM → WHERE → GROUP BY → HAVING → SELECT → DISTINCT → ORDER BY → LIMIT. Псевдоним создаётся на шаге SELECT, поэтому виден только начиная с ORDER BY.</p></div></details>
+<details class="q"><summary>Когда DISTINCT можно заменить на GROUP BY?</summary><div class="a"><p>Когда параллельно нужны агрегаты: <code>SELECT city FROM t GROUP BY city</code> эквивалентно <code>SELECT DISTINCT city FROM t</code>, но GROUP BY позволит добавить COUNT(*) и другие агрегаты. Если агрегаты не нужны — DISTINCT короче.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>

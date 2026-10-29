@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Выражения и функции</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ОСНОВЫ ЗАПРОСОВ</div>
+  <h1>Выражения и функции: CASE, строки, числа</h1>
+  <p class="lead">В списке выборки и в <code>WHERE</code> можно вычислять: разветвлять логику через <code>CASE</code>, подставлять значения по умолчанию через <code>COALESCE</code>, приводить типы через <code>CAST</code>, обрабатывать строки и числа. Всё это считается в базе — значит, результат приходит готовым, без досчёта в приложении.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">CASE</span><span class="tag">COALESCE</span><span class="tag">CAST</span><span class="tag">строки</span><span class="tag">числа</span><span class="tag">песочница</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="case"><span class="h-num">4.1</span>CASE — условные выражения</h2>
+<p><code>CASE</code> — это «if» внутри SQL-выражения. Есть две формы: с условиями и с поиском значения.</p>
+<pre><code class="sql">-- форма 1: набор условий WHEN … THEN (сверху вниз, первое совпадение)
+SELECT name, price,
+       CASE WHEN price &gt; 20000 THEN 'дорогой'
+            WHEN price &gt; 2000  THEN 'средний'
+            ELSE 'дешёвый'
+       END AS price_group
+FROM products;
+
+-- форма 2: сравнение одного выражения со значениями
+SELECT o.id,
+       CASE o.status
+            WHEN 'paid'    THEN 'оплачен'
+            WHEN 'shipped' THEN 'отправлен'
+            WHEN 'new'     THEN 'новый'
+            ELSE 'отменён'
+       END AS status_ru
+FROM orders o;</code></pre>
+<div class="callout info"><span class="c-title">CASE в GROUP BY / ORDER BY</span>
+CASE — обычное выражение, поэтому его можно использовать в GROUP BY, ORDER BY и WHERE. Но в WHERE он обычно читается хуже, чем явные условия с AND/OR.</div>
+
+<h2 id="coalesce"><span class="h-num">4.2</span>COALESCE и NULLIF</h2>
+<pre><code class="sql">-- COALESCE: первое не-NULL значение из списка
+SELECT name, COALESCE(city, 'город не указан') AS city FROM customers;
+
+-- NULLIF: вернуть NULL, если значения равны (защита от деления на ноль)
+SELECT a / NULLIF(b, 0) FROM t;   -- если b = 0, результат NULL, а не ошибка</code></pre>
+
+<h2 id="cast"><span class="h-num">4.3</span>CAST и преобразование типов</h2>
+<pre><code class="sql">SELECT CAST(price AS TEXT) FROM products;      -- число в строку
+SELECT CAST('42' AS INTEGER) + 1;              -- строку в число
+SELECT price::text FROM products;              -- PostgreSQL-сокращение ::type</code></pre>
+<div class="callout warn"><span class="c-title">Неявные преобразования</span>
+СУБД иногда приводит типы сама (например, сравнивая число и строку), но это источник сюрпризов и мешает использованию индексов. Приводите типы явно, особенно при сравнении в WHERE.</div>
+
+<h2 id="strings"><span class="h-num">4.4</span>Строковые функции</h2>
+<div class="table-wrap"><table>
+<tr><th>Функция</th><th>Пример</th><th>Результат</th></tr>
+<tr><td><code>||</code> / <code>concat</code></td><td><code>'a' || 'b'</code></td><td><code>ab</code></td></tr>
+<tr><td><code>length(s)</code></td><td><code>length('Привет')</code></td><td>6</td></tr>
+<tr><td><code>lower / upper</code></td><td><code>lower('ABC')</code></td><td><code>abc</code></td></tr>
+<tr><td><code>substr(s, start, len)</code></td><td><code>substr('abcde', 2, 3)</code></td><td><code>bcd</code></td></tr>
+<tr><td><code>replace(s, from, to)</code></td><td><code>replace('a,b', ',', ';')</code></td><td><code>a;b</code></td></tr>
+<tr><td><code>trim(s)</code></td><td><code>trim('  x  ')</code></td><td><code>x</code></td></tr>
+<tr><td><code>left / right</code></td><td><code>left('abcde', 2)</code></td><td><code>ab</code></td></tr>
+</table></div>
+<pre><code class="sql">SELECT name, upper(name) AS up, length(name) AS len FROM customers;</code></pre>
+<div class="callout info"><span class="c-title">Диалекты</span>
+Имена и набор функций немного различаются: в MySQL это <code>CONCAT()</code>, <code>SUBSTRING()</code>; в SQL Server — <code>LEN()</code>. Ядро идей одинаково, детали сверяйте с документацией своей СУБД.</div>
+
+<h2 id="numbers"><span class="h-num">4.5</span>Числовые функции</h2>
+<pre><code class="sql">SELECT round(price * 1.2, 2)  AS with_vat,   -- округление до 2 знаков
+       ceil(price / 1000)     AS thousands,  -- вверх
+       floor(price / 1000)    AS floor_k,    -- вниз
+       abs(price - 1000)      AS diff        -- модуль
+FROM products;</code></pre>
+<div class="callout warn"><span class="c-title">Точность и деньги</span>
+Не храните деньги во float/double — из-за двоичного представления накапливаются ошибки округления. Используйте <code>numeric(12,2)</code> (PostgreSQL) или <code>DECIMAL(12,2)</code> (MySQL).</div>
+
+<h2 id="sandbox"><span class="h-num">4.6</span>Песочница</h2>
+<div class="sqlbox" data-schema="shopSchema">
+  <div class="widget-title">SQL-песочница: выражения</div>
+  <div class="sql-presets">
+    <button data-sql="SELECT name, price,&#10;  CASE WHEN price &gt; 20000 THEN 'дорогой' WHEN price &gt; 2000 THEN 'средний' ELSE 'дешёвый' END AS grp&#10;FROM products;">CASE по цене</button>
+    <button data-sql="SELECT name, COALESCE(city, '—') AS city FROM customers;">COALESCE</button>
+    <button data-sql="SELECT name, upper(name) AS up, length(name) AS len FROM customers;">строки</button>
+    <button data-sql="SELECT name, price, round(price * 1.2, 2) AS vat FROM products;">цена с НДС</button>
+    <button data-sql="SELECT CAST('42' AS INTEGER) + 1;">CAST</button>
+  </div>
+  <textarea>SELECT name, price, CASE WHEN price > 20000 THEN 'дорогой' ELSE 'обычный' END AS grp FROM products;</textarea>
+</div>
+<p><b>Задания:</b> (1) выведите имя клиента и инициал города (первую букву, для NULL — «?»); (2) разбейте товары на группы «до 1000», «1000–10000», «дороже 10000» через CASE и посчитайте сколько в каждой (понадобится GROUP BY — тема 05).</p>
+
+<h2 id="quiz"><span class="h-num">4.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что вернёт <code>COALESCE(NULL, NULL, 'x', 'y')</code>?</p><ul><li>NULL</li><li><code>x</code></li><li><code>y</code></li><li>Ошибку</li></ul><div class="why">COALESCE возвращает первое не-NULL значение из списка — это 'x'.</div></div>
+<div class="mcq" data-ok="0"><p>Чем полезна функция NULLIF?</p><ul><li>Позволяет избежать деления на ноль и сравнивать значения, превращая равенство в NULL</li><li>Удаляет NULL из таблицы</li><li>Заменяет COALESCE</li><li>Она не существует</li></ul><div class="why">NULLIF(a,b) возвращает NULL, если a = b. Частый приём: x / NULLIF(y, 0), чтобы при y = 0 получить NULL вместо ошибки.</div></div>
+<div class="mcq" data-ok="2"><p>Как в PostgreSQL преобразовать число в текст?</p><ul><li><code>price as text</code></li><li><code>text(price)</code></li><li><code>price::text</code> или <code>CAST(price AS TEXT)</code></li><li><code>convert(price)</code></li></ul><div class="why">Двойное двоеточие — PostgreSQL-сокращение для CAST.</div></div>
+<div class="mcq" data-ok="3"><p>Почему деньги нельзя хранить во float?</p><ul><li>Float не поддерживает отрицательные значения</li><li>Float медленнее DECIMAL</li><li>Float занимает больше места</li><li>Из-за двоичного представления накапливаются ошибки округления</li></ul><div class="why">0.1 в двоичной системе — бесконечная дробь. Для денег используйте numeric/DECIMAL с фиксированной точностью.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем CASE с условиями отличается от CASE с поиском значения?</summary><div class="a"><p>В форме 1 каждый WHEN — произвольное условие (проверяются сверху вниз). В форме 2 одно выражение сравнивается на равенство с перечисленными значениями. Форма 2 короче, когда нужно просто «перевести код в текст».</p></div></details>
+<details class="q"><summary>Можно ли использовать CASE в WHERE и зачем?</summary><div class="a"><p>Можно, поскольку CASE — выражение. Но в WHERE его обычно заменяют явными условиями с AND/OR, которые читаются понятнее и лучше оптимизируются. В SELECT/GROUP BY/ORDER BY CASE незаменим для разбиения на категории.</p></div></details>
+</div>
+
+<script type="text/plain" id="shopSchema">
+CREATE TABLE customers (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, email TEXT UNIQUE, created_at TEXT NOT NULL);
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories(id));
+CREATE TABLE products (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL, price NUMERIC NOT NULL CHECK (price > 0));
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id),
+  status TEXT NOT NULL CHECK (status IN ('new','paid','shipped','cancelled')), created_at TEXT NOT NULL);
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id),
+  qty INTEGER NOT NULL CHECK (qty > 0), price NUMERIC NOT NULL, PRIMARY KEY (order_id, product_id));
+INSERT INTO customers VALUES
+  (1,'Анна','Минск','anna@ex.com','2026-01-10'), (2,'Борис','Москва','boris@ex.com','2026-02-03'),
+  (3,'Вера','Минск',NULL,'2026-03-15'), (4,'Глеб',NULL,'gleb@ex.com','2026-04-01'),
+  (5,'Дина','Алматы','dina@ex.com','2026-05-20'), (6,'Егор','Москва','egor@ex.com','2026-06-11');
+INSERT INTO categories VALUES
+  (1,'Электроника',NULL), (2,'Продукты',NULL), (3,'Посуда',NULL),
+  (4,'Ноутбуки',1), (5,'Периферия',1), (6,'Напитки',2);
+INSERT INTO products VALUES
+  (1,'Ноутбук','электроника',95000), (2,'Мышь','электроника',1500), (3,'Клавиатура','электроника',4200),
+  (4,'Кофе 1 кг','продукты',1800), (5,'Чай','продукты',600), (6,'Кружка','посуда',900),
+  (7,'Монитор','электроника',32000), (8,'Наушники','электроника',7800);
+INSERT INTO orders VALUES
+  (101,1,'paid','2026-06-01'), (102,1,'shipped','2026-06-15'), (103,2,'paid','2026-06-20'),
+  (104,3,'cancelled','2026-07-02'), (105,2,'new','2026-07-05'), (106,5,'paid','2026-07-09'),
+  (107,1,'paid','2026-08-01'), (108,6,'shipped','2026-08-12');
+INSERT INTO order_items VALUES
+  (101,1,1,95000), (101,2,1,1500), (102,4,2,1800), (103,7,1,32000), (103,2,2,1500),
+  (104,6,3,900), (105,5,5,600), (106,3,1,4200), (106,6,2,900), (107,4,1,1800),
+  (107,5,2,600), (108,1,1,93000);
+</script>
+
+</div></main>
+</div>
+</body>
+</html>
