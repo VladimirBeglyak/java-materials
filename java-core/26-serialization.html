@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>26 · Сериализация: JSON, Jackson, protobuf</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="26">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 26 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Сериализация: JSON, Jackson, protobuf</h1>
+  <p class="lead">Сериализация — превращение объектов в байты/текст для хранения и передачи. Senior сталкивается с ней каждый день: DTO в REST, события в очереди, интеграции с внешними системами. Здесь — чем заменить встроенную Java-сериализацию, как работать с Jackson, и как выбирать формат: JSON, protobuf, Avro или XML.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">Jackson</span><span class="tag">JSON</span><span class="tag">protobuf</span><span class="tag">records</span><span class="tag">версионирование</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">26.1</span>Зачем сериализация</h2>
+<p>Сериализация решает две задачи: <b>передать</b> данные между процессами/системами (HTTP, очередь, файл) и <b>сохранить</b> их (кэш, БД, журнал). Правильный формат — это компромисс между читаемостью, размером, скоростью и совместимостью версий.</p>
+<div class="grid-3">
+  <div class="card"><h4>Читаемость</h4><p>JSON/XML читает человек; бинарные форматы — нет.</p></div>
+  <div class="card"><h4>Размер и скорость</h4><p>Бинарные (protobuf) компактнее и быстрее текстовых.</p></div>
+  <div class="card"><h4>Совместимость</h4><p>Возможность менять схему, не ломая старых клиентов.</p></div>
+</div>
+
+<h2 id="java-ser"><span class="h-num">26.2</span>Почему не встроенная Java-сериализация</h2>
+<p>Нативный <code>Serializable</code> (тема 13) опасен для обмена данными:</p>
+<div class="table-wrap"><table>
+<tr><th>Проблема</th><th>Следствие</th></tr>
+<tr><td>Связан с именами классов и полей</td><td>ломается при переименовании/рефакторинге, несовместим между версиями</td></tr>
+<tr><td>Десриализация вызывает конструкторы/методы</td><td>вектор атак (gadget chains), RCE через недоверенные данные</td></tr>
+<tr><td>Формат бинарный и Java-специфичный</td><td>не прочитать из другого языка</td></tr>
+<tr><td><code>serialVersionUID</code> вручную</td><td>лёгкий способ получить <code>InvalidClassException</code></td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">Правило</span>
+Встроенная Java-сериализация — только для устаревших внутренних механизмов. Для API, очередей и хранилищ используйте JSON (Jackson) или бинарный protobuf/Avro.</div>
+
+<h2 id="jackson"><span class="h-num">26.3</span>JSON и Jackson: чтение и запись</h2>
+<p>Jackson — стандарт де-факто для JSON в Java. <code>ObjectMapper</code> — потокобезопасен, создаётся один раз и переиспользуется.</p>
+<pre data-title="Сериализация и десериализация"><code class="java">public record Order(long id, String status, List&lt;OrderItem&gt; items) {}
+public record OrderItem(String productId, int qty) {}
+
+ObjectMapper mapper = new ObjectMapper();          // один на приложение
+
+Order order = new Order(42, "paid", List.of(new OrderItem("p1", 2)));
+String json = mapper.writeValueAsString(order);    // → {"id":42,"status":"paid","items":[{"productId":"p1","qty":2}]}
+
+Order back = mapper.readValue(json, Order.class);  // обратно</code></pre>
+<div class="callout ok"><span class="c-title">Records — идеальные DTO</span>
+Records автоматически дают конструктор, equals, hashCode и неизменяемость, а Jackson умеет их читать/писать без аннотаций (если имена полей совпадают с JSON).</div>
+
+<h2 id="annotations"><span class="h-num">26.4</span>Аннотации Jackson</h2>
+<pre data-title="Тонкая настройка"><code class="java">public record User(
+    @JsonProperty("full_name") String name,     // другое имя поля в JSON
+    @JsonIgnore String passwordHash,            // не сериализовать
+    @JsonInclude(JsonInclude.Include.NON_NULL)  // пропускать null (на классе)
+    String email
+) {}</code></pre>
+<div class="table-wrap"><table>
+<tr><th>Аннотация</th><th>Зачем</th></tr>
+<tr><td><code>@JsonProperty</code></td><td>переименовать поле, задать порядок</td></tr>
+<tr><td><code>@JsonIgnore</code></td><td>исключить поле (секреты, вычисляемые значения)</td></tr>
+<tr><td><code>@JsonInclude</code></td><td>не писать null/пустые (меньше трафика, чище контракт)</td></tr>
+<tr><td><code>@JsonFormat</code></td><td>формат даты/числа</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Не раскрывайте внутренние объекты</span>
+Сериализуйте DTO, а не сущности JPA/доменные классы: иначе наружу утекут поля и связи, а добавление поля сущности незаметно изменит API.</div>
+
+<h2 id="formats"><span class="h-num">26.5</span>Выбор формата</h2>
+<div class="table-wrap"><table>
+<tr><th>Формат</th><th>Тип</th><th>Когда</th></tr>
+<tr><td>JSON</td><td>текстовый</td><td>REST API, конфиги, совместимость с браузером/JS; по умолчанию</td></tr>
+<tr><td>protobuf</td><td>бинарный</td><td>межсервисный gRPC, высокая пропускная способность, строгая схема</td></tr>
+<tr><td>Avro</td><td>бинарный, схема рядом</td><td>Kafka-стримы, data-пайплайны, эволюция схемы</td></tr>
+<tr><td>XML</td><td>текстовый</td><td>устаревшие интеграции (SOAP), когда контракт уже задан</td></tr>
+<tr><td>MessagePack/CBOR</td><td>бинарный JSON-подобный</td><td>когда нужен компактный JSON</td></tr>
+</table></div>
+<div class="callout info"><span class="c-title">Правило выбора</span>
+Если данные читает человек или браузер — JSON. Если это интенсивный обмен между своими сервисами и важны размер/скорость — protobuf (gRPC). Если потоковая аналитика и эволюция схемы — Avro.</div>
+
+<h2 id="protobuf"><span class="h-num">26.6</span>Protobuf: схема и бинарный формат</h2>
+<p>Protobuf описывает данные схемой (<code>.proto</code>), из которой генерируются классы. Поля имеют номера — они и есть «имя» в бинарном формате.</p>
+<pre data-title="Схема protobuf"><code class="txt">syntax = "proto3";
+
+message Order {
+  int64 id = 1;              // номер поля = идентификатор в бинарном виде
+  string status = 2;
+  repeated OrderItem items = 3;
+}
+message OrderItem {
+  string product_id = 1;
+  int32 qty = 2;
+}</code></pre>
+<div class="callout ok"><span class="c-title">Ключевое свойство protobuf</span>
+Номер поля — это и есть ключ в бинарном формате. Поэтому можно добавлять новые поля (с новыми номерами) и не ломать старых читателей: неизвестные поля просто игнорируются.</div>
+
+<h2 id="versioning"><span class="h-num">26.7</span>Версионирование и совместимость</h2>
+<ol class="steps">
+  <li><b>Добавляйте поля, не удаляйте и не переиспользуйте номера</b> (protobuf) — старые читатели проигнорируют новое, новые получат старое значение по умолчанию.</li>
+  <li><b>В JSON — добавляйте, не переименовывайте.</b> Лишние поля в JSON по умолчанию игнорируются (в Jackson — настройкой <code>FAIL_ON_UNKNOWN_PROPERTIES</code>).</li>
+  <li><b>Не меняйте тип/смысл существующего поля</b> — это ломает контракт тихо.</li>
+  <li><b>Для удаления поля</b> — сначала перестаньте писать, затем читать (двухфазный деплой).</li>
+  <li><b>Версионируйте API явно</b> (<code>/v1</code>, заголовок версии), когда меняете поведение, а не только схему.</li>
+</ol>
+
+<h2 id="quiz"><span class="h-num">26.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему встроенную Java-сериализацию нельзя использовать для обмена между системами?</p><ul><li>Она медленная</li><li>Связана с именами классов, небезопасна при десериализации и не переносима между языками</li><li>Она не поддерживает коллекции</li><li>Она текстовый формат</li></ul><div class="why">Serializable ломается при рефакторинге, уязвим к gadget-атакам и читается только из Java.</div></div>
+<div class="mcq" data-ok="0"><p>Как создать потокобезопасный ObjectMapper?</p><ul><li>Создать один экземпляр и переиспользовать</li><li>Создавать на каждый вызов</li><li>Обернуть в synchronized</li><li>Использовать static-блок</li></ul><div class="why">ObjectMapper потокобезопасен после настройки — держите один экземпляр на приложение.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает @JsonIgnore?</p><ul><li>Меняет имя поля</li><li>Форматирует дату</li><li>Исключает поле из сериализации/десериализации</li><li>Задаёт порядок полей</li></ul><div class="why">Прячет поля (секреты, вычисляемые значения) из JSON.</div></div>
+<div class="mcq" data-ok="3"><p>Почему в protobuf можно добавлять поля без поломки старых читателей?</p><ul><li>Потому что он текстовый</li><li>Потому что нет схемы</li><li>Потому что все поля опциональны</li><li>Поле идентифицируется номером, и неизвестные номера игнорируются</li></ul><div class="why">Старый читатель пропустит незнакомый номер; новое поле получит значение по умолчанию.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Когда выбирать JSON, а когда protobuf?</summary><div class="a"><p>JSON — REST/браузер/человекочитаемость, совместимость с JS; по умолчанию. Protobuf — интенсивный межсервисный обмен (gRPC), где важны размер, скорость и строгая схема.</p></div></details>
+<details class="q"><summary>Почему нельзя сериализовать JPA-сущности напрямую в API?</summary><div class="a"><p>Утекут внутренние поля и ленивые связи, а изменение сущности незаметно изменит публичный контракт. Для API — отдельные DTO (обычно records).</p></div></details>
+<details class="q"><summary>Как безопасно удалить поле из protobuf-схемы?</summary><div class="a"><p>Двухфазно: сначала перестать писать поле (все продюсеры обновлены), затем — читать. Номер поля при этом не переиспользовать под другое поле.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

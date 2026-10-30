@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · RabbitMQ против Kafka</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · ПРАКТИКА</div>
+  <h1>RabbitMQ против Kafka: выбор брокера</h1>
+  <p class="lead">RabbitMQ и Kafka решают похожие, но не одинаковые задачи. RabbitMQ — <b>умный брокер</b>, который следит за каждым сообщением; Kafka — <b>распределённый журнал</b>, который хранит всё и отдаёт позицию потребителю. Выбор сводится к тому, что важнее: сложная маршрутизация и задачи или масштаб, история и перечитывание.</p>
+  <div class="meta"><span class="tag">~1.5 часа</span><span class="tag">умный брокер vs журнал</span><span class="tag">сравнение</span><span class="tag">чек-лист</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="model"><span class="h-num">9.1</span>Умный брокер против журнала</h2>
+<div class="vs neutral">
+  <div class="card"><h4>RabbitMQ (умный брокер)</h4><p>Брокер хранит состояние каждого сообщения, маршрутизирует по правилам (exchange/routing key), подтверждает и удаляет после ack. Сообщение — «задача», которую нужно доставить одному обработчику.</p></div>
+  <div class="card"><h4>Kafka (журнал)</h4><p>Записи дописываются в журнал и хранятся по сроку независимо от чтения. Позицию хранит потребитель (offset), поэтому историю можно перечитывать и подключать новых читателей.</p></div>
+</div>
+
+<h2 id="table"><span class="h-num">9.2</span>Сравнение</h2>
+<div class="table-wrap"><table>
+<tr><th>Критерий</th><th>RabbitMQ</th><th>Kafka</th></tr>
+<tr><td>Модель</td><td>очередь задач, сообщение удаляется после ack</td><td>журнал, записи хранятся по ретенции</td></tr>
+<tr><td>Маршрутизация</td><td>гибкая (direct/topic/fanout/headers)</td><td>простая (топик → партиция по ключу)</td></tr>
+<tr><td>Порядок</td><td>внутри очереди, но конкуренция его ломает</td><td>внутри партиции строго</td></tr>
+<tr><td>Перечитывание истории</td><td>нет (сообщение ушло — ушло)</td><td>да (offset можно отмотать)</td></tr>
+<tr><td>Масштаб (пропускная способность)</td><td>десятки тысяч msg/s</td><td>миллионы msg/s</td></tr>
+<tr><td>Задачи с повторами/задержками/приоритетами</td><td>нативно (TTL, DLX, priority)</td><td>сложнее, вручную</td></tr>
+</table></div>
+
+<h2 id="scenarios"><span class="h-num">9.3</span>Сценарии</h2>
+<div class="grid-2">
+  <div class="card"><h4>Выбирайте RabbitMQ</h4><ul><li>Задачи: «отправить письмо», «сгенерировать отчёт»</li><li>Повторы с задержкой, приоритеты, RPC</li><li>Сложная маршрутизация (routing key/topic)</li><li>Умеренные объёмы, один обработчик на сообщение</li></ul></div>
+  <div class="card"><h4>Выбирайте Kafka</h4><ul><li>События: «заказ создан» для многих сервисов</li><li>Большой поток, история для аналитики/CDC</li><li>Перечитывание, потоковая обработка (Streams)</li><li>Порядок по ключу, высокая пропускная способность</li></ul></div>
+</div>
+<div class="callout info"><span class="c-title">Часто используют оба</span>
+Kafka — шина событий между сервисами; RabbitMQ — очередь задач внутри сервиса (или наоборот). Это не конкуренты «или-или», а инструменты разных слоёв.</div>
+
+<h2 id="checklist"><span class="h-num">9.4</span>Чек-лист выбора</h2>
+<ol class="steps">
+  <li><b>Сообщение — задача или событие?</b> Задача («сделай X») → RabbitMQ; событие («случилось X») → Kafka.</li>
+  <li><b>Сколько потребителей читают одно сообщение?</b> Один обработчик → очередь; много независимых читателей + история → журнал.</li>
+  <li><b>Нужны ли повторы/задержки/приоритеты?</b> Да → RabbitMQ проще.</li>
+  <li><b>Какой масштаб и нужна ли история?</b> Миллионы msg/s, аналитика, CDC → Kafka.</li>
+  <li><b>Нужно ли перечитывать прошлое?</b> Да → Kafka.</li>
+</ol>
+<p>Подробнее про Kafka — в пособии <a href="../system-design/index.html">System Design</a> (темы 12–14) и <a href="../db-choice/index.html">«Выбор базы данных»</a> (тема 12).</p>
+
+<h2 id="quiz"><span class="h-num">9.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В чём принципиальное различие моделей RabbitMQ и Kafka?</p><ul><li>Ни в чём</li><li>RabbitMQ удаляет сообщение после ack, Kafka хранит записи по ретенции с offset потребителя</li><li>Kafka не хранит сообщения</li><li>RabbitMQ не поддерживает очереди</li></ul><div class="why">Умный брокер vs журнал: состояние сообщения у брокера против позиции у потребителя.</div></div>
+<div class="mcq" data-ok="0"><p>Когда выбрать RabbitMQ, а не Kafka?</p><ul><li>Задачи с повторами/задержками/приоритетами и сложной маршрутизацией при умеренных объёмах</li><li>Миллионы событий в секунду</li><li>Перечитывание истории</li><li>Потоковая аналитика</li></ul><div class="why">RabbitMQ силён в задачах, маршрутизации и повторах; Kafka — в масштабе, истории и событиях.</div></div>
+<div class="mcq" data-ok="2"><p>Что важнее для события «заказ оплачен», нужного уведомлениям, бонусам и аналитике?</p><ul><li>Очередь задач</li><li>RabbitMQ fanout</li><li>Kafka: много независимых читателей + история</li><li>Одна общая очередь</li></ul><div class="why">Журнал отдаёт одно событие многим группам потребителей и позволяет перечитать историю.</div></div>
+<div class="mcq" data-ok="3"><p>Можно ли использовать RabbitMQ и Kafka вместе?</p><ul><li>Нет, это конфликтующие системы</li><li>Да, но только в разных дата-центрах</li><li>Только Kafka</li><li>Да: Kafka как шина событий, RabbitMQ как очередь задач внутри сервиса</li></ul><div class="why">Это разные слои: события между сервисами и задачи внутри сервиса.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему Kafka перечитывает историю, а RabbitMQ — нет?</summary><div class="a"><p>Kafka хранит записи по ретенции независимо от чтения, и позицию хранит потребитель — можно отмотать offset. RabbitMQ удаляет сообщение после ack, поэтому «прошлого» нет.</p></div></details>
+<details class="q"><summary>Сформулируйте правило выбора одной фразой.</summary><div class="a"><p>Задача с одним обработчиком, повторами и маршрутизацией — RabbitMQ; событие для многих читателей, с историей и большим потоком — Kafka.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

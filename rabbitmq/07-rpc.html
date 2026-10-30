@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · RPC поверх RabbitMQ</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · ПРАКТИКА</div>
+  <h1>RPC поверх RabbitMQ</h1>
+  <p class="lead">RabbitMQ — асинхронный брокер, но поверх него можно построить синхронный «запрос–ответ» (RPC): клиент публикует запрос и ждёт ответ в своей очереди. Паттерн решает задачу, когда нужно получить ответ от другого сервиса через очередь, но требует аккуратности с <code>correlationId</code> и таймаутами.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">RPC</span><span class="tag">reply-to</span><span class="tag">correlationId</span><span class="tag">таймауты</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="pattern"><span class="h-num">7.1</span>Паттерн запрос–ответ</h2>
+<p>Клиент создаёт временную очередь ответов, кладёт в запрос её имя (<code>reply_to</code>) и уникальный <code>correlation_id</code>. Сервер обрабатывает запрос и публикует ответ в <code>reply_to</code> с тем же <code>correlation_id</code>. Клиент читает свою очередь и сопоставляет ответ по id.</p>
+<div class="flow col">
+  <span class="node"><b>Клиент</b><small>reply_to=rpc.resp.1, correlation_id=42</small></span><span class="to">запрос →</span>
+  <span class="node info"><b>rpc.queue</b></span><span class="to">→</span>
+  <span class="node acc"><b>Сервер</b><small>обрабатывает</small></span><span class="to">ответ →</span>
+  <span class="node ok"><b>rpc.resp.1</b><small>correlation_id=42</small></span><span class="to">←</span>
+  <span class="node"><b>Клиент</b><small>совпал id → готово</small></span>
+</div>
+
+<h2 id="correlation"><span class="h-num">7.2</span>correlationId и reply-to</h2>
+<p>Без <code>correlation_id</code> клиент не отличит ответы разных запросов в общей очереди; без <code>reply_to</code> сервер не узнает, куда отвечать.</p>
+<pre data-title="Клиент: публикация запроса (концептуально)"><code class="java">String replyQueue = channel.queueDeclare().getQueue();      // временная очередь
+String corrId = UUID.randomUUID().toString();
+
+AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+        .correlationId(corrId)
+        .replyTo(replyQueue)
+        .build();
+channel.basicPublish("", "rpc.queue", props, requestBody);
+
+// читаем replyQueue, пока не встретим correlationId == corrId</code></pre>
+<div class="callout ok"><span class="c-title">Одна очередь на запрос или общая</span>
+Проще — временная очередь на каждый запрос (reply_to уникален). Можно и общую очередь ответов, но тогда correlationId обязателен для разбора, и очередь нужно чистить от «чужих»/просроченных ответов.</div>
+
+<h2 id="pitfalls"><span class="h-num">7.3</span>Таймауты и ловушки</h2>
+<div class="table-wrap"><table>
+<tr><th>Ловушка</th><th>Решение</th></tr>
+<tr><td>Ответ потерян — клиент ждёт вечно</td><td>таймаут ожидания, обработать как ошибку</td></tr>
+<tr><td>Сервер упал после обработки, до отправки ответа</td><td>идемпотентность запроса, повтор с тем же correlationId</td></tr>
+<tr><td>«Чужие» ответы в общей очереди</td><td>уникальный correlationId и фильтр</td></tr>
+<tr><td>RPC вместо событий там, где ответ не нужен</td><td>не строить RPC ради RPC: если ответ не нужен — обычная очередь</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">RPC — не замена HTTP без причины</span>
+Синхронный вызов через очередь добавляет задержку и сложность. RPC уместен, когда общение уже идёт через брокер и нужен ответ «здесь и сейчас» (например, запрос расчёта цены).</div>
+
+<h2 id="quiz"><span class="h-num">7.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Зачем нужен correlationId в RPC?</p><ul><li>Сопоставить ответ с конкретным запросом среди многих</li><li>Зашифровать сообщение</li><li>Ускорить доставку</li><li>Задать приоритет</li></ul><div class="why">В очереди ответов может быть несколько сообщений; correlationId связывает ответ с запросом.</div></div>
+<div class="mcq" data-ok="0"><p>Что указывает reply_to в запросе?</p><ul><li>Очередь, куда сервер должен отправить ответ</li><li>Адрес продюсера</li><li>Exchange для маршрутизации</li><li>Имя потребителя</li></ul><div class="why">reply_to — имя очереди ответов клиента; сервер публикует ответ туда.</div></div>
+<div class="mcq" data-ok="2"><p>Что делать, если ответ RPC не пришёл за таймаут?</p><ul><li>Ждать бесконечно</li><li>Удалить очередь</li><li>Завершить запрос ошибкой; при повторе — идемпотентность запроса</li><li>Игнорировать</li></ul><div class="why">Таймаут обязателен; повтор безопасен только при идемпотентном сервере.</div></div>
+<div class="mcq" data-ok="3"><p>Когда RPC поверх RabbitMQ уместен?</p><ul><li>Всегда вместо HTTP</li><li>Когда общение уже идёт через брокер и нужен синхронный ответ</li><li>Только для fanout</li><li>Никогда</li></ul><div class="why">RPC добавляет задержку и сложность; его используют, когда нужен ответ и инфраструктура брокера уже есть.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите полный цикл RPC-вызова.</summary><div class="a"><p>Клиент объявляет очередь ответов, публикует запрос с reply_to и correlationId. Сервер читает запрос, обрабатывает и публикует ответ в reply_to с тем же correlationId. Клиент читает свою очередь, находит ответ по correlationId и возвращает результат вызывающему.</p></div></details>
+<details class="q"><summary>Временная очередь на запрос или общая очередь ответов — что выбрать?</summary><div class="a"><p>Временная очередь проще: reply_to уникален, чужих ответов нет, очередь удаляется сама. Общая экономит очереди, но требует строгой фильтрации по correlationId и чистки просроченных ответов.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

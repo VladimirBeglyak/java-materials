@@ -28,7 +28,10 @@
     { id: "20", file: "20-solid-clean-code.html", title: "SOLID и чистый код", tier: "m", group: "Инженерная практика" },
     { id: "21", file: "21-build-tools.html", title: "Сборка: classpath, JAR, Maven, Gradle", tier: "j", group: "Инженерная практика" },
     { id: "22", file: "22-jdbc.html", title: "JDBC: работа с базой данных", tier: "m", group: "Инженерная практика" },
-    { id: "23", file: "23-testing.html", title: "Тестирование: JUnit 5, AssertJ, Mockito", tier: "m", group: "Инженерная практика" }
+    { id: "23", file: "23-testing.html", title: "Тестирование: JUnit 5, AssertJ, Mockito", tier: "m", group: "Инженерная практика" },
+    { id: "26", file: "26-serialization.html", title: "Сериализация: JSON, Jackson, protobuf", tier: "m", group: "Инженерная практика" },
+    { id: "27", file: "27-logging.html", title: "Логирование: SLF4J, Logback, уровни", tier: "m", group: "Инженерная практика" },
+    { id: "28", file: "28-http-client.html", title: "HTTP-клиент: HttpClient и RestClient", tier: "m", group: "Инженерная практика" }
   ];
   var TIER = { j: "Junior", m: "Middle", s: "Senior" };
   var KEY = "jcore-guide-done-v1";

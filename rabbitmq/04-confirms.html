@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Подтверждения: publisher confirms и consumer ack</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · НАДЁЖНОСТЬ</div>
+  <h1>Подтверждения: publisher confirms и consumer ack</h1>
+  <p class="lead">Надёжность доставки держится на двух независимых механизмах подтверждений: <b>publisher confirms</b> — продюсер узнаёт, что брокер принял сообщение; <b>consumer ack</b> — брокер узнаёт, что потребитель обработал сообщение. Их сочетание и определяет гарантию: at-least-once или at-most-once.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">publisher confirms</span><span class="tag">ack/nack</span><span class="tag">at-least-once</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="producer"><span class="h-num">4.1</span>Publisher confirms</h2>
+<p>По умолчанию продюсер не знает, принял ли брокер сообщение (оно могло потеряться по пути). Включив <b>publisher confirms</b>, продюсер получает от брокера подтверждение (<code>basic.ack</code>) или отказ (<code>basic.nack</code>).</p>
+<div class="flow">
+  <span class="node"><b>Producer</b></span><span class="to">publish →</span>
+  <span class="node info"><b>Broker</b><small>принял и сохранил</small></span><span class="to">← confirm →</span>
+  <span class="node ok"><b>Producer</b><small>можно забыть сообщение</small></span>
+</div>
+<div class="callout info"><span class="c-title">Confirm ≠ доставка потребителю</span>
+Confirm означает «брокер принял в очередь», а не «потребитель обработал». Дальше за доставку отвечает consumer ack.</div>
+
+<h2 id="consumer"><span class="h-num">4.2</span>Consumer ack / nack / reject</h2>
+<p>Потребитель подтверждает обработку. Брокер удаляет сообщение только после <code>ack</code>; при <code>nack</code>/<code>reject</code> можно вернуть сообщение в очередь (<code>requeue</code>) или отправить в DLX.</p>
+<div class="table-wrap"><table>
+<tr><th>Действие</th><th>Эффект</th></tr>
+<tr><td><code>basic.ack</code></td><td>удалить сообщение из очереди</td></tr>
+<tr><td><code>basic.nack</code> (requeue=true)</td><td>вернуть в очередь (может зациклиться!)</td></tr>
+<tr><td><code>basic.reject</code> (requeue=false)</td><td>отклонить; уйдёт в DLX, если настроен</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">ack обязателен при autoAck=false</span>
+Если потребитель упал до ack, брокер вернёт сообщение в очередь — это и есть at-least-once. Если включить autoAck, сообщение удаляется сразу при выдаче — риск потери (at-most-once).</div>
+
+<h2 id="guarantees"><span class="h-num">4.3</span>At-least-once против at-most-once</h2>
+<div class="vs">
+  <div class="card"><h4>At-least-once (стандарт)</h4><p>confirms включены, autoAck=false. Сообщение доставят, возможно, больше одного раза (повтор после сбоя). Обработчик должен быть <b>идемпотентным</b>.</p></div>
+  <div class="card"><h4>At-most-once</h4><p>autoAck=true или нет confirms. Сообщение может потеряться, зато без дублей. Годится для некритичных метрик.</p></div>
+</div>
+<div class="callout ok"><span class="c-title">Exactly-once не существует</span>
+RabbitMQ (как и почти любой брокер) не даёт exactly-once между брокером и внешним миром. Практический рецепт — at-least-once + идемпотентный потребитель.</div>
+
+<h2 id="quiz"><span class="h-num">4.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что подтверждает publisher confirm?</p><ul><li>Что потребитель обработал сообщение</li><li>Что брокер принял и сохранил сообщение в очереди</li><li>Что сообщение удалено</li><li>Что сообщение зашифровано</li></ul><div class="why">Confirm — «брокер принял». Доставку потребителю подтверждает уже consumer ack.</div></div>
+<div class="mcq" data-ok="0"><p>Когда брокер удаляет сообщение из очереди?</p><ul><li>После consumer ack (при autoAck=false)</li><li>Сразу при выдаче</li><li>При публикации</li><li>Никогда</li></ul><div class="why">При ручном ack сообщение живёт в очереди до подтверждения; упал потребитель — вернётся (at-least-once).</div></div>
+<div class="mcq" data-ok="2"><p>Чем опасен requeue=true при nack?</p><ul><li>Ничем</li><li>Он удаляет сообщение</li><li>Плохое сообщение будет возвращаться и обрабатываться бесконечно</li><li>Он ломает очередь</li></ul><div class="why">Повторный requeue «ядовитого» сообщения зациклит обработку. Лучше nack без requeue → DLX (тема 05).</div></div>
+<div class="mcq" data-ok="3"><p>Как добиться надёжной доставки без дублей эффектов?</p><ul><li>Включить autoAck</li><li>Отключить confirms</li><li>Использовать only fanout</li><li>At-least-once + идемпотентный потребитель</li></ul><div class="why">Exactly-once нет; дубли неизбежны при повторах, поэтому обработчик должен быть идемпотентным.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Опишите путь «надёжного» сообщения с обоими подтверждениями.</summary><div class="a"><p>Продюсер публикует с confirms и ждёт ack от брокера (сообщение в durable-очереди, persistent). Потребитель берёт сообщение (autoAck=false), обрабатывает и шлёт ack. При сбое до ack брокер вернёт сообщение — доставка at-least-once.</p></div></details>
+<details class="q"><summary>Почему exactly-once недостижим между брокером и БД/API?</summary><div class="a"><p>У брокера и внешней системы нет общей транзакции: падение между «обработал» и «подтвердил» даёт повтор. Решение — идемпотентность потребителя, а не попытка убрать дубли средствами брокера.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

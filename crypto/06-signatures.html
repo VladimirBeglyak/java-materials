@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Цифровые подписи и сертификаты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · КЛЮЧИ И ДОВЕРИЕ</div>
+  <h1>Цифровые подписи и сертификаты</h1>
+  <p class="lead">Цифровая подпись доказывает, что данные пришли от конкретного владельца ключа и не были изменены. На подписях строится вся система доверия в интернете: сертификаты связывают открытый ключ с именем сайта, а цепочка сертификатов доводит доверие до корневого удостоверяющего центра.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">подпись</span><span class="tag">сертификат</span><span class="tag">PKI</span><span class="tag">цепочка доверия</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="sign"><span class="h-num">6.1</span>Как работает подпись</h2>
+<p>Подписывают <b>закрытым</b> ключом, проверяют <b>открытым</b>. Подписывают не сами данные, а их хэш (быстрее и короче). Схема: взять хэш данных → зашифровать его закрытым ключом → это подпись. Проверка: расшифровать подпись открытым ключом и сравнить с хэшем данных.</p>
+<div class="flow">
+  <span class="node"><b>данные</b></span><span class="to">→</span>
+  <span class="node info"><b>хэш</b><small>SHA-256</small></span><span class="to">→</span>
+  <span class="node acc"><b>подпись</b><small>закрытым ключом</small></span>
+</div>
+<pre data-title="Подписать файл (openssl)"><code class="shell">$ openssl dgst -sha256 -sign priv.pem -out data.sig data.txt      # подпись
+$ openssl dgst -sha256 -verify pub.pem -signature data.sig data.txt  # проверка
+Verified OK</code></pre>
+<div class="callout info"><span class="c-title">Подпись ≠ шифрование</span>
+Подпись не скрывает данные — она лишь доказывает авторство и целостность. Подписанный документ остаётся читаемым. Для конфиденциальности нужен отдельный слой шифрования.</div>
+
+<h2 id="why"><span class="h-num">6.2</span>Что подпись гарантирует</h2>
+<div class="table-wrap"><table>
+<tr><th>Свойство</th><th>Как достигается</th></tr>
+<tr><td>Аутентичность</td><td>подписать мог только владелец закрытого ключа</td></tr>
+<tr><td>Целостность</td><td>изменение данных меняет хэш → проверка не сойдётся</td></tr>
+<tr><td>Неотказуемость</td><td>владелец не может отрицать, что подписал (в рамках доверия к его ключу)</td></tr>
+</table></div>
+
+<h2 id="cert"><span class="h-num">6.3</span>Сертификаты и цепочки доверия</h2>
+<p>Откуда известно, что открытый ключ принадлежит именно <code>bank.by</code>? Эту связь удостоверяет <b>сертификат</b> — открытый ключ + имя + срок действия + подпись удостоверяющего центра (CA).</p>
+<pre data-title="Посмотреть сертификат сайта"><code class="shell">$ openssl s_client -connect bank.by:443 -servername bank.by &lt;/dev/null 2&gt;/dev/null \
+    | openssl x509 -noout -subject -issuer -dates
+subject=CN=bank.by
+issuer=CN=Some Root CA</code></pre>
+<div class="flow col">
+  <span class="node acc"><b>Корневой CA</b><small>подписан сам собой, встроен в ОС/браузер</small></span><span class="to">подписывает ↓</span>
+  <span class="node info"><b>Промежуточный CA</b><small>подписан корневым</small></span><span class="to">подписывает ↓</span>
+  <span class="node ok"><b>Сертификат сайта</b><small>подписан промежуточным</small></span>
+</div>
+<p>Проверка идёт снизу вверх: сертификат сайта → промежуточный → корневой, который уже есть в доверенном хранилище. Если звено не сходится (истёк срок, не совпадает имя, подпись неверна) — соединение отклоняется.</p>
+<div class="callout ok"><span class="c-title">Цепочка доверия</span>
+Доверие в PKI не вычисляется, а <b>назначается</b>: вы доверяете корневым CA, которые предустановлены в системе. Поэтому так важно не добавлять в truststore посторонние корневые сертификаты.</div>
+
+<h2 id="quiz"><span class="h-num">6.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Каким ключом подписывают данные?</p><ul><li>Открытым</li><li>Закрытым</li><li>Любым</li><li>Симметричным</li></ul><div class="why">Подпись создаётся закрытым ключом (только у владельца), проверяется открытым (у всех).</div></div>
+<div class="mcq" data-ok="0"><p>Что именно подписывается в цифровой подписи?</p><ul><li>Хэш данных, а не сами данные (быстрее и короче)</li><li>Сами данные целиком</li><li>Только имя файла</li><li>Случайное число</li></ul><div class="why">Подписывается хэш — подпись получается короткой и не зависит от размера данных.</div></div>
+<div class="mcq" data-ok="2"><p>Что связывает сертификат?</p><ul><li>Имя пользователя с паролем</li><li>IP-адрес с портом</li><li>Открытый ключ с именем (субъектом) и доверием через подпись CA</li><li>Хэш с солью</li></ul><div class="why">Сертификат — это открытый ключ + идентичность + подпись удостоверяющего центра.</div></div>
+<div class="mcq" data-ok="3"><p>Почему нельзя слепо добавлять чужой корневой сертификат в truststore?</p><ul><li>Он замедлит TLS</li><li>Он занимает много места</li><li>Он несовместим</li><li>Вы делегируете доверие этому CA — он сможет подписывать сертификаты любых сайтов от вашего имени</li></ul><div class="why">Корневой CA — точка полного доверия: его ключом можно выпускать сертификаты для чего угодно.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Подпись шифрует данные? Объясните разницу.</summary><div class="a"><p>Нет. Подпись доказывает авторство и целостность, но данные остаются открытыми. Шифрование скрывает содержимое, но само по себе не доказывает, кто отправил. Часто их используют вместе: зашифровать и подписать.</p></div></details>
+<details class="q"><summary>Как проверяется цепочка сертификатов?</summary><div class="a"><p>Снизу вверх: у сертификата сайта проверяются подпись, срок и имя; затем у его издателя — то же, и так до корневого, который уже есть в доверенном хранилище. Любое несовпадение разрывает доверие.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

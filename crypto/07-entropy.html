@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Энтропия и генерация ключей</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · КЛЮЧИ И ДОВЕРИЕ</div>
+  <h1>Энтропия и генерация ключей</h1>
+  <p class="lead">Ключи и nonce должны быть <b>непредсказуемыми</b>. Вся криптография рушится, если «случайные» значения на самом деле предсказуемы: если злоумышленник угадает ключ или nonce, шифрование бесполезно. Поэтому генерация случайности — фундамент, и здесь нельзя экономить на качестве источника.</p>
+  <div class="meta"><span class="tag">~1.5 часа</span><span class="tag">энтропия</span><span class="tag">SecureRandom</span><span class="tag">nonce</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="entropy"><span class="h-num">7.1</span>Что такое энтропия</h2>
+<p>Энтропия — мера непредсказуемости. Криптографический генератор берёт энтропию из непредсказуемых физических источников (тайминги устройств, шум) и «собирает» из неё случайные байты. Чем больше энтропии, тем больше вариантов должен перебрать атакующий.</p>
+<div class="table-wrap"><table>
+<tr><th>Источник</th><th>Предсказуем</th><th>Годен для ключей</th></tr>
+<tr><td><code>java.util.Random</code></td><td>да (детерминированный seed)</td><td>❌</td></tr>
+<tr><td><code>Math.random()</code></td><td>да</td><td>❌</td></tr>
+<tr><td>текущее время (System.currentTimeMillis)</td><td>да</td><td>❌</td></tr>
+<tr><td><code>SecureRandom</code> (ОС-энтропия)</td><td>нет</td><td>✅</td></tr>
+</table></div>
+
+<h2 id="securerandom"><span class="h-num">7.2</span>SecureRandom против java.util.Random</h2>
+<p><code>java.util.Random</code> — псевдослучайный генератор (LCG), который полностью определяется начальным seed. Зная seed (например, время запуска), атакующий воспроизводит всю последовательность. <code>SecureRandom</code> черпает энтропию из ОС и не предсказуем.</p>
+<pre data-title="Правильная генерация ключа в Java"><code class="java">// SecureRandom для ключей и nonce
+SecureRandom random = new SecureRandom();        // не задавайте seed вручную!
+byte[] key = new byte[32];                        // 256 бит для AES-256
+random.nextBytes(key);
+
+// НЕ для ключей:
+// Random r = new Random(42);  → последовательность воспроизводима</code></pre>
+<div class="callout bad"><span class="c-title">Не засевайте SecureRandom вручную</span>
+<code>new SecureRandom(seedBytes)</code> или повторное использование одного и того же seed делает генератор детерминированным. Дайте SecureRandom взять энтропию из ОС самому.</div>
+
+<h2 id="nonce"><span class="h-num">7.3</span>Nonce и случайность</h2>
+<p>Для GCM nonce должен быть <b>уникальным</b>, для CBC IV — <b>случайным</b>. Оба требования удовлетворяются генерацией через SecureRandom нужной длины (для GCM обычно 96 бит / 12 байт).</p>
+<pre><code class="java">byte[] nonce = new byte[12];                       // 96 бит для GCM
+new SecureRandom().nextBytes(nonce);               // случайный nonce
+// или строгий монотонный счётчик, если гарантирована уникальность</code></pre>
+
+<h2 id="quiz"><span class="h-num">7.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему java.util.Random нельзя использовать для ключей?</p><ul><li>Он медленный</li><li>Он предсказуем: зная seed, можно воспроизвести всю последовательность</li><li>Он возвращает только int</li><li>Он не входит в JDK</li></ul><div class="why">Random — детерминированный LCG. Для ключей нужна криптографическая случайность SecureRandom.</div></div>
+<div class="mcq" data-ok="0"><p>Откуда SecureRandom берёт случайность?</p><ul><li>Из непредсказуемых источников энтропии ОС</li><li>Из текущего времени</li><li>Из фиксированного seed</li><li>Из java.util.Random</li></ul><div class="why">SecureRandom опирается на ОС-источник энтропии (например, /dev/urandom, RDRAND), не предсказуемый извне.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли задавать SecureRandom свой фиксированный seed?</p><ul><li>Да, это стандартная практика</li><li>Да, если seed длинный</li><li>Нет — это делает генератор детерминированным и предсказуемым</li><li>Только в тестах можно</li></ul><div class="why">Фиксированный seed воспроизводит последовательность — атакующий сможет её повторить. (В тестах — допустимо, но не в проде.)</div></div>
+<div class="mcq" data-ok="3"><p>Какой длины nonce обычно используют для AES-GCM?</p><ul><li>8 бит</li><li>32 бита</li><li>64 бита</li><li>96 бит (12 байт)</li></ul><div class="why">12 байт — рекомендуемая длина nonce для GCM; главное требование — уникальность на ключ.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что такое энтропия в контексте криптографии?</summary><div class="a"><p>Мера непредсказуемости. Криптографический генератор собирает энтропию из физических источников и превращает её в случайные байты для ключей и nonce. Без энтропии нет безопасности.</p></div></details>
+<details class="q"><summary>Чем требования к IV (CBC) и nonce (GCM) различаются?</summary><div class="a"><p>IV в CBC должен быть случайным и непредсказуемым; nonce в GCM — строго уникальным на ключ (случайный или счётчик), но не обязан быть секретным. Повтор nonce в GCM катастрофичен.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

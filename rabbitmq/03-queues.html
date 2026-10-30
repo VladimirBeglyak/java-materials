@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Очереди: durable, TTL, приоритеты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · ОСНОВЫ</div>
+  <h1>Очереди: durable, TTL, приоритеты</h1>
+  <p class="lead">Очередь — не просто список: у неё и у сообщений есть свойства, которые определяют, переживёт ли сообщение перезапуск брокера, сколько оно проживёт и в каком порядке будет обработано. Здесь — про долговечность, TTL и приоритеты.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">durable/persistent</span><span class="tag">TTL</span><span class="tag">приоритеты</span><span class="tag">DLX</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="durable"><span class="h-num">3.1</span>Durable и persistent</h2>
+<p>Две независимые вещи, которые часто путают:</p>
+<div class="table-wrap"><table>
+<tr><th>Свойство</th><th>Что переживает</th><th>Где задаётся</th></tr>
+<tr><td>очередь <code>durable</code></td><td>перезапуск брокера (очередь остаётся)</td><td>при объявлении очереди</td></tr>
+<tr><td>сообщение <code>persistent</code></td><td>перезапуск брокера (сообщение остаётся)</td><td>delivery_mode=2 у сообщения</td></tr>
+</table></div>
+<pre data-title="Долговечная очередь и стойкое сообщение"><code class="shell"># durable-очередь + persistent-сообщение переживут рестарт брокера
+$ rabbitmqadmin declare queue name=orders durable=true
+$ rabbitmqadmin publish exchange=amq.default routing_key=orders \
+    payload="..." properties='{"delivery_mode":2}'</code></pre>
+<div class="callout warn"><span class="c-title">Оба должны быть заданы</span>
+Durable-очередь с нестойкими сообщениями теряет сообщения; стойкие сообщения в не-durable-очереди — тоже (очередь исчезнет). Для гарантии нужны оба, плюс publisher confirms (тема 04).</div>
+
+<h2 id="ttl"><span class="h-num">3.2</span>TTL: время жизни</h2>
+<p>TTL можно задать на уровне очереди (все сообщения живут N) или на уровне сообщения (переопределяет очередь). Просроченное сообщение удаляется или, при настроенном DLX, уходит в dead-letter (тема 05).</p>
+<pre data-title="TTL очереди и сообщения"><code class="shell">$ rabbitmqadmin declare queue name=notifications arguments='{"x-message-ttl":60000}'   # 60 с
+
+# TTL на сообщение (переопределяет очередь)
+$ rabbitmqadmin publish routing_key=notifications payload="..." \
+    properties='{"expiration":"30000"}'</code></pre>
+<div class="callout info"><span class="c-title">TTL + DLX = отложенная очередь</span>
+Сообщение с TTL, попав в очередь с DLX, по истечении срока уходит в другую очередь — так делают отложенную доставку и повторы (тема 05).</div>
+
+<h2 id="priority"><span class="h-num">3.3</span>Приоритетные очереди</h2>
+<p>Очередь с <code>x-max-priority</code> обрабатывает сообщения по приоритету (число в заголовке <code>priority</code>), а не строго FIFO.</p>
+<pre><code class="shell">$ rabbitmqadmin declare queue name=tasks arguments='{"x-max-priority":10}'
+
+# приоритет 10 обработается раньше приоритета 1
+$ rabbitmqadmin publish routing_key=tasks payload="urgent" properties='{"priority":10}'
+$ rabbitmqadmin publish routing_key=tasks payload="normal" properties='{"priority":1}'</code></pre>
+<div class="callout warn"><span class="c-title">Цена приоритетов</span>
+Приоритетные очереди дороже: брокер поддерживает несколько внутренних очередей и сортирует. Используйте умеренно (до ~10 уровней) и не для огромных очередей.</div>
+
+<h2 id="dlx"><span class="h-num">3.4</span>DLX: куда уходят «плохие» сообщения</h2>
+<p>Dead-letter exchange (DLX) — exchange, куда брокер отправляет сообщение, если оно отклонено (<code>reject</code>/<code>nack</code> без requeue), просрочено (TTL) или очередь переполнена. Это основа обработки ошибок и повторов — детально в теме 05.</p>
+<pre><code class="shell">$ rabbitmqadmin declare queue name=orders.dead
+$ rabbitmqadmin declare queue name=orders \
+    arguments='{"x-dead-letter-exchange":"", "x-dead-letter-routing-key":"orders.dead"}'</code></pre>
+
+<h2 id="quiz"><span class="h-num">3.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем durable-очередь отличается от persistent-сообщения?</p><ul><li>Ничем</li><li>Durable — очередь переживает рестарт; persistent — сообщение переживает рестарт</li><li>Persistent быстрее</li><li>Durable относится к сообщению</li></ul><div class="why">Два независимых свойства: для сохранности нужны оба — durable-очередь и persistent-сообщение (delivery_mode=2).</div></div>
+<div class="mcq" data-ok="0"><p>Что происходит с сообщением по истечении TTL?</p><ul><li>Оно отправляется продюсеру обратно</li><li>Оно удаляется или уходит в DLX, если он настроен</li><li>Оно обрабатывается немедленно</li><li>Оно блокирует очередь</li></ul><div class="why">Просроченное сообщение удаляется, либо при x-dead-letter-exchange уходит в dead-letter очередь.</div></div>
+<div class="mcq" data-ok="2"><p>Зачем нужен DLX?</p><ul><li>Ускорять доставку</li><li>Шифровать сообщения</li><li>Перехватывать отклонённые/просроченные/переполненные сообщения в отдельную очередь</li><li>Дублировать сообщения</li></ul><div class="why">DLX — запасной exchange для «плохих» сообщений: основа повторов и dead-letter очередей.</div></div>
+<div class="mcq" data-ok="3"><p>Как сделать отложенную доставку сообщения?</p><ul><li>Только через cron</li><li>Никак</li><li>Через Kafka</li><li>TTL на сообщении + DLX: по истечении срока оно уйдёт в целевую очередь</li></ul><div class="why">Сообщение лежит в промежуточной очереди с TTL, затем DLX перенаправляет его в рабочую очередь.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что нужно для гарантии «сообщение переживёт рестарт брокера»?</summary><div class="a"><p>Durable-очередь + persistent-сообщение (delivery_mode=2) + publisher confirms, чтобы знать, что брокер принял и сохранил сообщение (тема 04). Любое звено в отдельности не даёт гарантии.</p></div></details>
+<details class="q"><summary>Почему приоритетные очереди дороже обычных?</summary><div class="a"><p>Брокер поддерживает внутренние очереди на каждый уровень приоритета и при выдаче выбирает сообщения с высшим приоритетом — это лишняя работа и память. Поэтому уровней должно быть немного.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Шифрование данных at rest</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · ПРИМЕНЕНИЕ</div>
+  <h1>Шифрование данных at rest</h1>
+  <p class="lead">Шифрование «at rest» защищает данные, которые лежат на диске или в резервных копиях, — от кражи самого носителя, а не от работы с ними. Его смысл: если диск или бэкап украдут, содержимое останется недоступным. Ключевой вопрос — не «какой алгоритм», а <b>где лежит ключ</b>.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">full-disk</span><span class="tag">тома/файлы</span><span class="tag">БД</span><span class="tag">ключи</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="levels"><span class="h-num">10.1</span>Уровни шифрования at rest</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Что защищает</th><th>От чего НЕ защищает</th></tr>
+<tr><td>Диск (full-disk)</td><td>весь носитель целиком</td><td>доступ работающей ОС</td></tr>
+<tr><td>Том/файловая система</td><td>отдельный раздел или файлы</td><td>доступ смонтированного тома</td></tr>
+<tr><td>Файлы</td><td>конкретные файлы/архивы</td><td>доступ к процессу с ключом</td></tr>
+<tr><td>База данных</td><td>файлы БД, отдельные столбцы</td><td>SQL-доступ к расшифрованным данным</td></tr>
+<tr><td>Приложение (field-level)</td><td>отдельные поля</td><td>— (тема 11)</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Общее ограничение</span>
+Любое шифрование at rest защищает «украли носитель», но не «вломились в работающую систему»: когда ОС/БД/приложение работают, данные уже расшифрованы в памяти. Это не замена контролю доступа.</div>
+
+<h2 id="disk"><span class="h-num">10.2</span>Шифрование диска</h2>
+<p>Full-disk encryption (BitLocker на Windows, LUKS на Linux, FileVault на macOS) шифрует весь диск прозрачно для ОС. Ключ часто «запечатан» в TPM (аппаратный модуль): диск расшифровывается только на этом железе.</p>
+<pre data-title="LUKS на Linux (концептуально)"><code class="shell">$ cryptsetup luksFormat /dev/sdb1        # инициализировать зашифрованный том
+$ cryptsetup open /dev/sdb1 data         # открыть (запросит пароль/ключ)
+$ mkfs.ext4 /dev/mapper/data             # дальше — обычная ФС</code></pre>
+
+<h2 id="files"><span class="h-num">10.3</span>Шифрование файлов и архивов</h2>
+<pre data-title="Зашифровать файл симметричным ключом"><code class="shell">$ openssl enc -aes-256-gcm -salt -pbkdf2 -in secret.txt -out secret.txt.enc
+$ openssl enc -aes-256-gcm -d -salt -pbkdf2 -in secret.txt.enc -out secret.txt</code></pre>
+<div class="callout info"><span class="c-title">Ключ из пароля</span>
+Опция <code>-pbkdf2</code> заставляет openssl выводить ключ из пароля через PBKDF2 (тема 08), а не устаревшим слабым способом. Всегда указывайте её при шифровании файла паролем.</div>
+
+<h2 id="db"><span class="h-num">10.4</span>Шифрование в базе данных</h2>
+<div class="grid-2">
+  <div class="card"><h4>Прозрачное (TDE)</h4><p>СУБД шифрует файлы данных «под капотом» (PostgreSQL через расширение, SQL Server TDE, MySQL InnoDB). Приложение ничего не меняет, но к работающей БД доступ даёт открытые данные.</p></div>
+  <div class="card"><h4>Столбцовое / field-level</h4><p>Шифруются отдельные поля (например, номер документа). Защищает и от чтения файлов БД, и частично от SQL-доступа, но ломает поиск/сортировку по полю (тема 11).</p></div>
+</div>
+<p>Более широкий контекст безопасности БД (роли, RLS, TLS к базе, бэкапы) — в теме 20 пособия <a href="../relational-db/index.html">«Реляционные базы данных изнутри»</a>.</p>
+
+<h2 id="keys"><span class="h-num">10.5</span>Где лежит ключ</h2>
+<p>Это главный вопрос шифрования at rest. Варианты по возрастанию безопасности:</p>
+<ol class="steps">
+  <li>Рядом с данными (в том же файле/томе) — бессмысленно, защита нулевая.</li>
+  <li>В конфигурации сервера — лучше, но кража сервера вместе с конфигом раскрывает всё.</li>
+  <li>В KMS/HSM (обёрнутый ключ, тема 08) — правильный вариант: ключ данных обёрнут мастер-ключом KMS.</li>
+  <li>В TPM, привязанный к железу — для дисков.</li>
+</ol>
+<div class="callout ok"><span class="c-title">Правило</span>
+Ключ шифрования at rest не должен храниться на том же носителе, что и данные. Иначе «шифрование» защищает только от кражи диска без сервера — а это редкий сценарий.</div>
+
+<h2 id="quiz"><span class="h-num">10.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>От чего защищает шифрование at rest?</p><ul><li>От кражи носителя/резервной копии — данные без ключа не читаются</li><li>От SQL-инъекций</li><li>От DDoS</li><li>От чтения данных работающим приложением</li></ul><div class="why">at rest защищает данные «в покое». Когда система работает, данные уже расшифрованы — это другой слой защиты.</div></div>
+<div class="mcq" data-ok="0"><p>Почему ключ нельзя хранить на том же диске, что и данные?</p><ul><li>Он займёт место</li><li>Тогда кража диска раскрывает и ключ, и данные — шифрование бесполезно</li><li>Он замедлит чтение</li><li>Он будет конфликтовать</li></ul><div class="why">Ключ и данные вместе — это замок с ключом в замочной скважине. Ключ — в KMS/HSM/TPM отдельно.</div></div>
+<div class="mcq" data-ok="2"><p>Чем TDE отличается от field-level шифрования?</p><ul><li>Ничем</li><li>TDE быстрее</li><li>TDE шифрует файлы БД прозрачно; field-level — отдельные поля, ломая поиск по ним</li><li>TDE не поддерживается</li></ul><div class="why">TDE — «под капотом», приложение не меняется. Field-level даёт защиту тоньше, но ценой поиска/сортировки.</div></div>
+<div class="mcq" data-ok="3"><p>Что такое TPM в контексте шифрования диска?</p><ul><li>Программа для сжатия</li><li>Сетевой протокол</li><li>Алгоритм хэширования</li><li>Аппаратный модуль, который хранит/выдаёт ключ только на этом железе</li></ul><div class="why">TPM «запечатывает» ключ диска к конфигурации загрузки и железу: на другом сервере диск не расшифруется.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какие уровни шифрования at rest существуют и как выбрать?</summary><div class="a"><p>Диск, том, файл, БД (TDE/столбцы), приложение. Выбор зависит от модели угроз: защита от кражи носителя — диск/том; защита отдельных чувствительных полей от утечки БД — field-level.</p></div></details>
+<details class="q"><summary>Почему at rest не заменяет контроль доступа?</summary><div class="a"><p>Потому что работающая система держит данные расшифрованными: кто имеет доступ к ОС/БД/приложению, тот читает данные независимо от шифрования диска. At rest — слой для кражи носителя, а не для авторизации.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

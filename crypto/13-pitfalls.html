@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Типичные ошибки и атаки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · ПРАКТИКА</div>
+  <h1>Типичные ошибки и атаки</h1>
+  <p class="lead">Криптографию почти никогда не «взламывают» математически — её ломают через ошибки реализации: слабый режим, предсказуемая случайность, ключ в коде, неаккуратное сравнение. Знание этих ошибок в лицо — то, что отличает специалиста, который не повторит чужой провал.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">ECB</span><span class="tag">слабый RNG</span><span class="tag">padding oracle</span><span class="tag">timing</span><span class="tag">downgrade</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="ecb"><span class="h-num">13.1</span>ECB и утечка структуры</h2>
+<p>В ECB одинаковые блоки открытого текста дают одинаковый шифротекст. Изображение, зашифрованное ECB, остаётся узнаваемым по контурам. Это самая наглядная ошибка выбора режима.</p>
+<div class="callout bad"><span class="c-title">Признак</span>
+<code>AES/ECB/…</code> в коде или конфигурации. Лечение — аутентифицированный режим (GCM).</div>
+
+<h2 id="rng"><span class="h-num">13.2</span>Слабая случайность</h2>
+<p>Ключи и nonce, сгенерированные <code>java.util.Random</code> или из времени, предсказуемы: атакующий воспроизводит генератор и угадывает ключ. Реальные инциденты (например, предсказуемые nonce в ECDSA) приводили к восстановлению закрытых ключей.</p>
+<pre data-title="Ошибка"><code class="java">Random r = new Random(System.currentTimeMillis());   // предсказуемо
+byte[] key = new byte[32]; r.nextBytes(key);          // НЕЛЬЗЯ</code></pre>
+<div class="callout ok"><span class="c-title">Лечение</span>
+Только <code>SecureRandom</code> без ручного seed (тема 07).</div>
+
+<h2 id="hardcoded"><span class="h-num">13.3</span>Захардкоженные ключи и секреты</h2>
+<p>Ключ в исходниках, конфигурации, docker-образе или логе — утечка навсегда (git-история не забывает). Поиск таких ключей автоматизирован (сканеры секретов).</p>
+<pre data-title="Ошибка"><code class="java">String key = "supersecret123";      // в коде — утёк
+Cipher c = Cipher.getInstance("AES/GCM/NoPadding");</code></pre>
+<div class="callout ok"><span class="c-title">Лечение</span>
+KMS/менеджер секретов, ротация, сканеры секретов в CI, никогда не логировать ключи и пароли.</div>
+
+<h2 id="oracle"><span class="h-num">13.4</span>Padding oracle</h2>
+<p>В CBC, если сервер по-разному отвечает на «неверный padding» и «неверный MAC», атакующий, посылая модифицированные шифротексты, байт за байтом восстанавливает открытый текст. Классические атаки (POODLE, Lucky13) эксплуатировали именно это.</p>
+<div class="callout ok"><span class="c-title">Лечение</span>
+Не использовать CBC; в AEAD (GCM) такой атаки нет, потому что тег проверяется атомарно до любых различимых ответов.</div>
+
+<h2 id="timing"><span class="h-num">13.5</span>Timing-атаки</h2>
+<p>Если сравнение секретов (пароль, HMAC, тег) выполняется побайтово с ранним выходом, время ответа утекает число совпавших байт. Атакующий подбирает значение по одному байту.</p>
+<pre data-title="Ошибка"><code class="java">if (!Arrays.equals(expectedMac, receivedMac)) throw ...;  // ранний выход</code></pre>
+<div class="callout ok"><span class="c-title">Лечение</span>
+<code>MessageDigest.isEqual(a, b)</code> — сравнение за постоянное время (тема 12).</div>
+
+<h2 id="downgrade"><span class="h-num">13.6</span>Downgrade-атаки</h2>
+<p>Злоумышленник заставляет стороны договориться о более слабом протоколе/шифре, отбрасывая сильные варианты (или клиент поддерживает устаревшие). TLS 1.3 борется с этим, фиксируя сильные алгоритмы и подписывая согласование.</p>
+<div class="callout ok"><span class="c-title">Лечение</span>
+Минимальная версия TLS 1.2+ (лучше 1.3), запрет слабых cipher suites, отключение SSLv3/TLS 1.0/1.1.</div>
+
+<h2 id="checklist"><span class="h-num">13.7</span>Чек-лист ревью криптографии</h2>
+<ol class="steps">
+  <li>Режим шифрования — AEAD (GCM/ChaCha20), не ECB и не «голый» CBC?</li>
+  <li>Случайность — SecureRandom без ручного seed?</li>
+  <li>Ключи — не в коде/логах, а в KMS; есть ли ротация?</li>
+  <li>Сравнение секретов — за постоянное время?</li>
+  <li>Пароли — argon2/bcrypt с солью, не SHA/MD5?</li>
+  <li>TLS — минимальная версия и сильные cipher suites?</li>
+  <li>Nonce/IV — уникальные, не переиспользуются?</li>
+</ol>
+
+<h2 id="quiz"><span class="h-num">13.8</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что такое padding oracle?</p><ul><li>Атака на неправильную обработку ошибок padding в CBC, позволяющая восстановить открытый текст</li><li>Утечка ключа</li><li>Перебор пароля</li><li>Подмена DNS</li></ul><div class="why">Разные ответы на «плохой padding»/«плохой MAC» дают оракул, по которому байт за байтом восстанавливают текст. AEAD лечит.</div></div>
+<div class="mcq" data-ok="0"><p>Почему Arrays.equals опасен для сравнения секретов?</p><ul><li>Он медленный</li><li>Он выходит раньше при расхождении — время утекает, сколько байт совпало</li><li>Он возвращает строку</li><li>Он не поддерживает byte[]</li></ul><div class="why">Timing-атака: по задержке подбирают байты. Используйте MessageDigest.isEqual.</div></div>
+<div class="mcq" data-ok="2"><p>Чем опасен ключ, закоммиченный в git?</p><ul><li>Он станет публичным и утечёт навсегда вместе с историей</li><li>Он замедлит сборку</li><li>Он не работает</li><li>Он конфликтует с ветками</li></ul><div class="why">Git хранит всю историю: даже удаление из текущей версии не убирает ключ из старых коммитов.</div></div>
+<div class="mcq" data-ok="3"><p>Как защититься от downgrade-атак TLS?</p><ul><li>Использовать SSLv3</li><li>Разрешить все версии</li><li>Отключить шифрование</li><li>Минимальная версия TLS 1.2+, запрет слабых cipher suites</li></ul><div class="why">Фиксация минимальной версии и сильных наборов не даёт сторонам «договориться» о слабом шифре.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Назовите три самых частых ошибки криптографии в коде.</summary><div class="a"><p>Слабый режим (ECB/CBC без MAC), предсказуемая случайность (java.util.Random/время) и захардкоженные ключи/секреты. Далее — неаккуратное сравнение (timing) и хранение паролей быстрым хэшем.</p></div></details>
+<details class="q"><summary>Почему AEAD устраняет целый класс атак?</summary><div class="a"><p>AEAD (GCM) проверяет целостность и конфиденциальность атомарно: любое изменение шифротекста ломает тег, и нет «различимых» ошибок, на которых строится padding oracle. Плюс исчезает риск «шифрование без целостности».</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

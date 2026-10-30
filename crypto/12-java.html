@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Криптография в Java (JCA)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · ПРИМЕНЕНИЕ</div>
+  <h1>Криптография в Java (JCA)</h1>
+  <p class="lead">JCA (Java Cryptography Architecture) — стандартный API для криптографии в JDK: <code>Cipher</code> для шифрования, <code>MessageDigest</code> для хэшей, <code>Mac</code> для HMAC, <code>Signature</code> для подписей, <code>KeyStore</code> для хранения ключей. Здесь — рабочие примеры на все изученные примитивы.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">Cipher</span><span class="tag">MessageDigest</span><span class="tag">Mac</span><span class="tag">Signature</span><span class="tag">KeyStore</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="digest"><span class="h-num">12.1</span>Хэш: MessageDigest</h2>
+<pre><code class="java">MessageDigest md = MessageDigest.getInstance("SHA-256");
+byte[] hash = md.digest("hello".getBytes(StandardCharsets.UTF_8));
+System.out.println(HexFormat.of().formatHex(hash));   // 2cf24dba…</code></pre>
+<div class="callout warn"><span class="c-title">Не используйте getInstance("MD5"/"SHA-1")</span>
+Для целостности и паролей — только SHA-256/SHA-3. Пароли — не MessageDigest вовсе, а argon2/bcrypt (тема 03).</div>
+
+<h2 id="mac"><span class="h-num">12.2</span>HMAC: Mac</h2>
+<pre><code class="java">SecretKeySpec key = new SecretKeySpec(keyBytes, "HmacSHA256");
+Mac mac = Mac.getInstance("HmacSHA256");
+mac.init(key);
+byte[] tag = mac.doFinal("данные".getBytes(StandardCharsets.UTF_8));
+// проверка: пересчитать на своей стороне и сравнить через MessageDigest.isEqual
+boolean ok = MessageDigest.isEqual(tag, expectedTag);   // постоянное время!</code></pre>
+<div class="callout ok"><span class="c-title">Сравнивайте HMAC через MessageDigest.isEqual</span>
+<code>MessageDigest.isEqual</code> сравнивает байты за постоянное время (защита от timing-атак). Обычный <code>Arrays.equals</code> выходит раньше при первом расхождении.</div>
+
+<h2 id="cipher"><span class="h-num">12.3</span>Шифрование: Cipher</h2>
+<pre data-title="AES-256-GCM: шифрование и расшифровка"><code class="java">KeyGenerator kg = KeyGenerator.getInstance("AES");
+kg.init(256);
+SecretKey key = kg.generateKey();
+
+byte[] nonce = new byte[12];
+new SecureRandom().nextBytes(nonce);
+
+Cipher enc = Cipher.getInstance("AES/GCM/NoPadding");
+enc.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, nonce));
+byte[] ciphertext = enc.doFinal("секрет".getBytes(StandardCharsets.UTF_8));
+
+Cipher dec = Cipher.getInstance("AES/GCM/NoPadding");
+dec.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, nonce));
+byte[] plain = dec.doFinal(ciphertext);</code></pre>
+<div class="callout bad"><span class="c-title">Чего избегать в Cipher</span>
+Режим <code>AES/ECB</code>, <code>AES/CBC</code> без отдельного HMAC, повторный nonce, <code>new SecureRandom(seed)</code>, хранение ключа в строковом виде. Используйте только AEAD (GCM) или ChaCha20-Poly1305.</div>
+
+<h2 id="signature"><span class="h-num">12.4</span>Подпись: Signature</h2>
+<pre><code class="java">KeyPairGenerator kpg = KeyPairGenerator.getInstance("EC");
+kpg.initialize(256);
+KeyPair pair = kpg.generateKeyPair();
+
+Signature sign = Signature.getInstance("SHA256withECDSA");
+sign.initSign(pair.getPrivate());
+sign.update("данные".getBytes(StandardCharsets.UTF_8));
+byte[] signature = sign.sign();
+
+Signature verify = Signature.getInstance("SHA256withECDSA");
+verify.initVerify(pair.getPublic());
+verify.update("данные".getBytes(StandardCharsets.UTF_8));
+boolean valid = verify.verify(signature);   // true</code></pre>
+
+<h2 id="keystore"><span class="h-num">12.5</span>KeyStore</h2>
+<pre><code class="java">// загрузить PKCS12-хранилище и достать ключ
+KeyStore ks = KeyStore.getInstance("PKCS12");
+try (InputStream in = Files.newInputStream(Path.of("keystore.p12"))) {
+    ks.load(in, "password".toCharArray());
+}
+Key key = ks.getKey("alias", "password".toCharArray());   // закрытый ключ
+Certificate cert = ks.getCertificate("alias");            // сертификат</code></pre>
+<div class="callout info"><span class="c-title">Форматы и диалекты</span>
+PKCS12 (<code>.p12</code>) — современный стандарт; JKS устарел. Для ключей в проде используйте KMS, а KeyStore — для локальных/TLS-ключей.</div>
+
+<h2 id="quiz"><span class="h-num">12.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой класс JCA отвечает за симметричное шифрование?</p><ul><li>Cipher</li><li>MessageDigest</li><li>Signature</li><li>KeyStore</li></ul><div class="why">Cipher — шифрование/расшифровка (AES-GCM и др.).</div></div>
+<div class="mcq" data-ok="0"><p>Почему HMAC-теги сравнивают через MessageDigest.isEqual?</p><ul><li>Он сравнивает за постоянное время, не утекая через timing</li><li>Он быстрее</li><li>Он короче</li><li>Он поддерживает null</li></ul><div class="why">Постоянное время сравнения защищает от timing-атак, когда по задержке можно подобрать байты тега.</div></div>
+<div class="mcq" data-ok="2"><p>Какой режим шифрования выбрать в Java по умолчанию?</p><ul><li>AES/ECB/PKCS5Padding</li><li>AES/CBC/PKCS5Padding</li><li>AES/GCM/NoPadding (AEAD)</li><li>DES/ECB</li></ul><div class="why">GCM даёт конфиденциальность и целостность; ECB/CBC без HMAC — антипаттерны.</div></div>
+<div class="mcq" data-ok="3"><p>Каким методом генерируют ключи в Java?</p><ul><li>new Random().nextBytes</li><li>Math.random</li><li>System.currentTimeMillis</li><li>KeyGenerator или SecureRandom</li></ul><div class="why">KeyGenerator генерирует ключи криптографически безопасно; SecureRandom — для nonce/случайных байт.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Что делает GCMParameterSpec и зачем он нужен?</summary><div class="a"><p>Передаёт в Cipher длину тега (обычно 128 бит) и nonce для режима GCM. Без корректного nonce GCM не работает; повтор nonce с тем же ключом недопустим.</p></div></details>
+<details class="q"><summary>Зачем нужен KeyStore и когда вместо него использовать KMS?</summary><div class="a"><p>KeyStore хранит ключи и сертификаты локально (PKCS12) — удобно для TLS-ключей и локальной разработки. В проде с ротацией, аудитом и защитой ключей используют KMS/HSM.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

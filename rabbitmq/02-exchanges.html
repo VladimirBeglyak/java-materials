@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Exchanges и маршрутизация</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="02">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 02 · ОСНОВЫ</div>
+  <h1>Exchanges и маршрутизация</h1>
+  <p class="lead">Exchange — это маршрутизатор: он принимает сообщение и решает, в какие очереди его положить. Правило зависит от <b>типа exchange</b> и <b>binding</b> — связок между exchange и очередью. Четыре типа покрывают почти все сценарии маршрутизации.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">direct</span><span class="tag">fanout</span><span class="tag">topic</span><span class="tag">headers</span><span class="tag">симулятор</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="types"><span class="h-num">2.1</span>Четыре типа exchange</h2>
+<div class="table-wrap"><table>
+<tr><th>Тип</th><th>Маршрутизация</th><th>Типовой сценарий</th></tr>
+<tr><td><code>direct</code></td><td>по точному совпадению routing key</td><td>точечная доставка одному обработчику</td></tr>
+<tr><td><code>fanout</code></td><td>во все привязанные очереди, ключ игнорируется</td><td>широковещательная рассылка</td></tr>
+<tr><td><code>topic</code></td><td>по шаблону routing key (точки, <code>*</code>, <code>#</code>)</td><td>гибкая маршрутизация по категориям</td></tr>
+<tr><td><code>headers</code></td><td>по заголовкам сообщения</td><td>маршрутизация по атрибутам, не по ключу</td></tr>
+</table></div>
+
+<h2 id="direct"><span class="h-num">2.2</span>Direct</h2>
+<p>Сообщение попадает в очередь, чей binding key <b>точно равен</b> routing key сообщения. Один ключ может вести в несколько очередей (тогда это и fan-out).</p>
+<pre data-title="Правила direct"><code class="shell">exchange: logs_direct (type=direct)
+  очередь errors ← binding key "error"
+  очередь all    ← binding key "info", "error"
+
+publish("error")  → errors, all
+publish("info")   → all
+publish("debug")  → никуда (нет binding)</code></pre>
+
+<h2 id="fanout"><span class="h-num">2.3</span>Fanout</h2>
+<p>Кладёт сообщение во <b>все</b> привязанные очереди, игнорируя routing key. Классика — «одно событие, много независимых потребителей» (рассылка всем).</p>
+<pre><code class="shell">exchange: news (type=fanout)
+  очередь notify ← привязана
+  очередь audit  ← привязана
+  очередь search ← привязана
+
+publish(любой ключ) → notify, audit, search  (все три)</code></pre>
+
+<h2 id="topic"><span class="h-num">2.4</span>Topic</h2>
+<p>Routing key — слова, разделённые точками (например, <code>orders.eu.paid</code>). В binding key можно использовать <code>*</code> (ровно одно слово) и <code>#</code> (ноль или более слов).</p>
+<pre data-title="Правила topic"><code class="shell">exchange: events (type=topic)
+  очередь eu_orders ← binding "orders.eu.#"
+  очередь paid      ← binding "orders.*.paid"
+
+publish("orders.eu.paid")   → eu_orders, paid
+publish("orders.us.paid")   → paid
+publish("orders.eu.created")→ eu_orders
+publish("users.eu.created") → никуда</code></pre>
+<div class="callout info"><span class="c-title">Topic покрывает direct и fanout</span>
+Binding <code>#</code> ловит всё (как fanout), а точный ключ без звёздочек — как direct. Topic — самый гибкий тип.</div>
+
+<h2 id="headers"><span class="h-num">2.5</span>Headers</h2>
+<p>Маршрутизация по заголовкам сообщения, а не по routing key. Binding задаёт, какие заголовки и с каким правилом (<code>x-match: all</code> — все должны совпасть, <code>any</code> — хотя бы один).</p>
+<pre><code class="shell">exchange: format (type=headers)
+  очередь pdf  ← x-match=all, format=pdf
+  очередь big  ← x-match=all, format=pdf, size=large
+
+publish(headers={format: pdf})          → pdf
+publish(headers={format: pdf, size: large}) → pdf, big</code></pre>
+<div class="callout warn"><span class="c-title">Headers редок</span>
+Обычно достаточно topic. Headers используют, когда маршрутизация зависит от многих атрибутов, а не от одного ключа.</div>
+
+<h2 id="sim"><span class="h-num">2.6</span>Симулятор маршрутизации</h2>
+<div class="widget" id="exSim">
+  <div class="widget-title">Куда попадёт сообщение</div>
+  <div class="controls">
+    <label>тип exchange<select id="exT">
+      <option value="direct">direct</option>
+      <option value="fanout">fanout</option>
+      <option value="topic">topic</option>
+    </select></label>
+    <label>routing key<input type="text" id="exK" value="orders.eu.paid" style="width:180px"></label>
+  </div>
+  <div class="out" id="exO"></div>
+  <div class="verdict" id="exV"></div>
+</div>
+<script>
+(function () {
+  var B = [
+    { q: "eu_orders", type: "topic", key: "orders.eu.#" },
+    { q: "paid", type: "topic", key: "orders.*.paid" },
+    { q: "errors", type: "direct", key: "error" },
+    { q: "all", type: "direct", key: "info" },
+    { q: "notify", type: "fanout", key: "" }
+  ];
+  function match(b, t, k) {
+    if (t === "fanout") return true;
+    if (t === "direct") return b.key === k;
+    if (t === "topic") {
+      var re = "^" + b.key.split(".").map(function (p) {
+        return p === "#" ? "(?:.*)" : p === "*" ? "[^.]+" : p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      }).join("\\.") + "$";
+      return new RegExp(re).test(k);
+    }
+    return false;
+  }
+  function run() {
+    var t = document.getElementById("exT").value, k = document.getElementById("exK").value.trim();
+    var hits = B.filter(function (b) { return b.type === t && match(b, t, k); });
+    var o = document.getElementById("exO");
+    o.textContent = "exchange(type=" + t + "), routing key = \"" + (k || "(пусто)") + "\"\n" +
+      (hits.length ? "→ " + hits.map(function (h) { return h.q; }).join(", ") : "→ ни в одну очередь (нет подходящего binding)");
+    var v = document.getElementById("exV");
+    if (!hits.length) { v.className = "verdict warn"; v.textContent = "Сообщение потеряется (если не включён mandatory/alternate exchange). Проверьте binding."; }
+    else { v.className = "verdict ok"; v.textContent = "Доставлено в " + hits.length + " очередь(ей)."; }
+  }
+  document.getElementById("exT").addEventListener("change", run);
+  document.getElementById("exK").addEventListener("input", run);
+  run();
+})();
+</script>
+
+<h2 id="quiz"><span class="h-num">2.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой exchange доставляет во все привязанные очереди?</p><ul><li>direct</li><li>fanout</li><li>topic</li><li>headers</li></ul><div class="why">Fanout игнорирует routing key и кладёт сообщение во все очереди.</div></div>
+<div class="mcq" data-ok="0"><p>Что означает <code>#</code> в binding key topic-exchange?</p><ul><li>Ноль или более слов (любая последовательность)</li><li>Ровно одно слово</li><li>Только цифры</li><li>Конец строки</li></ul><div class="why"># — ноль или более слов, * — ровно одно слово.</div></div>
+<div class="mcq" data-ok="2"><p>Что произойдёт, если сообщение не совпало ни с одним binding?</p><ul><li>Оно вернётся продюсеру всегда</li><li>Оно сохранится навсегда</li><li>Оно будет отброшено (если не включён mandatory/alternate exchange)</li><li>Ошибка протокола</li></ul><div class="why">По умолчанию несовпавшее сообщение молча теряется; mandatory/alternate exchange позволяют это перехватить.</div></div>
+<div class="mcq" data-ok="3"><p>Когда выбирают headers-exchange?</p><ul><li>Когда маршрутизация зависит от многих атрибутов-заголовков, а не одного ключа</li><li>Всегда вместо topic</li><li>Только для fan-out</li><li>Когда нет заголовков</li></ul><div class="why">Headers маршрутизирует по заголовкам с x-match all/any; обычно проще обойтись topic.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем topic отличается от direct и fanout?</summary><div class="a"><p>Topic маршрутизирует по шаблону из слов с * и #, покрывая и точное совпадение (как direct), и широкую рассылку (как fanout через #). Это самый гибкий тип.</p></div></details>
+<details class="q"><summary>Как избежать тихой потери несовпавшего сообщения?</summary><div class="a"><p>Включить mandatory-флаг (брокер вернёт сообщение продюсеру, если оно никуда не попало) или настроить alternate exchange — запасной exchange для несовпавших сообщений.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

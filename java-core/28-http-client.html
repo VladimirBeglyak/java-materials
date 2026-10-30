@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>28 · HTTP-клиент: HttpClient и RestClient</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="28">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 28 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>HTTP-клиент: HttpClient и RestClient</h1>
+  <p class="lead">Вызывать HTTP API — ежедневная задача. В стандартной библиотеке с JDK 11 есть <code>java.net.http.HttpClient</code> — современная замена устаревшему <code>HttpURLConnection</code>. Поверх него в Spring — высокоуровневые <code>RestClient</code> и <code>WebClient</code>. Здесь — как выбрать клиент и как обращаться с таймаутами.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">HttpClient</span><span class="tag">RestClient</span><span class="tag">таймауты</span><span class="tag">асинхронность</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="httpclient"><span class="h-num">28.1</span>java.net.http.HttpClient</h2>
+<p><code>HttpClient</code> (JDK 11+) — стандартный клиент: HTTP/2, WebSocket, асинхронность. Создаётся один раз (держит пул соединений) и переиспользуется.</p>
+<pre data-title="Синхронный GET"><code class="java">HttpClient client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(10))
+        .build();
+
+HttpRequest request = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.example.com/orders/42"))
+        .timeout(Duration.ofSeconds(5))
+        .header("Accept", "application/json")
+        .GET()
+        .build();
+
+HttpResponse&lt;String&gt; response = client.send(request, HttpResponse.BodyHandlers.ofString());
+System.out.println(response.statusCode() + " " + response.body());</code></pre>
+<div class="callout info"><span class="c-title">Два таймаута</span>
+<code>connectTimeout</code> на клиенте — на установление соединения; <code>timeout</code> на запросе — на весь запрос до ответа. В проде оба нужны, иначе зависший сервис повесит ваш поток.</div>
+
+<h2 id="async"><span class="h-num">28.2</span>Асинхронный вызов</h2>
+<pre data-title="Асинхронный POST с телом"><code class="java">String body = "{\"status\":\"paid\"}";
+HttpRequest post = HttpRequest.newBuilder()
+        .uri(URI.create("https://api.example.com/orders"))
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(body))
+        .build();
+
+CompletableFuture&lt;HttpResponse&lt;String&gt;&gt; future =
+        client.sendAsync(post, HttpResponse.BodyHandlers.ofString());
+
+future.thenApply(HttpResponse::body)
+      .thenAccept(System.out::println);</code></pre>
+<div class="callout ok"><span class="c-title">JSON через Jackson</span>
+Для готового объекта используйте <code>BodyHandlers.ofString()</code> + <code>mapper.readValue(...)</code>, либо сам напишите <code>BodyHandler</code> поверх <code>ofInputStream()</code>. Стандартная библиотека JSON не парсит.</div>
+
+<h2 id="restclient"><span class="h-num">28.3</span>Spring RestClient</h2>
+<p>В Spring 6.1 появился <code>RestClient</code> — современная замена <code>RestTemplate</code>: fluent-API, синхронный, с поддержкой конвертеров (JSON автоматически).</p>
+<pre data-title="RestClient (Spring)"><code class="java">RestClient client = RestClient.builder()
+        .baseUrl("https://api.example.com")
+        .build();
+
+Order order = client.get()
+        .uri("/orders/{id}", 42)
+        .retrieve()
+        .body(Order.class);            // JSON → объект автоматически
+
+ResponseEntity&lt;Void&gt; resp = client.post()
+        .uri("/orders")
+        .body(new Order("paid"))
+        .retrieve()
+        .toBodilessEntity();</code></pre>
+<div class="callout info"><span class="c-title">RestClient vs WebClient</span>
+RestClient — синхронный, простой (для MVC и обычных вызовов). WebClient — реактивный (Mono/Flux), для WebFlux-стека. RestTemplate оставлен для совместимости, новые проекты начинают с RestClient.</div>
+
+<h2 id="choose"><span class="h-num">28.4</span>Какой клиент выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Клиент</th><th>Когда</th></tr>
+<tr><td><code>java.net.http.HttpClient</code></td><td>без фреймворков, нужно только stdlib, HTTP/2, WebSocket</td></tr>
+<tr><td><code>RestClient</code> (Spring)</td><td>синхронные вызовы в Spring MVC/обычном сервисе</td></tr>
+<tr><td><code>WebClient</code> (Spring)</td><td>реактивный стек WebFlux</td></tr>
+<tr><td>OkHttp / Apache HttpClient</td><td>нужны специфичные фичи, которых нет в stdlib</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">HttpURLConnection — не используйте</span>
+Старый API неудобен и не поддерживает HTTP/2. В новом коде — <code>HttpClient</code> или Spring-клиенты. (Сетевой уровень — сокеты, пулы, TLS — в пособии «Компьютерные сети», тема 12.)</div>
+
+<h2 id="quiz"><span class="h-num">28.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем HttpClient лучше HttpURLConnection?</p><ul><li>Поддерживает HTTP/2, WebSocket и асинхронность, удобный API</li><li>Он быстрее компилируется</li><li>Он не требует JDK</li><li>Ничем</li></ul><div class="why">HttpClient — современная замена: HTTP/2, sendAsync, WebSocket, таймауты.</div></div>
+<div class="mcq" data-ok="0"><p>Чем отличаются connectTimeout и timeout запроса?</p><ul><li>connectTimeout — на соединение, timeout — на весь запрос до ответа</li><li>Ничем</li><li>timeout — только для POST</li><li>connectTimeout не нужен</li></ul><div class="why">Оба важны: зависший сервис не должен вечно держать поток.</div></div>
+<div class="mcq" data-ok="2"><p>Что возвращает sendAsync?</p><ul><li>HttpResponse напрямую</li><li>void</li><li>CompletableFuture&lt;HttpResponse&gt;</li><li>Stream</li></ul><div class="why">Асинхронный вызов возвращает CompletableFuture для композиции.</div></div>
+<div class="mcq" data-ok="3"><p>Какой Spring-клиент выбрать для синхронного вызова в MVC?</p><ul><li>WebClient</li><li>RestTemplate (устарел)</li><li>HttpURLConnection</li><li>RestClient</li></ul><div class="why">RestClient — современная синхронная замена RestTemplate; WebClient — для реактивного стека.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как распарсить JSON-ответ HttpClient в объект?</summary><div class="a"><p>Получить тело как строку через BodyHandlers.ofString() и распарсить Jackson-ом (ObjectMapper.readValue), либо написать свой BodyHandler поверх ofInputStream(). Стандартная библиотека JSON не разбирает.</p></div></details>
+<details class="q"><summary>Почему HttpClient создают один раз, а не на каждый запрос?</summary><div class="a"><p>Клиент держит пул соединений и executor; пересоздание теряет переиспользование соединений и плодит ресурсы. Один экземпляр — на всё приложение.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

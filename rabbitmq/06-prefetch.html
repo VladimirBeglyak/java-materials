@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Prefetch и распределение нагрузки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · НАДЁЖНОСТЬ</div>
+  <h1>Prefetch и распределение нагрузки</h1>
+  <p class="lead">Если несколько потребителей читают одну очередь, RabbitMQ по умолчанию раздаёт сообщения «кто быстрее возьмёт», и один быстрый потребитель может забрать всё, оставив остальных без работы. Настройка <b>prefetch</b> управляет тем, сколько необработанных сообщений брокер держит на потребителя, — это ключ к справедливой и предсказуемой загрузке.</p>
+  <div class="meta"><span class="tag">~1.5 часа</span><span class="tag">prefetch</span><span class="tag">fair dispatch</span><span class="tag">конкуренция</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="problem"><span class="h-num">6.1</span>Проблема: кто-то забирает всё</h2>
+<p>Брокер выдаёт сообщения потребителям по мере их готовности. Если потребитель A обрабатывает за 10 мс, а B — за 1 с, A успеет взять почти всё, и B простаивает. Более того, без ограничения A может набрать тысячи необработанных сообщений в свою локальную буферную память.</p>
+
+<h2 id="prefetch"><span class="h-num">6.2</span>Prefetch count</h2>
+<p><code>basic.qos(prefetch_count=N)</code> говорит брокеру: «выдавай этому потребителю не более N неподтверждённых сообщений». Пока не придёт ack, новые сообщения не выдаются.</p>
+<pre data-title="Установка prefetch"><code class="java">// не более 1 неподтверждённого сообщения на потребителя
+channel.basicQos(1);
+
+// в Spring AMQP
+spring.rabbitmq.listener.simple.prefetch: 10</code></pre>
+<div class="callout ok"><span class="c-title">prefetch = 1 → справедливая диспетчеризация</span>
+С prefetch=1 брокер даёт следующее сообщение только после ack предыдущего, поэтому работа распределяется равномерно между потребителями независимо от их скорости.</div>
+
+<h2 id="tuning"><span class="h-num">6.3</span>Как выбирать prefetch</h2>
+<div class="table-wrap"><table>
+<tr><th>Значение</th><th>Поведение</th><th>Когда</th></tr>
+<tr><td>1</td><td>по одному, равномерно</td><td>долгая/неравномерная обработка, нужна справедливость</td></tr>
+<tr><td>10–100</td><td>баланс скорости и справедливости</td><td>обычные задачи</td></tr>
+<tr><td>несколько сотен</td><td>высокая пропускная способность</td><td>быстрая обработка, но риск «однобокой» загрузки</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Слишком большой prefetch опасен</span>
+Тысячи неподтверждённых сообщений у одного потребителя — это задержка обработки у остальных и риск потери при падении (все они вернутся в очередь и будут обработаны заново).</div>
+
+<h2 id="concurrency"><span class="h-num">6.4</span>Параллелизм: конкуренция и потоки</h2>
+<p>Масштабировать чтение можно двумя способами: больше <b>конкурентных потребителей</b> (процессов/инстансов) на очередь или больше <b>потоков</b> внутри одного потребителя.</p>
+<pre data-title="Конкуренция в Spring AMQP"><code class="yaml">spring:
+  rabbitmq:
+    listener:
+      simple:
+        concurrency: 4        # 4 потока-потребителя
+        max-concurrency: 8
+        prefetch: 10          # на каждого потребителя</code></pre>
+<div class="callout info"><span class="c-title">Порядок и конкуренция</span>
+Конкурирующие потребители не гарантируют порядок: сообщения из одной очереди обрабатываются параллельно и могут завершаться в любом порядке. Порядок нужен — один потребитель с prefetch=1.</div>
+
+<h2 id="quiz"><span class="h-num">6.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает prefetch_count?</p><ul><li>Ограничивает число неподтверждённых сообщений на потребителя</li><li>Ускоряет брокер</li><li>Ограничивает размер очереди</li><li>Шифрует сообщения</li></ul><div class="why">Пока не пришёл ack, брокер не выдаёт потребителю больше prefetch_count сообщений.</div></div>
+<div class="mcq" data-ok="0"><p>Как добиться справедливого распределения между разными по скорости потребителями?</p><ul><li>prefetch = 1</li><li>prefetch = 10000</li><li>Включить autoAck</li><li>Один потребитель</li></ul><div class="why">С prefetch=1 следующее сообщение выдаётся только после ack — быстрые не «обгоняют» медленных.</div></div>
+<div class="mcq" data-ok="2"><p>Чем опасен слишком большой prefetch?</p><ul><li>Ничем</li><li>Сообщения шифруются</li><li>Задержка у других потребителей и большая повторная обработка при падении</li><li>Очередь переполняется</li></ul><div class="why">Тысячи неподтверждённых сообщений у одного — остальные простаивают, а при падении всё вернётся в очередь.</div></div>
+<div class="mcq" data-ok="3"><p>Гарантируют ли конкурирующие потребители порядок обработки?</p><ul><li>Да, всегда</li><li>Да, если prefetch=1</li><li>Нет — параллельная обработка может завершаться в любом порядке</li><li>Только для fanout</li></ul><div class="why">Порядок — только у одного потребителя с prefetch=1; конкуренция ради скорости жертвует порядком.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему один быстрый потребитель «съедает» всю очередь?</summary><div class="a"><p>Брокер отдаёт сообщения тому, кто готов взять. Быстрый потребитель успевает подтвердить и запросить следующее чаще, набирая основную часть. Prefetch ограничивает его «запас» неподтверждённых сообщений.</p></div></details>
+<details class="q"><summary>Как выбрать prefetch для своей нагрузки?</summary><div class="a"><p>Долгая и неравномерная обработка — prefetch=1. Быстрая и однородная — 10–100 для пропускной способности. Больше — только если обработка очень быстрая и потеря при падении допустима. Ориентир: prefetch ≈ concurrency × время обработки / частота поступления.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

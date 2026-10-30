@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · RabbitMQ в Spring (Spring AMQP)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · ПРАКТИКА</div>
+  <h1>RabbitMQ в Spring (Spring AMQP)</h1>
+  <p class="lead">Spring AMQP прячет детали протокола за <code>RabbitTemplate</code> (отправка) и <code>@RabbitListener</code> (приём). Вместо ручных каналов и ack вы описываете очереди декларативно и работаете с объектами через конвертеры. Но гарантии доставки всё равно зависят от того, как настроены подтверждения и обработка ошибок.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">RabbitTemplate</span><span class="tag">@RabbitListener</span><span class="tag">конвертеры</span><span class="tag">ошибки</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="config"><span class="h-num">8.1</span>Конфигурация и декларация</h2>
+<pre data-title="Объявление exchange, очереди и binding"><code class="java">@Configuration
+class RabbitConfig {
+    static final String EXCHANGE = "orders.exchange";
+    static final String QUEUE = "orders.queue";
+
+    @Bean DirectExchange exchange() { return new DirectExchange(EXCHANGE); }
+    @Bean Queue queue() { return QueueBuilder.durable(QUEUE)
+            .withArgument("x-dead-letter-exchange", "")
+            .withArgument("x-dead-letter-routing-key", "orders.dead").build(); }
+    @Bean Binding binding(Queue queue, DirectExchange exchange) {
+        return BindingBuilder.bind(queue).to(exchange).with("orders.created");
+    }
+}</code></pre>
+<pre data-title="application.yml"><code class="yaml">spring:
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    publisher-confirm-type: correlated     # publisher confirms
+    listener:
+      simple:
+        acknowledge-mode: manual           # или auto; manual — полный контроль ack
+        prefetch: 10</code></pre>
+
+<h2 id="template"><span class="h-num">8.2</span>RabbitTemplate: отправка</h2>
+<pre><code class="java">@Service
+class OrderEvents {
+    private final RabbitTemplate rabbit;
+
+    OrderEvents(RabbitTemplate rabbit) { this.rabbit = rabbit; }
+
+    void publish(OrderCreated event) {
+        rabbit.convertAndSend(EXCHANGE, "orders.created", event);
+    }
+}</code></pre>
+<div class="callout info"><span class="c-title">convertAndSend</span>
+Метод сериализует объект конвертером (по умолчанию Java-сериализация, в проде — JSON через Jackson2JsonMessageConverter) и публикует в exchange с routing key.</div>
+
+<h2 id="listener"><span class="h-num">8.3</span>@RabbitListener: приём</h2>
+<pre data-title="Потребитель с ручным ack и DLQ"><code class="java">@Component
+class OrderHandler {
+    @RabbitListener(queues = QUEUE)
+    void handle(OrderCreated event, Channel channel,
+                @Header(AmqpHeaders.DELIVERY_TAG) long tag) throws IOException {
+        try {
+            process(event);
+            channel.basicAck(tag, false);            // успех — подтвердить
+        } catch (RetryableException e) {
+            channel.basicNack(tag, false, false);    // в DLX (без requeue)
+        }
+    }
+}</code></pre>
+<div class="callout warn"><span class="c-title">acknowledge-mode: auto против manual</span>
+<code>auto</code> — Spring сам подтверждает после успешного возврата метода и отклоняет при исключении (проще). <code>manual</code> — полный контроль (как в примере). Для большинства задач auto достаточно, но нужно понимать поведение при исключениях.</div>
+
+<h2 id="converter"><span class="h-num">8.4</span>JSON-конвертер</h2>
+<pre data-title="Jackson-конвертер сообщений"><code class="java">@Bean
+Jackson2JsonMessageConverter converter() {
+    return new Jackson2JsonMessageConverter();   // JSON вместо Java-сериализации
+}
+
+@Bean
+RabbitTemplate rabbitTemplate(ConnectionFactory cf) {
+    RabbitTemplate t = new RabbitTemplate(cf);
+    t.setMessageConverter(converter());
+    return t;
+}</code></pre>
+<div class="callout bad"><span class="c-title">Не оставляйте Java-сериализацию</span>
+Default-конвертер Spring AMQP — Java-сериализация: несовместима между версиями, небезопасна. Всегда настраивайте JSON-конвертер для прод-сервисов.</div>
+
+<h2 id="errors"><span class="h-num">8.5</span>Обработка ошибок</h2>
+<p>Для повторов с задержкой и DLQ удобен неблокирующий подход через <code>@RetryableTopic</code> (Spring AMQP сам строит retry-топики/очереди) или ручная схема из темы 05 (TTL + DLX) с <code>RepublishMessageRecoverer</code>.</p>
+<pre><code class="java">@RabbitListener(queues = QUEUE)
+@RetryableTopic(attempts = "3", backoff = @Backoff(delay = 1000, multiplier = 2))
+void handle(OrderCreated event) {
+    process(event);   // при исключении Spring повторит, затем отправит в DLT
+}</code></pre>
+
+<h2 id="quiz"><span class="h-num">8.6</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой класс Spring AMQP отвечает за отправку сообщений?</p><ul><li>RabbitTemplate</li><li>@RabbitListener</li><li>ConnectionFactory</li><li>MessageConverter</li></ul><div class="why">RabbitTemplate — отправка (convertAndSend), @RabbitListener — приём.</div></div>
+<div class="mcq" data-ok="0"><p>Почему в проде нельзя оставлять дефолтный конвертер Spring AMQP?</p><ul><li>Он использует Java-сериализацию — небезопасно и несовместимо между версиями</li><li>Он медленный</li><li>Он не поддерживает JSON</li><li>Он удаляет сообщения</li></ul><div class="why">Default — Java-сериализация. Нужен Jackson2JsonMessageConverter.</div></div>
+<div class="mcq" data-ok="2"><p>Чем acknowledge-mode=auto отличается от manual?</p><ul><li>Ничем</li><li>auto быстрее</li><li>auto — Spring сам ack/nack; manual — вы сами вызываете basicAck/basicNack</li><li>manual не поддерживается</li></ul><div class="why">auto проще; manual даёт полный контроль над подтверждением.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает @RetryableTopic?</p><ul><li>Автоматически строит retry-очереди и DLT, повторяя обработку при исключении</li><li>Шифрует топик</li><li>Ускоряет доставку</li><li>Отключает ack</li></ul><div class="why">Spring AMQP сам создаёт retry-инфраструктуру и после попыток отправляет в DLT.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какие три вещи нужно настроить для надёжной отправки?</summary><div class="a"><p>Publisher confirms (publisher-confirm-type=correlated), durable-очередь и persistent-сообщения (через конвертер/декларацию), и JSON-конвертер вместо Java-сериализации.</p></div></details>
+<details class="q"><summary>Как Spring AMQP строит DLQ и повторы?</summary><div class="a"><p>Либо декларативно через @RetryableTopic (попытки, backoff, DLT), либо вручную: очередь с x-dead-letter-exchange на парковку, парковка с TTL и обратным DLX (тема 05), а RepublishMessageRecoverer отправляет исчерпавшее попытки сообщение в DLQ.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

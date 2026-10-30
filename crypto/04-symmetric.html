@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Симметричное шифрование: AES и режимы</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · ОСНОВЫ</div>
+  <h1>Симметричное шифрование: AES и режимы</h1>
+  <p class="lead">Симметричное шифрование использует <b>один ключ</b> и для шифрования, и для расшифровки. Современный стандарт — AES. Но выбор алгоритма — меньшая часть дела: главные ошибки случаются в выборе <b>режима</b> и обращении с <b>IV/nonce</b>. Правило на всю жизнь: не ECB, и использовать аутентифицированный режим.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">AES</span><span class="tag">ECB/CBC/CTR/GCM</span><span class="tag">IV/nonce</span><span class="tag">AEAD</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="aes"><span class="h-num">4.1</span>Блочный шифр AES</h2>
+<p>AES шифрует данные <b>блоками по 128 бит (16 байт)</b> одним ключом длиной 128, 192 или 256 бит. Один и тот же ключ + один и тот же блок всегда дают один и тот же зашифрованный блок — поэтому сам по себе AES ничего не скрывает о структуре данных. Режим шифрования определяет, как из блоков собирается защита длинного сообщения.</p>
+
+<h2 id="modes"><span class="h-num">4.2</span>Режимы шифрования</h2>
+<div class="table-wrap"><table>
+<tr><th>Режим</th><th>Как работает</th><th>Вердикт</th></tr>
+<tr><td><code>ECB</code></td><td>каждый блок шифруется независимо одним ключом</td><td>❌ утекает структура: одинаковые блоки → одинаковый шифротекст</td></tr>
+<tr><td><code>CBC</code></td><td>каждый блок XOR с предыдущим шифроблоком (+ IV)</td><td>✅ конфиденциальность, но ❌ нет целостности, нужен padding</td></tr>
+<tr><td><code>CTR</code></td><td>шифруется счётчик, результат XOR с данными</td><td>✅ быстрый, параллельный; нужен уникальный nonce</td></tr>
+<tr><td><code>GCM</code></td><td>CTR + аутентификационный тег (AEAD)</td><td>✅✅ конфиденциальность + целостность — выбор по умолчанию</td></tr>
+</table></div>
+<div class="callout bad"><span class="c-title">ECB — классическая ошибка</span>
+В режиме ECB одинаковые 16-байтные блоки дают одинаковый шифротекст. Картинку, зашифрованную ECB, видно «сквозь» шифрование. Никогда не используйте ECB для данных с повторяющимися блоками.</div>
+
+<h2 id="iv"><span class="h-num">4.3</span>IV и nonce</h2>
+<p>Чтобы одинаковые сообщения шифровались по-разному, режимы используют <b>IV</b> (initialization vector) или <b>nonce</b> — случайное/уникальное значение, добавляемое к каждому шифрованию.</p>
+<div class="table-wrap"><table>
+<tr><th>Правило</th><th>Режимы</th></tr>
+<tr><td>IV должен быть случайным, не секретным, уникальным на ключ</td><td>CBC</td></tr>
+<tr><td>nonce должен быть уникальным на ключ (можно счётчик)</td><td>CTR, GCM</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Повтор nonce в GCM = катастрофа</span>
+При повторном nonce с тем же ключом в GCM/CTR можно восстановить XOR двух сообщений и даже подделать тег. Поэтому nonce — либо случайный (96 бит), либо строго монотонный счётчик.</div>
+
+<h2 id="aead"><span class="h-num">4.4</span>Аутентифицированное шифрование (AEAD)</h2>
+<p>GCM не только шифрует, но и вычисляет <b>тег аутентичности</b> — короткую подпись всего сообщения и связанных данных (AAD). При расшифровке тег проверяется: если данные изменили, расшифровка завершится ошибкой. Это закрывает разрыв «конфиденциальность ≠ целостность» из темы 01.</p>
+<pre data-title="AES-256-GCM (openssl)"><code class="shell"># шифрование
+$ echo -n "секретные данные" | openssl enc -aes-256-gcm \
+    -K 000102...0f  -iv 000102...0b   # ключ 32 байта, nonce 12 байт
+# …вывод: шифротекст + тег
+
+# расшифровка (тег проверяется автоматически)
+$ echo -n "…" | openssl enc -aes-256-gcm -d -K … -iv …</code></pre>
+<div class="callout ok"><span class="c-title">Выбор по умолчанию</span>
+AES-256-GCM (или ChaCha20-Poly1305 на устройствах без аппаратного AES) покрывает и конфиденциальность, и целостность. CBC без отдельного HMAC — антипаттерн.</div>
+
+<h2 id="quiz"><span class="h-num">4.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чем плох режим ECB?</p><ul><li>Он медленный</li><li>Одинаковые блоки дают одинаковый шифротекст — утекает структура данных</li><li>Он не поддерживает длинные ключи</li><li>Он необратим</li></ul><div class="why">ECB шифрует каждый блок независимо, поэтому повторяющиеся блоки видны в шифротексте.</div></div>
+<div class="mcq" data-ok="0"><p>Что даёт режим GCM по сравнению с CBC?</p><ul><li>Конфиденциальность + целостность (аутентификационный тег) в одном режиме</li><li>Только сжатие</li><li>Только ускорение</li><li>Ничего</li></ul><div class="why">GCM — AEAD: CTR-шифрование плюс тег целостности. CBC целостности не даёт.</div></div>
+<div class="mcq" data-ok="2"><p>Почему нельзя повторно использовать nonce в GCM с тем же ключом?</p><ul><li>Он перестанет быть случайным</li><li>Это запрещено стандартом без причины</li><li>Повтор nonce позволяет восстановить XOR сообщений и подделать тег</li><li>Nonce вообще не нужен</li></ul><div class="why">Повтор nonce в CTR/GCM катастрофически ослабляет шифр — это ошибка уровня «сломали всё».</div></div>
+<div class="mcq" data-ok="3"><p>Должен ли IV быть секретным?</p><ul><li>Да, всегда</li><li>Да, в CBC</li><li>Да, в GCM</li><li>Нет — IV должен быть уникальным/случайным, но хранится вместе с шифротекстом</li></ul><div class="why">Секретность обеспечивает ключ; IV лишь разнообразит шифрование. Он передаётся открыто.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Почему AES сам по себе недостаточен для шифрования длинных данных?</summary><div class="a"><p>AES — блочный шифр: шифрует только 16-байтные блоки. Режим (CBC/CTR/GCM) определяет, как связать блоки в защищённый поток, добавить IV/nonce и (для GCM) целостность.</p></div></details>
+<details class="q"><summary>Что такое AEAD и зачем он нужен?</summary><div class="a"><p>Authenticated Encryption with Associated Data — шифрование, которое также проверяет целостность (и связанные открытые данные). Без него атакующий может изменить шифротекст незаметно. GCM и ChaCha20-Poly1305 — AEAD.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

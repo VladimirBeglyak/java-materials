@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Модель AMQP и зачем брокер</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · ОСНОВЫ</div>
+  <h1>Модель AMQP и зачем брокер</h1>
+  <p class="lead">RabbitMQ — брокер сообщений, работающий по протоколу AMQP. Его суть — <b>умный брокер</b>: продюсер отправляет сообщение не напрямую потребителю, а брокеру, и брокер сам решает, куда его доставить, хранит его и следит за доставкой. Чтобы не путаться в терминах, сначала разберём саму модель.</p>
+  <div class="meta"><span class="tag">~1.5 часа</span><span class="tag">AMQP</span><span class="tag">продюсер/потребитель</span><span class="tag">vhost</span><span class="tag">канал</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">1.1</span>Зачем нужен брокер</h2>
+<p>Брокер решает три задачи, которые иначе приходится писать вручную:</p>
+<div class="grid-3">
+  <div class="card"><h4>Развязка</h4><p>Продюсер не знает, кто читает сообщение и жив ли он сейчас. Можно менять потребителей независимо.</p></div>
+  <div class="card"><h4>Буферизация</h4><p>Пик сообщений копится в очереди, а потребитель обрабатывает в своём темпе.</p></div>
+  <div class="card"><h4>Надёжность</h4><p>Брокер хранит сообщение до подтверждения потребителем, а не теряет при падении процесса.</p></div>
+</div>
+
+<h2 id="model"><span class="h-num">1.2</span>Модель AMQP</h2>
+<p>Путь сообщения всегда один: продюсер публикует в <b>exchange</b>, exchange по правилам маршрутизации кладёт сообщение в одну или несколько <b>очередей</b>, из очередей его забирают потребители.</p>
+<div class="flow">
+  <span class="node"><b>Producer</b><small>publish(exchange, routing_key)</small></span><span class="to">→</span>
+  <span class="node acc"><b>Exchange</b><small>маршрутизация</small></span><span class="to">→</span>
+  <span class="node info"><b>Queue</b><small>буфер</small></span><span class="to">→</span>
+  <span class="node ok"><b>Consumer</b><small>consume(queue)</small></span>
+</div>
+<div class="callout info"><span class="c-title">Ключевое отличие от Kafka</span>
+В RabbitMQ сообщение адресуется через exchange и routing key, а не в конкретную партицию; после подтверждения оно <b>удаляется</b> из очереди. Брокер хранит состояние каждого сообщения, а не только журнал (подробно — тема 09).</div>
+
+<h2 id="parts"><span class="h-num">1.3</span>Соединение, канал, vhost</h2>
+<div class="table-wrap"><table>
+<tr><th>Понятие</th><th>Что это</th><th>Зачем</th></tr>
+<tr><td>Соединение (connection)</td><td>TCP-соединение с брокером</td><td>дорогое — держат переиспользуемым</td></tr>
+<tr><td>Канал (channel)</td><td>логический канал внутри соединения</td><td>десятки каналов на одно соединение, изоляция операций</td></tr>
+<tr><td>vhost</td><td>изолированная «область» внутри брокера</td><td>разделение приложений/сред, свои права</td></tr>
+</table></div>
+<div class="callout warn"><span class="c-title">Канал не потокобезопасен</span>
+Один канал нельзя использовать из нескольких потоков одновременно. Практика — пул каналов или отдельный канал на поток. Соединение при этом общее.</div>
+
+<h2 id="hands"><span class="h-num">1.4</span>Поднять RabbitMQ и посмотреть</h2>
+<pre data-title="Запуск RabbitMQ в Docker"><code class="shell">$ docker run -d --name rabbit -p 5672:5672 -p 15672:15672 rabbitmq:4-management
+# 5672  — AMQP для приложений
+# 15672 — веб-консоль управления: http://localhost:15672  (guest/guest)
+
+$ docker exec rabbit rabbitmqctl list_queues    # посмотреть очереди
+Timeout: 60.0 seconds ...
+Listing queues for vhost / ...
+name    messages</code></pre>
+
+<h2 id="quiz"><span class="h-num">1.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Куда продюсер публикует сообщение в RabbitMQ?</p><ul><li>Напрямую в очередь</li><li>В exchange, который маршрутизирует в очереди по правилам</li><li>Потребителю напрямую</li><li>В партицию</li></ul><div class="why">Продюсер публикует в exchange с routing key; exchange решает, в какие очереди попасть сообщению.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое vhost?</p><ul><li>Изолированная логическая область брокера со своими очередями и правами</li><li>Виртуальная машина</li><li>Поток в приложении</li><li>Очередь</li></ul><div class="why">vhost разделяет приложения/среды внутри одного брокера.</div></div>
+<div class="mcq" data-ok="2"><p>Почему канал нельзя делить между потоками?</p><ul><li>Он медленный</li><li>Он ограничен памятью</li><li>Канал не потокобезопасен — нужен отдельный канал на поток или пул</li><li>Он только для чтения</li></ul><div class="why">Один канал — одна конкурентная операция; соединение общее, каналы разделяют.</div></div>
+<div class="mcq" data-ok="3"><p>Чем очередь RabbitMQ отличается от журнала Kafka?</p><ul><li>Ничем</li><li>Очередь хранит дольше</li><li>Очередь удаляет сообщение после подтверждения</li><li>Очередь хранит сообщение после подтверждения потребителем, журнал — по ретенции независимо от чтения</li></ul><div class="why">RabbitMQ удаляет подтверждённое сообщение; Kafka хранит записи по сроку, а позицию хранит потребитель.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Какие три задачи решает брокер сообщений?</summary><div class="a"><p>Развязку производителей и потребителей, буферизацию пиков и надёжную доставку с хранением до подтверждения.</p></div></details>
+<details class="q"><summary>Опишите путь сообщения в AMQP.</summary><div class="a"><p>Producer публикует в exchange с routing key → exchange по типу и правилам (binding) кладёт сообщение в одну или несколько очередей → consumer подписан на очередь и подтверждает получение → сообщение удаляется.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

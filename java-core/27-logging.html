@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>27 · Логирование: SLF4J, Logback, уровни</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="27">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 27 · ИНЖЕНЕРНАЯ ПРАКТИКА</div>
+  <h1>Логирование: SLF4J, Logback, уровни</h1>
+  <p class="lead">Логи — это то, по чему вы будете разбирать инцидент в 3 часа ночи. Senior обязан уметь: выбрать фасад (SLF4J) и реализацию (Logback), настроить уровни по пакетам, связать записи одного запроса через <code>correlation id</code> (MDC) и не залить логи персональными данными. Это инженерная дисциплина, а не «добавить println».</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">SLF4J</span><span class="tag">Logback</span><span class="tag">уровни</span><span class="tag">MDC</span><span class="tag">structured logging</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="facade"><span class="h-num">27.1</span>SLF4J: фасад и реализация</h2>
+<p>SLF4J — это интерфейс (фасад); реальную запись делает реализация (Logback, Log4j2). Код пишет против SLF4J, а конкретную библиотеку выбирают на уровне зависимостей — так можно менять реализацию без правки кода.</p>
+<pre data-title="Использование SLF4J"><code class="java">import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+private static final Logger log = LoggerFactory.getLogger(OrderService.class);
+
+// параметризованное сообщение: строку собираем лениво, без конкатенации
+log.info("Заказ {} оплачен, сумма {}", orderId, total);</code></pre>
+<div class="callout info"><span class="c-title">Всегда SLF4J + параметры {}</span>
+<code>log.info("x=" + a + " y=" + b)</code> собирает строку даже если уровень INFO выключен. Параметры <code>{}</code> форматируются лениво — это и быстрее, и не утекает в лог лишнее.</div>
+
+<h2 id="levels"><span class="h-num">27.2</span>Уровни логирования</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Смысл</th><th>Когда</th></tr>
+<tr><td><code>ERROR</code></td><td>ошибка, требует внимания</td><td>исключения, сбои операций</td></tr>
+<tr><td><code>WARN</code></td><td>не ошибка, но подозрительно</td><td>повтор, деградация, близко к лимиту</td></tr>
+<tr><td><code>INFO</code></td><td>важные события системы</td><td>старт, обработка заказа, ключевые переходы</td></tr>
+<tr><td><code>DEBUG</code></td><td>детали для отладки</td><td>промежуточные значения, ветвления</td></tr>
+<tr><td><code>TRACE</code></td><td>максимальная детализация</td><td>вход/выход из методов</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Правило уровней</span>
+В проде обычно <code>INFO</code> (WARN/ERROR), для своего пакета можно <code>DEBUG</code>, для шумных библиотек — <code>WARN</code>. INFO должен рассказывать историю «что делает система», а не «что делает каждая строка кода».</div>
+
+<h2 id="logback"><span class="h-num">27.3</span>Logback: настройка</h2>
+<pre data-title="logback.xml"><code class="txt">&lt;configuration&gt;
+  &lt;appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender"&gt;
+    &lt;encoder&gt;
+      &lt;pattern&gt;%d{ISO8601} %-5level [%thread] %logger{36} - %msg%n&lt;/pattern&gt;
+    &lt;/encoder&gt;
+  &lt;/appender&gt;
+
+  &lt;root level="INFO"&gt;
+    &lt;appender-ref ref="STDOUT"/&gt;
+  &lt;/root&gt;
+  &lt;logger name="com.acme.orders" level="DEBUG"/&gt;   &lt;!-- свой пакет подробнее --&gt;
+  &lt;logger name="org.hibernate" level="WARN"/&gt;      &lt;!-- шумные библиотеки тише --&gt;
+&lt;/configuration&gt;</code></pre>
+
+<h2 id="mdc"><span class="h-num">27.4</span>MDC и correlation id</h2>
+<p>MDC (Mapped Diagnostic Context) хранит значения в контексте потока, которые попадают в каждую запись. Туда кладут <code>correlation id</code> / <code>request id</code> — так все логи одного запроса связываются воедино.</p>
+<pre data-title="correlation id через MDC"><code class="java">String requestId = UUID.randomUUID().toString();
+MDC.put("requestId", requestId);
+try {
+    log.info("начало обработки");
+    process(order);
+} finally {
+    MDC.remove("requestId");   // обязательно убрать (поток переиспользуется!)
+}</code></pre>
+<div class="callout warn"><span class="c-title">MDC — это ThreadLocal</span>
+Забытый <code>MDC.put</code> без <code>remove</code> утечёт в следующий запрос на том же потоке пула: логи перепутаются. Всегда в <code>finally</code>, либо через фильтр/перехватчик.</div>
+
+<h2 id="structured"><span class="h-num">27.5</span>Структурированные логи</h2>
+<p>Вместо свободного текста — JSON-записи: их можно индексировать и искать (ELK, Loki). Поля (<code>level</code>, <code>requestId</code>, <code>userId</code>) — структурированные, сообщение — в отдельном поле.</p>
+<pre data-title="Структурированный лог (JSON)"><code class="txt">{"ts":"2026-06-15T10:00:00Z","level":"INFO","logger":"OrderService",
+ "requestId":"8f1d…","userId":"42","msg":"заказ оплачен","orderId":101}</code></pre>
+<div class="callout ok"><span class="c-title">Готовые решения</span>
+Logback: <code>logstash-logback-encoder</code>. Логи собираются (Fluent Bit/Filebeat) → Loki/ELK → Grafana/Kibana. Не стройте это вручную, если уже есть стек.</div>
+
+<h2 id="practices"><span class="h-num">27.6</span>Что логировать, а что нет</h2>
+<ol class="steps">
+  <li><b>Логируйте:</b> старт/завершение операции, ключевые переходы состояния, ошибки со стектрейсом и контекстом, исходящие вызовы к внешним системам (с таймингом).</li>
+  <li><b>Не логируйте:</b> пароли, токены, полные номера карт/паспортов, тела ответов с персональными данными. Маскируйте.</li>
+  <li><b>Одна запись на событие</b>, а не по строчке на каждое поле.</li>
+  <li><b>Ошибка — с контекстом</b>: <code>log.error("не удалось оплатить заказ {}", id, e)</code>, а не голое <code>e.getMessage()</code>.</li>
+</ol>
+
+<h2 id="quiz"><span class="h-num">27.7</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Зачем нужен SLF4J, если есть Logback?</p><ul><li>SLF4J — фасад: код зависит от интерфейса, реализацию можно менять</li><li>SLF4J быстрее</li><li>SLF4J — это формат логов</li><li>Они несовместимы</li></ul><div class="why">Фасад отделяет API от реализации; выбор Logback/Log4j2 — на уровне зависимостей.</div></div>
+<div class="mcq" data-ok="0"><p>Почему параметры {} лучше конкатенации строк в логах?</p><ul><li>Строка собирается лениво, только если уровень включён</li><li>Так короче</li><li>Конкатенация запрещена</li><li>Нет разницы</li></ul><div class="why">log.info("x={}", a) не форматирует строку, когда INFO выключен — экономия и отсутствие лишних аллокаций.</div></div>
+<div class="mcq" data-ok="2"><p>Почему MDC нужно чистить в finally?</p><ul><li>MDC — ThreadLocal: значение утечёт в следующий запрос на том же потоке пула</li><li>Иначе память течёт</li><li>Иначе лог пуст</li><li>Не нужно чистить</li></ul><div class="why">Поток пула переиспользуется; забытый requestId попадёт в чужие логи.</div></div>
+<div class="mcq" data-ok="3"><p>Что даёт correlation id?</p><ul><li>Связывает все логи одного запроса в единую цепочку</li><li>Ускоряет логирование</li><li>Шифрует логи</li><li>Заменяет уровни</li></ul><div class="why">По requestId можно вытащить весь путь запроса через сервисы и потоки.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Как связать логи распределённого запроса через несколько сервисов?</summary><div class="a"><p>Генерировать requestId на входе (шлюз/фильтр), класть в MDC, передавать дальше в заголовке (например, X-Request-Id) и на каждом сервисе снова класть в MDC. Тогда все записи одного запроса связываются по этому id.</p></div></details>
+<details class="q"><summary>Чем структурированные логи лучше свободного текста?</summary><div class="a"><p>Их можно индексировать и искать по полям (level, requestId, userId), строить алерты и дашборды. Текст «заказ 42 оплачен» можно только grep-ать.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Повторы и dead-letter (DLX)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · НАДЁЖНОСТЬ</div>
+  <h1>Повторы и dead-letter (DLX)</h1>
+  <p class="lead">Что делать с сообщением, которое не удалось обработать? Наивный <code>requeue</code> зацикливает его, а молчаливый <code>ack</code> — теряет. Правильная схема — <b>повтор с задержкой</b> через TTL и <b>dead-letter exchange</b>, и лишь после исчерпания попыток — в отдельную очередь для разбора.</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">DLX</span><span class="tag">retry</span><span class="tag">dead-letter</span><span class="tag">TTL</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="dlx"><span class="h-num">5.1</span>Dead-letter exchange (DLX)</h2>
+<p>DLX — обычный exchange, куда брокер отправляет сообщение при трёх событиях: потребитель отклонил без requeue, истёк TTL, или очередь переполнилась. Настроить можно на очередь (для всех её сообщений) или на сообщение.</p>
+<pre data-title="Настройка DLX на очередь"><code class="shell">$ rabbitmqadmin declare queue name=orders.dead durable=true
+$ rabbitmqadmin declare queue name=orders durable=true \
+    arguments='{"x-dead-letter-exchange":"","x-dead-letter-routing-key":"orders.dead"}'</code></pre>
+<p>Пустая строка exchange означает «default exchange», где routing key — имя очереди. Так отклонённое сообщение попадает в <code>orders.dead</code>.</p>
+
+<h2 id="retry"><span class="h-num">5.2</span>Повтор с задержкой</h2>
+<p>Чтобы повторить обработку через N секунд, используют связку «очередь-парковка с TTL → DLX обратно в рабочую очередь»:</p>
+<div class="flow col">
+  <span class="node bad"><b>orders</b><small>сообщение не обработалось (nack, requeue=false)</small></span><span class="to">→ DLX →</span>
+  <span class="node warn"><b>orders.retry</b><small>x-message-ttl=30s, DLX обратно в orders</small></span><span class="to">→ через 30 с →</span>
+  <span class="node ok"><b>orders</b><small>повторная попытка</small></span>
+</div>
+<pre data-title="Схема повтора (объявление)"><code class="shell"># рабочая очередь: при отказе уводит в парковку
+$ rabbitmqadmin declare queue name=orders durable=true \
+    arguments='{"x-dead-letter-exchange":"","x-dead-letter-routing-key":"orders.retry"}'
+
+# парковка: живёт 30 с, затем возвращает в рабочую
+$ rabbitmqadmin declare queue name=orders.retry durable=true \
+    arguments='{"x-message-ttl":30000,"x-dead-letter-exchange":"","x-dead-letter-routing-key":"orders"}'</code></pre>
+
+<h2 id="dead"><span class="h-num">5.3</span>Dead-letter очередь</h2>
+<p>После N попыток сообщение должно уйти в <b>DLQ</b> (dead-letter queue), а не крутиться вечно. Число попыток обычно считают в заголовке сообщения (<code>x-retries</code>): на каждой итерации инкремент, при превышении — в DLQ.</p>
+<pre data-title="Логика повторов (концептуально)"><code class="java">void handle(Message msg) {
+    int retries = msg.getRetries();               // из заголовка x-retries
+    try {
+        process(msg);
+        channel.basicAck(tag, false);             // успех — удалить
+    } catch (RetryableException e) {
+        if (retries >= MAX) {
+            channel.basicNack(tag, false, false); // в DLX/DLQ
+        } else {
+            msg.incrementRetries();
+            channel.basicNack(tag, false, false); // в парковку с TTL
+        }
+    }
+}</code></pre>
+<div class="callout ok"><span class="c-title">DLQ — не корзина</span>
+Рост DLQ нужно алертить и разбирать: это сигнал о системной проблеме (битые данные, сломанный обработчик). Иначе «плохие» сообщения копятся незамеченными.</div>
+
+<h2 id="quiz"><span class="h-num">5.4</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>В каких случаях сообщение уходит в DLX?</p><ul><li>Отклонено без requeue, истёк TTL или очередь переполнена</li><li>Только при удалении очереди</li><li>При каждом ack</li><li>При подтверждении продюсера</li></ul><div class="why">DLX срабатывает на nack/reject без requeue, на TTL и на переполнение очереди.</div></div>
+<div class="mcq" data-ok="0"><p>Как устроен повтор с задержкой в RabbitMQ?</p><ul><li>Сообщение держат в парковочной очереди с TTL, по истечении DLX возвращает его в рабочую</li><li>Потребитель спит</li><li>Брокер ждёт таймер</li><li>Только через cron</li></ul><div class="why">Связка TTL + DLX даёт отложенный повтор без удержания потребителя.</div></div>
+<div class="mcq" data-ok="2"><p>Почему нельзя бесконечно requeue-ить плохое сообщение?</p><ul><li>Оно замедлит сеть</li><li>Оно станет больше</li><li>Оно зациклится и займёт потребителя навсегда — нужен предел попыток и DLQ</li><li>Оно потеряется</li></ul><div class="why">«Ядовитое» сообщение нужно после N попыток отправить в DLQ, а не крутить вечно.</div></div>
+<div class="mcq" data-ok="3"><p>Что такое DLQ и как с ней работать?</p><ul><li>Очередь «плохих» сообщений: алертить на рост, разбирать и переотправлять после исправления</li><li>Очередь для приоритетов</li><li>Временная очередь</li><li>Exchange fanout</li></ul><div class="why">DLQ накапливает необработанные сообщения; её рост — сигнал проблемы, требует процедуры разбора.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Объясните полную схему повторов с DLX.</summary><div class="a"><p>Рабочая очередь при отказе (nack без requeue) отправляет сообщение через DLX в парковочную очередь с TTL. Парковка по истечении TTL через свой DLX возвращает сообщение в рабочую очередь. Счётчик попыток в заголовке ограничивает число повторов; при исчерпании — в DLQ.</p></div></details>
+<details class="q"><summary>Чем парковочная очередь отличается от DLQ?</summary><div class="a"><p>Парковка — промежуточная очередь с TTL для отложенного повтора (сообщение вернётся в работу). DLQ — конечная очередь для сообщений, исчерпавших попытки (требуют ручного разбора).</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

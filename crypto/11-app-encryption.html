@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Шифрование в приложении</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · ПРИМЕНЕНИЕ</div>
+  <h1>Шифрование в приложении (field-level)</h1>
+  <p class="lead">Field-level шифрование — когда приложение само шифрует отдельные поля (номер паспорта, токен, платёжные данные) до записи в БД. Это защищает даже от чтения файлов БД и частично от SQL-доступа, но ломает поиск, сортировку и индексы по зашифрованному полю. Задача — понять этот trade-off и выбрать правильный режим.</p>
+  <div class="meta"><span class="tag">~2 часа</span><span class="tag">field-level</span><span class="tag">AES-GCM</span><span class="tag">детерминированное шифрование</span><span class="tag">trade-off</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="idea"><span class="h-num">11.1</span>Зачем шифровать поле</h2>
+<p>Обычно БД уже защищена (TLS, роли, шифрование at rest), но есть поля, которые не должны видеть даже администраторы БД или те, кто получил дамп: номера документов, секреты, чувствительные персональные данные. Их шифруют в приложении — ключ лежит только в приложении/KMS, а не в БД.</p>
+<div class="callout info"><span class="c-title">Дополнение, а не замена</span>
+Field-level не отменяет остальные меры: это последний рубеж для самых чувствительных полей. Для всех остальных данных достаточно TLS + at rest + контроля доступа.</div>
+
+<h2 id="how"><span class="h-num">11.2</span>Как шифровать поле</h2>
+<pre data-title="Шифрование поля AES-256-GCM (концептуально)"><code class="java">// ключ — из KMS (обёрнутый, тема 08), nonce — случайный 96 бит
+byte[] encrypt(byte[] plain, SecretKey key) {
+    byte[] nonce = new byte[12];
+    new SecureRandom().nextBytes(nonce);
+    Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+    c.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, nonce));
+    byte[] ct = c.doFinal(plain);
+    return concat(nonce, ct);   // храним nonce + шифротекст вместе
+}</code></pre>
+<div class="callout ok"><span class="c-title">Храните nonce с шифротекстом</span>
+Nonce не секретен, но нужен для расшифровки — сохраняйте его в той же колонке (nonce || ciphertext) или отдельным полем. Не переиспользуйте nonce с одним ключом (тема 04).</div>
+
+<h2 id="tradeoff"><span class="h-num">11.3</span>Trade-off: что ломается</h2>
+<div class="table-wrap"><table>
+<tr><th>Операция</th><th>Работает ли по зашифрованному полю</th></tr>
+<tr><td>Точное сравнение (<code>WHERE field = ?</code>)</td><td>❌ нельзя — шифротекст разный каждый раз</td></tr>
+<tr><td>Поиск подстроки (<code>LIKE</code>)</td><td>❌</td></tr>
+<tr><td>Сортировка (<code>ORDER BY</code>)</td><td>❌ порядок шифротекста не совпадает</td></tr>
+<tr><td>Индекс</td><td>❌ обычный индекс бесполезен</td></tr>
+<tr><td>Агрегаты, диапазоны (<code>BETWEEN</code>)</td><td>❌</td></tr>
+</table></div>
+<p>Поэтому field-level применяют к полям, по которым <b>не ищут</b>, а ищут по соседним незашифрованным полям или по отдельному «слепому индексу» (см. ниже).</p>
+
+<h2 id="deterministic"><span class="h-num">11.4</span>Детерминированное шифрование</h2>
+<p>Если по полю всё же нужно точное сравнение, используют <b>детерминированное</b> шифрование: один и тот же открытый текст всегда даёт один и тот же шифротекст (фиксированный nonce/синтетический IV). Тогда <code>WHERE enc = ?</code> работает.</p>
+<div class="vs">
+  <div class="card"><h4>Вероятностное (GCM, случайный nonce)</h4><p>Один текст → разный шифротекст. Безопаснее (не видно повторов), но поиск невозможен.</p></div>
+  <div class="card"><h4>Детерминированное</h4><p>Один текст → один шифротекст. Позволяет точное равенство, но утекает факт «у двух записей одинаковое значение».</p></div>
+</div>
+<div class="callout warn"><span class="c-title">Компромисс детерминированности</span>
+Детерминированное шифрование раскрывает равенство значений (кто-то может сопоставить записи). Используйте его только когда точный поиск необходим, и сочетайте с высокой энтропией значений (например, уникальные номера документов).</div>
+
+<h2 id="quiz"><span class="h-num">11.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что ломает field-level шифрование у поля?</p><ul><li>Поиск, сортировку, индексы и агрегаты по этому полю</li><li>Ничего</li><li>Только запись</li><li>Только чтение соседних полей</li></ul><div class="why">Шифротекст случаен, поэтому сравнивать, искать и сортировать по нему нельзя.</div></div>
+<div class="mcq" data-ok="0"><p>Когда оправдано детерминированное шифрование?</p><ul><li>Когда нужен точный поиск по равенству, но можно смириться с утечкой равенства значений</li><li>Всегда</li><li>Никогда</li><li>Только для паролей</li></ul><div class="why">Оно даёт равенство ценой раскрытия повторов. Приемлемо для полей высокой энтропии (уникальные номера).</div></div>
+<div class="mcq" data-ok="2"><p>Куда девать nonce при field-level шифровании?</p><ul><li>Выбросить после шифрования</li><li>Держать в памяти</li><li>Хранить вместе с шифротекстом (он не секретен, но нужен для расшифровки)</li><li>Зашифровать другим ключом</li></ul><div class="why">Nonce нужен при расшифровке, но не секретен — хранится рядом с шифротекстом.</div></div>
+<div class="mcq" data-ok="3"><p>Где должен лежать ключ field-level шифрования?</p><ul><li>В той же БД</li><li>В коде</li><li>В логах</li><li>В приложении/KMS, отдельно от данных — не в БД</li></ul><div class="why">Смысл field-level — защитить поле даже от администратора БД; если ключ в БД, защиты нет.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем field-level отличается от TDE?</summary><div class="a"><p>TDE шифрует файлы БД целиком и прозрачно — администратор БД всё равно видит открытые данные. Field-level шифрует поле в приложении ключом, которого нет в БД, — защищает даже от дампа и SQL-доступа, но ломает поиск по полю.</p></div></details>
+<details class="q"><summary>Как искать по зашифрованному полю?</summary><div class="a"><p>Варианты: детерминированное шифрование (только равенство), «слепой индекс» (хранить отдельно HMAC значения и искать по нему), или искать по незашифрованным соседним полям. Полноценный LIKE/диапазоны по надёжно зашифрованному полю невозможны.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>

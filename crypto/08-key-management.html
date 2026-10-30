@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Управление ключами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · КЛЮЧИ И ДОВЕРИЕ</div>
+  <h1>Управление ключами: KDF, обёртывание, KMS</h1>
+  <p class="lead">Криптография сильна настолько, насколько защищены её ключи. Алгоритмы взламывают редко; ключи теряют и крадут постоянно. Эта тема — о том, как из пароля получить ключ, как защитить ключи другими ключами и как управлять ими в проде (KMS, ротация).</p>
+  <div class="meta"><span class="tag">~2.5 часа</span><span class="tag">KDF</span><span class="tag">PBKDF2/HKDF</span><span class="tag">envelope</span><span class="tag">KMS/HSM</span><span class="tag">ротация</span><span class="tag">тест</span></div>
+</header>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="kdf"><span class="h-num">8.1</span>KDF: из пароля — ключ</h2>
+<p>Пароли — плохой ключевой материал: короткие, человекочитаемые, низкой энтропии. <b>KDF</b> (Key Derivation Function) превращает пароль (+ соль) в стойкий ключ и специально делает это дорого.</p>
+<div class="table-wrap"><table>
+<tr><th>KDF</th><th>Назначение</th></tr>
+<tr><td><code>PBKDF2</code></td><td>из пароля в ключ, настраиваемое число итераций</td></tr>
+<tr><td><code>scrypt / argon2</code></td><td>то же, но с требованием памяти</td></tr>
+<tr><td><code>HKDF</code></td><td>развернуть один секрет в несколько ключей (быстро)</td></tr>
+</table></div>
+<pre data-title="PBKDF2 (openssl)"><code class="shell">$ echo -n "пароль" | openssl kdf -keylen 32 -kdfopt digest:SHA256 \
+    -kdfopt pass:пароль -kdfopt salt:a1b2c3d4 -kdfopt iter:600000 PBKDF2</code></pre>
+<div class="callout info"><span class="c-title">KDF против хэша пароля</span>
+PBKDF2/argon2 используют и для хранения паролей (тема 03), и для вывода ключей из пароля. Отличие в задаче: в первом случае важна проверка, во втором — получение байтов ключа.</div>
+
+<h2 id="wrap"><span class="h-num">8.2</span>Обёртывание ключей</h2>
+<p>Ключ шифруется другим ключом — <b>обёртывание</b> (key wrapping). Так ключ данных (data key) можно безопасно хранить рядом с зашифрованными данными: без мастер-ключа его не развернуть.</p>
+<pre data-title="Обёртывание ключа (идея)"><code class="shell"># data key — случайный AES-ключ для данных
+# ключ обёртывания (KEK) — мастер-ключ
+$ openssl enc -aes-256-gcm -K $KEK -iv $nonce -in data_key.bin -out data_key.wrapped</code></pre>
+
+<h2 id="envelope"><span class="h-num">8.3</span>Envelope encryption</h2>
+<p>Схема, используемая облачными KMS: данные шифруются <b>ключом данных</b>, а ключ данных — <b>мастер-ключом</b>, который живёт в KMS и не покидает его.</p>
+<div class="flow col">
+  <span class="node"><b>данные</b><small>шифруются data key (AES-GCM)</small></span><span class="to">→</span>
+  <span class="node info"><b>data key</b><small>оборачивается мастер-ключом KMS</small></span><span class="to">→</span>
+  <span class="node acc"><b>хранение</b><small>шифротекст + обёрнутый data key</small></span>
+</div>
+<p>Плюсы: мастер-ключ не копируется, ротация дешёвая (меняется только обёрнутый data key), данные шифруются быстро симметрией.</p>
+
+<h2 id="kms"><span class="h-num">8.4</span>KMS, HSM и ротация</h2>
+<div class="grid-2">
+  <div class="card"><h4>KMS</h4><p>Сервис управления ключами (AWS KMS, GCP KMS, Vault): хранит мастер-ключи, выполняет шифрование/обёртывание по API, ведёт аудит, делает ротацию. Ключ не выходит наружу.</p></div>
+  <div class="card"><h4>HSM</h4><p>Аппаратный модуль безопасности: ключи физически не извлекаются, операции идут внутри устройства. Максимальная защита, выше стоимость.</p></div>
+</div>
+<div class="callout ok"><span class="c-title">Правила управления ключами</span>
+Разделяйте ключи по назначению (данные, подпись, TLS); никогда не храните ключ в коде/репозитории; ротируйте ключи по расписанию; ведите учёт, где какой ключ используется; данные старого ключа — перешифровать или хранить старые версии ключа.</div>
+
+<h2 id="quiz"><span class="h-num">8.5</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Зачем нужен KDF?</p><ul><li>Превратить пароль (низкой энтропии) в стойкий ключ фиксированной длины</li><li>Сжать данные</li><li>Зашифровать файл</li><li>Сгенерировать соль</li></ul><div class="why">Пароль нельзя использовать как ключ напрямую; KDF выводит из него ключ и делает перебор дорогим.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое envelope encryption?</p><ul><li>Данные шифруются data key, а data key оборачивается мастер-ключом KMS</li><li>Двойное сжатие</li><li>Шифрование письма в конверте</li><li>Только подпись данных</li></ul><div class="why">Гибрид на уровне ключей: быстрая симметрия для данных + защита ключа в KMS.</div></div>
+<div class="mcq" data-ok="2"><p>Почему мастер-ключ KMS не покидает сервис?</p><ul><li>Он слишком большой</li><li>Это замедлит систему</li><li>Чем меньше копий ключа, тем меньше поверхность атаки и проще аудит</li><li>Это требование скорости</li></ul><div class="why">KMS выполняет операции внутри себя и отдаёт только обёрнутые ключи — мастер-ключ не расползается по системам.</div></div>
+<div class="mcq" data-ok="3"><p>Где категорически нельзя хранить ключ?</p><ul><li>В KMS</li><li>В HSM</li><li>В переменных окружения сервера</li><li>В коде/репозитории</li></ul><div class="why">Ключ в git-репозитории утекает навсегда вместе с историей. Используйте KMS/менеджер секретов.</div></div>
+
+<div class="quiz">
+<details class="q"><summary>Чем PBKDF2 отличается от HKDF?</summary><div class="a"><p>PBKDF2 — медленный KDF из пароля (настраиваемые итерации, защита от перебора). HKDF — быстрый KDF, разворачивающий уже секретный материал (общий секрет из ECDH) в несколько независимых ключей.</p></div></details>
+<details class="q"><summary>Что даёт ротация ключей?</summary><div class="a"><p>Ограничивает ущерб от компрометации ключа и объём данных, зашифрованных одним ключом. При ротации новые данные шифруются новым ключом; старые либо перешифровываются, либо для них сохраняются старые версии ключа.</p></div></details>
+</div>
+
+</div></main>
+</div>
+</body>
+</html>
