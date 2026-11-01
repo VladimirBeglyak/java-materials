@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Deadlock и диагностика — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · СНАЧАЛА ПРОСТО</div>
+  <h1>Deadlock и диагностика — простыми словами</h1>
+  <p class="lead">Многопоточные ошибки — самые коварные: проявляются раз в неделю под нагрузкой и не воспроизводятся на машине разработчика. Разберёмся, что такое deadlock, livelock и голодание, как читать thread dump, как помогает JFR, как тестировать конкурентный код и что проверять на код-ревью.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 11 <a href="11-problems.html">«Deadlock, диагностика, тестирование»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="deadlock"><span class="h-num">11.1</span>Deadlock: взаимная блокировка</h2>
+<p>Два повара: первому нужны нож и доска, второму — доска и нож. Первый взял нож и ждёт доску, второй взял доску и ждёт нож. Оба будут ждать вечно. Это <b>deadlock</b>.</p>
+<div class="widget stepper">
+  <div class="widget-title">Перевод денег между двумя счетами</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">поток 1: перевод A → B: lock(A) ✓ … теперь lock(B)
+поток 2: перевод B → A: lock(B) ✓ … теперь lock(A)</span><span data-from="2" data-to="3">поток 1 ждёт B (у потока 2)
+поток 2 ждёт A (у потока 1) → вечное ожидание</span><span data-from="3">лечение: брать замки в едином порядке — например, по id счёта
+оба потока сначала lock(меньший id), потом lock(больший) → цикл невозможен</span></pre></div>
+  <section class="st-step" data-t="Каждый взял по одному"><p>По отдельности всё правильно.</p></section>
+  <section class="st-step" data-t="Цикл ожидания"><p>Каждый ждёт то, что держит другой.</p></section>
+  <section class="st-step" data-t="Единый порядок"><p>Если все берут замки в одном порядке, замкнутого круга не бывает.</p></section>
+</div>
+<p>Другие способы: tryLock с таймаутом (не смог взять второй — отпусти первый и попробуй позже), меньше вложенных замков, не вызывать чужой код под своим замком.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Deadlock = круг ожидания. Единый порядок взятия замков его исключает.</div>
+<p class="easy-bridge">В полной главе: <a href="11-problems.html#deadlock">11.1 Deadlock</a></p>
+
+<h2 id="others"><span class="h-num">11.2</span>Livelock, голодание и голодание пула</h2>
+<ul>
+  <li><b>Livelock</b> — двое в коридоре одновременно уступают друг другу дорогу, шагая в одну сторону, — оба «работают», но не продвигаются.</li>
+  <li><b>Starvation</b> (голодание) — поток бесконечно не получает ресурс, потому что его постоянно обгоняют другие.</li>
+  <li><b>Голодание пула</b> — задачи в пуле ждут результат других задач того же пула, а свободных потоков для них нет — всё стоит.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Не только deadlock: livelock, голодание и «задача ждёт задачу в том же пуле».</div>
+<p class="easy-bridge">В полной главе: <a href="11-problems.html#others">11.2 Livelock, starvation и голодание пула</a></p>
+
+<h2 id="dump"><span class="h-num">11.3</span>Thread dump: снимок всех потоков</h2>
+<p>Thread dump (команды <code>jstack</code>, <code>jcmd Thread.print</code>) — «фотография» всех потоков в момент: в каком состоянии каждый, какой у него стек вызовов, какие замки держит и каких ждёт. JVM даже сама находит deadlock и пишет «Found one Java-level deadlock». Совет: снимите несколько дампов с интервалом в пару секунд — если поток всё время стоит на одной строке, вот она, проблема.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Сервис завис — снимите несколько thread dump и сравните.</div>
+<p class="easy-bridge">В полной главе: <a href="11-problems.html#dump">11.3 Thread dump: читать и находить</a></p>
+
+<h2 id="jfr"><span class="h-num">11.4</span>JFR: бортовой самописец</h2>
+<p>Java Flight Recorder записывает события работающей программы почти без потерь скорости: кто и сколько ждал замков, где потоки блокировались, где были паузы. Открываете запись в JDK Mission Control и видите, какие замки самые «горячие».</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+JFR показывает, где потоки ждут друг друга, прямо на рабочем сервисе.</div>
+<p class="easy-bridge">В полной главе: <a href="11-problems.html#jfr">11.4 JFR и профилирование конкуренции</a></p>
+
+<h2 id="testing"><span class="h-num">11.5</span>Как тестировать конкурентный код</h2>
+<p>Обычный тест прогоняет код один раз — и гонка, случающаяся раз на миллион, не проявится. Помогает: запускать много потоков одновременно и много раз (одновременный старт через CountDownLatch); специальные инструменты вроде <b>jcstress</b>, которые перебирают варианты перемешивания; и главное — проектировать так, чтобы общего изменяемого состояния было как можно меньше.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+«Тест прошёл» не доказывает отсутствие гонок. Меньше общего состояния — меньше ошибок.</div>
+<p class="easy-bridge">В полной главе: <a href="11-problems.html#testing">11.5 Тестирование конкурентного кода</a></p>
+
+<h2 id="checklist"><span class="h-num">11.6</span>Чек-лист ревью</h2>
+<ol class="steps">
+  <li>У каждого общего изменяемого поля понятна защита (замок, volatile, atomic, неизменяемость).</li>
+  <li>Нет «проверь, потом сделай» без атомарности.</li>
+  <li>Замки берутся в едином порядке, unlock — в finally.</li>
+  <li>Пулы ограничены, задачи ловят исключения, пулы останавливаются.</li>
+  <li>InterruptedException не проглатывается.</li>
+  <li>Нет долгих операций (сеть, база) под замком.</li>
+</ol>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Шесть пунктов ловят большинство многопоточных ошибок.</div>
+<p class="easy-bridge">В полной главе: <a href="11-problems.html#checklist">11.6 Чек-лист code review</a></p>
+
+<h2 id="gloss"><span class="h-num">11.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Deadlock</td><td>Потоки ждут друг друга по кругу вечно.</td></tr>
+<tr><td>Livelock</td><td>Потоки суетятся, но не продвигаются.</td></tr>
+<tr><td>Starvation</td><td>Поток никак не получает ресурс.</td></tr>
+<tr><td>Thread dump</td><td>Снимок состояния всех потоков.</td></tr>
+<tr><td>JFR</td><td>Запись событий JVM для анализа.</td></tr>
+<tr><td>jcstress</td><td>Инструмент для стресс-тестов многопоточности.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">11.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Как надёжно избежать deadlock при переводе между счетами?</p><ul><li>увеличить число потоков</li><li>брать замки счетов всегда в одном порядке, например по id</li><li>добавить sleep</li><li>не использовать замки вообще</li></ul><div class="why">Без цикла ожидания deadlock невозможен.</div></div>
+<div class="mcq" data-ok="3"><p>Сервис завис. Что снять первым?</p><ul><li>дамп кучи</li><li>логи GC</li><li>скриншот</li><li>несколько thread dump с интервалом</li></ul><div class="why">Видно, кто что ждёт и на какой строке стоит.</div></div>
+<div class="mcq" data-ok="0"><p>Задачи в пуле на 4 потока ждут результат других задач того же пула. Что может случиться?</p><ul><li>голодание пула: все потоки ждут, а задачам, которых ждут, некому выполниться</li><li>ускорение</li><li>ничего</li><li>пул увеличится сам</li></ul><div class="why">Не ждите внутри пула задач того же пула.</div></div>
+<div class="mcq" data-ok="2"><p>Тест многопоточного кода прошёл 10 раз. Значит, гонок нет?</p><ul><li>да</li><li>да, если тест быстрый</li><li>нет: гонка может проявляться раз на миллион запусков</li><li>да, на любой машине</li></ul><div class="why">Нужны стресс-тесты и правильный дизайн.</div></div>
+<div class="mcq" data-ok="1"><p>Почему опасно ходить в базу под замком?</p><ul><li>база не работает с замками</li><li>замок держится долго, и все остальные потоки ждут</li><li>это запрещено</li><li>неопасно</li></ul><div class="why">Под замком — только быстрые операции с памятью.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="11-problems.html">11 «Deadlock, диагностика, тестирование»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

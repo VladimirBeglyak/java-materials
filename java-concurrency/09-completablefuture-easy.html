@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Future и CompletableFuture — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · СНАЧАЛА ПРОСТО</div>
+  <h1>Future и CompletableFuture — простыми словами</h1>
+  <p class="lead">Как запустить задачу и получить её результат позже, не простаивая в ожидании? Разберёмся, что умеет обычный Future и чего ему не хватает, как CompletableFuture собирает цепочки асинхронных шагов, в каком потоке выполняются эти шаги, как обрабатывать ошибки, отменять и ставить таймауты.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 09 <a href="09-completablefuture.html">«Future и CompletableFuture»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="future"><span class="h-num">9.1</span>Future: квитанция</h2>
+<p>Отдали задачу пулу — получили <b>Future</b>, как квитанцию в химчистке. Результат можно забрать <code>get()</code>, но если он не готов, вы будете стоять у окошка и ждать (поток блокируется). Нельзя сказать «когда будет готово — сделай вот это», нельзя удобно объединить несколько квитанций.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Future — результат в будущем, но забрать можно только ожиданием.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#future">9.1 Future: что умеет и чего нет</a></p>
+
+<h2 id="create"><span class="h-num">9.2</span>Создание CompletableFuture</h2>
+<p><code>supplyAsync(задача)</code> — запустить задачу с результатом в фоне, <code>runAsync</code> — без результата. Обязательно передавайте <b>свой пул</b> вторым аргументом: по умолчанию используется общий ForkJoinPool, маленький и общий для всего приложения — блокирующие задачи (база, сеть) его быстро забьют.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+supplyAsync со своим пулом — особенно для задач с ожиданием.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#create">9.2 Создание</a></p>
+
+<h2 id="ops"><span class="h-num">9.3</span>Цепочки шагов</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Смысл</th><th>Аналогия</th></tr>
+<tr><td>thenApply</td><td>преобразовать результат</td><td>забрали костюм — повесили в чехол</td></tr>
+<tr><td>thenCompose</td><td>следующий асинхронный шаг, зависящий от результата</td><td>по номеру заказа узнать адрес доставки</td></tr>
+<tr><td>thenCombine</td><td>объединить два независимых результата</td><td>цена + наличие → карточка товара</td></tr>
+<tr><td>allOf / anyOf</td><td>дождаться всех / первого</td><td>заказать в трёх местах, ждать всех</td></tr>
+<tr><td>thenAccept</td><td>использовать результат, ничего не возвращая</td><td>отправить письмо</td></tr>
+</table></div>
+<div class="widget stepper">
+  <div class="widget-title">Карточка товара из двух сервисов</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">цена = supplyAsync(запрос цены, pool)        — пошёл в фоне
+остаток = supplyAsync(запрос склада, pool)  — пошёл параллельно</span><span data-from="2" data-to="3">карточка = цена.thenCombine(остаток, собрать карточку)
+никто не ждёт — просто описали, что делать по готовности</span><span data-from="3">оба ответа пришли → карточка собралась сама
+время = самый медленный запрос, а не сумма</span></pre></div>
+  <section class="st-step" data-t="Два запроса"><p>Независимые запросы запускаются одновременно.</p></section>
+  <section class="st-step" data-t="Описание"><p>Цепочка — это инструкция на будущее, а не ожидание.</p></section>
+  <section class="st-step" data-t="Результат"><p>Шаги выполнятся, когда будут готовы данные.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+thenApply — преобразовать, thenCompose — следующий асинхронный шаг, thenCombine — соединить два.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#ops">9.3 Операции композиции</a></p>
+
+<h2 id="threads"><span class="h-num">9.4</span>В каком потоке выполнится шаг</h2>
+<p>Неочевидная вещь: <code>thenApply</code> без суффикса Async выполнится либо в том потоке, который завершил предыдущий шаг, либо — если результат уже был готов — прямо в потоке, который вызвал thenApply. Варианты <code>...Async</code> отправляют шаг в пул. Если шаг тяжёлый или блокирующий — используйте Async со своим пулом, чтобы не занимать чужой поток.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Без Async — «в каком-то из уже работающих потоков». Тяжёлые шаги — Async со своим пулом.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#threads">9.4 В каком потоке выполнится колбэк</a></p>
+
+<h2 id="errors"><span class="h-num">9.5</span>Ошибки</h2>
+<p>Если шаг упал, ошибка «едет» по цепочке, пропуская обычные шаги, до первого обработчика: <code>exceptionally</code> (заменить ошибку значением по умолчанию), <code>handle</code> (получить и результат, и ошибку), <code>whenComplete</code> (посмотреть, но не менять). Без обработчика ошибка тихо лежит внутри future, пока кто-нибудь не вызовет join/get.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Ошибка пропускает шаги до exceptionally/handle. Не оставляйте цепочку без обработчика.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#errors">9.5 Ошибки</a></p>
+
+<h2 id="cancel"><span class="h-num">9.6</span>Отмена и таймауты</h2>
+<p><code>orTimeout</code> — завершить ошибкой, если не успели; <code>completeOnTimeout</code> — подставить запасное значение. Важно: <code>cancel</code> у CompletableFuture не прерывает уже работающую задачу — он лишь помечает результат как отменённый. Задача может продолжать тратить ресурсы.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Таймауты ставьте всегда. cancel не останавливает уже запущенную работу.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#cancel">9.6 Отмена и таймауты</a></p>
+
+<h2 id="pitfalls"><span class="h-num">9.7</span>Частые ошибки</h2>
+<ul>
+  <li>Блокирующие задачи в общем пуле по умолчанию.</li>
+  <li><code>get()</code>/<code>join()</code> сразу после запуска — асинхронность пропала.</li>
+  <li>thenApply вместо thenCompose — получается «future внутри future».</li>
+  <li>Нет обработки ошибок и таймаутов.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Свой пул, никаких get посреди цепочки, ошибки и таймауты — обязательно.</div>
+<p class="easy-bridge">В полной главе: <a href="09-completablefuture.html#pitfalls">9.7 Чек-лист ошибок</a></p>
+
+<h2 id="gloss"><span class="h-num">9.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Future</td><td>«Квитанция» на результат, забрать — ожиданием.</td></tr>
+<tr><td>CompletableFuture</td><td>Квитанция с инструкциями «когда готово — сделай».</td></tr>
+<tr><td>thenApply / thenCompose</td><td>Преобразовать / следующий асинхронный шаг.</td></tr>
+<tr><td>thenCombine / allOf</td><td>Соединить два / дождаться всех.</td></tr>
+<tr><td>exceptionally / handle</td><td>Обработать ошибку.</td></tr>
+<tr><td>orTimeout</td><td>Ограничить время ожидания.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">9.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Чего не умеет обычный Future?</p><ul><li>хранить результат</li><li>выполнить действие по готовности без блокирующего ожидания</li><li>сообщить, готов ли результат</li><li>отменить задачу</li></ul><div class="why">Только get с ожиданием.</div></div>
+<div class="mcq" data-ok="2"><p>Почему для запросов к базе в supplyAsync нужно передавать свой пул?</p><ul><li>иначе не скомпилируется</li><li>так быстрее считается</li><li>общий пул по умолчанию маленький и делится со всем приложением — блокирующие задачи его забьют</li><li>не нужно</li></ul><div class="why">Общий ForkJoinPool рассчитан на вычисления.</div></div>
+<div class="mcq" data-ok="0"><p>Нужно по id заказа асинхронно получить пользователя, а по нему — асинхронно адрес. Какой метод соединяет шаги?</p><ul><li>thenCompose</li><li>thenApply</li><li>thenAccept</li><li>allOf</li></ul><div class="why">thenApply дал бы future внутри future.</div></div>
+<div class="mcq" data-ok="3"><p>Что сделает cancel(true) у CompletableFuture с уже работающей задачей?</p><ul><li>прервёт её поток</li><li>удалит задачу из памяти</li><li>перезапустит её</li><li>только пометит результат отменённым, задача может продолжить работу</li></ul><div class="why">Остановка работы — отдельная забота.</div></div>
+<div class="mcq" data-ok="2"><p>Шаг цепочки бросил исключение. Что будет с последующими thenApply?</p><ul><li>выполнятся как обычно</li><li>программа упадёт</li><li>пропустятся до ближайшего exceptionally/handle</li><li>повторятся</li></ul><div class="why">Ошибка «едет» по цепочке.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="09-completablefuture.html">09 «Future и CompletableFuture»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

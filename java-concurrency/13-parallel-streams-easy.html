@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Параллельные стримы — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · СНАЧАЛА ПРОСТО</div>
+  <h1>Параллельные стримы — простыми словами</h1>
+  <p class="lead">Добавить .parallel() — и всё станет быстрее? Не всегда, а иногда и медленнее или вовсе неправильно. Разберёмся, как работает параллельный стрим, когда он оправдан, каким трём правилам должен подчиняться код внутри и чем опасен общий пул потоков.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 13 <a href="13-parallel-streams.html">«Параллельные стримы и ForkJoin на практике»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="how"><span class="h-num">13.1</span>Как это работает</h2>
+<p>Параллельный стрим — как бригада, разбирающая большую кучу писем: кучу делят пополам, половины — ещё пополам, пока куски не станут маленькими; каждый работник обрабатывает свои куски, а результаты потом объединяются. Работники берутся из общего <b>ForkJoinPool</b> — по умолчанию их на один меньше, чем ядер (плюс сам вызывающий поток).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Делим данные на куски → обрабатываем параллельно → объединяем результаты.</div>
+<p class="easy-bridge">В полной главе: <a href="13-parallel-streams.html#how">13.1 Как работает параллельный стрим</a></p>
+
+<h2 id="worth"><span class="h-num">13.2</span>Стоит ли распараллеливать</h2>
+<p>Делить, раздавать и объединять — накладные расходы. Они окупаются, только если:</p>
+<ul>
+  <li><b>данных много</b> (десятки тысяч элементов и больше);</li>
+  <li><b>работа на элемент тяжёлая</b> (вычисления, а не сложение двух чисел);</li>
+  <li><b>источник легко делится</b>: массив и ArrayList — да, LinkedList и чтение строк из файла — плохо.</li>
+</ul>
+<p>Правило: не распараллеливать «на всякий случай», а замерять (JMH, глава 15).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Много данных + тяжёлая работа + делимый источник. Иначе — медленнее.</div>
+<p class="easy-bridge">В полной главе: <a href="13-parallel-streams.html#worth">13.2 Стоит ли распараллеливать</a></p>
+
+<h2 id="rules"><span class="h-num">13.3</span>Три правила корректности</h2>
+<div class="widget stepper">
+  <div class="widget-title">Почему результат «прыгает»</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">✗ list = new ArrayList();  stream.parallel().forEach(x -&gt; list.add(x))
+несколько потоков пишут в обычный список → потери и исключения</span><span data-from="2" data-to="3">✓ stream.parallel().toList() — коллектор сам собирает куски безопасно</span><span data-from="3" data-to="4">✗ reduce(0, (a, b) -&gt; a - b) — вычитание зависит от порядка группировки
+результат меняется от запуска к запуску</span><span data-from="4">правила: 1) без побочных эффектов  2) операции ассоциативны
+3) не полагаться на порядок (forEach в параллели идёт вразнобой)</span></pre></div>
+  <section class="st-step" data-t="Общий список"><p>Побочный эффект в параллели — гонка данных.</p></section>
+  <section class="st-step" data-t="Коллектор"><p>collect и toList объединяют куски правильно.</p></section>
+  <section class="st-step" data-t="Не ассоциативно"><p>(a−b)−c ≠ a−(b−c) — куски сложатся иначе.</p></section>
+  <section class="st-step" data-t="Правила"><p>Соблюдайте — и результат совпадёт с последовательным.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Без побочных эффектов, только ассоциативные операции, не надеяться на порядок.</div>
+<p class="easy-bridge">В полной главе: <a href="13-parallel-streams.html#rules">13.3 Три правила корректности</a></p>
+
+<h2 id="pool"><span class="h-num">13.4</span>Общий пул и его последствия</h2>
+<p>Все параллельные стримы приложения (и CompletableFuture по умолчанию) делят <b>один общий пул</b>. Если в одном месте внутри параллельного стрима делать блокирующие вызовы (база, сеть), его немногочисленные потоки будут стоять — и замедлятся все остальные параллельные стримы приложения. Как если бы один отдел занял все общие переговорки на целый день. На сервере, обрабатывающем много запросов, параллельные стримы вообще редко полезны: ядра и так заняты запросами.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Общий пул — один на всех. Никаких блокирующих вызовов в параллельных стримах.</div>
+<p class="easy-bridge">В полной главе: <a href="13-parallel-streams.html#pool">13.4 Общий пул и его последствия</a></p>
+
+<h2 id="gloss"><span class="h-num">13.5</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Параллельный стрим</td><td>Стрим, куски которого обрабатываются разными потоками.</td></tr>
+<tr><td>ForkJoinPool</td><td>Пул для задач «раздели и властвуй».</td></tr>
+<tr><td>Common pool</td><td>Общий пул по умолчанию для всего приложения.</td></tr>
+<tr><td>Spliterator</td><td>То, что умеет делить источник на части.</td></tr>
+<tr><td>Ассоциативность</td><td>Результат не зависит от группировки: (a+b)+c = a+(b+c).</td></tr>
+<tr><td>Побочный эффект</td><td>Изменение чего-то снаружи операции.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">13.6</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Когда параллельный стрим скорее ускорит работу?</p><ul><li>100 элементов, сложение</li><li>миллион элементов массива, тяжёлый расчёт на каждый</li><li>чтение строк из сетевого потока</li><li>запросы в базу для каждого элемента</li></ul><div class="why">Много данных, тяжёлая работа, делимый источник.</div></div>
+<div class="mcq" data-ok="3"><p>Что не так с parallel().forEach(x -&gt; list.add(x)) для ArrayList?</p><ul><li>ничего</li><li>слишком медленно</li><li>порядок будет обратный</li><li>гонка данных: несколько потоков пишут в обычный список</li></ul><div class="why">Используйте collect / toList.</div></div>
+<div class="mcq" data-ok="0"><p>Почему reduce с вычитанием даёт разный результат в параллели?</p><ul><li>вычитание не ассоциативно, а куски объединяются в разном порядке</li><li>ошибка в JVM</li><li>из-за переполнения</li><li>из-за сборщика мусора</li></ul><div class="why">Для reduce нужны ассоциативные операции.</div></div>
+<div class="mcq" data-ok="2"><p>Чем опасны сетевые вызовы внутри параллельного стрима?</p><ul><li>они не выполнятся</li><li>они выполнятся дважды</li><li>они занимают потоки общего пула, и тормозят все параллельные операции приложения</li><li>ничем</li></ul><div class="why">Общий пул маленький и один на всех.</div></div>
+<div class="mcq" data-ok="1"><p>Сколько потоков в общем ForkJoinPool по умолчанию?</p><ul><li>один</li><li>на один меньше числа ядер</li><li>сколько угодно</li><li>200</li></ul><div class="why">Плюс вызывающий поток тоже участвует в работе.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="13-parallel-streams.html">13 «Параллельные стримы и ForkJoin на практике»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

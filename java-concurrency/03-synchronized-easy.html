@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · synchronized и wait/notify — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="03e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 03 · СНАЧАЛА ПРОСТО</div>
+  <h1>synchronized и wait/notify — простыми словами</h1>
+  <p class="lead">synchronized — самый старый и простой способ защитить общие данные. Разберёмся, что он делает, что именно защищает, почему поток может войти «сам к себе» повторно, как он устроен в JVM, почему потокобезопасная коллекция не спасает от составных действий и как правильно ждать условия через wait/notify.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 03 <a href="03-synchronized.html">«synchronized, монитор, wait/notify»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="basics"><span class="h-num">3.1</span>Что делает synchronized</h2>
+<p>Представьте примерочную с одним ключом. Кто взял ключ — заходит, остальные ждут у двери. Вышел — отдал ключ следующему. synchronized даёт сразу две вещи:</p>
+<ul>
+  <li><b>Взаимное исключение</b> — внутри блока только один поток.</li>
+  <li><b>Видимость</b> — всё, что поток сделал внутри, увидит следующий, кто возьмёт тот же ключ (happens-before, глава 02).</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+synchronized = один поток за раз + видимость изменений для следующего.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#basics">3.1 Что делает synchronized</a></p>
+
+<h2 id="what"><span class="h-num">3.2</span>Что защищает ключ</h2>
+<p>Ключ — это конкретный объект-монитор. <code>synchronized</code>-метод экземпляра запирает на <code>this</code>, статический — на объект класса. Защита работает, только если <b>все</b> обращения к данным идут через один и тот же ключ. Если один метод запирает на <code>this</code>, а другой меняет те же данные без замка или на другом объекте — защиты нет. Как две двери в комнату, у одной из которых нет замка.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Одни данные — один замок, и все обращения через него.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#what">3.2 Что именно защищает лок</a></p>
+
+<h2 id="reentrant"><span class="h-num">3.3</span>Повторный вход</h2>
+<p>Поток, уже держащий ключ, может снова войти в synchronized на том же объекте — например, один synchronized-метод вызывает другой. Он не заблокирует сам себя: JVM считает, сколько раз ключ взят, и отпускает, когда счётчик дойдёт до нуля. Это называется <b>реентерабельностью</b>.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Свой же замок повторно взять можно — сам себя поток не запрёт.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#reentrant">3.3 Реентерабельность</a></p>
+
+<h2 id="impl"><span class="h-num">3.4</span>Как это устроено в JVM</h2>
+<p>У каждого объекта в заголовке есть место для отметки о блокировке. Если конкуренции нет, взятие ключа — одна быстрая атомарная операция. Если потоки реально толкаются, JVM заводит полноценный монитор с очередью ожидающих, и потоки «засыпают» через операционную систему — это дороже. Поэтому неконкурентный synchronized почти бесплатен.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Без конкуренции synchronized дешёвый, при толкотне — дорогой.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#impl">3.4 Как это устроено в HotSpot</a></p>
+
+<h2 id="compound"><span class="h-num">3.5</span>Составные действия</h2>
+<p>Даже если каждая операция коллекции потокобезопасна, их <b>комбинация</b> — нет. «Если ключа нет — положи» — это проверка и действие; между ними другой поток может успеть положить свой ключ. Нужно либо держать один замок на всё составное действие, либо использовать атомарные методы вроде <code>putIfAbsent</code> / <code>computeIfAbsent</code>.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+«Проверь, потом сделай» — гонка, даже на потокобезопасной коллекции.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#compound">3.5 Составные действия на «потокобезопасных» объектах</a></p>
+
+<h2 id="wait"><span class="h-num">3.6</span>wait и notify: подождать, пока позовут</h2>
+<p>Иногда потоку нужно ждать условия: «в очереди появился заказ». Крутиться в цикле и проверять — трата процессора. <code>wait()</code> — «отдаю ключ и сажусь в зал ожидания», <code>notifyAll()</code> — «эй, в зале, что-то изменилось».</p>
+<div class="widget stepper">
+  <div class="widget-title">Повар ждёт заказ</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">повар (взял ключ): заказов нет → wait()
+→ ключ отдан, повар в зале ожидания</span><span data-from="2" data-to="3">официант (взял ключ): добавил заказ → notifyAll() → вышел</span><span data-from="3" data-to="4">повар проснулся, снова получил ключ
+ПРОВЕРЯЕТ УСЛОВИЕ ЕЩЁ РАЗ — может, заказ уже забрал другой повар</span><span data-from="4">правило: while (заказов нет) wait();   — всегда цикл, не if</span></pre></div>
+  <section class="st-step" data-t="Ожидание"><p>wait освобождает ключ, иначе никто не смог бы добавить заказ.</p></section>
+  <section class="st-step" data-t="Сигнал"><p>notifyAll будит всех ждущих.</p></section>
+  <section class="st-step" data-t="Перепроверка"><p>Проснуться можно и «ложно», и опоздав к заказу.</p></section>
+  <section class="st-step" data-t="Правило"><p>Условие проверяется в цикле.</p></section>
+</div>
+<p>На практике wait/notify пишут редко — проще готовые очереди (BlockingQueue, глава 07) и синхронизаторы (глава 06).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+wait — только внутри synchronized и только в цикле while. Обычно лучше BlockingQueue.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#wait">3.6 wait / notify: ожидание условия</a></p>
+
+<h2 id="choose"><span class="h-num">3.7</span>Когда synchronized, а когда другое</h2>
+<p>synchronized хорош по умолчанию: короткие критические секции, простой код, автоматическое освобождение даже при исключении. Если нужно ждать ключ с таймаутом, прерываемо, несколько условий ожидания или раздельные замки для чтения и записи — берите Lock (глава 04). Для простых счётчиков — атомики (глава 05).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+По умолчанию synchronized; особые возможности — Lock; счётчики — атомики.</div>
+<p class="easy-bridge">В полной главе: <a href="03-synchronized.html#choose">3.7 Когда synchronized, а когда что-то другое</a></p>
+
+<h2 id="gloss"><span class="h-num">3.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Монитор</td><td>«Ключ» объекта для synchronized.</td></tr>
+<tr><td>Критическая секция</td><td>Код, где одновременно может быть только один поток.</td></tr>
+<tr><td>Реентерабельность</td><td>Поток может повторно взять свой же замок.</td></tr>
+<tr><td>Составное действие</td><td>Несколько операций, которые должны пройти как одна.</td></tr>
+<tr><td>wait / notifyAll</td><td>Ждать условия / разбудить ждущих.</td></tr>
+<tr><td>Ложное пробуждение</td><td>Поток проснулся без сигнала — поэтому цикл.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">3.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что даёт synchronized, кроме «один поток за раз»?</p><ul><li>ускорение</li><li>видимость изменений для следующего владельца замка</li><li>атомарность всех методов класса</li><li>ничего</li></ul><div class="why">Выход и вход в монитор связаны happens-before.</div></div>
+<div class="mcq" data-ok="3"><p>Почему wait() вызывают в цикле while, а не в if?</p><ul><li>так быстрее</li><li>так требует компилятор</li><li>чтобы не отдавать ключ</li><li>после пробуждения условие может снова оказаться ложным</li></ul><div class="why">Ложные пробуждения и опоздания.</div></div>
+<div class="mcq" data-ok="0"><p>Метод A пишет поле под synchronized(this), метод B читает его без синхронизации. Защищено ли поле?</p><ul><li>нет: все обращения должны идти через тот же замок</li><li>да</li><li>да, если поле int</li><li>только на чтение</li></ul><div class="why">Дверь без замка.</div></div>
+<div class="mcq" data-ok="2"><p>Безопасно ли «if (!map.containsKey(k)) map.put(k, v)» на ConcurrentHashMap?</p><ul><li>да, коллекция потокобезопасна</li><li>да, если ключи строки</li><li>нет: между проверкой и вставкой может вклиниться другой поток</li><li>это не компилируется</li></ul><div class="why">Используйте putIfAbsent.</div></div>
+<div class="mcq" data-ok="1"><p>Synchronized-метод вызывает другой synchronized-метод того же объекта. Что будет?</p><ul><li>deadlock</li><li>всё нормально: замок реентерабельный</li><li>исключение</li><li>второй метод не выполнится</li></ul><div class="why">Свой замок брать повторно можно.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="03-synchronized.html">03 «synchronized, монитор, wait/notify»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

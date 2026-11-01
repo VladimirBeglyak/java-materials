@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Потоки — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="01e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 01 · СНАЧАЛА ПРОСТО</div>
+  <h1>Потоки — простыми словами</h1>
+  <p class="lead">Многопоточность начинается с потока — отдельного исполнителя внутри программы. Разберёмся, чем поток отличается от процесса, как его создать и запустить, в каких состояниях он бывает, как его правильно остановить, что происходит с ошибками в потоках и зачем нужен ThreadLocal.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 01 <a href="01-threads.html">«Потоки: жизненный цикл и API»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="what"><span class="h-num">1.1</span>Процесс, поток, ядро</h2>
+<p><b>Процесс</b> — отдельная квартира: своя память, свои файлы. <b>Поток</b> — жилец этой квартиры, точнее, повар на её кухне: у каждого своя закладка в рецепте и своя стопка заметок (стек), а холодильник (куча с объектами) — общий для всех поваров квартиры. <b>Ядро процессора</b> — плита: сколько плит, столько поваров могут готовить по-настоящему одновременно; остальные ждут своей очереди, и операционная система быстро их переключает.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Потоки одного процесса делят общую память. Отсюда и сила многопоточности, и все её проблемы.</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#what">1.1 Процесс, поток, ядро</a></p>
+
+<h2 id="create"><span class="h-num">1.2</span>Создание и запуск</h2>
+<p>Поток получает задачу — <code>Runnable</code> (что сделать) — и запускается методом <code>start()</code>. Частая ошибка новичка — вызвать <code>run()</code>: тогда задача выполнится в текущем потоке, никакого нового повара не появится. В реальных приложениях потоки вручную почти не создают — используют пулы (глава 08) или виртуальные потоки (глава 10).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+start() создаёт нового исполнителя, run() — просто вызов метода. В коде чаще пулы, чем new Thread.</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#create">1.2 Создание и запуск</a></p>
+
+<h2 id="states"><span class="h-num">1.3</span>Состояния потока</h2>
+<div class="widget stepper">
+  <div class="widget-title">Жизнь одного потока</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">NEW — повар нанят, но ещё не вышел на кухню (до start)</span><span data-from="2" data-to="3">RUNNABLE — готовит или ждёт свободную плиту</span><span data-from="3" data-to="4">BLOCKED — ждёт ключ от занятой плиты (synchronized)</span><span data-from="4" data-to="5">WAITING / TIMED_WAITING — ждёт сигнала или таймера:
+join, wait, sleep, park</span><span data-from="5">TERMINATED — смена закончена, повара не вернуть (второй start нельзя)</span></pre></div>
+  <section class="st-step" data-t="NEW"><p>Объект потока создан, но не запущен.</p></section>
+  <section class="st-step" data-t="RUNNABLE"><p>Работает или готов работать. Ожидание сети в Java тоже выглядит как RUNNABLE.</p></section>
+  <section class="st-step" data-t="BLOCKED"><p>Ждёт входа в synchronized-блок, занятый другим.</p></section>
+  <section class="st-step" data-t="WAITING"><p>Ждёт события: другого потока, сигнала, времени.</p></section>
+  <section class="st-step" data-t="TERMINATED"><p>Задача закончена. Перезапустить тот же поток нельзя.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+NEW → RUNNABLE ⇄ BLOCKED / WAITING → TERMINATED. Поток одноразовый.</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#states">1.3 Состояния потока</a></p>
+
+<h2 id="interrupt"><span class="h-num">1.4</span>Прерывание: вежливая просьба остановиться</h2>
+<p>Остановить поток силой в Java нельзя (старый метод stop опасен и удалён). Вместо этого есть <b>interrupt</b> — вежливая записка «пожалуйста, заканчивай». Поток сам проверяет флаг и аккуратно завершает работу. Если поток в этот момент спит или ждёт, ожидание прерывается исключением <code>InterruptedException</code>.</p>
+<p>Главное правило: не глотайте InterruptedException. Если не знаете, что делать, — восстановите флаг (<code>Thread.currentThread().interrupt()</code>) и выходите, чтобы просьбу увидели выше.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Прерывание — кооперативное. Получили InterruptedException — завершайтесь или восстановите флаг.</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#interrupt">1.4 Прерывание: кооперативная отмена</a></p>
+
+<h2 id="join"><span class="h-num">1.5</span>join, sleep и демоны</h2>
+<ul>
+  <li><b>join</b> — «подожди, пока тот повар закончит».</li>
+  <li><b>sleep</b> — «вздремни N миллисекунд». Для синхронизации не годится: «подожду секунду, наверное, успеет» — ненадёжно.</li>
+  <li><b>daemon</b> — фоновый поток: программа не ждёт его завершения при выходе.</li>
+  <li><b>priority</b> — лишь пожелание системе, полагаться на него нельзя.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+join — ждать завершения; sleep — не способ синхронизации.</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#join">1.5 join, sleep, yield, daemon, priority</a></p>
+
+<h2 id="exceptions"><span class="h-num">1.6</span>Исключения в потоках</h2>
+<p>Если в потоке вылетело исключение и его никто не поймал, умирает только этот поток — остальные продолжают работать, а ошибка лишь печатается в консоль. В пулах ещё коварнее: исключение может тихо осесть внутри Future, и никто его не увидит (глава 08). Ловите ошибки внутри задач и логируйте их.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Ошибка в потоке не роняет программу — и поэтому легко остаётся незамеченной.</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#exceptions">1.6 Исключения в потоках</a></p>
+
+<h2 id="threadlocal"><span class="h-num">1.7</span>ThreadLocal: личный шкафчик</h2>
+<p>Самый простой способ избежать проблем с общими данными — не делить их. <b>ThreadLocal</b> — личный шкафчик каждого повара: одно имя переменной, но у каждого потока своё значение. Так хранят текущего пользователя запроса или объекты, которые нельзя делить между потоками (например, старый SimpleDateFormat). Опасность — в пулах потоки переиспользуются: если не очистить шкафчик, следующий запрос найдёт там чужие вещи.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+ThreadLocal — личные данные потока. В пулах обязательно очищайте (remove).</div>
+<p class="easy-bridge">В полной главе: <a href="01-threads.html#threadlocal">1.7 ThreadLocal и thread confinement</a></p>
+
+<h2 id="gloss"><span class="h-num">1.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Поток</td><td>Исполнитель внутри процесса со своим стеком.</td></tr>
+<tr><td>Runnable</td><td>Задача «что сделать».</td></tr>
+<tr><td>start / run</td><td>Запустить новый поток / просто вызвать метод.</td></tr>
+<tr><td>interrupt</td><td>Вежливая просьба потоку завершиться.</td></tr>
+<tr><td>join</td><td>Дождаться окончания другого потока.</td></tr>
+<tr><td>Daemon</td><td>Фоновый поток, не мешающий выходу программы.</td></tr>
+<tr><td>ThreadLocal</td><td>Своё значение переменной у каждого потока.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">1.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что произойдёт, если вызвать у потока run() вместо start()?</p><ul><li>поток запустится</li><li>задача выполнится в текущем потоке, нового не будет</li><li>ошибка компиляции</li><li>поток запустится дважды</li></ul><div class="why">run — обычный вызов метода.</div></div>
+<div class="mcq" data-ok="3"><p>Как правильно остановить поток?</p><ul><li>Thread.stop()</li><li>убить процесс</li><li>выставить приоритет 0</li><li>interrupt(), а поток сам аккуратно завершится</li></ul><div class="why">Остановка в Java кооперативная.</div></div>
+<div class="mcq" data-ok="0"><p>Вы поймали InterruptedException и не знаете, что с ним делать. Правильно…</p><ul><li>восстановить флаг прерывания и выйти</li><li>проигнорировать</li><li>напечатать и продолжить работу</li><li>вызвать stop</li></ul><div class="why">Иначе просьба остановиться потеряется.</div></div>
+<div class="mcq" data-ok="2"><p>Что делят между собой потоки одного процесса?</p><ul><li>ничего</li><li>стеки</li><li>кучу — общие объекты</li><li>счётчик команд</li></ul><div class="why">Стек у каждого свой, объекты — общие.</div></div>
+<div class="mcq" data-ok="1"><p>Чем опасен ThreadLocal в пуле потоков?</p><ul><li>он медленный</li><li>без очистки следующая задача увидит данные предыдущей</li><li>он не работает в пулах</li><li>ничем</li></ul><div class="why">Потоки переиспользуются вместе со шкафчиком.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="01-threads.html">01 «Потоки: жизненный цикл и API»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

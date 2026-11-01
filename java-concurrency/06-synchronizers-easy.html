@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Синхронизаторы — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · СНАЧАЛА ПРОСТО</div>
+  <h1>Синхронизаторы — простыми словами</h1>
+  <p class="lead">Часто потокам нужно не просто не мешать друг другу, а договориться: дождаться, пока все загрузятся; не пускать к базе больше десяти одновременно; собраться перед следующим этапом. Для этого в Java есть готовые синхронизаторы. Разберёмся, какой для чего.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 06 <a href="06-synchronizers.html">«Синхронизаторы»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="overview"><span class="h-num">6.1</span>Карта выбора</h2>
+<div class="table-wrap"><table>
+<tr><th>Задача</th><th>Инструмент</th><th>Аналогия</th></tr>
+<tr><td>дождаться, пока N дел закончатся</td><td>CountDownLatch</td><td>обратный отсчёт перед стартом ракеты</td></tr>
+<tr><td>не больше N одновременно</td><td>Semaphore</td><td>парковка на N мест</td></tr>
+<tr><td>все встречаются и идут дальше, снова и снова</td><td>CyclicBarrier</td><td>группа туристов на каждой остановке</td></tr>
+<tr><td>этапы с меняющимся числом участников</td><td>Phaser</td><td>эстафета, где бегуны входят и выходят</td></tr>
+<tr><td>два потока меняются данными</td><td>Exchanger</td><td>обмен подарками</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Выбирайте по задаче: ждать / ограничить / собраться / обменяться.</div>
+<p class="easy-bridge">В полной главе: <a href="06-synchronizers.html#overview">6.1 Карта выбора</a></p>
+
+<h2 id="latch"><span class="h-num">6.2</span>CountDownLatch: обратный отсчёт</h2>
+<p>Главный поток запускает 5 загрузчиков и хочет дождаться всех. Заводит защёлку на 5. Каждый загрузчик, закончив, делает <code>countDown()</code>. Главный ждёт в <code>await()</code>, пока счётчик не дойдёт до нуля. Защёлка <b>одноразовая</b>: дошла до нуля — открыта навсегда.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CountDownLatch — «жду, пока N раз отметятся». Одноразовый.</div>
+<p class="easy-bridge">В полной главе: <a href="06-synchronizers.html#latch">6.2 CountDownLatch</a></p>
+
+<h2 id="semaphore"><span class="h-num">6.3</span>Semaphore: парковка на N мест</h2>
+<p>Внешний сервис выдерживает не больше 10 одновременных запросов. Семафор на 10 «разрешений»: перед запросом <code>acquire()</code> (занять место), после — <code>release()</code> в finally (освободить). Одиннадцатый будет ждать, пока кто-то уедет.</p>
+<div class="widget stepper">
+  <div class="widget-title">Семафор на 2 места, приходят 3 потока</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">мест: 2. A: acquire ✓ (осталось 1). B: acquire ✓ (осталось 0)</span><span data-from="2" data-to="3">C: acquire — мест нет → ждёт</span><span data-from="3" data-to="4">A закончил: release → мест 1 → C просыпается и занимает место</span><span data-from="4">release — обязательно в finally, иначе место «пропадёт» навсегда</span></pre></div>
+  <section class="st-step" data-t="Двое заехали"><p>Места разбираются.</p></section>
+  <section class="st-step" data-t="Третий ждёт"><p>Мест нет — поток спит, процессор не тратит.</p></section>
+  <section class="st-step" data-t="Освободили"><p>Ждущий получает место.</p></section>
+  <section class="st-step" data-t="Правило"><p>Как с unlock — release в finally.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Semaphore ограничивает число одновременных действий. release — в finally.</div>
+<p class="easy-bridge">В полной главе: <a href="06-synchronizers.html#semaphore">6.3 Semaphore</a></p>
+
+<h2 id="barrier"><span class="h-num">6.4</span>CyclicBarrier: всех ждём на остановке</h2>
+<p>Группа туристов идёт по маршруту: на каждой остановке ждут, пока подтянутся все, и только потом идут дальше. Барьер на N участников: каждый вызывает <code>await()</code>, и пока не придут все N, никто не продолжает. Барьер <b>многоразовый</b> — работает на каждом этапе.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CyclicBarrier — все ждут друг друга на каждом этапе.</div>
+<p class="easy-bridge">В полной главе: <a href="06-synchronizers.html#barrier">6.4 CyclicBarrier</a></p>
+
+<h2 id="phaser"><span class="h-num">6.5</span>Phaser: гибкие этапы</h2>
+<p>Как барьер, но участники могут присоединяться и выходить по ходу дела, а этапов сколько угодно. Нужен редко — для сложных многоэтапных вычислений.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Phaser — барьер с меняющимся числом участников.</div>
+<p class="easy-bridge">В полной главе: <a href="06-synchronizers.html#phaser">6.5 Phaser</a></p>
+
+<h2 id="exchanger"><span class="h-num">6.6</span>Exchanger: обмен</h2>
+<p>Два потока встречаются в точке обмена и меняются объектами: например, один заполняет буфер, другой опустошает, и они меняются буферами. Экзотика, но иногда удобна.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Exchanger — встреча двух потоков с обменом данными.</div>
+<p class="easy-bridge">В полной главе: <a href="06-synchronizers.html#exchanger">6.6 Exchanger</a></p>
+
+<h2 id="gloss"><span class="h-num">6.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Синхронизатор</td><td>Готовый инструмент согласования потоков.</td></tr>
+<tr><td>CountDownLatch</td><td>Одноразовый обратный отсчёт.</td></tr>
+<tr><td>Semaphore</td><td>Ограничение числа одновременных участников.</td></tr>
+<tr><td>CyclicBarrier</td><td>Многоразовая точка сбора.</td></tr>
+<tr><td>Phaser</td><td>Гибкий многоэтапный барьер.</td></tr>
+<tr><td>Exchanger</td><td>Точка обмена между двумя потоками.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">6.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Главный поток должен дождаться, пока 3 задачи загрузят данные. Что использовать?</p><ul><li>Semaphore</li><li>Exchanger</li><li>CountDownLatch на 3</li><li>sleep</li></ul><div class="why">Каждая задача делает countDown, главный ждёт await.</div></div>
+<div class="mcq" data-ok="0"><p>К сервису можно не больше 5 одновременных запросов. Что использовать?</p><ul><li>Semaphore на 5</li><li>CyclicBarrier</li><li>CountDownLatch</li><li>volatile</li></ul><div class="why">Парковка на 5 мест.</div></div>
+<div class="mcq" data-ok="3"><p>Чем CyclicBarrier отличается от CountDownLatch?</p><ul><li>ничем</li><li>барьер быстрее</li><li>барьер ограничивает число потоков</li><li>барьер многоразовый и все участники ждут друг друга</li></ul><div class="why">Защёлка одноразовая, и ждёт её обычно другой поток.</div></div>
+<div class="mcq" data-ok="1"><p>Почему release() у семафора вызывают в finally?</p><ul><li>так быстрее</li><li>иначе при исключении разрешение пропадёт навсегда</li><li>так требует компилятор</li><li>не обязательно</li></ul><div class="why">Места на парковке будут таять.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли повторно использовать CountDownLatch после того, как счётчик дошёл до нуля?</p><ul><li>да, он сбросится сам</li><li>да, через reset</li><li>нет, он одноразовый</li><li>только в тестах</li></ul><div class="why">Для повторяющихся этапов — CyclicBarrier или Phaser.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="06-synchronizers.html">06 «Синхронизаторы»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

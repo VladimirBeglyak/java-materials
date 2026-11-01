@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Конкурентные коллекции — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · СНАЧАЛА ПРОСТО</div>
+  <h1>Конкурентные коллекции — простыми словами</h1>
+  <p class="lead">Обычные коллекции ломаются, если их меняют из нескольких потоков. Разберёмся, какие бывают потокобезопасные коллекции, как устроена ConcurrentHashMap, когда подходит CopyOnWriteArrayList, как очереди связывают производителей и потребителей и как выбрать нужную.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 07 <a href="07-collections.html">«Конкурентные коллекции»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="landscape"><span class="h-num">7.1</span>Три поколения</h2>
+<div class="grid-3">
+  <div class="card"><h4>Старые: Vector, Hashtable</h4><p>Каждый метод под одним замком. Безопасно, но медленно, и составные действия всё равно не защищены.</p></div>
+  <div class="card"><h4>Обёртки: synchronizedList</h4><p>То же самое для обычных коллекций. При обходе нужно вручную держать замок.</p></div>
+  <div class="card"><h4>Конкурентные: java.util.concurrent</h4><p>Спроектированы для многих потоков: мелкие замки или CAS, безопасный обход. Их и используют.</p></div>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Для многопоточности — коллекции из java.util.concurrent.</div>
+<p class="easy-bridge">В полной главе: <a href="07-collections.html#landscape">7.1 Три поколения</a></p>
+
+<h2 id="chm"><span class="h-num">7.2</span>ConcurrentHashMap: замки на ящиках</h2>
+<p>Обычная HashMap — шкаф с ящиками (глава 09 java-core). Чтобы несколько потоков работали одновременно, ConcurrentHashMap не запирает весь шкаф: пустой ящик заполняется через CAS, а при записи в непустой запирается <b>только этот ящик</b>. Чтение вообще без замков. Поэтому сотни потоков работают параллельно, если попадают в разные ящики.</p>
+<p>Составные действия делайте её атомарными методами: <code>computeIfAbsent</code>, <code>merge</code>, <code>compute</code> — а не «get, потом put». Ещё особенности: null нельзя ни в ключах, ни в значениях; <code>size()</code> во время записей — примерный.</p>
+<div class="widget stepper">
+  <div class="widget-title">Подсчёт слов из многих потоков</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">✗ c = map.get(w); map.put(w, c + 1)
+два потока прочитали 5 → оба записали 6 → одно слово потеряно</span><span data-from="2" data-to="3">✓ map.merge(w, 1, Integer::sum)
+чтение + сложение + запись — одно атомарное действие для ключа</span><span data-from="3">разные слова в разных ящиках → потоки вообще не мешают друг другу</span></pre></div>
+  <section class="st-step" data-t="Неправильно"><p>Каждая операция безопасна, а их связка — нет.</p></section>
+  <section class="st-step" data-t="Правильно"><p>merge выполняет всё под замком ящика.</p></section>
+  <section class="st-step" data-t="Параллельность"><p>Замок только на ящик — остальные свободны.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+ConcurrentHashMap — замки на отдельные ящики. Составные действия — через merge/compute.</div>
+<p class="easy-bridge">В полной главе: <a href="07-collections.html#chm">7.2 ConcurrentHashMap изнутри (JDK 8+)</a></p>
+
+<h2 id="cow"><span class="h-num">7.3</span>CopyOnWrite: копия при каждой записи</h2>
+<p><code>CopyOnWriteArrayList</code> при каждом изменении делает <b>полную копию</b> массива и подменяет ссылку. Читатели всегда видят целый, неизменный «снимок» и не ждут ни секунды. Идеально для списка подписчиков или настроек: читают постоянно, меняют редко. Для частых записей — ужасно: каждое добавление копирует всё.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Много чтений, редкие записи — CopyOnWrite. Частые записи — никогда.</div>
+<p class="easy-bridge">В полной главе: <a href="07-collections.html#cow">7.3 CopyOnWriteArrayList / Set</a></p>
+
+<h2 id="queues"><span class="h-num">7.4</span>BlockingQueue: конвейер между потоками</h2>
+<p>Производители кладут задачи на ленту, потребители забирают. <b>BlockingQueue</b> сама разруливает ожидание: если лента пуста, <code>take()</code> ждёт; если полна (у очереди есть вместимость), <code>put()</code> ждёт. Так естественно возникает <b>обратное давление</b>: быстрый производитель не завалит медленного потребителя.</p>
+<ul>
+  <li><b>ArrayBlockingQueue</b> — фиксированная вместимость;</li>
+  <li><b>LinkedBlockingQueue</b> — по умолчанию практически без ограничения (осторожно с памятью);</li>
+  <li><b>SynchronousQueue</b> — без места вовсе: «из рук в руки»;</li>
+  <li><b>PriorityBlockingQueue</b>, <b>DelayQueue</b> — по приоритету и по времени.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+BlockingQueue — готовый производитель-потребитель. Ограничивайте вместимость.</div>
+<p class="easy-bridge">В полной главе: <a href="07-collections.html#queues">7.4 BlockingQueue: передача данных между потоками</a></p>
+
+<h2 id="skiplist"><span class="h-num">7.5</span>ConcurrentSkipListMap: отсортированная и конкурентная</h2>
+<p>Если нужна map с отсортированными ключами для многих потоков (аналог TreeMap), есть <b>ConcurrentSkipListMap</b>. Внутри — «список с экспресс-полосами»: несколько уровней ссылок, по которым поиск перескакивает через многие элементы, как экспресс-поезд мимо мелких станций.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Нужна сортировка и потоки — ConcurrentSkipListMap.</div>
+<p class="easy-bridge">В полной главе: <a href="07-collections.html#skiplist">7.5 ConcurrentSkipListMap / Set</a></p>
+
+<h2 id="choose"><span class="h-num">7.6</span>Шпаргалка выбора</h2>
+<div class="table-wrap"><table>
+<tr><th>Нужно</th><th>Выбор</th></tr>
+<tr><td>map из многих потоков</td><td>ConcurrentHashMap</td></tr>
+<tr><td>отсортированная map из многих потоков</td><td>ConcurrentSkipListMap</td></tr>
+<tr><td>список, который почти не меняется</td><td>CopyOnWriteArrayList</td></tr>
+<tr><td>передача задач между потоками</td><td>BlockingQueue с ограничением</td></tr>
+<tr><td>неблокирующая очередь</td><td>ConcurrentLinkedQueue</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Выбирайте по сценарию: map, редкие записи, передача задач.</div>
+<p class="easy-bridge">В полной главе: <a href="07-collections.html#choose">7.6 Шпаргалка выбора</a></p>
+
+<h2 id="gloss"><span class="h-num">7.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>ConcurrentHashMap</td><td>Потокобезопасная map с замками на отдельные ящики.</td></tr>
+<tr><td>CopyOnWrite</td><td>Копия при каждой записи, чтение без замков.</td></tr>
+<tr><td>BlockingQueue</td><td>Очередь, которая ждёт, если пусто или полно.</td></tr>
+<tr><td>Производитель / потребитель</td><td>Кто кладёт задачи / кто их обрабатывает.</td></tr>
+<tr><td>Backpressure</td><td>Обратное давление: медленный тормозит быстрого.</td></tr>
+<tr><td>Skip list</td><td>Список с «экспресс-полосами» для быстрого поиска.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">7.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Как правильно увеличить счётчик слова в ConcurrentHashMap из многих потоков?</p><ul><li>get, затем put</li><li>map.merge(слово, 1, Integer::sum)</li><li>synchronized вокруг get</li><li>volatile map</li></ul><div class="why">merge атомарен для ключа.</div></div>
+<div class="mcq" data-ok="3"><p>Когда CopyOnWriteArrayList — плохой выбор?</p><ul><li>список подписчиков</li><li>настройки, которые меняются раз в час</li><li>когда читают чаще, чем пишут</li><li>когда в список часто добавляют элементы</li></ul><div class="why">Каждая запись копирует весь массив.</div></div>
+<div class="mcq" data-ok="0"><p>Что делает take() у пустой BlockingQueue?</p><ul><li>ждёт, пока появится элемент</li><li>возвращает null</li><li>бросает исключение</li><li>создаёт элемент</li></ul><div class="why">Поэтому она удобна для производителя-потребителя.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли положить null в ConcurrentHashMap?</p><ul><li>да</li><li>только как значение</li><li>нет, ни ключ, ни значение</li><li>только как ключ</li></ul><div class="why">Иначе null в get был бы неоднозначен при параллельной работе.</div></div>
+<div class="mcq" data-ok="1"><p>Почему ConcurrentHashMap быстрее Hashtable при многих потоках?</p><ul><li>она меньше</li><li>она запирает не всю таблицу, а только нужный ящик, а чтение идёт без замков</li><li>она не потокобезопасна</li><li>Hashtable быстрее</li></ul><div class="why">Потоки в разных ящиках не мешают друг другу.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="07-collections.html">07 «Конкурентные коллекции»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

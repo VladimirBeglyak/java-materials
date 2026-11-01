@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Lock, Condition и AQS — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="04e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 04 · СНАЧАЛА ПРОСТО</div>
+  <h1>Lock, Condition и AQS — простыми словами</h1>
+  <p class="lead">Пакет java.util.concurrent даёт более гибкие замки, чем synchronized. Разберёмся, как правильно пользоваться Lock, зачем несколько очередей ожидания, как читатели и писатели делят один ресурс, что такое оптимистичное чтение и как устроен общий «двигатель» AQS.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 04 <a href="04-locks-aqs.html">«Lock, Condition и AQS»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="lock"><span class="h-num">4.1</span>Lock и обязательная идиома</h2>
+<p><code>ReentrantLock</code> делает то же, что synchronized, но вручную: <code>lock()</code> — взять ключ, <code>unlock()</code> — отдать. Главное правило: <b>unlock всегда в finally</b>. Иначе при исключении ключ останется у ушедшего потока навсегда, и все остальные встанут.</p>
+<p>Зато у Lock есть возможности, которых нет у synchronized: <code>tryLock()</code> — «попробовать взять, а если занято — не ждать» (или ждать не дольше N секунд), <code>lockInterruptibly()</code> — ожидание, которое можно прервать, честная очередь (fair).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+lock() — try — finally unlock(). Lock нужен ради tryLock, таймаутов и прерываемости.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#lock">4.1 Интерфейс Lock и обязательная идиома</a></p>
+
+<h2 id="condition"><span class="h-num">4.2</span>Condition: несколько залов ожидания</h2>
+<p>У synchronized один «зал ожидания» на объект: и ждущие «место в очереди», и ждущие «заказ» сидят вместе, и notifyAll будит всех. <b>Condition</b> позволяет завести несколько залов: «ждут, пока очередь не пуста» и «ждут, пока очередь не полна» — и будить только нужных. Правила те же: ждать в цикле while.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Condition — отдельные залы ожидания для разных условий.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#condition">4.2 Condition: несколько очередей ожидания</a></p>
+
+<h2 id="rw"><span class="h-num">4.3</span>Читатели и писатели</h2>
+<p>В библиотеке читать книгу могут многие одновременно, а исправлять — только один, и в это время читать нельзя. <code>ReentrantReadWriteLock</code> даёт два ключа: <b>на чтение</b> (общий, сколько угодно) и <b>на запись</b> (эксклюзивный). Выгодно, когда читают часто, а пишут редко и чтение долгое.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Много читателей одновременно, писатель — один и без читателей.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#rw">4.3 ReentrantReadWriteLock</a></p>
+
+<h2 id="stamped"><span class="h-num">4.4</span>StampedLock: оптимистичное чтение</h2>
+<p>Ещё быстрее: читатель вообще не берёт ключ, а просто запоминает «номер версии», читает данные и проверяет — не поменялась ли версия. Не поменялась — данные согласованы. Поменялась — перечитывает уже под настоящим ключом. Как прочитать объявление на доске и глянуть, не поменяли ли его, пока читали. Сложен в использовании и не реентерабелен.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Оптимистичное чтение без блокировки, с проверкой версии. Только для горячих мест.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#stamped">4.4 StampedLock: оптимистичное чтение</a></p>
+
+<h2 id="aqs"><span class="h-num">4.5</span>AQS: общий двигатель</h2>
+<p>ReentrantLock, Semaphore, CountDownLatch и другие построены на одном механизме — <b>AbstractQueuedSynchronizer</b>. Внутри у него два элемента: <b>число-состояние</b> (сколько раз взят замок, сколько осталось разрешений) и <b>очередь ждущих потоков</b>. Попытка взять — атомарно поменять состояние (CAS). Не получилось — встать в очередь и уснуть. Освободили — разбудить первого в очереди.</p>
+<div class="widget stepper">
+  <div class="widget-title">Три потока и один ReentrantLock</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">state = 0 (свободно). Поток A: CAS 0→1 ✓ — ключ у A</span><span data-from="2" data-to="3">поток B: CAS не удался → в очередь, уснул
+поток C: тоже в очередь
+очередь: [B, C]</span><span data-from="3" data-to="4">A: unlock → state = 0 → будит первого в очереди: B</span><span data-from="4">B: CAS 0→1 ✓ — ключ у B. C ждёт дальше</span></pre></div>
+  <section class="st-step" data-t="Первый"><p>Свободный замок берётся одной атомарной операцией.</p></section>
+  <section class="st-step" data-t="Очередь"><p>Опоздавшие встают в очередь и засыпают — процессор не тратится.</p></section>
+  <section class="st-step" data-t="Освобождение"><p>Будится только следующий, а не все.</p></section>
+  <section class="st-step" data-t="Передача"><p>Так работает почти весь java.util.concurrent.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+AQS = число-состояние + очередь ждущих. На нём построены почти все синхронизаторы.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#aqs">4.5 AQS изнутри</a></p>
+
+<h2 id="own"><span class="h-num">4.6</span>Свой синхронизатор</h2>
+<p>Благодаря AQS свой синхронизатор (например, «защёлка, открывающаяся один раз») пишется в несколько строк: нужно лишь описать, что значит «взять» и «отпустить» в терминах числа-состояния, а очередь, засыпание и пробуждение AQS сделает сам. В прикладном коде это нужно редко — почти всегда хватает готовых инструментов.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+AQS берёт на себя очередь и сон — остаётся описать правила состояния.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#own">4.6 Пишем свой синхронизатор на AQS</a></p>
+
+<h2 id="compare"><span class="h-num">4.7</span>Что выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Нужно</th><th>Выбор</th></tr>
+<tr><td>просто защитить данные</td><td>synchronized</td></tr>
+<tr><td>таймаут, tryLock, прерываемость</td><td>ReentrantLock</td></tr>
+<tr><td>много чтений, редкие записи</td><td>ReadWriteLock</td></tr>
+<tr><td>очень горячее чтение</td><td>StampedLock</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Начинайте с простого; сложный замок — только при доказанной потребности.</div>
+<p class="easy-bridge">В полной главе: <a href="04-locks-aqs.html#compare">4.7 Сравнение</a></p>
+
+<h2 id="gloss"><span class="h-num">4.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>ReentrantLock</td><td>Ручной замок с дополнительными возможностями.</td></tr>
+<tr><td>tryLock</td><td>Попытка взять без долгого ожидания.</td></tr>
+<tr><td>Condition</td><td>Отдельный «зал ожидания» условия.</td></tr>
+<tr><td>ReadWriteLock</td><td>Общий ключ на чтение и эксклюзивный на запись.</td></tr>
+<tr><td>StampedLock</td><td>Замок с оптимистичным чтением по версии.</td></tr>
+<tr><td>AQS</td><td>Общий механизм: состояние + очередь ждущих.</td></tr>
+<tr><td>Fair lock</td><td>Честная очередь: кто раньше пришёл, тот раньше вошёл.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">4.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Где вызывать unlock()?</p><ul><li>в конце try</li><li>в catch</li><li>в finally</li><li>не нужно, отпустится сам</li></ul><div class="why">Иначе при исключении замок останется занятым навсегда.</div></div>
+<div class="mcq" data-ok="0"><p>Что умеет ReentrantLock, чего не умеет synchronized?</p><ul><li>ждать с таймаутом (tryLock) и прерываемо</li><li>защищать данные</li><li>давать видимость</li><li>быть реентерабельным</li></ul><div class="why">Остальное умеют оба.</div></div>
+<div class="mcq" data-ok="3"><p>Данные читают тысячи раз в секунду, а меняют раз в минуту. Что подойдёт?</p><ul><li>один synchronized на всё</li><li>Semaphore(1)</li><li>без синхронизации</li><li>ReadWriteLock: читатели не мешают друг другу</li></ul><div class="why">Общий ключ на чтение.</div></div>
+<div class="mcq" data-ok="1"><p>Из чего состоит AQS?</p><ul><li>из пула потоков</li><li>из числа-состояния и очереди ждущих потоков</li><li>из HashMap</li><li>из таймера</li></ul><div class="why">На этом построены Lock, Semaphore, CountDownLatch.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает оптимистичное чтение StampedLock?</p><ul><li>блокирует всех писателей</li><li>читает без проверки</li><li>читает без замка и проверяет, не изменилась ли версия</li><li>копирует данные</li></ul><div class="why">Если версия поменялась — перечитывают под замком.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="04-locks-aqs.html">04 «Lock, Condition и AQS»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

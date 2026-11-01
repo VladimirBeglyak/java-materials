@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Пулы потоков — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="08e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 08 · СНАЧАЛА ПРОСТО</div>
+  <h1>Пулы потоков — простыми словами</h1>
+  <p class="lead">Создавать новый поток на каждую задачу дорого и опасно. Поэтому задачи отдают пулу. Разберёмся, зачем нужны пулы, как устроен ThreadPoolExecutor, по какому алгоритму он принимает задачи, чем опасны готовые фабрики, что делать при переполнении, как выбрать размер и куда пропадают исключения.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~15 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 08 <a href="08-executors.html">«Executors и ThreadPoolExecutor»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">8.1</span>Зачем пулы</h2>
+<p>Нанимать нового рабочего на каждую мелкую задачу и увольнять после — долго и дорого. Лучше держать <b>бригаду</b> и <b>очередь заданий</b>. Пул даёт: переиспользование потоков (создание потока дорогое), ограничение их числа (тысяча потоков задушат машину) и управление: очередь, отказ при перегрузке, корректная остановка.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Пул = бригада потоков + очередь задач + правила перегрузки.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#why">8.1 Зачем пулы</a></p>
+
+<h2 id="api"><span class="h-num">8.2</span>Жизненный цикл пула</h2>
+<p>Задачи отдают через <code>execute</code> (без результата) или <code>submit</code> (с результатом — Future). Пул нужно останавливать: <code>shutdown()</code> — «новых не принимаем, доделываем начатое», затем <code>awaitTermination</code> — подождать. <code>shutdownNow()</code> — «срочно прерываем всех». Забытый пул держит потоки, и программа может не завершиться.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+submit — с результатом, shutdown + awaitTermination — корректная остановка.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#api">8.2 Иерархия и жизненный цикл</a></p>
+
+<h2 id="algo"><span class="h-num">8.3</span>Алгоритм приёма задачи</h2>
+<p>У ThreadPoolExecutor есть «основная бригада» (core), очередь и «временные работники» (до max). Порядок неочевидный, его спрашивают на собеседованиях:</p>
+<div class="widget stepper">
+  <div class="widget-title">Пришла новая задача: core = 2, очередь = 3 места, max = 4</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">1. работников меньше core (2)? → нанять нового под эту задачу</span><span data-from="2" data-to="3">2. core заняты → положить задачу в очередь (если есть место)</span><span data-from="3" data-to="4">3. очередь полна → нанять временного, пока работников меньше max (4)</span><span data-from="4">4. и очередь полна, и работников max → ОТКАЗ (политика reject)
+временные увольняются, если долго простаивают</span></pre></div>
+  <section class="st-step" data-t="Основная бригада"><p>Сначала набирается core.</p></section>
+  <section class="st-step" data-t="Очередь"><p>Потом задачи копятся в очереди, а не нанимаются новые.</p></section>
+  <section class="st-step" data-t="Временные"><p>Временные работники появляются, только когда очередь заполнена.</p></section>
+  <section class="st-step" data-t="Отказ"><p>Всё полно — срабатывает политика отказа.</p></section>
+</div>
+<p>Отсюда ловушка: с <b>бесконечной очередью</b> шаг 3 никогда не наступит — пул никогда не вырастет выше core, а очередь будет расти до нехватки памяти.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+core → очередь → временные до max → отказ. С бесконечной очередью max не работает.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#algo">8.3 Алгоритм execute() — выучить наизусть</a></p>
+
+<h2 id="factories"><span class="h-num">8.4</span>Ловушки готовых фабрик</h2>
+<ul>
+  <li><code>newFixedThreadPool</code> — фиксированная бригада и <b>бесконечная</b> очередь: при перегрузке задачи копятся до OutOfMemoryError.</li>
+  <li><code>newCachedThreadPool</code> — нанимает без ограничения: при наплыве создаст тысячи потоков.</li>
+</ul>
+<p>Для серверного кода лучше создавать ThreadPoolExecutor явно, с ограниченной очередью и понятной политикой отказа.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Готовые фабрики прячут бесконечность. Ограничивайте очередь или число потоков.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#factories">8.4 Фабрики Executors и их ловушки</a></p>
+
+<h2 id="reject"><span class="h-num">8.5</span>Что делать при перегрузке</h2>
+<div class="table-wrap"><table>
+<tr><th>Политика</th><th>Что делает</th></tr>
+<tr><td>Abort (по умолчанию)</td><td>бросает исключение — вызывающий узнаёт о перегрузке</td></tr>
+<tr><td>CallerRuns</td><td>задачу выполняет сам отправитель — естественно его замедляет</td></tr>
+<tr><td>Discard / DiscardOldest</td><td>тихо выбрасывает задачу — опасно, если задачи важны</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CallerRuns — простое обратное давление. Тихо выбрасывать — только неважное.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#reject">8.5 Политики отказа</a></p>
+
+<h2 id="sizing"><span class="h-num">8.6</span>Размер пула</h2>
+<p>Если задачи <b>считают</b> (процессор) — потоков примерно по числу ядер. Если задачи в основном <b>ждут</b> (база, сеть) — потоков нужно больше: пока одни ждут, другие работают. Приближённая формула: ядра × (1 + время ожидания / время работы). Но лучший ответ — замер под нагрузкой. А для задач с ожиданием сегодня часто проще виртуальные потоки (глава 10).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Счёт — по числу ядер, ожидание — больше. Проверяйте замером.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#sizing">8.6 Размер пула</a></p>
+
+<h2 id="exceptions"><span class="h-num">8.7</span>Куда пропадают исключения</h2>
+<p>Если задача отправлена через <code>submit</code> и упала, исключение тихо сохраняется внутри Future. Пока никто не вызовет <code>get()</code>, о нём никто не узнает — в логах пусто. Через <code>execute</code> исключение хотя бы напечатается. Правило: ловите и логируйте ошибки внутри задачи или обязательно проверяйте результат Future.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+submit прячет исключения в Future. Логируйте внутри задачи.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#exceptions">8.7 Исключения и задачи</a></p>
+
+<h2 id="fj"><span class="h-num">8.8</span>ForkJoinPool и кража работы</h2>
+<p>ForkJoinPool — особый пул для задач «раздели пополам и реши части». У каждого работника своя стопка задач; освободившийся работник <b>крадёт</b> задачи из чужой стопки — никто не сидит без дела. На нём работают параллельные стримы и асинхронные операции CompletableFuture по умолчанию (общий пул). Блокирующие операции в общем пуле — плохая идея: они занимают и без того немногочисленных работников.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+ForkJoinPool — для деления задач; не блокируйте общий пул.</div>
+<p class="easy-bridge">В полной главе: <a href="08-executors.html#fj">8.8 ForkJoinPool и work-stealing</a></p>
+
+<h2 id="gloss"><span class="h-num">8.9</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>ExecutorService</td><td>Пул, которому отдают задачи.</td></tr>
+<tr><td>core / max</td><td>Основная бригада / предел с временными.</td></tr>
+<tr><td>Рабочая очередь</td><td>Очередь задач, ждущих работника.</td></tr>
+<tr><td>Политика отказа</td><td>Что делать, если всё переполнено.</td></tr>
+<tr><td>Future</td><td>«Квитанция» на будущий результат задачи.</td></tr>
+<tr><td>Work stealing</td><td>Свободный работник крадёт чужие задачи.</td></tr>
+<tr><td>shutdown</td><td>Корректная остановка пула.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">8.10</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>core = 4, max = 20, очередь бесконечная. Сколько потоков будет при большой нагрузке?</p><ul><li>20</li><li>сколько угодно</li><li>4: временные нанимаются, только когда очередь полна, а она никогда не заполнится</li><li>0</li></ul><div class="why">Классическая ловушка конфигурации.</div></div>
+<div class="mcq" data-ok="0"><p>Чем опасен Executors.newFixedThreadPool под перегрузкой?</p><ul><li>бесконечная очередь копит задачи до нехватки памяти</li><li>создаёт тысячи потоков</li><li>сразу отказывает</li><li>ничем</li></ul><div class="why">Ограничивайте очередь.</div></div>
+<div class="mcq" data-ok="3"><p>Задача, отправленная через submit, бросила исключение. Где оно?</p><ul><li>в логах</li><li>оно уронило программу</li><li>потерялось навсегда</li><li>сохранено внутри Future и всплывёт при get()</li></ul><div class="why">Если get не вызвать — о нём никто не узнает.</div></div>
+<div class="mcq" data-ok="1"><p>Какая политика отказа заставляет отправителя притормозить?</p><ul><li>Abort</li><li>CallerRuns</li><li>Discard</li><li>DiscardOldest</li></ul><div class="why">Отправитель сам выполняет задачу и не успевает слать новые.</div></div>
+<div class="mcq" data-ok="2"><p>Задачи в основном ждут ответа базы. Сколько потоков в пуле?</p><ul><li>ровно по числу ядер</li><li>один</li><li>больше числа ядер — пока одни ждут, другие работают (или виртуальные потоки)</li><li>тысячи всегда</li></ul><div class="why">Для ожидания нужно больше исполнителей.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="08-executors.html">08 «Executors и ThreadPoolExecutor»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

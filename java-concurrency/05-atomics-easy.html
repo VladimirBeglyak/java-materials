@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · CAS и атомики — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="05e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 05 · СНАЧАЛА ПРОСТО</div>
+  <h1>CAS и атомики — простыми словами</h1>
+  <p class="lead">Замок — не единственный способ безопасно менять общие данные. Процессор умеет атомарную операцию «сравни и поменяй» (CAS), и на ней строят быстрые счётчики и структуры без блокировок. Разберёмся, как работает CAS, что такое проблема ABA, почему LongAdder быстрее AtomicLong и когда CAS хуже обычного замка.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 05 <a href="05-atomics.html">«CAS, Atomic*, LongAdder, VarHandle»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cas"><span class="h-num">5.1</span>Compare-and-Swap</h2>
+<p>CAS — одна неделимая команда процессора: «если в ячейке сейчас X — запиши Y; если не X — ничего не делай и скажи, что не вышло». Как обмен в магазине: «поменяю куртку, если цена всё ещё 5000; если уже переоценили — заново смотрю ценник».</p>
+<div class="widget stepper">
+  <div class="widget-title">Два потока увеличивают счётчик через CAS</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">счётчик = 10. A прочитал 10, B прочитал 10</span><span data-from="2" data-to="3">A: CAS(10 → 11) ✓ — счётчик 11</span><span data-from="3" data-to="4">B: CAS(10 → 11) ✗ — там уже 11, а не 10</span><span data-from="4">B: перечитал 11 → CAS(11 → 12) ✓
+итог 12 — ни одно прибавление не потерялось</span></pre></div>
+  <section class="st-step" data-t="Оба прочитали"><p>Как и при обычном ++, оба видят 10.</p></section>
+  <section class="st-step" data-t="A успел"><p>Первый CAS проходит.</p></section>
+  <section class="st-step" data-t="B не успел"><p>CAS замечает, что значение изменилось, и отказывает.</p></section>
+  <section class="st-step" data-t="Повтор"><p>B повторяет с новым значением. Никто не засыпал и не ждал замка.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CAS: поменять, только если не изменилось; иначе перечитать и повторить.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#cas">5.1 Compare-and-Swap</a></p>
+
+<h2 id="atomic"><span class="h-num">5.2</span>Семейство Atomic*</h2>
+<p><code>AtomicInteger</code>, <code>AtomicLong</code>, <code>AtomicBoolean</code>, <code>AtomicReference</code> — обёртки, у которых операции вроде <code>incrementAndGet</code>, <code>compareAndSet</code>, <code>updateAndGet</code> атомарны и видимы всем потокам. Для счётчика запросов или флага «уже запущено» это проще и быстрее замка.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Одна переменная, атомарное изменение — Atomic*.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#atomic">5.2 Семейство Atomic*</a></p>
+
+<h2 id="treiber"><span class="h-num">5.3</span>Структура без блокировок</h2>
+<p>На CAS можно построить целую структуру, например стек: «новая вершина указывает на старую вершину; CAS вершины со старой на новую; не вышло — повторить». Никто никогда не засыпает в ожидании замка — такие структуры называют <b>lock-free</b>. Писать их сложно, поэтому в жизни берут готовые (ConcurrentLinkedQueue и др.).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Lock-free структуры строят на CAS-циклах. Пользуйтесь готовыми.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#treiber">5.3 Lock-free структура: стек Трайбера</a></p>
+
+<h2 id="aba"><span class="h-num">5.4</span>Проблема ABA</h2>
+<p>CAS проверяет только «значение то же?». Но значение могло измениться с A на B и обратно на A — CAS этого не заметит. Как оставить машину на парковке, вернуться — машина стоит на месте, но пока вас не было, её успели взять покататься и вернуть. Для чисел это обычно не важно, для ссылок в lock-free структурах — может сломать логику. Лечение — добавлять номер версии (<code>AtomicStampedReference</code>).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CAS не видит «изменилось и вернулось». Против ABA — номер версии.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#aba">5.4 Проблема ABA</a></p>
+
+<h2 id="adder"><span class="h-num">5.5</span>LongAdder: много касс вместо одной</h2>
+<p>Если сотни потоков увеличивают один AtomicLong, их CAS постоянно сталкиваются и повторяются. <b>LongAdder</b> работает как супермаркет с несколькими кассами: каждый поток стучит в «свою» ячейку, а итог — сумма всех ячеек. Запись становится намного быстрее, а чтение суммы чуть дороже и не мгновенно-точное в момент гонки. Идеален для метрик и статистики.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Горячий счётчик с частыми записями — LongAdder.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#adder">5.5 LongAdder и Striped64</a></p>
+
+<h2 id="varhandle"><span class="h-num">5.6</span>VarHandle</h2>
+<p>VarHandle — низкоуровневый инструмент, дающий CAS и разные режимы видимости для обычных полей и элементов массива — без отдельных объектов-обёрток. Им пользуются авторы библиотек; в прикладном коде он почти не нужен.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+VarHandle — для авторов библиотек.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#varhandle">5.6 VarHandle и режимы доступа к памяти</a></p>
+
+<h2 id="when"><span class="h-num">5.7</span>Когда CAS хуже замка</h2>
+<p>При сильной толкотне CAS-циклы крутятся и тратят процессор впустую, а замок усыпил бы ждущих. Кроме того, CAS защищает одну переменную: если нужно согласованно изменить несколько полей, проще и надёжнее замок. Правило: одна переменная и умеренная конкуренция — атомик; несколько связанных полей — замок.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Одна переменная — атомик; несколько связанных — замок.</div>
+<p class="easy-bridge">В полной главе: <a href="05-atomics.html#when">5.7 Когда CAS хуже лока</a></p>
+
+<h2 id="gloss"><span class="h-num">5.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>CAS</td><td>«Поменяй, если не изменилось» одной командой.</td></tr>
+<tr><td>Atomic*</td><td>Переменные с атомарными операциями.</td></tr>
+<tr><td>Lock-free</td><td>Структура без замков, на CAS.</td></tr>
+<tr><td>ABA</td><td>Значение изменилось и вернулось — CAS не заметил.</td></tr>
+<tr><td>LongAdder</td><td>Счётчик с несколькими ячейками для частых записей.</td></tr>
+<tr><td>VarHandle</td><td>Низкоуровневый доступ к полю с CAS.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">5.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Что делает CAS, если значение уже изменилось?</p><ul><li>перезаписывает всё равно</li><li>ничего не меняет и сообщает о неудаче</li><li>блокирует поток</li><li>бросает исключение</li></ul><div class="why">Дальше код перечитывает и повторяет.</div></div>
+<div class="mcq" data-ok="3"><p>Какой инструмент для счётчика метрик, который увеличивают сотни потоков?</p><ul><li>обычный long</li><li>volatile long</li><li>synchronized на каждое увеличение</li><li>LongAdder</li></ul><div class="why">Несколько «касс» снижают столкновения.</div></div>
+<div class="mcq" data-ok="0"><p>Что такое проблема ABA?</p><ul><li>значение изменилось и вернулось к прежнему, и CAS этого не заметил</li><li>deadlock двух потоков</li><li>ошибка компиляции</li><li>переполнение int</li></ul><div class="why">Лечится номером версии.</div></div>
+<div class="mcq" data-ok="2"><p>Нужно согласованно изменить баланс и историю операций. Что лучше?</p><ul><li>два AtomicLong</li><li>volatile</li><li>замок на оба изменения</li><li>ничего не нужно</li></ul><div class="why">CAS защищает одну переменную.</div></div>
+<div class="mcq" data-ok="1"><p>Почему при сильной конкуренции CAS может быть хуже замка?</p><ul><li>CAS не работает при конкуренции</li><li>потоки крутятся в повторах и тратят процессор впустую</li><li>CAS медленнее всегда</li><li>CAS вызывает deadlock</li></ul><div class="why">Замок бы усыпил ожидающих.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="05-atomics.html">05 «CAS, Atomic*, LongAdder, VarHandle»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>
