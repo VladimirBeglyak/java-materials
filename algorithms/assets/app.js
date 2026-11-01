@@ -3,7 +3,9 @@
   "use strict";
 
   var PAGES = [
-    { id: "00", file: "index.html", title: "Карта курса", group: null },
+    { id: "school", num: "·", intro: true, file: "00-school.html", title: "Алгоритмы за 20 минут (для школьника)", group: null },
+    { id: "simple", num: "·", intro: true, file: "00-simple.html", title: "Простыми словами: что и зачем", group: null },
+    { id: "00", intro: true, file: "index.html", title: "Карта курса", group: null },
     { id: "01", file: "01-complexity.html", title: "Сложность и план решения задачи", tier: "j", group: "Основы" },
     { id: "02", file: "02-two-pointers.html", title: "Два указателя", tier: "j", group: "Основы" },
     { id: "03", file: "03-sliding-window.html", title: "Скользящее окно", tier: "m", group: "Основы" },
@@ -53,8 +55,8 @@
     PAGES.forEach(function (p) {
       if (p.group && p.group !== g) { g = p.group; html += '</ul><div class="nav-group">' + g + '</div><ul class="nav-list">'; }
       var cls = (p.id === current ? "current " : "") + (state[p.id] ? "done" : "");
-      html += '<li><a class="' + cls + '" href="' + p.file + '"><span class="num">' + p.id + '</span><span>' + p.title +
-        '</span>' + (p.id === "00" ? "<span></span>" : '<span class="done-mark" title="изучено"></span>') + "</a></li>";
+      html += '<li><a class="' + cls + '" href="' + p.file + '"><span class="num">' + (p.num || p.id) + '</span><span>' + p.title +
+        '</span>' + (p.intro ? "<span></span>" : '<span class="done-mark" title="изучено"></span>') + "</a></li>";
     });
     html += "</ul>";
     html += '<button class="theme-toggle" type="button">◐ Светлая / тёмная тема</button>';
@@ -71,8 +73,8 @@
   }
 
   function updateProgress() {
-    var total = PAGES.length - 1, done = 0;
-    PAGES.forEach(function (p) { if (p.id !== "00" && state[p.id]) done++; });
+    var total = 0, done = 0;
+    PAGES.forEach(function (p) { if (p.intro) return; total++; if (state[p.id]) done++; });
     var bar = document.getElementById("pbar"), lab = document.getElementById("plabel");
     if (bar) bar.style.width = Math.round(done / total * 100) + "%";
     if (lab) lab.textContent = "Изучено " + done + " из " + total;
@@ -84,8 +86,8 @@
   /* ---------- Footer: mark done + prev/next ---------- */
   function buildFooter() {
     var c = document.querySelector(".content");
-    if (!c || current === "00") return;
     var idx = PAGES.findIndex(function (p) { return p.id === current; });
+    if (!c || idx < 0 || PAGES[idx].intro) return;
     var wrap = document.createElement("div");
     wrap.innerHTML =
       '<label class="mark-done"><input type="checkbox" id="doneBox"><span><b>Тема изучена.</b> Я могу распознать этот паттерн в задаче и написать решение сам, объяснив сложность, без подсказок.</span></label>';
