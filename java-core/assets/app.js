@@ -34,6 +34,10 @@
     { id: "28", file: "28-http-client.html", title: "HTTP-клиент: HttpClient и RestClient", tier: "m", group: "Инженерная практика" }
   ];
   var TIER = { j: "Junior", m: "Middle", s: "Senior" };
+  /* У каждой главы есть упрощённая версия NN-name-easy.html (id «NNe»); в навигации она идёт перед главой */
+  function easyOf(p) { return p.id === "00" ? null : { id: p.id + "e", file: p.file.replace(".html", "-easy.html"), title: "Простыми словами: " + p.title, easy: true, of: p.id }; }
+  var SEQ = [];
+  PAGES.forEach(function (p) { var e = easyOf(p); if (e) SEQ.push(e); SEQ.push(p); });
   var KEY = "jcore-guide-done-v1";
 
   function load() { try { return JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { return {}; } }
@@ -63,6 +67,9 @@
     PAGES.forEach(function (p) {
       if (p.group && p.group !== g) { g = p.group; html += '</ul><div class="nav-group">' + g + '</div><ul class="nav-list">'; }
       var cls = (p.id === current ? "current " : "") + (state[p.id] ? "done" : "");
+      var e = easyOf(p);
+      if (e) html += '<li class="sub"><a class="' + (e.id === current ? "current" : "") + '" href="' + e.file + '"><span class="num">' + p.id +
+        '</span><span>Сначала просто</span><span></span></a></li>';
       html += '<li><a class="' + cls + '" href="' + p.file + '"><span class="num">' + p.id + '</span><span>' + p.title +
         '</span>' + (p.id === "00" ? "<span></span>" : '<span class="done-mark" title="изучено"></span>') + "</a></li>";
     });
@@ -93,17 +100,20 @@
   function buildFooter() {
     var c = document.querySelector(".content");
     if (!c || current === "00") return;
-    var idx = PAGES.findIndex(function (p) { return p.id === current; });
+    var idx = SEQ.findIndex(function (p) { return p.id === current; });
+    if (idx < 0) return;
+    var isEasy = !!SEQ[idx].easy;
     var wrap = document.createElement("div");
-    wrap.innerHTML =
+    wrap.innerHTML = isEasy ? "" :
       '<label class="mark-done"><input type="checkbox" id="doneBox"><span><b>Тема изучена.</b> Я могу ответить на все вопросы для самопроверки без подсказок и написать примеры с нуля.</span></label>';
     var pager = '<nav class="pager">';
-    var prev = PAGES[idx - 1], next = PAGES[idx + 1];
+    var prev = SEQ[idx - 1], next = SEQ[idx + 1];
     if (prev) pager += '<a class="prev" href="' + prev.file + '"><small>← Назад</small>' + prev.title + "</a>";
     if (next) pager += '<a class="next" href="' + next.file + '"><small>Дальше →</small>' + next.title + "</a>";
     pager += "</nav>";
     wrap.innerHTML += pager;
     c.appendChild(wrap);
+    if (isEasy) return;
     var box = document.getElementById("doneBox");
     box.checked = !!state[current];
     box.addEventListener("change", function () {

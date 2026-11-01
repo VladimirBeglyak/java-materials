@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>28 · HTTP-клиент — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="28e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 28 · СНАЧАЛА ПРОСТО</div>
+  <h1>HTTP-клиент — простыми словами</h1>
+  <p class="lead">Почти каждый сервис вызывает другие: платёжный шлюз, сервис доставки, внешние API. Разберёмся, как отправить HTTP-запрос встроенным в Java клиентом, чем отличается асинхронный вызов, как это делает Spring RestClient и какой клиент когда выбирать.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 28 <a href="28-http-client.html">«HTTP-клиент: HttpClient и RestClient»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="httpclient"><span class="h-num">28.1</span>Встроенный HttpClient</h2>
+<p>С Java 11 в JDK есть <code>java.net.http.HttpClient</code>. Работа в три шага, как отправка письма:</p>
+<ol class="steps">
+  <li><b>Клиент</b> — почтовое отделение: создаётся один раз на приложение и переиспользуется (он держит пул соединений).</li>
+  <li><b>Запрос</b> — письмо: адрес, метод (GET, POST), заголовки, тело. Собирается строителем.</li>
+  <li><b>Ответ</b> — код статуса (200 — успех, 404 — не найдено, 500 — ошибка сервера) и тело.</li>
+</ol>
+<p>Обязательно задавайте <b>таймауты</b> — на соединение и на ответ. Без них зависший чужой сервис будет держать ваши потоки бесконечно.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Один клиент на приложение, запрос через строитель, всегда — таймауты.</div>
+<p class="easy-bridge">В полной главе: <a href="28-http-client.html#httpclient">28.1 java.net.http.HttpClient</a></p>
+
+<h2 id="async"><span class="h-num">28.2</span>Асинхронный вызов</h2>
+<p>Обычный вызов (<code>send</code>) ждёт ответа — поток стоит. Асинхронный (<code>sendAsync</code>) сразу возвращает «обещание» (CompletableFuture), а ответ придёт потом — можно сразу отправить несколько запросов параллельно и дождаться всех. Как заказать еду в трёх ресторанах одновременно, а не по очереди. С виртуальными потоками (Java 21) часто проще писать обычный блокирующий код — ожидание там почти ничего не стоит.</p>
+<div class="widget stepper">
+  <div class="widget-title">Три запроса: по очереди и параллельно</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">по очереди: цены (200 мс) → склад (300 мс) → доставка (250 мс)
+итого ≈ 750 мс</span><span data-from="2" data-to="3">асинхронно: отправили все три сразу
+ждём, пока придут все ответы</span><span data-from="3">итого ≈ 300 мс — время самого медленного
+важно: таймаут и обработка ошибки для каждого</span></pre></div>
+  <section class="st-step" data-t="Последовательно"><p>Времена складываются.</p></section>
+  <section class="st-step" data-t="Параллельно"><p>Запросы независимы — отправляем сразу.</p></section>
+  <section class="st-step" data-t="Итог"><p>Общее время равно самому медленному ответу.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Независимые запросы — параллельно: асинхронно или в виртуальных потоках.</div>
+<p class="easy-bridge">В полной главе: <a href="28-http-client.html#async">28.2 Асинхронный вызов</a></p>
+
+<h2 id="restclient"><span class="h-num">28.3</span>Spring RestClient</h2>
+<p>В Spring-приложениях удобнее <b>RestClient</b> (Spring 6.1+): цепочка вызовов «метод → адрес → получить → превратить в объект», а JSON автоматически превращается в ваши классы через Jackson. Он также встраивается в наблюдаемость Spring (метрики, трассировка). Старый RestTemplate остался для совместимости, а WebClient нужен в реактивных приложениях.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+В Spring — RestClient: коротко, с JSON «из коробки».</div>
+<p class="easy-bridge">В полной главе: <a href="28-http-client.html#restclient">28.3 Spring RestClient</a></p>
+
+<h2 id="choose"><span class="h-num">28.4</span>Какой клиент выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Ситуация</th><th>Выбор</th></tr>
+<tr><td>Без Spring, простая утилита</td><td>java.net.http.HttpClient</td></tr>
+<tr><td>Spring-приложение, обычный код</td><td>RestClient</td></tr>
+<tr><td>Реактивное приложение (WebFlux)</td><td>WebClient</td></tr>
+<tr><td>Много однотипных вызовов одного API</td><td>декларативный клиент (интерфейс с аннотациями @HttpExchange)</td></tr>
+</table></div>
+<p>В любом случае: таймауты, обработка ошибочных кодов, повтор только для безопасных (идемпотентных) запросов.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Без Spring — HttpClient, со Spring — RestClient. Таймауты и обработка ошибок — всегда.</div>
+<p class="easy-bridge">В полной главе: <a href="28-http-client.html#choose">28.4 Какой клиент выбрать</a></p>
+
+<h2 id="gloss"><span class="h-num">28.5</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>HTTP-клиент</td><td>Код, который отправляет запросы другим сервисам.</td></tr>
+<tr><td>Метод (GET, POST…)</td><td>Тип действия: получить, создать, изменить.</td></tr>
+<tr><td>Код статуса</td><td>Ответ сервера: 2xx успех, 4xx ошибка клиента, 5xx ошибка сервера.</td></tr>
+<tr><td>Таймаут</td><td>Сколько максимум ждать.</td></tr>
+<tr><td>CompletableFuture</td><td>«Обещание» результата в будущем.</td></tr>
+<tr><td>RestClient</td><td>Удобный HTTP-клиент Spring.</td></tr>
+<tr><td>Идемпотентный запрос</td><td>Запрос, который безопасно повторить.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">28.6</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сколько экземпляров HttpClient создавать?</p><ul><li>на каждый запрос новый</li><li>один на приложение и переиспользовать</li><li>по одному на поток</li><li>не создавать</li></ul><div class="why">Он держит пул соединений.</div></div>
+<div class="mcq" data-ok="3"><p>Что будет без таймаутов, если чужой сервис завис?</p><ul><li>запрос сам отменится через секунду</li><li>Java перезапустится</li><li>ничего страшного</li><li>ваши потоки будут ждать бесконечно, и сервис может встать</li></ul><div class="why">Зависание соседа становится вашим.</div></div>
+<div class="mcq" data-ok="0"><p>Три независимых запроса по 200, 300 и 250 мс отправили параллельно. Сколько примерно ждать?</p><ul><li>~300 мс</li><li>~750 мс</li><li>~200 мс</li><li>~50 мс</li></ul><div class="why">Время самого медленного.</div></div>
+<div class="mcq" data-ok="2"><p>Что означает код ответа 503?</p><ul><li>всё хорошо</li><li>не найдено</li><li>ошибка на стороне сервера (сервис недоступен)</li><li>нет доступа</li></ul><div class="why">5xx — проблема сервера; такие запросы иногда имеет смысл повторить.</div></div>
+<div class="mcq" data-ok="1"><p>Какой клиент обычно выбирают в новом Spring-приложении без реактивности?</p><ul><li>RestTemplate</li><li>RestClient</li><li>WebClient</li><li>HttpURLConnection</li></ul><div class="why">Современный и удобный.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="28-http-client.html">28 «HTTP-клиент: HttpClient и RestClient»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

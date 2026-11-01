@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>27 · Логирование — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="27e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 27 · СНАЧАЛА ПРОСТО</div>
+  <h1>Логирование — простыми словами</h1>
+  <p class="lead">Когда в продакшене что-то ломается, первое, что смотрят, — логи. Разберёмся, почему в коде используют SLF4J, какие бывают уровни, как настраивать Logback, что такое MDC и correlation id, зачем логи в JSON и что категорически нельзя писать в журнал.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 27 <a href="27-logging.html">«Логирование: SLF4J, Logback, уровни»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="facade"><span class="h-num">27.1</span>SLF4J: фасад и реализация</h2>
+<p>Код пишет в журнал через <b>SLF4J</b> — единый «пульт». А кто реально записывает (Logback, Log4j2), подключается отдельно. Как розетка и электростанция: прибору всё равно, откуда ток. Поэтому библиотеки используют SLF4J и не навязывают приложению свою систему логов.</p>
+<p>Сообщения пишут с подстановкой: <code>log.info("Заказ {} создан", id)</code>, а не склейкой строк — тогда строка не собирается, если этот уровень выключен.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Пишем через SLF4J с {}-подстановкой, реализация — Logback.</div>
+<p class="easy-bridge">В полной главе: <a href="27-logging.html#facade">27.1 SLF4J: фасад и реализация</a></p>
+
+<h2 id="levels"><span class="h-num">27.2</span>Уровни: от пожара до шёпота</h2>
+<div class="table-wrap"><table>
+<tr><th>Уровень</th><th>Когда</th></tr>
+<tr><td>ERROR</td><td>операция провалилась, нужен человек</td></tr>
+<tr><td>WARN</td><td>что-то странное, но работаем дальше</td></tr>
+<tr><td>INFO</td><td>важные события: старт, заказ создан</td></tr>
+<tr><td>DEBUG</td><td>подробности для разработчика</td></tr>
+<tr><td>TRACE</td><td>очень подробно, почти никогда не включено</td></tr>
+</table></div>
+<p>В продакшене обычно включён INFO. Если всё писать в ERROR, настоящая тревога потеряется среди ложных.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Уровень — это важность. ERROR — только для настоящих проблем.</div>
+<p class="easy-bridge">В полной главе: <a href="27-logging.html#levels">27.2 Уровни логирования</a></p>
+
+<h2 id="logback"><span class="h-num">27.3</span>Logback: куда и как писать</h2>
+<p>Настройка (logback.xml или настройки Spring Boot) задаёт: <b>appender</b> — куда писать (консоль, файл), <b>шаблон</b> — как выглядит строка, <b>уровни</b> для разных пакетов (свой код — DEBUG, библиотеки — WARN). Для файлов настраивают ротацию: новый файл каждый день и удаление старых.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Appender — куда, pattern — как, уровни — сколько.</div>
+<p class="easy-bridge">В полной главе: <a href="27-logging.html#logback">27.3 Logback: настройка</a></p>
+
+<h2 id="mdc"><span class="h-num">27.4</span>MDC и correlation id</h2>
+<p>Сервер обрабатывает сотни запросов одновременно, и строки логов перемешаны. Как найти все строки одного запроса? Каждому запросу дают уникальный <b>correlation id</b> и кладут его в <b>MDC</b> — «карман» текущего потока. Logback добавляет его в каждую строку. Тот же id передают в другие сервисы — и путь запроса виден через всю систему.</p>
+<div class="widget stepper">
+  <div class="widget-title">Найти всё про один запрос</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">запрос пришёл → фильтр создаёт id = a7f3 → MDC.put("cid", "a7f3")</span><span data-from="2" data-to="3">[a7f3] INFO  заказ принят
+[c912] INFO  заказ принят        ← другой запрос
+[a7f3] WARN  склад отвечает медленно</span><span data-from="3" data-to="4">вызов в сервис оплаты с заголовком X-Correlation-Id: a7f3
+там в логах тоже [a7f3]</span><span data-from="4">поиск по a7f3 → вся история запроса во всех сервисах
+в конце запроса MDC очищают</span></pre></div>
+  <section class="st-step" data-t="Метка"><p>Каждый запрос получает свою метку.</p></section>
+  <section class="st-step" data-t="Перемешанные логи"><p>Метка позволяет отделить один запрос от другого.</p></section>
+  <section class="st-step" data-t="Другие сервисы"><p>Метка передаётся дальше в заголовке.</p></section>
+  <section class="st-step" data-t="Поиск"><p>Не забудьте очистить MDC: поток из пула достанется следующему запросу.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Correlation id в MDC связывает все строки одного запроса — даже между сервисами.</div>
+<p class="easy-bridge">В полной главе: <a href="27-logging.html#mdc">27.4 MDC и correlation id</a></p>
+
+<h2 id="structured"><span class="h-num">27.5</span>Структурированные логи</h2>
+<p>Строки вида «Заказ 42 создан пользователем 7» удобно читать человеку, но трудно искать машиной. Если писать логи в <b>JSON</b> (каждое значение в своём поле), системы вроде Elasticsearch или Loki позволяют фильтровать: «все ошибки по заказу 42 за час».</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+В продакшене — логи в JSON, чтобы по ним можно было искать.</div>
+<p class="easy-bridge">В полной главе: <a href="27-logging.html#structured">27.5 Структурированные логи</a></p>
+
+<h2 id="practices"><span class="h-num">27.6</span>Что писать и что нельзя</h2>
+<ul>
+  <li><b>Писать:</b> важные события, причины ошибок со стек-трейсом, идентификаторы (заказа, пользователя).</li>
+  <li><b>Нельзя:</b> пароли, токены, номера карт, персональные данные — логи читают многие и хранят долго.</li>
+  <li><b>Не дублировать:</b> одну ошибку логирует тот, кто её обработал, а не каждый уровень.</li>
+  <li><b>Не писать в цикле</b> на каждой итерации — логи станут дороже работы.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Логи — для расследования. Без секретов, без дублей, без спама.</div>
+<p class="easy-bridge">В полной главе: <a href="27-logging.html#practices">27.6 Что логировать, а что нет</a></p>
+
+<h2 id="gloss"><span class="h-num">27.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>SLF4J</td><td>Единый интерфейс для логирования.</td></tr>
+<tr><td>Logback</td><td>Реализация, которая пишет логи.</td></tr>
+<tr><td>Уровень</td><td>Важность записи: ERROR, WARN, INFO, DEBUG.</td></tr>
+<tr><td>Appender</td><td>Куда писать: консоль, файл.</td></tr>
+<tr><td>MDC</td><td>«Карман» потока для меток вроде correlation id.</td></tr>
+<tr><td>Correlation id</td><td>Метка, связывающая записи одного запроса.</td></tr>
+<tr><td>Структурированный лог</td><td>Запись в JSON с отдельными полями.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">27.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Почему лучше <code>log.debug("Заказ {}", id)</code>, чем <code>log.debug("Заказ " + id)</code>?</p><ul><li>так короче</li><li>это одно и то же</li><li>при выключенном DEBUG строка даже не собирается</li><li>иначе ошибка компиляции</li></ul><div class="why">Подстановка ленивая.</div></div>
+<div class="mcq" data-ok="0"><p>Как найти все строки логов одного запроса среди тысяч?</p><ul><li>по correlation id, положенному в MDC</li><li>по времени</li><li>по уровню</li><li>никак</li></ul><div class="why">Метка добавляется в каждую строку.</div></div>
+<div class="mcq" data-ok="3"><p>Что нельзя писать в логи?</p><ul><li>id заказа</li><li>стек-трейс ошибки</li><li>время события</li><li>пароли, токены, номера карт</li></ul><div class="why">Логи читают многие и хранят долго.</div></div>
+<div class="mcq" data-ok="1"><p>Какой уровень обычно включён в продакшене?</p><ul><li>TRACE</li><li>INFO</li><li>DEBUG</li><li>никакой</li></ul><div class="why">DEBUG и TRACE включают временно для расследований.</div></div>
+<div class="mcq" data-ok="2"><p>Зачем очищать MDC в конце запроса?</p><ul><li>для скорости</li><li>чтобы освободить диск</li><li>поток из пула достанется следующему запросу, и старая метка попадёт в чужие логи</li><li>не нужно</li></ul><div class="why">MDC привязан к потоку, а потоки переиспользуются.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="27-logging.html">27 «Логирование: SLF4J, Logback, уровни»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

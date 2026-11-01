@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · JDBC — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="22e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · СНАЧАЛА ПРОСТО</div>
+  <h1>JDBC — простыми словами</h1>
+  <p class="lead">Почти каждое приложение работает с базой данных. Под всеми фреймворками (JPA, Spring Data) лежит JDBC. Разберёмся, как устроен запрос от начала до конца, почему склеивать SQL со строками опасно, что такое транзакции, пакетные операции и пул соединений.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 22 <a href="22-jdbc.html">«JDBC: работа с базой данных без фреймворков»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="arch"><span class="h-num">22.1</span>Как устроен JDBC</h2>
+<p>JDBC — набор интерфейсов в Java, а <b>драйвер</b> — их реализация для конкретной базы (PostgreSQL, MySQL). Как универсальная розетка и вилка от конкретного прибора: ваш код говорит на языке JDBC, а драйвер переводит на язык своей базы.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Код пишется под JDBC, драйвер подключает конкретную базу.</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#arch">22.1 Архитектура JDBC</a></p>
+
+<h2 id="basic"><span class="h-num">22.2</span>Запрос от начала до конца</h2>
+<div class="widget stepper">
+  <div class="widget-title">Найти заказ по номеру</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">1. взять соединение (Connection) — из пула</span><span data-from="2" data-to="3">2. подготовить запрос: SELECT … FROM orders WHERE id = ?
+   подставить параметр: ? = 42</span><span data-from="3" data-to="4">3. выполнить → ResultSet — «курсор» по строкам результата
+   while (rs.next()) читаем колонки текущей строки</span><span data-from="4">4. закрыть ResultSet, запрос, вернуть соединение
+   всё — в try-with-resources</span></pre></div>
+  <section class="st-step" data-t="Соединение"><p>Открыть новое соединение долго, поэтому их держат в пуле.</p></section>
+  <section class="st-step" data-t="Запрос с параметром"><p>Знак ? — место для значения, подставляемого безопасно.</p></section>
+  <section class="st-step" data-t="Чтение"><p>ResultSet идёт по строкам, как палец по таблице.</p></section>
+  <section class="st-step" data-t="Закрытие"><p>Незакрытые ресурсы — утечка соединений.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Соединение → подготовленный запрос → строки результата → закрыть всё.</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#basic">22.2 Запрос от начала до конца</a></p>
+
+<h2 id="injection"><span class="h-num">22.3</span>SQL-инъекция</h2>
+<p>Если склеить SQL со строкой от пользователя — <code>"... WHERE name = '" + name + "'"</code>, — злоумышленник введёт вместо имени кусок SQL, например <code>' OR '1'='1</code>, и запрос вернёт все записи (или удалит таблицу). Это как анкета, где в поле «имя» человек пишет «и выдать мне ключи от сейфа», а сотрудник выполняет это буквально.</p>
+<p>Лечение — <b>PreparedStatement</b> с параметрами <code>?</code>: значение передаётся отдельно от текста запроса и никогда не воспринимается как SQL.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Никогда не склеивайте SQL с данными. Только PreparedStatement с параметрами.</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#injection">22.3 Statement, PreparedStatement и SQL-инъекция</a></p>
+
+<h2 id="tx"><span class="h-num">22.4</span>Транзакции: всё или ничего</h2>
+<p>Перевод денег — это два действия: списать с одного счёта и зачислить на другой. Если после списания случится сбой, деньги пропадут. <b>Транзакция</b> объединяет действия: либо все выполнятся (commit), либо все отменятся (rollback). По умолчанию JDBC подтверждает каждый запрос отдельно (auto-commit); для транзакции его выключают, а в конце вызывают commit или rollback.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Связанные изменения — в одной транзакции: всё или ничего.</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#tx">22.4 Транзакции</a></p>
+
+<h2 id="batch"><span class="h-num">22.5</span>Пакетные операции и большие выборки</h2>
+<p>Вставить 10 000 строк по одной — 10 000 «поездок» до базы. Пакет (batch) отправляет их пачками — в разы быстрее. А при чтении миллионов строк не нужно загружать всё в память: драйвер может подгружать строки порциями (fetch size).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Много вставок — пакетом, много строк на чтение — порциями.</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#batch">22.5 Пакетные операции и большие выборки</a></p>
+
+<h2 id="pool"><span class="h-num">22.6</span>Пул соединений</h2>
+<p>Открыть соединение с базой — долго (сеть, проверка пароля). Пул (например, HikariCP) держит несколько готовых соединений и выдаёт их по запросу, как прокат велосипедов: взял, покатался, вернул. Размер пула ограничен — если соединения не возвращать (не закрывать), пул быстро опустеет, и приложение встанет в ожидании.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Соединения — из пула, и обязательно возвращать (close).</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#pool">22.6 Пул соединений</a></p>
+
+<h2 id="errors"><span class="h-num">22.7</span>Ошибки</h2>
+<p>Все ошибки JDBC — <code>SQLException</code> с кодом (SQLState), по которому можно понять причину: нарушение уникальности, взаимоблокировка, обрыв связи. Одни ошибки имеет смысл повторить (взаимоблокировка, временный сбой), другие — нет (нарушение ограничений).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Различайте ошибки по коду: временные можно повторить, логические — нет.</div>
+<p class="easy-bridge">В полной главе: <a href="22-jdbc.html#errors">22.7 Ошибки</a></p>
+
+<h2 id="gloss"><span class="h-num">22.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>JDBC</td><td>Стандартный API Java для работы с базами.</td></tr>
+<tr><td>Драйвер</td><td>Реализация JDBC для конкретной базы.</td></tr>
+<tr><td>Connection</td><td>Соединение с базой.</td></tr>
+<tr><td>PreparedStatement</td><td>Запрос с безопасными параметрами ?.</td></tr>
+<tr><td>ResultSet</td><td>Курсор по строкам результата.</td></tr>
+<tr><td>SQL-инъекция</td><td>Подмена смысла запроса через пользовательские данные.</td></tr>
+<tr><td>Транзакция</td><td>Группа действий «всё или ничего».</td></tr>
+<tr><td>Пул соединений</td><td>Прокат готовых соединений.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">22.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Как защититься от SQL-инъекции?</p><ul><li>проверять длину строки</li><li>передавать значения через PreparedStatement с параметрами</li><li>экранировать кавычки вручную</li><li>использовать заглавные буквы в SQL</li></ul><div class="why">Значение передаётся отдельно от текста SQL.</div></div>
+<div class="mcq" data-ok="3"><p>Списали деньги со счёта, а при зачислении случился сбой. Что предотвращает потерю?</p><ul><li>пул соединений</li><li>batch</li><li>ResultSet</li><li>транзакция с rollback</li></ul><div class="why">Всё или ничего.</div></div>
+<div class="mcq" data-ok="0"><p>Зачем нужен пул соединений?</p><ul><li>открывать соединение долго — пул держит готовые и выдаёт их</li><li>для шифрования</li><li>для хранения данных</li><li>чтобы база работала без SQL</li></ul><div class="why">Прокат вместо покупки каждый раз.</div></div>
+<div class="mcq" data-ok="2"><p>Приложение «зависает» в ожидании соединения. Вероятная причина?</p><ul><li>медленный процессор</li><li>слишком много памяти</li><li>соединения берут из пула и не возвращают (не закрывают)</li><li>неправильный SQL</li></ul><div class="why">Используйте try-with-resources.</div></div>
+<div class="mcq" data-ok="1"><p>Как быстрее вставить 10 000 строк?</p><ul><li>по одной в цикле</li><li>пакетом (batch)</li><li>через ResultSet</li><li>открыть 10 000 соединений</li></ul><div class="why">Меньше поездок до базы.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="22-jdbc.html">22 «JDBC: работа с базой данных без фреймворков»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>
