@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Сборщики мусора — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="13e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 13 · СНАЧАЛА ПРОСТО</div>
+  <h1>Сборщики мусора — простыми словами</h1>
+  <p class="lead">В JVM несколько сборщиков мусора, и они по-разному решают одну задачу. Разберёмся, какой компромисс они выбирают, как устроены Serial и Parallel, как G1 делит кучу на регионы, как ZGC добивается крошечных пауз и как выбрать сборщик для своего сервиса.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 13 <a href="13-gc-collectors.html">«Сборщики: Serial, Parallel, G1, ZGC, Shenandoah»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="triangle"><span class="h-num">13.1</span>Треугольник компромиссов</h2>
+<div class="grid-3">
+  <div class="card"><h4>Паузы</h4><p>Насколько надолго замирает программа. Важно для веб-сервисов.</p></div>
+  <div class="card"><h4>Пропускная способность</h4><p>Какую долю времени программа работает, а не ждёт уборки. Важно для пакетной обработки.</p></div>
+  <div class="card"><h4>Память</h4><p>Сколько лишней памяти нужно сборщику.</p></div>
+</div>
+<p>Улучшить одну вершину можно только за счёт других. Короткие паузы стоят памяти и процессора; максимальная пропускная способность — длинных пауз.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Паузы, пропускная способность, память — выбрать все три нельзя.</div>
+<p class="easy-bridge">В полной главе: <a href="13-gc-collectors.html#triangle">13.1 Треугольник компромиссов</a></p>
+
+<h2 id="classic"><span class="h-num">13.2</span>Serial и Parallel</h2>
+<p><b>Serial</b> — один уборщик, все ждут: просто и экономно, подходит маленьким программам и контейнерам с одним ядром. <b>Parallel</b> — бригада уборщиков, все по-прежнему ждут, но уборка быстрее: максимальная пропускная способность, хорош для пакетных задач, где паузы не страшны. Оба останавливают программу на всё время сборки.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Serial — маленьким, Parallel — пакетным задачам. Паузы на всю уборку.</div>
+<p class="easy-bridge">В полной главе: <a href="13-gc-collectors.html#classic">13.2 Serial и Parallel</a></p>
+
+<h2 id="g1"><span class="h-num">13.3</span>G1: регионы</h2>
+<div class="widget stepper">
+  <div class="widget-title">Как G1 убирает кучу по частям</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">куча поделена на тысячи одинаковых регионов:
+одни — для молодых, другие — для старых, третьи — пустые</span><span data-from="2" data-to="3">молодые регионы заполнились → малая сборка: живых копируем в свободные регионы</span><span data-from="3" data-to="4">параллельно с программой G1 помечает старые регионы и считает,
+где больше всего мусора</span><span data-from="4">смешанная сборка: убирает молодые + самые «мусорные» старые регионы,
+столько, чтобы уложиться в целевую паузу (по умолчанию 200 мс)</span></pre></div>
+  <section class="st-step" data-t="Регионы"><p>Не две большие области, а много маленьких.</p></section>
+  <section class="st-step" data-t="Малая сборка"><p>Копирование живых молодых объектов.</p></section>
+  <section class="st-step" data-t="Конкурентная пометка"><p>Анализ старых регионов без остановки.</p></section>
+  <section class="st-step" data-t="Смешанная сборка"><p>Сначала самые грязные — отсюда название Garbage First.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+G1 убирает кучу по регионам, начиная с самых грязных, стараясь уложиться в целевую паузу.</div>
+<p class="easy-bridge">В полной главе: <a href="13-gc-collectors.html#g1">13.3 G1: регионы и смешанные сборки</a></p>
+
+<h2 id="zgc"><span class="h-num">13.4</span>ZGC: паузы меньше миллисекунды</h2>
+<p><b>ZGC</b> делает почти всё — и пометку, и перенос объектов — <b>одновременно</b> с работой программы. Как переезд, во время которого жильцы продолжают жить: если кто-то тянется к вещи, которую уже перевезли, «барьер» на чтении ссылки подсказывает новый адрес. Паузы — доли миллисекунды независимо от размера кучи, даже терабайтной. Цена — больше процессора и запас памяти. Shenandoah — похожий сборщик с той же целью.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+ZGC переносит объекты, не останавливая программу. Паузы крошечные, цена — ресурсы.</div>
+<p class="easy-bridge">В полной главе: <a href="13-gc-collectors.html#zgc">13.4 ZGC: паузы меньше миллисекунды</a></p>
+
+<h2 id="choose"><span class="h-num">13.5</span>Какой выбрать</h2>
+<div class="table-wrap"><table>
+<tr><th>Ситуация</th><th>Сборщик</th></tr>
+<tr><td>обычный веб-сервис</td><td>G1 (по умолчанию)</td></tr>
+<tr><td>нужны минимальные паузы, большая куча</td><td>ZGC</td></tr>
+<tr><td>пакетная обработка, паузы не важны</td><td>Parallel</td></tr>
+<tr><td>маленький контейнер, 1 ядро, мало памяти</td><td>Serial</td></tr>
+</table></div>
+<p>Менять сборщик стоит по измерениям, а не по моде: включите логи GC (глава 14) и посмотрите, есть ли вообще проблема.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+По умолчанию G1; паузы критичны — ZGC; выбор — по логам, а не наугад.</div>
+<p class="easy-bridge">В полной главе: <a href="13-gc-collectors.html#choose">13.5 Какой сборщик выбрать</a></p>
+
+<h2 id="gloss"><span class="h-num">13.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Throughput</td><td>Доля времени, когда работает программа, а не сборщик.</td></tr>
+<tr><td>Serial / Parallel</td><td>Простые сборщики с паузой на всю уборку.</td></tr>
+<tr><td>G1</td><td>Сборщик по регионам с целевой паузой.</td></tr>
+<tr><td>Регион</td><td>Кусок кучи одинакового размера.</td></tr>
+<tr><td>ZGC / Shenandoah</td><td>Сборщики со сверхкороткими паузами.</td></tr>
+<tr><td>Load barrier</td><td>Проверка при чтении ссылки (у ZGC).</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">13.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какой сборщик по умолчанию в современных версиях Java на обычном сервере?</p><ul><li>Serial</li><li>CMS</li><li>G1</li><li>ZGC</li></ul><div class="why">Сбалансированный вариант.</div></div>
+<div class="mcq" data-ok="0"><p>Что значит Garbage First?</p><ul><li>G1 сначала убирает регионы, где больше всего мусора</li><li>сначала убирается молодое поколение</li><li>мусор удаляется до сборки</li><li>ничего</li></ul><div class="why">Максимум освобождённой памяти за паузу.</div></div>
+<div class="mcq" data-ok="3"><p>Как ZGC добивается пауз меньше миллисекунды?</p><ul><li>не собирает мусор</li><li>работает только с маленькой кучей</li><li>отключает потоки</li><li>помечает и переносит объекты параллельно с программой</li></ul><div class="why">Барьеры подсказывают новые адреса.</div></div>
+<div class="mcq" data-ok="1"><p>Ночная пакетная обработка данных, паузы не важны, важна скорость. Что выбрать?</p><ul><li>ZGC</li><li>Parallel</li><li>Serial</li><li>без сборщика</li></ul><div class="why">Максимальная пропускная способность.</div></div>
+<div class="mcq" data-ok="2"><p>Чем приходится платить за сверхкороткие паузы?</p><ul><li>ничем</li><li>потерей данных</li><li>дополнительным процессором и памятью</li><li>невозможностью многопоточности</li></ul><div class="why">Треугольник компромиссов.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="13-gc-collectors.html">13 «Сборщики: Serial, Parallel, G1, ZGC, Shenandoah»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

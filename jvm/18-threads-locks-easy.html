@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 · Потоки и блокировки внутри JVM — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="18e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 18 · СНАЧАЛА ПРОСТО</div>
+  <h1>Потоки и блокировки внутри JVM — простыми словами</h1>
+  <p class="lead">Как JVM управляет потоками изнутри? Разберёмся, как потоки Java связаны с потоками ОС, что такое safepoint и почему пауза бывает дольше, чем работа сборщика, как устроен synchronized внутри и как работают виртуальные потоки.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 18 <a href="18-threads-locks.html">«Потоки, safepoints и блокировки в JVM»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="threads"><span class="h-num">18.1</span>Потоки JVM и ОС</h2>
+<p>Каждый обычный (платформенный) поток Java — это поток операционной системы: планирует его ОС, стек выделяет ОС. Кроме ваших потоков, JVM держит служебные: потоки сборщика мусора, компиляторов JIT, обработки сигналов, финализации. Их видно в дампе потоков (jstack).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Платформенный поток = поток ОС. У JVM ещё десятки служебных потоков.</div>
+<p class="easy-bridge">В полной главе: <a href="18-threads-locks.html#threads">18.1 Потоки JVM и ОС</a></p>
+
+<h2 id="safepoint"><span class="h-num">18.2</span>Safepoint и время до него</h2>
+<div class="widget stepper">
+  <div class="widget-title">Почему пауза 50 мс, если сборка заняла 2 мс</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">JVM: «всем остановиться на ближайшей безопасной точке»</span><span data-from="2" data-to="3">99 потоков остановились за доли миллисекунды</span><span data-from="3" data-to="4">1 поток крутит длинный цикл со счётчиком int,
+где JIT убрал проверки safepoint ради скорости (особенно в старых версиях) — он не слышит сигнала</span><span data-from="4">все ждут его 48 мс, потом 2 мс собственно сборка
+в логах: «время до safepoint» (time to safepoint) — вот где ушло время</span></pre></div>
+  <section class="st-step" data-t="Сигнал"><p>Остановка нужна для сборки, деоптимизации, дампа потоков.</p></section>
+  <section class="st-step" data-t="Почти все"><p>Обычно потоки доходят быстро.</p></section>
+  <section class="st-step" data-t="Отстающий"><p>Долгий участок без проверок задерживает всех.</p></section>
+  <section class="st-step" data-t="Итог"><p>Пауза = ожидание самого медленного + работа.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Пауза включает ожидание, пока все потоки дойдут до safepoint. Смотрите «time to safepoint».</div>
+<p class="easy-bridge">В полной главе: <a href="18-threads-locks.html#safepoint">18.2 Safepoint и время до него</a></p>
+
+<h2 id="monitor"><span class="h-num">18.3</span>Как устроен synchronized</h2>
+<p>Когда конкуренции нет, взятие замка — одна атомарная операция с отметкой в заголовке объекта (тот самый mark word, глава 10): «занято потоком X». Если другой поток пытается войти, пока занято, JVM сначала немного подождёт активно (вдруг скоро освободится), а потом заведёт полноценный <b>монитор</b> с очередью и усыпит ожидающих через ОС. Отсюда правило: неконкурентный synchronized почти бесплатен, а толкотня за одним замком — дорогая.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Без конкуренции — отметка в заголовке; с конкуренцией — монитор и сон через ОС.</div>
+<p class="easy-bridge">В полной главе: <a href="18-threads-locks.html#monitor">18.3 Как устроен synchronized</a></p>
+
+<h2 id="vthreads"><span class="h-num">18.4</span>Виртуальные потоки изнутри</h2>
+<p>Виртуальный поток — объект JVM со стеком, который хранится в куче частями. Работает он на потоке-носителе из небольшого пула (ForkJoinPool). При блокирующей операции JVM сохраняет его стек в кучу, «снимает» с носителя, а когда данные пришли, — возвращает на любой свободный носитель. Подробно и с аналогией такси — в курсе <a href="../java-concurrency/10-virtual-threads-easy.html">многопоточности</a>.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Виртуальный поток — стек в куче, который пересаживается между носителями.</div>
+<p class="easy-bridge">В полной главе: <a href="18-threads-locks.html#vthreads">18.4 Виртуальные потоки изнутри</a></p>
+
+<h2 id="gloss"><span class="h-num">18.5</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Платформенный поток</td><td>Поток Java, равный потоку ОС.</td></tr>
+<tr><td>Safepoint</td><td>Точка, где поток можно безопасно остановить.</td></tr>
+<tr><td>Time to safepoint</td><td>Сколько ждали, пока все потоки остановятся.</td></tr>
+<tr><td>Монитор</td><td>Полноценная структура замка с очередью.</td></tr>
+<tr><td>Spin</td><td>Короткое активное ожидание замка.</td></tr>
+<tr><td>Носитель</td><td>Платформенный поток, на котором работает виртуальный.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">18.6</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сборка заняла 2 мс, а пауза — 50 мс. Где искать время?</p><ul><li>в сети</li><li>в базе данных</li><li>во времени ожидания safepoint — какой-то поток долго не останавливался</li><li>в DNS</li></ul><div class="why">Пауза = ожидание + работа.</div></div>
+<div class="mcq" data-ok="0"><p>Сколько стоит synchronized без конкуренции?</p><ul><li>почти ничего: одна атомарная отметка в заголовке</li><li>системный вызов</li><li>миллисекунду</li><li>он всегда дорогой</li></ul><div class="why">Дорогим он становится при толкотне.</div></div>
+<div class="mcq" data-ok="3"><p>Чем является обычный поток Java?</p><ul><li>объектом в куче</li><li>процессом</li><li>корутиной</li><li>потоком операционной системы</li></ul><div class="why">Виртуальные потоки — другое дело.</div></div>
+<div class="mcq" data-ok="1"><p>Где хранится стек виртуального потока, пока он ждёт?</p><ul><li>в стеке ОС</li><li>в куче</li><li>на диске</li><li>в Metaspace</li></ul><div class="why">Поэтому ждущие виртуальные потоки дёшевы.</div></div>
+<div class="mcq" data-ok="2"><p>Что делает JVM, если поток долго не может войти в занятый synchronized?</p><ul><li>бросает исключение</li><li>прерывает владельца</li><li>заводит монитор с очередью и усыпляет ожидающего</li><li>запускает его параллельно</li></ul><div class="why">После короткого активного ожидания.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="18-threads-locks.html">18 «Потоки, safepoints и блокировки в JVM»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

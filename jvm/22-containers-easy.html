@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>22 · JVM в контейнерах — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="22e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 22 · СНАЧАЛА ПРОСТО</div>
+  <h1>JVM в контейнерах — простыми словами</h1>
+  <p class="lead">Почти все Java-сервисы сегодня работают в контейнерах. Разберёмся, что JVM видит внутри контейнера, как подобрать флаги под лимиты пода, откуда берутся невидимые паузы троттлинга, как собрать хороший образ и как корректно завершать под.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 22 <a href="22-containers.html">«JVM в контейнерах»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="cgroups"><span class="h-num">22.1</span>Что JVM видит в контейнере</h2>
+<p>Раньше JVM смотрела на всю машину: видела 64 ГБ и 32 ядра, хотя контейнеру разрешено 2 ГБ и 2 ядра, — и выбирала неверную кучу и число потоков. Современные версии читают лимиты контейнера (cgroups) и считают от них: максимум кучи по умолчанию — четверть лимита памяти, число «процессоров» — по квоте CPU.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Современная JVM видит лимиты контейнера, но значения по умолчанию лучше переопределить.</div>
+<p class="easy-bridge">В полной главе: <a href="22-containers.html#cgroups">22.1 Что JVM видит в контейнере</a></p>
+
+<h2 id="gen"><span class="h-num">22.2</span>Флаги под лимиты пода</h2>
+<ul>
+  <li><code>-XX:MaxRAMPercentage=70</code> — куча в процентах от лимита: примерно 60–75%, остальное — Metaspace, стеки, код, буферы (глава 09).</li>
+  <li><code>-XX:ActiveProcessorCount</code> — если квота дробная или хочется явно задать число ядер для пулов и GC.</li>
+  <li>Лимит памяти пода = request памяти: так под не будет внезапно вытеснен при нехватке памяти на узле.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Куча — проценты от лимита с запасом; память пода — limit = request.</div>
+<p class="easy-bridge">В полной главе: <a href="22-containers.html#gen">22.2 Генератор флагов под лимиты пода</a></p>
+
+<h2 id="throttle"><span class="h-num">22.3</span>Троттлинг CPU</h2>
+<div class="widget stepper">
+  <div class="widget-title">Лимит 1 CPU, а сервис «подвисает» на 70 мс</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">квота: 100 мс процессорного времени на каждые 100 мс</span><span data-from="2" data-to="3">пришёл всплеск запросов + сборка мусора в 4 потока
+за первые 25 мс реального времени израсходовано 100 мс квоты</span><span data-from="3" data-to="4">остальные 75 мс периода контейнер стоит — его не пускают к процессору</span><span data-from="4">в графиках средняя загрузка 40%, а p99 задержки — с провалами
+лечение: больше CPU limit или убрать limit, меньше потоков GC, следить за метрикой throttling</span></pre></div>
+  <section class="st-step" data-t="Квота"><p>Лимит считается за короткие периоды.</p></section>
+  <section class="st-step" data-t="Всплеск"><p>Многопоточная работа быстро тратит квоту.</p></section>
+  <section class="st-step" data-t="Простой"><p>До конца периода контейнер ждёт.</p></section>
+  <section class="st-step" data-t="Симптом"><p>Среднее нормальное, хвосты задержек плохие.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CPU limit режет работу периодами — отсюда невидимые паузы. Смотрите метрику throttling.</div>
+<p class="easy-bridge">В полной главе: <a href="22-containers.html#throttle">22.3 Троттлинг CPU: невидимые паузы</a></p>
+
+<h2 id="image"><span class="h-num">22.4</span>Образ</h2>
+<p>Хороший образ: базовый слой только с JRE (или свой runtime от jlink, глава 08), приложение разложено на слои — сначала редко меняющиеся библиотеки, потом ваш код (тогда при обновлении скачивается маленький слой), запуск не от root, фиксированные версии. Spring Boot и инструменты вроде Jib умеют делать это автоматически.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Маленький базовый образ, слои по частоте изменений, не root.</div>
+<p class="easy-bridge">В полной главе: <a href="22-containers.html#image">22.4 Образ</a></p>
+
+<h2 id="shutdown"><span class="h-num">22.5</span>Корректное завершение пода</h2>
+<p>При остановке Kubernetes посылает процессу SIGTERM и ждёт (по умолчанию 30 секунд), потом SIGKILL. За это время сервис должен перестать принимать новые запросы, доделать текущие и закрыть соединения. Важно, чтобы Java была главным процессом контейнера (PID 1) или сигнал до неё доходил — иначе она узнает об остановке только по SIGKILL. В Spring Boot для этого есть graceful shutdown.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+SIGTERM → дообработать и закрыться за отведённое время. Сигнал должен доходить до JVM.</div>
+<p class="easy-bridge">В полной главе: <a href="22-containers.html#shutdown">22.5 Корректное завершение пода</a></p>
+
+<h2 id="gloss"><span class="h-num">22.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>cgroups</td><td>Лимиты ядра на память и CPU контейнера.</td></tr>
+<tr><td>MaxRAMPercentage</td><td>Куча в процентах от доступной памяти.</td></tr>
+<tr><td>CPU quota</td><td>Сколько процессорного времени на период.</td></tr>
+<tr><td>Throttling</td><td>Простой контейнера после исчерпания квоты.</td></tr>
+<tr><td>Graceful shutdown</td><td>Аккуратное завершение с доработкой запросов.</td></tr>
+<tr><td>SIGTERM / SIGKILL</td><td>Вежливая просьба завершиться / убийство.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">22.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Лимит пода 2 ГБ. Какой MaxRAMPercentage разумен?</p><ul><li>100</li><li>25 (по умолчанию) всегда</li><li>около 70: остальное нужно JVM вне кучи</li><li>150</li></ul><div class="why">Запас на Metaspace, стеки, код.</div></div>
+<div class="mcq" data-ok="0"><p>Средняя загрузка CPU 40%, а задержки скачут на десятки мс. Что проверить?</p><ul><li>троттлинг CPU в контейнере</li><li>DNS</li><li>размер диска</li><li>версию Kubernetes</li></ul><div class="why">Квота тратится всплесками.</div></div>
+<div class="mcq" data-ok="3"><p>Что Kubernetes делает при остановке пода?</p><ul><li>сразу SIGKILL</li><li>перезагружает узел</li><li>ничего</li><li>шлёт SIGTERM, ждёт grace period, потом SIGKILL</li></ul><div class="why">Время на аккуратное завершение.</div></div>
+<div class="mcq" data-ok="1"><p>Зачем раскладывать образ на слои «библиотеки отдельно, код отдельно»?</p><ul><li>для безопасности</li><li>при обновлении кода скачивается только маленький слой</li><li>так требует Docker</li><li>для скорости JIT</li></ul><div class="why">Библиотеки меняются редко.</div></div>
+<div class="mcq" data-ok="2"><p>Почему важно, чтобы сигнал SIGTERM доходил до JVM?</p><ul><li>иначе образ не соберётся</li><li>иначе не запустится JIT</li><li>иначе приложение не успеет завершиться аккуратно и будет убито SIGKILL</li><li>не важно</li></ul><div class="why">Например, если её запускает shell-скрипт без exec.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="22-containers.html">22 «JVM в контейнерах»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

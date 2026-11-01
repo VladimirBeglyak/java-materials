@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Свои загрузчики и утечки — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="07e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 07 · СНАЧАЛА ПРОСТО</div>
+  <h1>Свои загрузчики и утечки — простыми словами</h1>
+  <p class="lead">Серверы приложений, плагины, горячая перезагрузка кода — всё это построено на собственных загрузчиках классов. Разберёмся, как их пишут, как работает горячая перезагрузка, где они встречаются в реальных системах, почему из-за них бывают утечки Metaspace и что такое Java-агенты.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 07 <a href="07-custom-loaders.html">«Свои загрузчики, изоляция, утечки»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="write"><span class="h-num">7.1</span>Свой загрузчик</h2>
+<p>Свой загрузчик — наследник ClassLoader, который умеет находить байты класса там, где нужно: в отдельной папке плагина, в базе, по сети. Обычно переопределяют только «найди байты» (findClass), а делегирование родителю остаётся стандартным. Ещё загрузчик может проверять подписи или расшифровывать классы.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Свой загрузчик решает, откуда брать байты классов.</div>
+<p class="easy-bridge">В полной главе: <a href="07-custom-loaders.html#write">7.1 Пишем загрузчик</a></p>
+
+<h2 id="hot-reload"><span class="h-num">7.2</span>Горячая перезагрузка</h2>
+<p>Изменить уже загруженный класс нельзя. Но можно выбросить старый загрузчик и загрузить новые версии классов новым загрузчиком. Старые объекты продолжают жить со старыми классами, новые — создаются из новых. Так работают «перезапуск без перезапуска» в инструментах разработки (например, Spring DevTools держит отдельный загрузчик для вашего кода).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Перезагрузка = новый загрузчик для новых версий классов.</div>
+<p class="easy-bridge">В полной главе: <a href="07-custom-loaders.html#hot-reload">7.2 Горячая перезагрузка</a></p>
+
+<h2 id="real"><span class="h-num">7.3</span>Загрузчики в реальных системах</h2>
+<ul>
+  <li><b>Tomcat</b> — свой загрузчик на каждое веб-приложение: два приложения могут использовать разные версии библиотеки.</li>
+  <li><b>Spring Boot fat jar</b> — особый загрузчик умеет читать JAR-ы, вложенные в JAR.</li>
+  <li><b>Плагины</b> (IDE, Jenkins, Elasticsearch) — изоляция плагинов друг от друга.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Изоляция приложений и плагинов — главное применение своих загрузчиков.</div>
+<p class="easy-bridge">В полной главе: <a href="07-custom-loaders.html#real">7.3 Загрузчики в реальных системах</a></p>
+
+<h2 id="unload"><span class="h-num">7.4</span>Выгрузка классов и утечки</h2>
+<div class="widget stepper">
+  <div class="widget-title">Почему после пяти передеплоев кончается Metaspace</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">приложение задеплоено → загрузчик L1 загрузил его 5000 классов</span><span data-from="2" data-to="3">передеплой → новый загрузчик L2, старый L1 должен исчезнуть</span><span data-from="3" data-to="4">но в общем классе сервера осталась ссылка на объект приложения
+(ThreadLocal в чужом потоке, зарегистрированный драйвер, кэш)</span><span data-from="4">объект держит свой класс → класс держит L1 → L1 держит все 5000 классов
+каждый передеплой — ещё одна копия → OutOfMemoryError: Metaspace</span></pre></div>
+  <section class="st-step" data-t="Загрузка"><p>Каждый класс помнит свой загрузчик.</p></section>
+  <section class="st-step" data-t="Передеплой"><p>Старые классы могут уйти, только если ушёл весь загрузчик.</p></section>
+  <section class="st-step" data-t="Забытая ссылка"><p>Одна ссылка снаружи держит всё.</p></section>
+  <section class="st-step" data-t="Утечка"><p>Лечение — снимать регистрации и чистить ThreadLocal при остановке.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Класс выгружается только со всем загрузчиком. Одна забытая ссылка — утечка всех классов.</div>
+<p class="easy-bridge">В полной главе: <a href="07-custom-loaders.html#unload">7.4 Выгрузка классов и утечки загрузчиков</a></p>
+
+<h2 id="agents"><span class="h-num">7.5</span>Java-агенты</h2>
+<p><b>Агент</b> — специальная программа, которая подключается к JVM (флагом <code>-javaagent</code> или на лету) и может менять байткод классов при их загрузке. Так работают APM-системы и трассировка (OpenTelemetry), профилировщики, моки статических методов, покрытие тестов. Сила и опасность одновременно: агент может изменить что угодно.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Агенты правят байткод при загрузке — основа мониторинга и инструментов.</div>
+<p class="easy-bridge">В полной главе: <a href="07-custom-loaders.html#agents">7.5 Java-агенты и инструментирование</a></p>
+
+<h2 id="gloss"><span class="h-num">7.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>findClass</td><td>Метод «найди байты класса» в своём загрузчике.</td></tr>
+<tr><td>Горячая перезагрузка</td><td>Новые версии классов без перезапуска JVM.</td></tr>
+<tr><td>Выгрузка классов</td><td>Удаление классов вместе с загрузчиком.</td></tr>
+<tr><td>Утечка загрузчика</td><td>Старый загрузчик удерживается и держит все классы.</td></tr>
+<tr><td>Java-агент</td><td>Программа, меняющая байткод при загрузке.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">7.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Когда класс может быть выгружен из JVM?</p><ul><li>когда нет объектов этого класса</li><li>по таймеру</li><li>только когда недостижим весь его загрузчик</li><li>никогда</li></ul><div class="why">Классы выгружаются вместе с загрузчиком.</div></div>
+<div class="mcq" data-ok="0"><p>После нескольких передеплоев — OutOfMemoryError: Metaspace. Что подозревать?</p><ul><li>утечку загрузчика: старые классы удерживает забытая ссылка</li><li>мало кучи</li><li>медленный диск</li><li>DNS</li></ul><div class="why">Каждый деплой добавляет копию классов.</div></div>
+<div class="mcq" data-ok="3"><p>Как два веб-приложения в одном Tomcat используют разные версии одной библиотеки?</p><ul><li>никак</li><li>через модули</li><li>через рефлексию</li><li>у каждого свой загрузчик классов</li></ul><div class="why">Изоляция загрузчиками.</div></div>
+<div class="mcq" data-ok="1"><p>Что делает Java-агент?</p><ul><li>собирает мусор</li><li>может менять байткод классов при их загрузке</li><li>компилирует Java</li><li>управляет сетью</li></ul><div class="why">Основа APM и профилировщиков.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли изменить уже загруженный класс без агента?</p><ul><li>да, через рефлексию</li><li>да, перезаписав .class-файл</li><li>нет: можно только загрузить новую версию другим загрузчиком</li><li>да, через static-блок</li></ul><div class="why">На этом построена горячая перезагрузка.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="07-custom-loaders.html">07 «Свои загрузчики, изоляция, утечки»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

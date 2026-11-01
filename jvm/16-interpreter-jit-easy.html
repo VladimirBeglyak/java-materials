@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Интерпретатор и JIT — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · СНАЧАЛА ПРОСТО</div>
+  <h1>Интерпретатор и JIT — простыми словами</h1>
+  <p class="lead">Почему Java не компилирует всё заранее и как она становится быстрой во время работы? Разберёмся, зачем компиляция «на лету», что такое пять уровней компиляции, как ускоряется долгий цикл посреди выполнения, как читать журнал компиляции и что делать с прогревом.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 16 <a href="16-interpreter-jit.html">«Интерпретатор и JIT: tiered compilation»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="why"><span class="h-num">16.1</span>Зачем компилировать во время работы</h2>
+<p>Компилятор заранее не знает, как программа будет использоваться: какие ветки «если» срабатывают, какие типы реально приходят, какие методы вызываются миллионы раз. JIT видит это во время работы и оптимизирует именно реальное поведение — иногда лучше, чем заранее скомпилированный код. Цена — время на прогрев и сам процесс компиляции.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+JIT оптимизирует по реальному поведению программы — ценой прогрева.</div>
+<p class="easy-bridge">В полной главе: <a href="16-interpreter-jit.html#why">16.1 Зачем компилировать во время работы</a></p>
+
+<h2 id="tiers"><span class="h-num">16.2</span>Уровни компиляции</h2>
+<div class="widget stepper">
+  <div class="widget-title">Жизнь горячего метода</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">уровень 0: интерпретатор + подсчёт вызовов и циклов</span><span data-from="2" data-to="3">метод вызван сотни раз → C1 быстро компилирует его со сбором профиля (уровень 3)</span><span data-from="3" data-to="4">профиль собран: какие типы, какие ветки, сколько итераций</span><span data-from="4">метод вызван тысячи раз → C2 тщательно компилирует с оптимизациями (уровень 4)
+самый быстрый код — в основном для по-настоящему горячих мест</span></pre></div>
+  <section class="st-step" data-t="Интерпретатор"><p>Старт без задержек на компиляцию.</p></section>
+  <section class="st-step" data-t="C1"><p>Быстрая компиляция, код уже в разы быстрее.</p></section>
+  <section class="st-step" data-t="Профиль"><p>Собираются сведения для смелых оптимизаций.</p></section>
+  <section class="st-step" data-t="C2"><p>Агрессивная оптимизация по профилю.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Интерпретатор → C1 с профилем → C2. Чем горячее код, тем тщательнее компиляция.</div>
+<p class="easy-bridge">В полной главе: <a href="16-interpreter-jit.html#tiers">16.2 Пять уровней</a></p>
+
+<h2 id="osr"><span class="h-num">16.3</span>OSR: ускорение посреди цикла</h2>
+<p>Если метод вызван один раз, но внутри у него цикл на миллиард итераций, ждать следующего вызова бессмысленно. JVM умеет скомпилировать метод и «пересадить» выполнение на скомпилированный код прямо посреди цикла — <b>OSR</b> (on-stack replacement). Как поменять колесо на ходу.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+OSR переключает долгий цикл на скомпилированный код, не дожидаясь нового вызова.</div>
+<p class="easy-bridge">В полной главе: <a href="16-interpreter-jit.html#osr">16.3 OSR: компиляция посреди цикла</a></p>
+
+<h2 id="print"><span class="h-num">16.4</span>Журнал компиляции</h2>
+<p>Флаг <code>-XX:+PrintCompilation</code> печатает, какие методы и на каком уровне компилируются. Знак <code>%</code> — OSR-компиляция, «made not entrant» — скомпилированный код выброшен (деоптимизация, глава 17). По журналу видно, когда программа прогрелась и не «скачут» ли компиляции туда-обратно.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+PrintCompilation показывает, что, когда и как компилируется.</div>
+<p class="easy-bridge">В полной главе: <a href="16-interpreter-jit.html#print">16.4 Читаем -XX:+PrintCompilation</a></p>
+
+<h2 id="warmup"><span class="h-num">16.5</span>Прогрев</h2>
+<p>После старта сервис медленнее: код ещё в интерпретаторе, а компиляторы заняты. Что делают: прогревают перед приёмом трафика (тестовые запросы, readiness-проба только после прогрева), плавно добавляют нагрузку на новые экземпляры, используют сохранение результатов прошлых запусков (AOT-кэш, CRaC — глава 20). И никогда не меряют скорость без прогрева.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Прогрейте до приёма трафика; замеры — только после прогрева.</div>
+<p class="easy-bridge">В полной главе: <a href="16-interpreter-jit.html#warmup">16.5 Прогрев и что с ним делать</a></p>
+
+<h2 id="gloss"><span class="h-num">16.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>JIT</td><td>Компиляция во время работы программы.</td></tr>
+<tr><td>C1 / C2</td><td>Быстрый простой / медленный оптимизирующий компилятор.</td></tr>
+<tr><td>Tiered compilation</td><td>Ступенчатая компиляция по уровням.</td></tr>
+<tr><td>Профиль</td><td>Сведения о реальном поведении кода.</td></tr>
+<tr><td>OSR</td><td>Переход на скомпилированный код посреди цикла.</td></tr>
+<tr><td>Прогрев</td><td>Период, пока горячий код ещё не скомпилирован.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">16.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему JIT может оптимизировать лучше, чем компилятор заранее?</p><ul><li>он новее</li><li>он видит реальное поведение: типы, ветки, частоту вызовов</li><li>он работает на сервере</li><li>не может</li></ul><div class="why">Профиль во время работы.</div></div>
+<div class="mcq" data-ok="3"><p>Какой компилятор делает самые агрессивные оптимизации?</p><ul><li>javac</li><li>интерпретатор</li><li>C1</li><li>C2</li></ul><div class="why">C1 — быстрый, C2 — тщательный.</div></div>
+<div class="mcq" data-ok="0"><p>Метод вызывается один раз, но в нём цикл на миллиард итераций. Останется ли он в интерпретаторе?</p><ul><li>нет: OSR скомпилирует его и переключит посреди цикла</li><li>да, навсегда</li><li>да, до следующего вызова</li><li>программа упадёт</li></ul><div class="why">Колесо меняется на ходу.</div></div>
+<div class="mcq" data-ok="2"><p>Почему новый экземпляр сервиса медленно обрабатывает первые запросы?</p><ul><li>медленный диск</li><li>нет кэша DNS</li><li>код ещё не скомпилирован JIT — идёт прогрев</li><li>так задумано</li></ul><div class="why">Сначала интерпретатор.</div></div>
+<div class="mcq" data-ok="1"><p>Что означает «%» в выводе PrintCompilation?</p><ul><li>ошибку</li><li>OSR-компиляцию</li><li>процент готовности</li><li>деоптимизацию</li></ul><div class="why">Компиляция с заменой посреди выполнения.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="16-interpreter-jit.html">16 «Интерпретатор и JIT: tiered compilation»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

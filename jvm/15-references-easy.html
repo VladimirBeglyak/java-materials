@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Слабые ссылки и Cleaner — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · СНАЧАЛА ПРОСТО</div>
+  <h1>Слабые ссылки и Cleaner — простыми словами</h1>
+  <p class="lead">Иногда нужно ссылаться на объект, не мешая сборщику его убрать: для кэшей, для служебных таблиц, для освобождения внешних ресурсов. Разберёмся, какие бывают ссылки, как узнать, что объект собран, в чём ловушки WeakHashMap и мягких кэшей и почему finalize ушёл в прошлое.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 15 <a href="15-references.html">«Слабые ссылки, Cleaner, финализация»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="kinds"><span class="h-num">15.1</span>Сила ссылок</h2>
+<div class="table-wrap"><table>
+<tr><th>Ссылка</th><th>Аналогия</th><th>Когда объект соберут</th></tr>
+<tr><td>Strong (обычная)</td><td>держу крепко</td><td>никогда, пока держу</td></tr>
+<tr><td>Soft</td><td>держу, пока есть место в шкафу</td><td>когда памяти начнёт не хватать</td></tr>
+<tr><td>Weak</td><td>держу, пока держат другие</td><td>при первой сборке, если крепких ссылок нет</td></tr>
+<tr><td>Phantom</td><td>хочу узнать, когда уберут</td><td>получить объект через неё нельзя</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Soft — до нехватки памяти, weak — до первой сборки, phantom — только уведомление.</div>
+<p class="easy-bridge">В полной главе: <a href="15-references.html#kinds">15.1 Сила достижимости</a></p>
+
+<h2 id="queue"><span class="h-num">15.2</span>Как узнать, что объект собран</h2>
+<p>Слабую ссылку можно создать с <b>ReferenceQueue</b> — «почтовым ящиком»: когда сборщик уберёт объект, сама ссылка окажется в этой очереди. Программа может забирать такие ссылки и чистить связанные с ними записи — например, удалять из своей таблицы.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+ReferenceQueue сообщает, что объект за ссылкой уже собран.</div>
+<p class="easy-bridge">В полной главе: <a href="15-references.html#queue">15.2 ReferenceQueue и обработка ссылок</a></p>
+
+<h2 id="whm"><span class="h-num">15.3</span>Ловушки WeakHashMap и мягких кэшей</h2>
+<ul>
+  <li><b>WeakHashMap</b> держит слабо <b>ключи</b>, а значения — крепко. Если значение ссылается на свой ключ, ключ никогда не освободится — утечка.</li>
+  <li>Ключи-строки из пула и маленькие Integer из кэша живут вечно — такие записи не исчезнут.</li>
+  <li><b>Кэш на SoftReference</b> выглядит заманчиво, но очищается непредсказуемо и «всем сразу», когда памяти уже мало, — сборщик работает тяжело, и задержки скачут. Лучше обычный кэш с ограничением размера и времени жизни (например, Caffeine).</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+WeakHashMap слаб только по ключам. Для кэшей — ограниченный кэш, а не soft-ссылки.</div>
+<p class="easy-bridge">В полной главе: <a href="15-references.html#whm">15.3 Ловушки WeakHashMap и мягких кэшей</a></p>
+
+<h2 id="cleaner"><span class="h-num">15.4</span>Cleaner вместо finalize</h2>
+<p>Старый метод <code>finalize</code> вызывался «когда-нибудь» перед уборкой объекта: непредсказуемо, медленно, мог «воскресить» объект — и теперь объявлен устаревшим к удалению. Современная замена — <b>Cleaner</b>: регистрируете действие по освобождению внешнего ресурса, и оно выполнится после того, как объект стал недостижим. Но это лишь страховка: главный способ — явно закрывать ресурсы через try-with-resources.</p>
+<div class="widget stepper">
+  <div class="widget-title">Освобождение нативного ресурса</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">объект держит внешний ресурс (нативную память, дескриптор)</span><span data-from="2" data-to="3">правильно: try-with-resources → close() → ресурс освобождён сразу</span><span data-from="3" data-to="4">забыли close → объект стал недостижим</span><span data-from="4">Cleaner после сборки выполняет действие и освобождает ресурс
+поздно и непредсказуемо, но лучше, чем никогда</span></pre></div>
+  <section class="st-step" data-t="Ресурс"><p>Внешний ресурс не освобождается сборщиком сам.</p></section>
+  <section class="st-step" data-t="Правильно"><p>Явное закрытие — сразу.</p></section>
+  <section class="st-step" data-t="Забыли"><p>Объект ушёл, ресурс остался.</p></section>
+  <section class="st-step" data-t="Страховка"><p>Cleaner спасёт, но позже.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+finalize — в прошлом. Закрывайте ресурсы явно, Cleaner — запасной вариант.</div>
+<p class="easy-bridge">В полной главе: <a href="15-references.html#cleaner">15.4 Cleaner вместо finalize</a></p>
+
+<h2 id="gloss"><span class="h-num">15.5</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>SoftReference</td><td>Держит, пока хватает памяти.</td></tr>
+<tr><td>WeakReference</td><td>Держит, пока держат другие.</td></tr>
+<tr><td>PhantomReference</td><td>Только уведомление о сборке.</td></tr>
+<tr><td>ReferenceQueue</td><td>Очередь ссылок на собранные объекты.</td></tr>
+<tr><td>Cleaner</td><td>Действие после того, как объект стал недостижим.</td></tr>
+<tr><td>finalize</td><td>Устаревший механизм, не использовать.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">15.6</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Когда соберут объект, на который есть только WeakReference?</p><ul><li>никогда</li><li>когда кончится память</li><li>при ближайшей сборке</li><li>при выключении JVM</li></ul><div class="why">Слабая ссылка не защищает объект.</div></div>
+<div class="mcq" data-ok="0"><p>Что в WeakHashMap держится слабо?</p><ul><li>только ключи</li><li>только значения</li><li>и ключи, и значения</li><li>ничего</li></ul><div class="why">Значение, ссылающееся на ключ, создаёт утечку.</div></div>
+<div class="mcq" data-ok="3"><p>Почему кэш на SoftReference — плохая идея для сервиса?</p><ul><li>он не работает</li><li>он слишком быстрый</li><li>он запрещён</li><li>очищается непредсказуемо и в момент, когда памяти уже мало</li></ul><div class="why">Лучше кэш с ограничением размера.</div></div>
+<div class="mcq" data-ok="1"><p>Чем заменить finalize?</p><ul><li>System.gc()</li><li>явным close() через try-with-resources, а как страховку — Cleaner</li><li>static-блоком</li><li>ничем</li></ul><div class="why">finalize устарел и непредсказуем.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли получить объект через PhantomReference?</p><ul><li>да</li><li>да, до сборки</li><li>нет: она нужна только чтобы узнать, что объект собран</li><li>только в Java 8</li></ul><div class="why">get() всегда возвращает null.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="15-references.html">15 «Слабые ссылки, Cleaner, финализация»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

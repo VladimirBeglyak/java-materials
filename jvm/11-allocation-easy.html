@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Выделение памяти — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · СНАЧАЛА ПРОСТО</div>
+  <h1>Выделение памяти — простыми словами</h1>
+  <p class="lead">Многие боятся создавать объекты в Java, думая, что это дорого. Разберёмся, как на самом деле устроено выделение памяти, что такое TLAB, как escape analysis убирает объекты целиком и почему важен не размер кучи, а темп выделения.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 11 <a href="11-allocation.html">«Выделение памяти: TLAB, escape analysis»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="fast"><span class="h-num">11.1</span>Быстрый путь: сдвинуть указатель</h2>
+<p>Каждый поток получает свой кусок молодой памяти — <b>TLAB</b> (буфер выделения потока). Создать объект — значит взять место прямо за последним созданным объектом и сдвинуть указатель «свободно отсюда». Никаких поисков свободного места и никаких блокировок между потоками. Как отрывной блокнот: следующий лист всегда сверху.</p>
+<div class="widget stepper">
+  <div class="widget-title">Поток создаёт три объекта</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">TLAB потока: [свободно → ................................]</span><span data-from="2" data-to="3">new A (24 байта): [A][свободно → .......................]</span><span data-from="3" data-to="4">new B, new C:      [A][B][C][свободно → ..............]</span><span data-from="4">TLAB закончился → поток берёт новый кусок из общего Eden
+это редкая и чуть более дорогая операция</span></pre></div>
+  <section class="st-step" data-t="TLAB"><p>Личный участок потока.</p></section>
+  <section class="st-step" data-t="Выделение"><p>Сдвиг указателя — несколько машинных команд.</p></section>
+  <section class="st-step" data-t="Ещё"><p>Объекты ложатся подряд.</p></section>
+  <section class="st-step" data-t="Новый TLAB"><p>Только тогда нужна синхронизация.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Выделение в TLAB — сдвиг указателя без блокировок. Создание объектов дешёвое.</div>
+<p class="easy-bridge">В полной главе: <a href="11-allocation.html#fast">11.1 Быстрый путь: bump pointer в TLAB</a></p>
+
+<h2 id="escape"><span class="h-num">11.2</span>Escape analysis: объект, которого нет</h2>
+<p>JIT смотрит, «убегает» ли объект из метода: возвращается ли, кладётся ли в поле или коллекцию. Если нет — объект нужен только внутри, и JIT может разложить его поля по обычным переменным (<b>скалярная замена</b>) — объект вообще не создаётся в куче. Например, временный Point для расчёта расстояния может исчезнуть полностью. Работает только в скомпилированном коде и не всегда — но это одна из причин, почему мелкие временные объекты дешевле, чем кажется.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Объект, не покидающий метод, JIT может не создавать вовсе.</div>
+<p class="easy-bridge">В полной главе: <a href="11-allocation.html#escape">11.2 Escape analysis и скалярная замена</a></p>
+
+<h2 id="rate"><span class="h-num">11.3</span>Темп выделения определяет частоту сборок</h2>
+<p>Молодая область заполняется, и запускается сборка. Если сервис создаёт 1 ГБ объектов в секунду, а молодая область — 500 МБ, сборка будет дважды в секунду. Дорогим становится не само создание, а частые сборки и то, что выжившие переезжают и копируются. Поэтому при оптимизации памяти смотрят на <b>темп выделения</b> (allocation rate) — его показывают JFR и профилировщики — и снижают его в самых горячих местах.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Чем больше мусора в секунду, тем чаще сборки. Смотрите allocation rate.</div>
+<p class="easy-bridge">В полной главе: <a href="11-allocation.html#rate">11.3 Темп выделения определяет частоту сборок</a></p>
+
+<h2 id="gloss"><span class="h-num">11.4</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>TLAB</td><td>Личный участок памяти потока для новых объектов.</td></tr>
+<tr><td>Bump pointer</td><td>Выделение сдвигом указателя.</td></tr>
+<tr><td>Eden</td><td>Область, где рождаются объекты.</td></tr>
+<tr><td>Escape analysis</td><td>Анализ, покидает ли объект метод.</td></tr>
+<tr><td>Скалярная замена</td><td>Поля объекта превращаются в переменные, объекта нет.</td></tr>
+<tr><td>Allocation rate</td><td>Сколько памяти создаётся в секунду.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">11.5</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему создание объекта в Java обычно дёшево?</p><ul><li>объекты маленькие</li><li>в своём TLAB поток просто сдвигает указатель, без блокировок</li><li>объекты создаются заранее</li><li>это не так</li></ul><div class="why">Несколько машинных команд.</div></div>
+<div class="mcq" data-ok="3"><p>Что делает escape analysis?</p><ul><li>ищет утечки памяти</li><li>удаляет неиспользуемые классы</li><li>шифрует объекты</li><li>определяет, покидает ли объект метод, и может обойтись без его создания</li></ul><div class="why">Скалярная замена.</div></div>
+<div class="mcq" data-ok="0"><p>Сборки молодого поколения идут слишком часто. На что смотреть в первую очередь?</p><ul><li>на темп выделения памяти</li><li>на число классов</li><li>на версию Java</li><li>на размер диска</li></ul><div class="why">Больше мусора в секунду — чаще сборки.</div></div>
+<div class="mcq" data-ok="2"><p>Что происходит, когда TLAB потока закончился?</p><ul><li>программа падает</li><li>запускается полная сборка</li><li>поток получает новый кусок из общей области</li><li>поток останавливается навсегда</li></ul><div class="why">Редкая и чуть более дорогая операция.</div></div>
+<div class="mcq" data-ok="1"><p>Временный объект создаётся в методе и никуда не передаётся. Что может сделать JIT?</p><ul><li>ничего</li><li>не создавать его в куче вовсе</li><li>сделать его статическим</li><li>перенести в Metaspace</li></ul><div class="why">Объект «растворится» в переменных.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="11-allocation.html">11 «Выделение памяти: TLAB, escape analysis»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

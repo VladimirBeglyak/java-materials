@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>14 · Логи GC и OutOfMemoryError — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="14e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 14 · СНАЧАЛА ПРОСТО</div>
+  <h1>Логи GC и OutOfMemoryError — простыми словами</h1>
+  <p class="lead">Как понять, всё ли хорошо с памятью, и что делать, когда сервис падает с OutOfMemoryError? Разберёмся, как включить и читать логи GC, как отличить утечку от нехватки памяти, какие бывают OutOfMemoryError, как анализировать дамп кучи и в каком порядке настраивать JVM.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 14 <a href="14-gc-tuning.html">«Логи GC, настройка и OutOfMemoryError»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="logging"><span class="h-num">14.1</span>Включайте логи GC всегда</h2>
+<p>Флаг <code>-Xlog:gc*:file=gc.log:time,uptime:filecount=5,filesize=20m</code> пишет в файл каждую сборку с ротацией. Стоят логи копейки, а без них после аварии нечего анализировать. Это первое, что нужно включить в продакшене.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Логи GC — всегда, с ротацией. Почти бесплатно и бесценно при авариях.</div>
+<p class="easy-bridge">В полной главе: <a href="14-gc-tuning.html#logging">14.1 Включить логи GC (всегда, в продакшене)</a></p>
+
+<h2 id="decode"><span class="h-num">14.2</span>Как читать строку лога</h2>
+<p>Типичная строка: <code>GC(42) Pause Young (Normal) 512M-&gt;128M(1024M) 8.5ms</code>. Читается так: сборка №42, пауза, молодое поколение; до сборки было занято 512 МБ, после — 128 МБ, всего куча 1024 МБ; пауза длилась 8,5 мс. Самое важное — <b>длительность пауз</b> и <b>сколько занято после</b>.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Было → стало (всего), длительность. Смотрите на «стало» и на паузы.</div>
+<p class="easy-bridge">В полной главе: <a href="14-gc-tuning.html#decode">14.2 Расшифровка строк лога</a></p>
+
+<h2 id="trend"><span class="h-num">14.3</span>Утечка или мало кучи</h2>
+<div class="widget stepper">
+  <div class="widget-title">График «занято после сборки» за сутки</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">здоровый сервис: после каждой сборки ~400 МБ, ровно — «пила» с ровным дном</span><span data-from="2" data-to="3">мало кучи: дно ровное, но 90% кучи → сборки очень часто
+лечение — увеличить кучу или уменьшить потребление</span><span data-from="3" data-to="4">утечка: дно медленно растёт: 400 → 600 → 900 → 1500 МБ…
+сколько памяти ни дай — рано или поздно OutOfMemoryError</span><span data-from="4">утечку лечат не памятью, а поиском виновника в дампе кучи</span></pre></div>
+  <section class="st-step" data-t="Норма"><p>После уборки остаётся одно и то же.</p></section>
+  <section class="st-step" data-t="Тесно"><p>Стабильно, но впритык.</p></section>
+  <section class="st-step" data-t="Утечка"><p>«Дно» растёт — что-то копится.</p></section>
+  <section class="st-step" data-t="Лечение"><p>Увеличение кучи лишь отсрочит падение.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Растёт «занято после сборки» — утечка. Стоит высоко — мало кучи.</div>
+<p class="easy-bridge">В полной главе: <a href="14-gc-tuning.html#trend">14.3 Утечка или мало кучи: смотрим на «занято после GC»</a></p>
+
+<h2 id="oom"><span class="h-num">14.4</span>Виды OutOfMemoryError</h2>
+<div class="table-wrap"><table>
+<tr><th>Сообщение</th><th>Что кончилось</th></tr>
+<tr><td>Java heap space</td><td>куча</td></tr>
+<tr><td>GC overhead limit exceeded</td><td>сборщик работает почти всё время и почти ничего не освобождает</td></tr>
+<tr><td>Metaspace</td><td>память для классов (часто — утечка загрузчиков)</td></tr>
+<tr><td>unable to create native thread</td><td>нельзя создать ещё поток (лимиты ОС или память)</td></tr>
+<tr><td>Direct buffer memory</td><td>память для direct-буферов (NIO, Netty)</td></tr>
+</table></div>
+<p>А если процесс просто «исчез» без OutOfMemoryError — его, скорее всего, убил OOM killer ОС или контейнера: процесс целиком превысил лимит памяти (глава 22).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Текст после OutOfMemoryError говорит, какая память кончилась.</div>
+<p class="easy-bridge">В полной главе: <a href="14-gc-tuning.html#oom">14.4 Виды OutOfMemoryError</a></p>
+
+<h2 id="dump"><span class="h-num">14.5</span>Дамп кучи</h2>
+<p>Включите <code>-XX:+HeapDumpOnOutOfMemoryError</code> — при падении JVM сохранит снимок всех объектов. В анализаторе (Eclipse MAT и др.) смотрите: какие объекты удерживают больше всего памяти (<b>retained size</b>) и <b>цепочку ссылок до корня</b> — кто их держит. Обычно виновник — растущая коллекция в каком-то статическом поле или кэш без ограничения.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Дамп кучи + «кто удерживает» = виновник утечки.</div>
+<p class="easy-bridge">В полной главе: <a href="14-gc-tuning.html#dump">14.5 Анализ дампа кучи</a></p>
+
+<h2 id="tuning"><span class="h-num">14.6</span>Порядок настройки</h2>
+<ol class="steps">
+  <li>Включить логи GC и метрики, понять, есть ли проблема.</li>
+  <li>Задать размер кучи с запасом (живые данные × 3–4).</li>
+  <li>Выбрать сборщик под задачу (глава 13).</li>
+  <li>Если паузы велики — сначала уменьшить мусор в коде, потом крутить флаги.</li>
+  <li>Менять по одному параметру и измерять.</li>
+</ol>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Измерить → размер кучи → сборщик → код → по одному флагу.</div>
+<p class="easy-bridge">В полной главе: <a href="14-gc-tuning.html#tuning">14.6 Порядок настройки</a></p>
+
+<h2 id="gloss"><span class="h-num">14.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>GC log</td><td>Журнал всех сборок мусора.</td></tr>
+<tr><td>Live set</td><td>Живые данные — сколько занято после сборки.</td></tr>
+<tr><td>OutOfMemoryError</td><td>Кончилась какая-то область памяти JVM.</td></tr>
+<tr><td>Heap dump</td><td>Снимок всех объектов кучи.</td></tr>
+<tr><td>Retained size</td><td>Сколько памяти освободится, если убрать объект.</td></tr>
+<tr><td>Path to GC roots</td><td>Цепочка ссылок, удерживающая объект.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">14.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>«Занято после сборки» растёт день ото дня. Что это?</p><ul><li>норма</li><li>утечка памяти</li><li>слишком быстрый процессор</li><li>мало потоков</li></ul><div class="why">Что-то копится и не освобождается.</div></div>
+<div class="mcq" data-ok="3"><p>При утечке памяти помогло увеличение -Xmx вдвое. Проблема решена?</p><ul><li>да</li><li>да, навсегда</li><li>да, если перезапускать</li><li>нет: падение лишь отложено</li></ul><div class="why">Ищите виновника в дампе.</div></div>
+<div class="mcq" data-ok="0"><p>OutOfMemoryError: Metaspace — что вероятнее всего?</p><ul><li>утечка загрузчиков классов или очень много классов</li><li>мало кучи</li><li>много потоков</li><li>медленный диск</li></ul><div class="why">Metaspace — память для классов.</div></div>
+<div class="mcq" data-ok="2"><p>Что показывает «путь до корней» в анализаторе дампа?</p><ul><li>скорость программы</li><li>размер класса</li><li>цепочку ссылок, которая не даёт объекту быть собранным</li><li>список потоков</li></ul><div class="why">Кто держит объект.</div></div>
+<div class="mcq" data-ok="1"><p>Процесс исчез без OutOfMemoryError в логах, а в Kubernetes — OOMKilled. Что произошло?</p><ul><li>утечка в куче</li><li>процесс целиком превысил лимит памяти контейнера и был убит ядром</li><li>JVM упала с ошибкой</li><li>кончился диск</li></ul><div class="why">Куча меньше лимита, но всё вместе — больше.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="14-gc-tuning.html">14 «Логи GC, настройка и OutOfMemoryError»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

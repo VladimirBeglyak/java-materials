@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>21 · Диагностика JVM — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="21e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 21 · СНАЧАЛА ПРОСТО</div>
+  <h1>Диагностика JVM — простыми словами</h1>
+  <p class="lead">Сервис тормозит, ест процессор или память — с чего начать? Разберёмся, какие инструменты отвечают на какие вопросы, как читать дамп потоков, как расследовать «процесс ест 100% CPU», как читать флеймграф и чем полезен Java Flight Recorder.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 21 <a href="21-diagnostics.html">«Диагностика: jcmd, JFR, дампы, профилировщики»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="tools"><span class="h-num">21.1</span>Инструменты и вопросы</h2>
+<div class="table-wrap"><table>
+<tr><th>Вопрос</th><th>Инструмент</th></tr>
+<tr><td>что делают потоки прямо сейчас?</td><td>jcmd PID Thread.print (jstack)</td></tr>
+<tr><td>что занимает память?</td><td>jcmd PID GC.heap_dump → анализатор</td></tr>
+<tr><td>какие флаги и версия?</td><td>jcmd PID VM.flags, VM.version</td></tr>
+<tr><td>где тратится время и память?</td><td>JFR, async-profiler</td></tr>
+<tr><td>как часто сборки и паузы?</td><td>логи GC (глава 14)</td></tr>
+</table></div>
+<p><b>jcmd</b> — универсальный пульт: почти всё можно сделать им одним.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+jcmd — пульт; потоки — дамп потоков, память — дамп кучи, время — JFR и профилировщики.</div>
+<p class="easy-bridge">В полной главе: <a href="21-diagnostics.html#tools">21.1 Инструменты и вопросы</a></p>
+
+<h2 id="threaddump"><span class="h-num">21.2</span>Читаем дамп потоков</h2>
+<p>Дамп потоков — «фотография» всех потоков: имя, состояние и стек вызовов. Что искать: много потоков <b>BLOCKED</b> на одном замке (кто его держит?), потоки, ждущие одного и того же ресурса (пул соединений, внешний вызов), «Found one Java-level deadlock». Снимайте 3–5 дампов с интервалом в несколько секунд: если поток всё время на одной строке — там и проблема.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Несколько дампов подряд → кто стоит на одном месте и чего ждёт.</div>
+<p class="easy-bridge">В полной главе: <a href="21-diagnostics.html#threaddump">21.2 Читаем дамп потоков</a></p>
+
+<h2 id="cpu"><span class="h-num">21.3</span>Расследование: процесс ест 100% CPU</h2>
+<div class="widget stepper">
+  <div class="widget-title">Найти поток-«обжору»</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">top -H -p PID → поток с id 12345 ест 98% CPU</span><span data-from="2" data-to="3">переводим 12345 в шестнадцатеричный: 0x3039</span><span data-from="3" data-to="4">jcmd PID Thread.print → ищем nid=0x3039 → видим стек этого потока</span><span data-from="4">если это «GC Thread» — проблема с памятью (частые сборки)
+если ваш код — бесконечный цикл или тяжёлое вычисление на этой строке</span></pre></div>
+  <section class="st-step" data-t="Кто ест"><p>Системный top по потокам.</p></section>
+  <section class="st-step" data-t="Номер"><p>В дампе id потока ОС записан в hex.</p></section>
+  <section class="st-step" data-t="Стек"><p>Видно, какой код выполняет этот поток.</p></section>
+  <section class="st-step" data-t="Диагноз"><p>Сборщик или ваш код — разные лечения.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+top -H → id потока → hex → найти в дампе потоков → стек.</div>
+<p class="easy-bridge">В полной главе: <a href="21-diagnostics.html#cpu">21.3 Расследование: процесс ест 100% CPU</a></p>
+
+<h2 id="flame"><span class="h-num">21.4</span>Как читать флеймграф</h2>
+<p>Флеймграф — картинка из «языков пламени»: каждый прямоугольник — метод, по вертикали — цепочка вызовов (снизу кто вызвал, сверху кто вызван), а <b>ширина</b> — доля времени, проведённого в нём. Порядок слева направо значения не имеет. Ищите <b>широкие плато наверху</b> — это методы, где реально тратится время. Профилировщик async-profiler строит такие графики почти без замедления сервиса.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Ширина = время. Широкие вершины — горячие места.</div>
+<p class="easy-bridge">В полной главе: <a href="21-diagnostics.html#flame">21.4 Как читать флеймграф</a></p>
+
+<h2 id="jfr"><span class="h-num">21.5</span>Java Flight Recorder</h2>
+<p>JFR — «бортовой самописец», встроенный в JVM: записывает события (выделение памяти, блокировки, сборки, ввод-вывод, исключения, нагрузку на CPU) почти без потерь производительности, поэтому его можно держать включённым на продакшене. Запись открывают в JDK Mission Control. Особенно ценен режим «последние N минут в кольцевом буфере» — после аварии можно сохранить то, что было до неё.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+JFR — самописец на продакшене. Держите включённым, сохраняйте после аварии.</div>
+<p class="easy-bridge">В полной главе: <a href="21-diagnostics.html#jfr">21.5 Java Flight Recorder</a></p>
+
+<h2 id="gloss"><span class="h-num">21.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>jcmd</td><td>Универсальная команда управления JVM.</td></tr>
+<tr><td>Thread dump</td><td>Снимок состояния всех потоков.</td></tr>
+<tr><td>Heap dump</td><td>Снимок всех объектов кучи.</td></tr>
+<tr><td>JFR</td><td>Встроенный самописец событий JVM.</td></tr>
+<tr><td>Флеймграф</td><td>Картинка, где ширина — время в методе.</td></tr>
+<tr><td>async-profiler</td><td>Профилировщик с малыми накладными расходами.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">21.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сервис «завис». Какой инструмент первым?</p><ul><li>дамп кучи</li><li>несколько дампов потоков с интервалом</li><li>перезапуск</li><li>логи GC</li></ul><div class="why">Видно, кто чего ждёт.</div></div>
+<div class="mcq" data-ok="3"><p>Как во флеймграфе найти, где тратится время?</p><ul><li>по самым высоким столбикам</li><li>по левому краю</li><li>по цвету</li><li>по самым широким прямоугольникам вверху</li></ul><div class="why">Ширина — доля времени.</div></div>
+<div class="mcq" data-ok="0"><p>По top -H видно, что поток с id 12345 ест CPU. Как найти его в дампе потоков?</p><ul><li>перевести в шестнадцатеричный (0x3039) и найти nid</li><li>по имени процесса</li><li>никак</li><li>по номеру строки</li></ul><div class="why">В дампе id ОС записан в hex.</div></div>
+<div class="mcq" data-ok="2"><p>Можно ли держать JFR включённым на продакшене?</p><ul><li>нет, он замедляет в разы</li><li>только ночью</li><li>да: накладные расходы очень малы</li><li>только в тестах</li></ul><div class="why">Для этого он и создан.</div></div>
+<div class="mcq" data-ok="1"><p>Поток, съедающий CPU, называется «GC Thread». О чём это говорит?</p><ul><li>о бесконечном цикле в коде</li><li>о проблемах с памятью: сборщик работает непрерывно</li><li>о сети</li><li>ни о чём</li></ul><div class="why">Смотрите логи GC и дамп кучи.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="21-diagnostics.html">21 «Диагностика: jcmd, JFR, дампы, профилировщики»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Области памяти JVM — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="09e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 09 · СНАЧАЛА ПРОСТО</div>
+  <h1>Области памяти JVM — простыми словами</h1>
+  <p class="lead">«Почему процесс Java занимает 3 ГБ, если -Xmx=2g?» — частый вопрос. Разберёмся с картой памяти JVM: стеки, куча, Metaspace, code cache, служебные области, — и научимся считать реальный расход и находить, куда он уходит.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 09 <a href="09-runtime-areas.html">«Области памяти JVM»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="map"><span class="h-num">9.1</span>Карта памяти процесса</h2>
+<div class="grid-2">
+  <div class="card"><h4>Куча</h4><p>Все объекты. Ограничена -Xmx. Убирается сборщиком мусора.</p></div>
+  <div class="card"><h4>Стеки потоков</h4><p>Вызовы и локальные переменные. Свой у каждого потока (обычно до 1 МБ).</p></div>
+  <div class="card"><h4>Metaspace</h4><p>Описания загруженных классов.</p></div>
+  <div class="card"><h4>Code cache</h4><p>Машинный код, скомпилированный JIT.</p></div>
+  <div class="card"><h4>Служебное</h4><p>Структуры сборщика, внутренние таблицы, память самой JVM.</p></div>
+  <div class="card"><h4>Direct-буферы</h4><p>Память вне кучи для ввода-вывода (NIO, Netty).</p></div>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Куча — только часть. Есть ещё стеки, классы, код, служебное и direct-буферы.</div>
+<p class="easy-bridge">В полной главе: <a href="09-runtime-areas.html#map">9.1 Карта памяти процесса</a></p>
+
+<h2 id="stack"><span class="h-num">9.2</span>Стек потока</h2>
+<p>Каждый поток получает свой стек: кадры вызовов с локальными переменными. Размер задаётся <code>-Xss</code> (обычно 1 МБ, но реально занимается только используемая часть). Слишком глубокая рекурсия — StackOverflowError. Много потоков — много стеков: тысяча потоков — до гигабайта зарезервированной памяти.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Стек — у каждого потока свой. Больше потоков — больше памяти.</div>
+<p class="easy-bridge">В полной главе: <a href="09-runtime-areas.html#stack">9.2 Стек потока</a></p>
+
+<h2 id="heap"><span class="h-num">9.3</span>Куча</h2>
+<p>Все объекты живут в куче — общей для всех потоков. Её нижняя и верхняя границы — <code>-Xms</code> и <code>-Xmx</code>. В сервисах часто ставят их равными, чтобы JVM не тратила время на рост и сжатие кучи. Внутри куча поделена так, как удобно сборщику (поколения, регионы — главы 12–13).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Куча — объекты, -Xmx — её предел.</div>
+<p class="easy-bridge">В полной главе: <a href="09-runtime-areas.html#heap">9.3 Куча</a></p>
+
+<h2 id="metaspace"><span class="h-num">9.4</span>Metaspace и code cache</h2>
+<p><b>Metaspace</b> хранит описания классов (раньше это называлось PermGen). Растёт с числом загруженных классов — в больших Spring-приложениях это сотни мегабайт; утечки загрузчиков (глава 07) переполняют именно его. <b>Code cache</b> — место для машинного кода от JIT. Если оно заполнится, JIT перестанет компилировать, и программа заметно замедлится.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Metaspace — классы, code cache — скомпилированный код. Оба вне кучи.</div>
+<p class="easy-bridge">В полной главе: <a href="09-runtime-areas.html#metaspace">9.4 Metaspace и code cache</a></p>
+
+<h2 id="rss"><span class="h-num">9.5</span>Сколько займёт процесс</h2>
+<div class="widget stepper">
+  <div class="widget-title">Почему -Xmx2g, а процесс 2,8 ГБ</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">куча: до 2048 МБ</span><span data-from="2" data-to="3">+ Metaspace: ~200 МБ (Spring, сотни библиотек)</span><span data-from="3" data-to="4">+ стеки 300 потоков: ~150–300 МБ
++ code cache: ~100 МБ</span><span data-from="4">+ структуры GC, direct-буферы, служебное: ~200 МБ
+итого ≈ 2,7–2,9 ГБ → лимит контейнера в 2 ГБ гарантирует убийство</span></pre></div>
+  <section class="st-step" data-t="Куча"><p>Самая большая, но не единственная.</p></section>
+  <section class="st-step" data-t="Классы"><p>Растут с числом библиотек.</p></section>
+  <section class="st-step" data-t="Потоки и код"><p>Зависят от числа потоков и объёма горячего кода.</p></section>
+  <section class="st-step" data-t="Итого"><p>Кучу делают заметно меньше лимита контейнера.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Реальный расход = куча + 20–40% сверху. В контейнере куча — примерно 60–75% лимита.</div>
+<p class="easy-bridge">В полной главе: <a href="09-runtime-areas.html#rss">9.5 Сколько памяти займёт процесс</a></p>
+
+<h2 id="nmt"><span class="h-num">9.6</span>Native Memory Tracking</h2>
+<p>Чтобы узнать, куда ушла память вне кучи, есть <b>NMT</b>: включается флагом <code>-XX:NativeMemoryTracking=summary</code>, а потом <code>jcmd PID VM.native_memory</code> показывает раскладку по областям — классы, потоки, код, GC и прочее. Сравнивая снимки во времени, видно, что растёт.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+NMT показывает, куда уходит память вне кучи.</div>
+<p class="easy-bridge">В полной главе: <a href="09-runtime-areas.html#nmt">9.6 Native Memory Tracking</a></p>
+
+<h2 id="gloss"><span class="h-num">9.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>-Xmx / -Xms</td><td>Максимальный / начальный размер кучи.</td></tr>
+<tr><td>-Xss</td><td>Размер стека потока.</td></tr>
+<tr><td>Metaspace</td><td>Память для описаний классов.</td></tr>
+<tr><td>Code cache</td><td>Память для машинного кода JIT.</td></tr>
+<tr><td>Direct buffer</td><td>Память вне кучи для ввода-вывода.</td></tr>
+<tr><td>RSS</td><td>Сколько реальной памяти занимает процесс.</td></tr>
+<tr><td>NMT</td><td>Учёт памяти JVM вне кучи.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">9.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Почему процесс с -Xmx2g занимает около 3 ГБ?</p><ul><li>ошибка JVM</li><li>кроме кучи есть Metaspace, стеки, code cache и служебная память</li><li>Linux удваивает память</li><li>так и должно быть только на Windows</li></ul><div class="why">Куча — лишь часть.</div></div>
+<div class="mcq" data-ok="3"><p>Где хранятся описания загруженных классов?</p><ul><li>в куче</li><li>в стеке</li><li>в code cache</li><li>в Metaspace</li></ul><div class="why">Раньше это был PermGen.</div></div>
+<div class="mcq" data-ok="0"><p>Что будет, если заполнится code cache?</p><ul><li>JIT перестанет компилировать, программа замедлится</li><li>программа упадёт сразу</li><li>очистится куча</li><li>ничего</li></ul><div class="why">Горячий код останется в интерпретаторе.</div></div>
+<div class="mcq" data-ok="2"><p>Лимит контейнера 4 ГБ. Какая куча разумна?</p><ul><li>4 ГБ</li><li>5 ГБ</li><li>примерно 2,5–3 ГБ</li><li>500 МБ всегда</li></ul><div class="why">Нужен запас на всё, что вне кучи.</div></div>
+<div class="mcq" data-ok="1"><p>Как узнать, сколько памяти вне кучи занимают потоки и классы?</p><ul><li>посмотреть -Xmx</li><li>включить Native Memory Tracking и вызвать jcmd VM.native_memory</li><li>дамп кучи</li><li>никак</li></ul><div class="why">Дамп кучи показывает только кучу.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="09-runtime-areas.html">09 «Области памяти JVM»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Объект в памяти — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · СНАЧАЛА ПРОСТО</div>
+  <h1>Объект в памяти — простыми словами</h1>
+  <p class="lead">Сколько памяти на самом деле занимает объект? Разберёмся, что лежит в заголовке объекта, что такое сжатые указатели и почему куча 32 ГБ бывает «меньше» кучи 31 ГБ, как JVM раскладывает поля и сколько реально весят коллекции.</p>
+  <div class="meta"><span class="tag">минимум кода</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 10 <a href="10-object-layout.html">«Объект в памяти: заголовок и раскладка»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="header"><span class="h-num">10.1</span>Заголовок объекта</h2>
+<p>Перед полями у каждого объекта — «шапка»: <b>mark word</b> (хэш-код, возраст для сборщика, состояние блокировки) и <b>ссылка на класс</b>. Обычно это 12 байт (со сжатыми указателями). У массивов ещё 4 байта на длину. В новых версиях Java есть режим компактных заголовков, уменьшающий шапку до 8 байт.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Шапка объекта — обычно 12 байт, даже если полей нет.</div>
+<p class="easy-bridge">В полной главе: <a href="10-object-layout.html#header">10.1 Заголовок объекта</a></p>
+
+<h2 id="oops"><span class="h-num">10.2</span>Сжатые указатели и порог 32 ГБ</h2>
+<p>На 64-битной машине ссылка занимает 8 байт. Но пока куча меньше ~32 ГБ, JVM хранит ссылки в 4 байтах — <b>сжатые указатели</b> (объекты выровнены по 8 байт, и номер «восьмёрки» помещается в 32 бита). Как только куча становится больше 32 ГБ, ссылки становятся 8-байтными — и все объекты с ссылками раздуваются. Куча 33 ГБ может вместить меньше данных, чем 31 ГБ.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+До ~32 ГБ кучи ссылки — 4 байта. Перешагнули — ссылки удваиваются.</div>
+<p class="easy-bridge">В полной главе: <a href="10-object-layout.html#oops">10.2 Сжатые указатели и обрыв на 32 ГБ</a></p>
+
+<h2 id="layout"><span class="h-num">10.3</span>Раскладка полей</h2>
+<div class="widget stepper">
+  <div class="widget-title">Сколько весит new Point(int x, int y) и Integer</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">шапка Point: 12 байт</span><span data-from="2" data-to="3">+ поле x (int): 4 байта → 16
++ поле y (int): 4 байта → 20</span><span data-from="3" data-to="4">выравнивание до кратного 8 → 24 байта на объект</span><span data-from="4">Integer: шапка 12 + int 4 = 16 байт — в 4 раза больше самого числа
+плюс 4 байта на ссылку на него из массива или списка</span></pre></div>
+  <section class="st-step" data-t="Шапка"><p>Обязательная часть каждого объекта.</p></section>
+  <section class="st-step" data-t="Поля"><p>JVM раскладывает поля, группируя по размеру.</p></section>
+  <section class="st-step" data-t="Выравнивание"><p>Размер объекта кратен 8 байтам.</p></section>
+  <section class="st-step" data-t="Обёртки"><p>Мелкие объекты-обёртки дороги.</p></section>
+</div>
+<p>Точные цифры для своих классов покажет инструмент JOL (Java Object Layout).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Шапка + поля + выравнивание до 8. Мелкие объекты в основном состоят из шапки.</div>
+<p class="easy-bridge">В полной главе: <a href="10-object-layout.html#layout">10.3 Раскладка полей: калькулятор</a></p>
+
+<h2 id="costs"><span class="h-num">10.4</span>Сколько весят коллекции</h2>
+<div class="table-wrap"><table>
+<tr><th>Миллион чисел в…</th><th>Примерно</th></tr>
+<tr><td>int[]</td><td>4 МБ</td></tr>
+<tr><td>ArrayList&lt;Integer&gt;</td><td>~20 МБ (ссылки + объекты Integer)</td></tr>
+<tr><td>HashSet&lt;Integer&gt;</td><td>~50 МБ и больше (узлы, таблица)</td></tr>
+</table></div>
+<p>Каждый элемент HashMap — отдельный объект-узел со своей шапкой, ключом, значением, хэшем и ссылкой на следующий. Для больших объёмов чисел помогают массивы примитивов или специальные библиотеки коллекций примитивов.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Коллекции объектов весят в разы больше данных. Для миллионов чисел — массивы примитивов.</div>
+<p class="easy-bridge">В полной главе: <a href="10-object-layout.html#costs">10.4 Сколько на самом деле занимают коллекции</a></p>
+
+<h2 id="gloss"><span class="h-num">10.5</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Заголовок объекта</td><td>Служебная «шапка» перед полями.</td></tr>
+<tr><td>Mark word</td><td>Часть шапки: хэш, возраст, блокировка.</td></tr>
+<tr><td>Compressed oops</td><td>4-байтные ссылки при куче до ~32 ГБ.</td></tr>
+<tr><td>Выравнивание</td><td>Размер объекта кратен 8 байтам.</td></tr>
+<tr><td>JOL</td><td>Инструмент, показывающий раскладку объекта.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">10.6</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Сколько примерно занимает объект Integer?</p><ul><li>4 байта</li><li>8 байт</li><li>16 байт</li><li>64 байта</li></ul><div class="why">Шапка 12 + число 4.</div></div>
+<div class="mcq" data-ok="0"><p>Почему куча 33 ГБ может вместить меньше объектов, чем 31 ГБ?</p><ul><li>выше ~32 ГБ отключаются сжатые указатели и ссылки становятся 8-байтными</li><li>из-за ошибки</li><li>из-за сборщика</li><li>не может</li></ul><div class="why">Все ссылки удваиваются.</div></div>
+<div class="mcq" data-ok="3"><p>Что лежит в mark word?</p><ul><li>поля объекта</li><li>имя класса</li><li>байткод</li><li>хэш-код, возраст для сборщика, состояние блокировки</li></ul><div class="why">Служебная информация.</div></div>
+<div class="mcq" data-ok="1"><p>Как хранить 10 миллионов чисел экономнее всего?</p><ul><li>HashSet&lt;Integer&gt;</li><li>массив int[]</li><li>ArrayList&lt;Integer&gt;</li><li>LinkedList&lt;Integer&gt;</li></ul><div class="why">Без шапок и ссылок.</div></div>
+<div class="mcq" data-ok="2"><p>Каким инструментом узнать точную раскладку вашего класса?</p><ul><li>javac</li><li>jstack</li><li>JOL</li><li>jlink</li></ul><div class="why">Java Object Layout.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="10-object-layout.html">10 «Объект в памяти: заголовок и раскладка»</a>. Там те же идеи, но точно: с кодом, интерактивом и практикумом в IDEA. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>
