@@ -3,6 +3,8 @@
   "use strict";
 
   var PAGES = [
+    { id: "school", file: "00-school.html", title: "Компьютер за 15 минут (для школьника)", group: null },
+    { id: "simple", file: "00-simple.html", title: "Простыми словами: зачем это", group: null },
     { id: "00", file: "index.html", title: "Карта курса", group: null },
     { id: "01", file: "01-data.html", title: "Информация: биты, числа, текст", tier: "j", group: "Данные и логика" },
     { id: "02", file: "02-logic.html", title: "Логика: от транзистора до регистра", tier: "j", group: "Данные и логика" },
@@ -55,7 +57,7 @@
       if (p.group && p.group !== g) { g = p.group; html += '</ul><div class="nav-group">' + g + '</div><ul class="nav-list">'; }
       var cls = (p.id === current ? "current " : "") + (state[p.id] ? "done" : "");
       html += '<li><a class="' + cls + '" href="' + p.file + '"><span class="num">' + p.id + '</span><span>' + p.title +
-        '</span>' + (p.id === "00" ? "<span></span>" : '<span class="done-mark" title="изучено"></span>') + "</a></li>";
+        '</span>' + ((p.id === "00" || p.id === "simple" || p.id === "school") ? "<span></span>" : '<span class="done-mark" title="изучено"></span>') + "</a></li>";
     });
     html += "</ul>";
     html += '<button class="theme-toggle" type="button">◐ Светлая / тёмная тема</button>';
@@ -70,8 +72,8 @@
   }
 
   function updateProgress() {
-    var total = PAGES.length - 1, done = 0;
-    PAGES.forEach(function (p) { if (p.id !== "00" && state[p.id]) done++; });
+    var total = PAGES.length - 3, done = 0;
+    PAGES.forEach(function (p) { if (p.id !== "00" && p.id !== "simple" && p.id !== "school" && state[p.id]) done++; });
     var bar = document.getElementById("pbar"), lab = document.getElementById("plabel");
     if (bar) bar.style.width = Math.round(done / total * 100) + "%";
     if (lab) lab.textContent = "Изучено " + done + " из " + total;
@@ -83,7 +85,7 @@
   /* ---------- Footer: mark done + prev/next ---------- */
   function buildFooter() {
     var c = document.querySelector(".content");
-    if (!c || current === "00") return;
+    if (!c || current === "00" || current === "simple" || current === "school") return;
     var idx = PAGES.findIndex(function (p) { return p.id === current; });
     var wrap = document.createElement("div");
     wrap.innerHTML =
