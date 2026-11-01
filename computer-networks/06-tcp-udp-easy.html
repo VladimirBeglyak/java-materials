@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · TCP и UDP — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="06e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 06 · СНАЧАЛА ПРОСТО</div>
+  <h1>TCP и UDP — простыми словами</h1>
+  <p class="lead">IP доставляет пакет до компьютера, но не говорит, какой программе он предназначен, и ничего не обещает: пакет может потеряться. Эти задачи решает транспортный уровень. Разберёмся с портами, UDP, устройством TCP, рукопожатием, надёжностью, управлением потоком, закрытием соединения и тем, как всё это выглядит из Java.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~15 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 06 <a href="06-tcp-udp.html">«UDP и TCP: соединение и надёжность»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="ports"><span class="h-num">6.1</span>Порты и сокеты</h2>
+<p>IP-адрес — адрес дома, а <b>порт</b> — номер квартиры: какой программе отдать данные. Веб-сервер слушает порт 443, база PostgreSQL — 5432. Соединение однозначно определяется четвёркой: адрес и порт клиента + адрес и порт сервера. Поэтому один сервер на порту 443 может держать тысячи соединений — у каждого клиента свой адрес или порт. <b>Сокет</b> — «розетка» программы для одного соединения.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+IP — дом, порт — квартира. Соединение = четвёрка адресов и портов.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#ports">6.1 Порты и сокеты</a></p>
+
+<h2 id="udp"><span class="h-num">6.2</span>UDP: открытка</h2>
+<p>UDP просто отправляет пакет: без установки соединения, без подтверждений, без повторов. Как открытка — быстро и дёшево, но может потеряться или прийти не по порядку. Подходит, когда опоздавшие данные бесполезны (голос, видео, игры), когда запрос маленький (DNS) или когда надёжность делают сами поверх UDP (QUIC, глава 11).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+UDP — быстро и без гарантий. Для живого звука, игр, DNS, QUIC.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#udp">6.2 UDP</a></p>
+
+<h2 id="tcpheader"><span class="h-num">6.3</span>Что на конверте TCP</h2>
+<p>Порты отправителя и получателя; <b>номер последовательности</b> — какой по счёту байт везём; <b>номер подтверждения</b> — до какого байта всё получено; <b>флаги</b> (SYN — «давай знакомиться», ACK — «получил», FIN — «я закончил», RST — «аварийный сброс»); <b>окно</b> — сколько ещё могу принять.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Номера байтов, подтверждения, флаги и окно — инструменты надёжности TCP.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#tcpheader">6.3 Заголовок TCP</a></p>
+
+<h2 id="handshake"><span class="h-num">6.4</span>Рукопожатие</h2>
+<div class="widget stepper">
+  <div class="widget-title">Установка TCP-соединения</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">клиент → сервер: SYN, «начинаю счёт с 1000»</span><span data-from="2" data-to="3">сервер → клиент: SYN+ACK, «услышал 1000, я начинаю с 5000»</span><span data-from="3" data-to="4">клиент → сервер: ACK, «услышал 5000»</span><span data-from="4">соединение установлено — прошло полтора RTT, данных ещё нет
+поэтому соединения переиспользуют (keep-alive, пулы)</span></pre></div>
+  <section class="st-step" data-t="SYN"><p>Клиент предлагает начать и называет свой стартовый номер.</p></section>
+  <section class="st-step" data-t="SYN+ACK"><p>Сервер соглашается и называет свой.</p></section>
+  <section class="st-step" data-t="ACK"><p>Обе стороны знают номера друг друга.</p></section>
+  <section class="st-step" data-t="Цена"><p>Каждое новое соединение — лишний круг по сети до первых данных.</p></section>
+</div>
+<p>Если порт закрыт, сервер ответит RST — «Connection refused» придёт сразу. Если пакеты молча режет файрвол — будет долгий таймаут.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+SYN → SYN+ACK → ACK. Новое соединение стоит времени — переиспользуйте.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#handshake">6.4 Установление соединения</a></p>
+
+<h2 id="reliability"><span class="h-num">6.5</span>Надёжность: нумерация и повторы</h2>
+<p>Каждый байт пронумерован. Получатель сообщает: «всё до байта N получил». Если подтверждение не пришло за отведённое время — отправитель шлёт снова. Пришло не по порядку — получатель сложит правильно. Программа видит ровный поток байтов без дыр и перестановок, хотя внизу пакеты терялись и путались.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Нумерация + подтверждения + повторы = надёжный поток из ненадёжной сети.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#reliability">6.5 Надёжность: номера, подтверждения, повторы</a></p>
+
+<h2 id="flow"><span class="h-num">6.6</span>Управление потоком</h2>
+<p>Получатель в каждом ответе сообщает размер <b>окна</b>: «могу принять ещё столько-то байт». Если программа-получатель медленно читает, её буфер заполняется, окно уменьшается до нуля — и отправитель останавливается. Так быстрый отправитель не утопит медленного получателя.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Окно — «сколько ещё влезет». Медленный читатель сам тормозит отправителя.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#flow">6.6 Управление потоком</a></p>
+
+<h2 id="close"><span class="h-num">6.7</span>Закрытие, TIME_WAIT и CLOSE_WAIT</h2>
+<p>Каждая сторона закрывает своё направление отдельно (FIN → ACK). Тот, кто закрыл первым, ещё какое-то время держит запись в состоянии <b>TIME_WAIT</b> — на случай опоздавших пакетов. Много TIME_WAIT — признак того, что открывается и закрывается слишком много коротких соединений. Много <b>CLOSE_WAIT</b> — почти всегда ошибка в вашей программе: собеседник закрыл, а вы своё соединение не закрываете (утечка).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+TIME_WAIT — нормально, но много — короткие соединения. CLOSE_WAIT — вы забыли close().</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#close">6.7 Закрытие, TIME_WAIT и CLOSE_WAIT</a></p>
+
+<h2 id="java"><span class="h-num">6.8</span>Как это видно в Java</h2>
+<ul>
+  <li><code>ConnectException: Connection refused</code> — на том порту никто не слушает.</li>
+  <li><code>SocketTimeoutException: connect timed out</code> — ответа нет совсем (файрвол, сеть).</li>
+  <li><code>Read timed out</code> — соединение есть, но ответ не пришёл вовремя.</li>
+  <li><code>Connection reset</code> — другая сторона аварийно оборвала соединение (RST).</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Текст исключения подсказывает, на каком этапе TCP проблема.</div>
+<p class="easy-bridge">В полной главе: <a href="06-tcp-udp.html#java">6.8 Как это выглядит в Java</a></p>
+
+<h2 id="gloss"><span class="h-num">6.9</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Порт</td><td>Номер «квартиры» программы на компьютере.</td></tr>
+<tr><td>UDP</td><td>Отправка без гарантий — «открытка».</td></tr>
+<tr><td>TCP</td><td>Надёжный упорядоченный поток байтов.</td></tr>
+<tr><td>SYN / ACK / FIN / RST</td><td>Начать / подтверждаю / закончил / аварийный сброс.</td></tr>
+<tr><td>Рукопожатие</td><td>Три сообщения для открытия соединения.</td></tr>
+<tr><td>Окно</td><td>Сколько ещё может принять получатель.</td></tr>
+<tr><td>TIME_WAIT / CLOSE_WAIT</td><td>Состояния после закрытия соединения.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">6.10</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Как один веб-сервер на порту 443 держит тысячи соединений?</p><ul><li>у него тысячи портов 443</li><li>соединения различаются адресом и портом клиента</li><li>он обслуживает их по очереди</li><li>не может</li></ul><div class="why">Соединение — это четвёрка, а не только порт сервера.</div></div>
+<div class="mcq" data-ok="2"><p>Почему для видеозвонков часто используют UDP?</p><ul><li>он безопаснее</li><li>он надёжнее</li><li>опоздавший кусок звука бесполезен, а ждать повторов хуже, чем потерять</li><li>TCP запрещён</li></ul><div class="why">Живая связь важнее идеальной.</div></div>
+<div class="mcq" data-ok="0"><p>На сервере тысячи соединений в CLOSE_WAIT. Что это значит?</p><ul><li>программа не закрывает соединения, которые закрыла другая сторона</li><li>всё нормально</li><li>слишком много клиентов</li><li>проблема в сети провайдера</li></ul><div class="why">Ищите незакрытые ресурсы в коде.</div></div>
+<div class="mcq" data-ok="3"><p>Чем «Connection refused» отличается от «connect timed out»?</p><ul><li>ничем</li><li>refused — медленный сервер</li><li>timed out — неверный пароль</li><li>refused — пришёл отказ (порт закрыт), timed out — ответа нет совсем</li></ul><div class="why">Отказ — быстрый, молчание — долгое.</div></div>
+<div class="mcq" data-ok="1"><p>Что сделает TCP-отправитель, если окно получателя стало равно нулю?</p><ul><li>увеличит скорость</li><li>приостановит отправку, пока получатель не освободит место</li><li>разорвёт соединение</li><li>отправит всё равно</li></ul><div class="why">Это управление потоком.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="06-tcp-udp.html">06 «UDP и TCP: соединение и надёжность»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

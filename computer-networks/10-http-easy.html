@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · HTTP — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="10e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 10 · СНАЧАЛА ПРОСТО</div>
+  <h1>HTTP — простыми словами</h1>
+  <p class="lead">HTTP — главный протокол бэкенда. Разберёмся, как устроено сообщение, чем методы отличаются и что такое идемпотентность, какие коды ответов когда возвращать, как работает кэширование, cookies и CORS, а также сжатие и прочие возможности.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~15 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 10 <a href="10-http.html">«HTTP: семантика для бэкенда»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="message"><span class="h-num">10.1</span>Сообщение</h2>
+<p>HTTP-запрос — как бланк заявки: <b>строка запроса</b> (метод и адрес: <code>GET /orders/42</code>), <b>заголовки</b> (служебные поля: кто я, что принимаю, токен) и необязательное <b>тело</b> (данные, например JSON). Ответ — <b>код статуса</b>, заголовки и тело.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Метод + адрес, заголовки, тело. Ответ — код, заголовки, тело.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#message">10.1 Сообщение</a></p>
+
+<h2 id="methods"><span class="h-num">10.2</span>Методы и идемпотентность</h2>
+<div class="table-wrap"><table>
+<tr><th>Метод</th><th>Что делает</th><th>Безопасен</th><th>Идемпотентен</th></tr>
+<tr><td>GET</td><td>получить</td><td>да</td><td>да</td></tr>
+<tr><td>POST</td><td>создать / выполнить действие</td><td>нет</td><td>нет</td></tr>
+<tr><td>PUT</td><td>положить целиком (заменить)</td><td>нет</td><td>да</td></tr>
+<tr><td>PATCH</td><td>изменить часть</td><td>нет</td><td>не обязательно</td></tr>
+<tr><td>DELETE</td><td>удалить</td><td>нет</td><td>да</td></tr>
+</table></div>
+<p><b>Безопасный</b> — ничего не меняет. <b>Идемпотентный</b> — повтор даёт тот же результат, как нажать кнопку лифта пять раз. Это важно для повторов: GET и PUT можно спокойно повторить при обрыве связи, а повтор POST может создать два заказа — для него нужен ключ идемпотентности.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Повторять безопасно только идемпотентные запросы. Для POST — ключ идемпотентности.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#methods">10.2 Методы и идемпотентность</a></p>
+
+<h2 id="status"><span class="h-num">10.3</span>Коды ответа</h2>
+<div class="table-wrap"><table>
+<tr><th>Группа</th><th>Смысл</th><th>Примеры</th></tr>
+<tr><td>2xx</td><td>успех</td><td>200 OK, 201 Created, 204 No Content</td></tr>
+<tr><td>3xx</td><td>перейдите в другое место</td><td>301/308 насовсем, 302/307 временно, 304 не изменилось</td></tr>
+<tr><td>4xx</td><td>ошибка клиента</td><td>400 неверный запрос, 401 кто вы?, 403 нельзя, 404 нет такого, 409 конфликт, 429 слишком часто</td></tr>
+<tr><td>5xx</td><td>ошибка сервера</td><td>500 сломалось, 502/504 проблема за прокси, 503 перегружен</td></tr>
+</table></div>
+<p>Различие 4xx и 5xx важно: 4xx повторять бессмысленно (запрос неправильный), 5xx и 429 — можно, но с паузой.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+4xx — виноват клиент, повтор не поможет. 5xx — виноват сервер, можно повторить позже.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#status">10.3 Коды ответа</a></p>
+
+<h2 id="caching"><span class="h-num">10.4</span>Кэширование</h2>
+<p>Сервер подсказывает кэшам (браузеру, CDN), можно ли хранить ответ и сколько: <code>Cache-Control: max-age=3600</code> — час, <code>no-store</code> — не хранить вообще (для личных данных). Когда срок вышел, кэш может спросить «не изменилось ли?» с меткой версии (ETag) — и получить коротенький ответ 304, а не всё заново.</p>
+<div class="widget stepper">
+  <div class="widget-title">Картинка с max-age=60 и ETag</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">первый запрос → 200, картинка, ETag "v7", max-age=60</span><span data-from="2" data-to="3">через 30 с → берём из кэша, в сеть не ходим</span><span data-from="3" data-to="4">через 90 с → срок вышел: «If-None-Match: v7?»</span><span data-from="4">сервер: 304 Not Modified (без тела) → используем старую копию ещё 60 с</span></pre></div>
+  <section class="st-step" data-t="Первый раз"><p>Ответ с правилами кэширования.</p></section>
+  <section class="st-step" data-t="Свежий"><p>Пока свежий — запросов нет вовсе.</p></section>
+  <section class="st-step" data-t="Перепроверка"><p>Устарел — спрашиваем, изменился ли.</p></section>
+  <section class="st-step" data-t="304"><p>Не изменился — экономим трафик.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Cache-Control — сколько хранить, ETag и 304 — дешёвая перепроверка.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#caching">10.4 Кэширование</a></p>
+
+<h2 id="cookies"><span class="h-num">10.5</span>Cookies</h2>
+<p>Cookie — «номерок в гардеробе»: сервер выдаёт его ответом, браузер прикладывает к каждому следующему запросу к этому сайту. Так работают сессии. Важные флаги: <b>HttpOnly</b> — недоступен скриптам на странице (защита от кражи), <b>Secure</b> — только по HTTPS, <b>SameSite</b> — не отправлять с запросами, начатыми на чужих сайтах (защита от подделки запросов).</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Cookie сессии — HttpOnly, Secure, SameSite.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#cookies">10.5 Cookies</a></p>
+
+<h2 id="cors"><span class="h-num">10.6</span>CORS</h2>
+<p>Браузер не позволяет скрипту с сайта A читать ответы от сайта B — иначе любой сайт мог бы читать вашу почту от вашего имени. <b>CORS</b> — способ, которым сервер B говорит: «сайту A можно». Для «непростых» запросов браузер сначала спрашивает разрешение (предварительный запрос OPTIONS). Важно: CORS — защита пользователя в браузере, а не сервера; curl и другие серверы его не соблюдают.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+CORS — правило браузера: сервер разрешает чужим сайтам читать свои ответы.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#cors">10.6 CORS</a></p>
+
+<h2 id="other"><span class="h-num">10.7</span>Сжатие, диапазоны, согласование</h2>
+<ul>
+  <li><b>Сжатие</b> (gzip, brotli) уменьшает текстовые ответы в разы.</li>
+  <li><b>Диапазоны</b> (Range) — докачка файла с места обрыва, перемотка видео.</li>
+  <li><b>Согласование</b> — клиент говорит, что принимает (JSON, язык), сервер выбирает.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Сжатие, докачка и выбор формата — тоже работа заголовков.</div>
+<p class="easy-bridge">В полной главе: <a href="10-http.html#other">10.7 Сжатие, диапазоны, согласование</a></p>
+
+<h2 id="gloss"><span class="h-num">10.8</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Метод</td><td>Что сделать: GET, POST, PUT, DELETE.</td></tr>
+<tr><td>Идемпотентность</td><td>Повтор даёт тот же результат.</td></tr>
+<tr><td>Код статуса</td><td>Итог запроса: 2xx, 3xx, 4xx, 5xx.</td></tr>
+<tr><td>Cache-Control</td><td>Правила кэширования ответа.</td></tr>
+<tr><td>ETag / 304</td><td>Версия ресурса / «не изменилось».</td></tr>
+<tr><td>Cookie</td><td>«Номерок», который браузер прикладывает к запросам.</td></tr>
+<tr><td>CORS</td><td>Разрешение чужим сайтам читать ответы.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">10.9</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Какой запрос можно безопасно повторить при обрыве связи?</p><ul><li>POST «создать заказ»</li><li>PUT «положить профиль целиком»</li><li>любой</li><li>никакой</li></ul><div class="why">PUT идемпотентен, POST — нет.</div></div>
+<div class="mcq" data-ok="3"><p>Сервер вернул 400. Имеет ли смысл повторить тот же запрос?</p><ul><li>да, сразу</li><li>да, через минуту</li><li>да, трижды</li><li>нет: ошибка в самом запросе</li></ul><div class="why">4xx — повтор того же не поможет.</div></div>
+<div class="mcq" data-ok="0"><p>Чем 401 отличается от 403?</p><ul><li>401 — «кто вы?» (нет аутентификации), 403 — «знаю вас, но нельзя»</li><li>ничем</li><li>403 — сервер сломан</li><li>401 — нет страницы</li></ul><div class="why">Аутентификация против авторизации.</div></div>
+<div class="mcq" data-ok="2"><p>Какой флаг cookie защищает её от чтения скриптами на странице?</p><ul><li>Secure</li><li>SameSite</li><li>HttpOnly</li><li>Max-Age</li></ul><div class="why">Защита от кражи сессии через XSS.</div></div>
+<div class="mcq" data-ok="1"><p>Защищает ли CORS сервер от запросов curl?</p><ul><li>да</li><li>нет: это правило браузера для защиты пользователя</li><li>только для POST</li><li>только с HTTPS</li></ul><div class="why">Сервер должен проверять доступ сам.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="10-http.html">10 «HTTP: семантика для бэкенда»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

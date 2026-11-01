@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 · Сеть в Linux — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="16e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 16 · СНАЧАЛА ПРОСТО</div>
+  <h1>Сеть в Linux — простыми словами</h1>
+  <p class="lead">Под Java-сервисом работает ядро Linux, и многие сетевые сюрпризы рождаются там. Разберёмся, как пакет проходит через ядро, что за две очереди у слушающего сокета, как буферы создают обратное давление, почему кончаются порты и дескрипторы, как работает epoll, что делают netfilter и conntrack и как устроена сеть контейнера.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 16 <a href="16-linux-networking.html">«Сеть в Linux: очереди, сокеты, контейнеры»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="path"><span class="h-num">16.1</span>Путь пакета через ядро</h2>
+<p>Сетевая карта кладёт пакет в память и «звонит» ядру. Ядро разбирает конверты (Ethernet, IP, TCP), прогоняет пакет через правила фильтрации и находит сокет, которому он адресован, — и кладёт данные в его буфер. Приложение забирает их вызовом чтения. Подробнее — в главе 13 курса <a href="../computer-science/13-network-io-easy.html">«Как устроен компьютер»</a>.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Карта → ядро (разбор, фильтры) → буфер сокета → приложение.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#path">16.1 Путь входящего пакета через ядро</a></p>
+
+<h2 id="queues"><span class="h-num">16.2</span>Две очереди слушающего сокета</h2>
+<div class="widget stepper">
+  <div class="widget-title">Наплыв новых клиентов</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">клиент прислал SYN → соединение в очереди «полуоткрытых» (SYN queue)</span><span data-from="2" data-to="3">рукопожатие завершено → соединение переходит в очередь готовых (accept queue)</span><span data-from="3" data-to="4">приложение вызывает accept() и забирает готовое соединение</span><span data-from="4">если приложение не успевает (все потоки заняты),
+очередь готовых переполняется → новые соединения отбрасываются,
+клиенты видят таймауты, хотя «сервер работает»</span></pre></div>
+  <section class="st-step" data-t="SYN"><p>Ядро ведёт рукопожатие само.</p></section>
+  <section class="st-step" data-t="Готово"><p>Соединение ждёт, пока приложение его заберёт.</p></section>
+  <section class="st-step" data-t="accept"><p>Приложение забирает.</p></section>
+  <section class="st-step" data-t="Переполнение"><p>Длину очереди задаёт backlog и настройка ядра somaxconn.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Если приложение не успевает принимать соединения, ядро начинает их отбрасывать.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#queues">16.2 Две очереди слушающего сокета</a></p>
+
+<h2 id="buffers"><span class="h-num">16.3</span>Буферы сокета и обратное давление</h2>
+<p>У каждого сокета два буфера: на приём и на отправку. Если приложение медленно читает, буфер приёма заполняется, TCP сообщает отправителю нулевое окно — и тот останавливается. Если медленно читает клиент, заполняется ваш буфер отправки — и запись в сокет «зависает». Это естественное обратное давление, но оно же объясняет, почему медленный клиент может держать поток сервера.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Полный буфер останавливает отправителя. Медленный клиент может «держать» сервер.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#buffers">16.3 Буферы сокета и обратное давление</a></p>
+
+<h2 id="ports"><span class="h-num">16.4</span>Порты и дескрипторы — конечны</h2>
+<p>Каждое исходящее соединение занимает локальный порт из ограниченного диапазона (несколько десятков тысяч), а закрытые ещё какое-то время висят в TIME_WAIT. Каждый сокет и файл — это <b>файловый дескриптор</b>, и у процесса есть лимит на их количество (часто 1024 по умолчанию). Ошибки «Cannot assign requested address» и «Too many open files» — признаки, что эти ресурсы кончились: обычно из-за отсутствия пулов соединений или утечки незакрытых сокетов.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Порты и дескрипторы заканчиваются. Переиспользуйте соединения и закрывайте ресурсы.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#ports">16.4 Порты и дескрипторы — конечные ресурсы</a></p>
+
+<h2 id="epoll"><span class="h-num">16.5</span>epoll: один поток на тысячи сокетов</h2>
+<p>Вместо потока на каждое соединение программа говорит ядру: «следи за этими 10 000 сокетов и скажи, где появились данные». Ядро будит её со списком готовых. Так работают Nginx, Netty и виртуальные потоки Java под капотом.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+epoll — «разбуди, когда где-то есть данные». Основа масштабируемых серверов.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#epoll">16.5 epoll: как один поток обслуживает тысячи сокетов</a></p>
+
+<h2 id="netfilter"><span class="h-num">16.6</span>netfilter и conntrack</h2>
+<p><b>netfilter</b> — встроенный в ядро фильтр и «переписчик» пакетов: на нём построены файрволы (iptables, nftables), NAT и Service в Kubernetes. <b>conntrack</b> — таблица всех соединений, проходящих через фильтр, чтобы знать, какому соединению принадлежит пакет. У неё есть предел: при огромном числе соединений таблица переполняется, и ядро начинает отбрасывать новые пакеты — в логах «nf_conntrack: table full».</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Файрвол и NAT в Linux — netfilter; таблица conntrack тоже может переполниться.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#netfilter">16.6 netfilter и conntrack</a></p>
+
+<h2 id="containers"><span class="h-num">16.7</span>Сеть контейнера</h2>
+<p>У контейнера своё «сетевое пространство» (namespace): свои интерфейсы, адреса и маршруты. С хостом его соединяет пара виртуальных интерфейсов — как виртуальный кабель с двумя концами, а контейнеры одного хоста объединяет виртуальный коммутатор (bridge). Выход наружу — через NAT на netfilter. Никакой магии — те же детали ядра.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Сеть контейнера = namespace + виртуальный кабель + мост + NAT.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#containers">16.7 Сеть контейнера — из тех же деталей</a></p>
+
+<h2 id="tools"><span class="h-num">16.8</span>Шпаргалка наблюдения</h2>
+<div class="table-wrap"><table>
+<tr><th>Вопрос</th><th>Команда</th></tr>
+<tr><td>соединения и их состояния</td><td>ss -tan</td></tr>
+<tr><td>очереди слушающих сокетов</td><td>ss -ltn (Recv-Q / Send-Q)</td></tr>
+<tr><td>переполнения и отбросы</td><td>nstat, netstat -s</td></tr>
+<tr><td>открытые дескрипторы процесса</td><td>ls /proc/PID/fd | wc -l</td></tr>
+<tr><td>правила фильтра</td><td>iptables -S, nft list ruleset</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+ss — главный инструмент для соединений и очередей.</div>
+<p class="easy-bridge">В полной главе: <a href="16-linux-networking.html#tools">16.8 Шпаргалка наблюдения</a></p>
+
+<h2 id="gloss"><span class="h-num">16.9</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Accept queue</td><td>Очередь установленных, но не принятых соединений.</td></tr>
+<tr><td>Backlog / somaxconn</td><td>Размер этой очереди.</td></tr>
+<tr><td>Файловый дескриптор</td><td>Номер открытого файла или сокета.</td></tr>
+<tr><td>epoll</td><td>Слежение за многими сокетами одним потоком.</td></tr>
+<tr><td>netfilter / conntrack</td><td>Фильтр пакетов ядра / таблица соединений.</td></tr>
+<tr><td>Network namespace</td><td>Отдельная сеть для контейнера.</td></tr>
+<tr><td>veth / bridge</td><td>Виртуальный кабель / виртуальный коммутатор.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">16.10</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="1"><p>Сервер «жив», но под нагрузкой новые клиенты получают таймауты подключения. Что проверить?</p><ul><li>DNS</li><li>не переполнена ли очередь принятых соединений (accept queue)</li><li>сертификат</li><li>CORS</li></ul><div class="why">Приложение не успевает забирать соединения.</div></div>
+<div class="mcq" data-ok="3"><p>Что означает ошибка «Too many open files»?</p><ul><li>диск заполнен</li><li>слишком большие файлы</li><li>нет прав</li><li>исчерпан лимит файловых дескрипторов (сокетов и файлов)</li></ul><div class="why">Часто — утечка незакрытых соединений.</div></div>
+<div class="mcq" data-ok="0"><p>Из чего собрана сеть Docker-контейнера?</p><ul><li>namespace, виртуальный кабель, мост и NAT ядра</li><li>отдельной сетевой карты</li><li>VPN</li><li>специального железа</li></ul><div class="why">Те же детали ядра Linux.</div></div>
+<div class="mcq" data-ok="2"><p>В логах ядра «nf_conntrack: table full». Что происходит?</p><ul><li>диск полон</li><li>сеть отключена</li><li>таблица отслеживания соединений переполнена, новые пакеты отбрасываются</li><li>всё нормально</li></ul><div class="why">Нужно увеличить лимит или уменьшить число соединений.</div></div>
+<div class="mcq" data-ok="1"><p>Какая команда покажет состояния TCP-соединений?</p><ul><li>ping</li><li>ss -tan</li><li>dig</li><li>top</li></ul><div class="why">ss — современная замена netstat.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="16-linux-networking.html">16 «Сеть в Linux: очереди, сокеты, контейнеры»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

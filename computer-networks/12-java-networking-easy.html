@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Сеть в Java-бэкенде — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="12e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 12 · СНАЧАЛА ПРОСТО</div>
+  <h1>Сеть в Java-бэкенде — простыми словами</h1>
+  <p class="lead">Теория сетей превращается в аварии на продакшене именно здесь: зависшие потоки, исчерпанные пулы, шторм повторов. Разберёмся, как модели ввода-вывода влияют на сервис, зачем пулы соединений, какие бывают таймауты, как повторять запросы, не устраивая шторм, и какие аварии случаются чаще всего.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 12 <a href="12-java-networking.html">«Сеть в Java-бэкенде»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="io"><span class="h-num">12.1</span>Модели ввода-вывода</h2>
+<p>Классический сервер — поток на запрос: пока ждём базу, поток стоит. Потоков ограниченное число, и при медленной зависимости они все оказываются в ожидании. Асинхронные модели (Netty, WebFlux) и виртуальные потоки решают проблему ожидания по-разному — подробно в курсе <a href="../java-concurrency/10-virtual-threads-easy.html">многопоточности</a>. Но ни одна модель не отменяет главного: ожидание нужно ограничивать таймаутами.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Любая модель ввода-вывода требует таймаутов: бесконечное ожидание съедает ресурсы.</div>
+<p class="easy-bridge">В полной главе: <a href="12-java-networking.html#io">12.1 Модели ввода-вывода</a></p>
+
+<h2 id="pools"><span class="h-num">12.2</span>Пулы соединений</h2>
+<p>Открыть соединение — рукопожатие TCP, затем TLS: десятки миллисекунд. Поэтому соединения держат в пуле и переиспользуют (HikariCP для базы, пул в HTTP-клиенте). Пул ограничен, и если все соединения заняты медленными запросами, новые ждут в очереди — нужен таймаут и на получение соединения из пула.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Соединения — из пула. Ограничьте и ожидание соединения из пула.</div>
+<p class="easy-bridge">В полной главе: <a href="12-java-networking.html#pools">12.2 Пулы соединений</a></p>
+
+<h2 id="timeouts"><span class="h-num">12.3</span>Таймауты: полная карта</h2>
+<div class="table-wrap"><table>
+<tr><th>Таймаут</th><th>Что ограничивает</th></tr>
+<tr><td>получения соединения из пула</td><td>ждать свободное соединение</td></tr>
+<tr><td>connect</td><td>установку TCP (и TLS)</td></tr>
+<tr><td>read / response</td><td>ожидание данных ответа</td></tr>
+<tr><td>общий (deadline)</td><td>весь вызов, включая повторы</td></tr>
+</table></div>
+<p>Таймаут вызова должен быть <b>меньше</b>, чем таймаут того, кто вызывает вас: если клиент ждёт 2 секунды, бессмысленно ждать зависимость 5 секунд — клиент уже ушёл.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Таймаут на каждом этапе и общий бюджет меньше, чем у вызывающего.</div>
+<p class="easy-bridge">В полной главе: <a href="12-java-networking.html#timeouts">12.3 Таймауты: полная карта</a></p>
+
+<h2 id="retries"><span class="h-num">12.4</span>Повторы без шторма</h2>
+<div class="widget stepper">
+  <div class="widget-title">Как три уровня повторов устраивают шторм</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">фронт → сервис A → сервис B → база. База замедлилась</span><span data-from="2" data-to="3">B повторяет запрос к базе 3 раза
+A повторяет запрос к B 3 раза
+фронт повторяет запрос к A 3 раза</span><span data-from="3" data-to="4">на одну операцию пользователя в базу летит до 3 × 3 × 3 = 27 запросов
+и это в момент, когда она и так перегружена</span><span data-from="4">правила: повторять только на одном уровне, мало раз,
+с растущей паузой и случайным разбросом (jitter), только идемпотентное</span></pre></div>
+  <section class="st-step" data-t="Цепочка"><p>Типичная цепочка вызовов.</p></section>
+  <section class="st-step" data-t="Повторы везде"><p>Каждый уровень «помогает» повторами.</p></section>
+  <section class="st-step" data-t="Умножение"><p>Повторы перемножаются и добивают больную зависимость.</p></section>
+  <section class="st-step" data-t="Правила"><p>Плюс circuit breaker: при массовых ошибках временно не звать вовсе.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Мало повторов, на одном уровне, с паузой и jitter, только идемпотентное. И circuit breaker.</div>
+<p class="easy-bridge">В полной главе: <a href="12-java-networking.html#retries">12.4 Ретраи без шторма</a></p>
+
+<h2 id="incidents"><span class="h-num">12.5</span>Типовые аварии</h2>
+<ul>
+  <li><b>Нет таймаута</b> — зависимость «повисла», и все потоки сервиса ждут её вечно.</li>
+  <li><b>Пул исчерпан</b> — медленные запросы заняли все соединения.</li>
+  <li><b>Шторм повторов</b> — повторы добивают и без того перегруженный сервис.</li>
+  <li><b>Устаревшие соединения</b> — балансировщик закрыл простаивающее соединение, а пул об этом не знает.</li>
+  <li><b>DNS-кэш</b> — сервис ходит на старый IP после переезда зависимости.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Большинство сетевых аварий — отсутствие таймаутов, переполненные пулы и повторы.</div>
+<p class="easy-bridge">В полной главе: <a href="12-java-networking.html#incidents">12.5 Типовые аварии</a></p>
+
+<h2 id="checklist"><span class="h-num">12.6</span>Чек-лист исходящего вызова</h2>
+<ol class="steps">
+  <li>Пул соединений с ограничением и таймаутом ожидания.</li>
+  <li>Таймауты connect и read, общий бюджет меньше, чем у вызывающего.</li>
+  <li>Повторы — только идемпотентных, мало, с паузой и jitter.</li>
+  <li>Circuit breaker и понятный запасной вариант при отказе.</li>
+  <li>Метрики: время ответа, ошибки, занятость пула.</li>
+</ol>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Пять пунктов на каждый внешний вызов.</div>
+<p class="easy-bridge">В полной главе: <a href="12-java-networking.html#checklist">12.6 Чек-лист любого исходящего вызова</a></p>
+
+<h2 id="gloss"><span class="h-num">12.7</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Пул соединений</td><td>Набор готовых соединений для переиспользования.</td></tr>
+<tr><td>Connect / read timeout</td><td>Предел на установку соединения / на ожидание ответа.</td></tr>
+<tr><td>Deadline</td><td>Общий бюджет времени на операцию.</td></tr>
+<tr><td>Retry storm</td><td>Лавина повторов, добивающая сервис.</td></tr>
+<tr><td>Backoff + jitter</td><td>Растущая пауза со случайным разбросом.</td></tr>
+<tr><td>Circuit breaker</td><td>«Автомат», временно отключающий вызовы при массовых ошибках.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">12.8</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Клиент ждёт ваш сервис 2 секунды. Какой таймаут поставить на вызов зависимости?</p><ul><li>10 секунд</li><li>без таймаута</li><li>меньше 2 секунд, с учётом своей работы</li><li>ровно 2 секунды на каждую попытку</li></ul><div class="why">Ждать дольше клиента бессмысленно.</div></div>
+<div class="mcq" data-ok="0"><p>Три уровня сервисов делают по 3 повтора. Сколько запросов может получить база на одну операцию?</p><ul><li>до 27</li><li>3</li><li>9</li><li>1</li></ul><div class="why">Повторы перемножаются.</div></div>
+<div class="mcq" data-ok="3"><p>Зачем к паузе между повторами добавляют случайность (jitter)?</p><ul><li>для красоты</li><li>чтобы повторы шли быстрее</li><li>так требует HTTP</li><li>чтобы тысячи клиентов не повторяли одновременно</li></ul><div class="why">Иначе повторы приходят «залпом».</div></div>
+<div class="mcq" data-ok="1"><p>Что делает circuit breaker?</p><ul><li>шифрует трафик</li><li>при массовых ошибках временно перестаёт вызывать зависимость</li><li>увеличивает таймауты</li><li>перезапускает сервис</li></ul><div class="why">Даёт зависимости восстановиться и не тратит ресурсы впустую.</div></div>
+<div class="mcq" data-ok="2"><p>Какую операцию нельзя бездумно повторять?</p><ul><li>GET профиля</li><li>PUT настроек</li><li>POST «списать деньги» без ключа идемпотентности</li><li>DELETE</li></ul><div class="why">Повтор может списать дважды.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="12-java-networking.html">12 «Сеть в Java-бэкенде»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

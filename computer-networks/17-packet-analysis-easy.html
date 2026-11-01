@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 · Читаем дампы трафика — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="17e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 17 · СНАЧАЛА ПРОСТО</div>
+  <h1>Читаем дампы трафика — простыми словами</h1>
+  <p class="lead">Когда логи молчат, а «сеть тормозит», нужно посмотреть, что реально ходит по проводу. Разберёмся, как снять дамп безопасно, как читать строку tcpdump, как по дампу ставить диагноз в типичных ситуациях и какие приёмы Wireshark экономят больше всего времени.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~10 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 17 <a href="17-packet-analysis.html">«Практикум: читаем дампы трафика»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="capture"><span class="h-num">17.1</span>Как снять дамп</h2>
+<p><code>tcpdump</code> записывает пакеты с интерфейса. Главное — <b>фильтр</b>, иначе запишется всё подряд: например, «только порт 5432» или «только хост такой-то». Сохраняйте в файл (<code>-w dump.pcap</code>) и открывайте потом в Wireshark. Осторожно: в дампе могут быть пароли и личные данные (если трафик не зашифрован) — обращайтесь с ним как с секретом. На проде ограничивайте размер и время записи.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+tcpdump с фильтром в файл → Wireshark. Дамп — секретные данные.</div>
+<p class="easy-bridge">В полной главе: <a href="17-packet-analysis.html#capture">17.1 Как снять дамп</a></p>
+
+<h2 id="read"><span class="h-num">17.2</span>Как читать строку tcpdump</h2>
+<p>Строка выглядит примерно так: время, <code>IP 10.0.0.5.51234 &gt; 10.0.0.9.443</code> — откуда и куда (адрес и порт), <code>Flags [S]</code> — флаги (S — SYN, . — ACK, P — данные «отдай сразу», F — FIN, R — RST), номера последовательности, окно и длина данных. Читается как переписка: кто кому что сказал и когда.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Откуда → куда, флаги, номера, длина. Это переписка двух сторон.</div>
+<p class="easy-bridge">В полной главе: <a href="17-packet-analysis.html#read">17.2 Как читать строку tcpdump</a></p>
+
+<h2 id="cases"><span class="h-num">17.3</span>Дампы и диагнозы</h2>
+<div class="widget stepper">
+  <div class="widget-title">Что видно в дампе — и что это значит</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">SYN, SYN, SYN… без ответа → пакеты режет файрвол или сервер недоступен</span><span data-from="2" data-to="3">SYN → RST сразу → порт закрыт, никто не слушает</span><span data-from="3" data-to="4">запрос ушёл, ACK пришёл, а ответа 30 секунд нет → медленный сервер, а не сеть</span><span data-from="4" data-to="5">много повторных передач одного и того же → потери пакетов на пути</span><span data-from="5">одна сторона шлёт RST посреди обмена → обрыв: таймаут простоя,
+перезапуск, балансировщик закрыл соединение</span></pre></div>
+  <section class="st-step" data-t="Молчание"><p>Пакеты уходят в пустоту.</p></section>
+  <section class="st-step" data-t="Отказ"><p>Быстрый RST — порт закрыт.</p></section>
+  <section class="st-step" data-t="Сеть в порядке"><p>Сеть доставила, а приложение думает долго.</p></section>
+  <section class="st-step" data-t="Потери"><p>Повторы выдают проблемы канала.</p></section>
+  <section class="st-step" data-t="Обрыв"><p>По тому, кто отправил RST, видно виновника.</p></section>
+</div>
+<p>Особенно ценно: дамп отвечает на вопрос «виновата сеть или приложение?» — по времени между запросом и ответом.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Дамп показывает, кто молчит, кто отказывает, где потери и где время уходит в ожидание сервера.</div>
+<p class="easy-bridge">В полной главе: <a href="17-packet-analysis.html#cases">17.3 Восемь дампов: поставьте диагноз</a></p>
+
+<h2 id="wireshark"><span class="h-num">17.4</span>Приёмы Wireshark</h2>
+<ul>
+  <li><b>Follow TCP Stream</b> — показать всю переписку одного соединения подряд.</li>
+  <li><b>Фильтры отображения</b> — например, только повторные передачи или только RST.</li>
+  <li><b>Statistics → Conversations</b> — какие соединения самые «тяжёлые».</li>
+  <li><b>Колонка времени с предыдущего пакета</b> — где были долгие паузы.</li>
+  <li><b>Ключи TLS</b> — можно расшифровать свой HTTPS-трафик, если приложение выгрузило сессионные ключи.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Follow Stream, фильтры и колонка пауз решают большинство задач.</div>
+<p class="easy-bridge">В полной главе: <a href="17-packet-analysis.html#wireshark">17.4 Wireshark: пять приёмов</a></p>
+
+<h2 id="gloss"><span class="h-num">17.5</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Дамп (pcap)</td><td>Запись прошедших пакетов.</td></tr>
+<tr><td>tcpdump</td><td>Консольная программа для записи пакетов.</td></tr>
+<tr><td>Wireshark</td><td>Программа для удобного просмотра дампов.</td></tr>
+<tr><td>Фильтр захвата</td><td>Что записывать.</td></tr>
+<tr><td>Повторная передача</td><td>Пакет, отправленный снова из-за потери.</td></tr>
+<tr><td>RST</td><td>Аварийный обрыв соединения.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">17.6</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>В дампе клиент шлёт SYN несколько раз, ответа нет. Вероятная причина?</p><ul><li>сервер медленно думает</li><li>порт закрыт</li><li>пакеты режет файрвол или сервер недоступен</li><li>ошибка TLS</li></ul><div class="why">Закрытый порт ответил бы RST.</div></div>
+<div class="mcq" data-ok="0"><p>Запрос доставлен, подтверждение пришло, а ответ — через 20 секунд. Кто виноват?</p><ul><li>скорее приложение на сервере, а не сеть</li><li>сеть</li><li>DNS</li><li>клиент</li></ul><div class="why">Сеть доставила вовремя.</div></div>
+<div class="mcq" data-ok="3"><p>Почему с дампом обращаются как с секретом?</p><ul><li>он большой</li><li>он нужен только админам</li><li>его нельзя открыть</li><li>в незашифрованном трафике могут быть пароли и личные данные</li></ul><div class="why">Храните и передавайте осторожно.</div></div>
+<div class="mcq" data-ok="1"><p>Как в Wireshark увидеть всю переписку одного соединения подряд?</p><ul><li>Statistics → IO Graph</li><li>Follow TCP Stream</li><li>Capture → Options</li><li>никак</li></ul><div class="why">Удобно читать запрос и ответ целиком.</div></div>
+<div class="mcq" data-ok="2"><p>Много повторных передач одних и тех же данных означает…</p><ul><li>сервер быстрый</li><li>DNS сломан</li><li>пакеты теряются на пути</li><li>сертификат истёк</li></ul><div class="why">Ищите проблемный участок сети.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="17-packet-analysis.html">17 «Практикум: читаем дампы трафика»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

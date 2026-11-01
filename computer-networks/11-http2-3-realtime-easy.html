@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · HTTP/2, HTTP/3 и реальное время — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="11e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 11 · СНАЧАЛА ПРОСТО</div>
+  <h1>HTTP/2, HTTP/3 и реальное время — простыми словами</h1>
+  <p class="lead">Как ускорили HTTP, почему HTTP/3 работает поверх UDP, как сервер может сам присылать данные клиенту и что такое gRPC. Разберёмся на примере очередей в кассу.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 11 <a href="11-http2-3-realtime.html">«HTTP/2, HTTP/3, WebSocket, gRPC»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="h1"><span class="h-num">11.1</span>HTTP/1.1: одна касса</h2>
+<p>В одном соединении HTTP/1.1 запросы идут строго по очереди: пока не пришёл ответ на первый, второй ждёт. Медленный ответ задерживает всех, кто за ним, — это <b>блокировка начала очереди</b>. Браузеры обходят это, открывая до 6 соединений к одному сайту, — как открыть шесть касс, но каждая всё равно работает по очереди.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+HTTP/1.1: один запрос за раз на соединение. Медленный блокирует остальных.</div>
+<p class="easy-bridge">В полной главе: <a href="11-http2-3-realtime.html#h1">11.1 HTTP/1.1 и его пределы</a></p>
+
+<h2 id="h2"><span class="h-num">11.2</span>HTTP/2: всё вперемешку по одному соединению</h2>
+<p>HTTP/2 режет запросы и ответы на маленькие кадры и пускает их вперемешку по <b>одному</b> соединению — <b>мультиплексирование</b>. Медленный ответ больше не задерживает быстрые. Плюс сжатие заголовков. Но осталась проблема уровнем ниже: TCP отдаёт данные строго по порядку, и если потерялся один пакет, ждут <b>все</b> потоки, пока его не перешлют.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+HTTP/2 — много запросов в одном соединении. Но потеря пакета в TCP тормозит всех.</div>
+<p class="easy-bridge">В полной главе: <a href="11-http2-3-realtime.html#h2">11.2 HTTP/2: мультиплексирование</a></p>
+
+<h2 id="h3"><span class="h-num">11.3</span>HTTP/3 и QUIC</h2>
+<p><b>QUIC</b> — новый транспорт поверх UDP, который сам делает надёжность, но <b>для каждого потока отдельно</b>: потеря пакета одного запроса не тормозит остальные. Ещё QUIC объединяет установку соединения и TLS в один круг, а соединение переживает смену сети (с Wi-Fi на мобильную) без переподключения. HTTP поверх QUIC — это <b>HTTP/3</b>.</p>
+<div class="widget stepper">
+  <div class="widget-title">Потерялся один пакет, в работе три запроса</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">HTTP/1.1: запросы по очереди → второй и третий ждут первого</span><span data-from="2" data-to="3">HTTP/2: все три в одном TCP → пакет запроса 1 потерян
+TCP держит ВСЁ, пока не придёт повтор → ждут все три</span><span data-from="3">HTTP/3 (QUIC): у каждого запроса свой поток
+ждёт только запрос 1, запросы 2 и 3 получены сразу</span></pre></div>
+  <section class="st-step" data-t="HTTP/1.1"><p>Очередь на уровне HTTP.</p></section>
+  <section class="st-step" data-t="HTTP/2"><p>Очередь переехала в TCP.</p></section>
+  <section class="st-step" data-t="HTTP/3"><p>Потеря затрагивает только свой поток.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+HTTP/3 = HTTP поверх QUIC (UDP): потеря не тормозит соседей, быстрее установка.</div>
+<p class="easy-bridge">В полной главе: <a href="11-http2-3-realtime.html#h3">11.3 HTTP/3 и QUIC</a></p>
+
+<h2 id="realtime"><span class="h-num">11.4</span>Сервер → клиент: как прислать обновление</h2>
+<div class="table-wrap"><table>
+<tr><th>Способ</th><th>Как работает</th><th>Когда</th></tr>
+<tr><td>Polling</td><td>клиент каждые N секунд спрашивает «есть новое?»</td><td>просто, но лишняя нагрузка</td></tr>
+<tr><td>Long polling</td><td>сервер держит запрос, пока не появится новое</td><td>совместимость со старым</td></tr>
+<tr><td>SSE</td><td>сервер шлёт поток событий по обычному HTTP</td><td>уведомления, ленты — только сервер → клиент</td></tr>
+<tr><td>WebSocket</td><td>постоянный двусторонний канал</td><td>чаты, игры, совместное редактирование</td></tr>
+</table></div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Только от сервера — SSE; в обе стороны — WebSocket.</div>
+<p class="easy-bridge">В полной главе: <a href="11-http2-3-realtime.html#realtime">11.4 Сервер → клиент: polling, SSE, WebSocket</a></p>
+
+<h2 id="grpc"><span class="h-num">11.5</span>gRPC</h2>
+<p><b>gRPC</b> — способ вызывать методы другого сервиса, как будто они локальные. Описываете в схеме (protobuf), какие методы и сообщения есть, — и получаете готовый клиент и сервер на разных языках. Работает поверх HTTP/2, компактно и быстро, умеет потоки в обе стороны. Хорош для общения сервисов внутри компании; для публичных API и браузеров обычно удобнее REST/JSON.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+gRPC — быстрый вызов методов между сервисами по схеме protobuf поверх HTTP/2.</div>
+<p class="easy-bridge">В полной главе: <a href="11-http2-3-realtime.html#grpc">11.5 gRPC</a></p>
+
+<h2 id="gloss"><span class="h-num">11.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>Head-of-line blocking</td><td>Первый в очереди задерживает всех.</td></tr>
+<tr><td>Мультиплексирование</td><td>Много запросов вперемешку по одному соединению.</td></tr>
+<tr><td>QUIC</td><td>Транспорт поверх UDP с потоками и встроенным TLS.</td></tr>
+<tr><td>SSE</td><td>Поток событий от сервера к клиенту.</td></tr>
+<tr><td>WebSocket</td><td>Постоянный двусторонний канал.</td></tr>
+<tr><td>gRPC</td><td>Вызов удалённых методов по схеме.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">11.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Какую проблему HTTP/2 решил не до конца?</p><ul><li>сжатие заголовков</li><li>количество соединений</li><li>потеря пакета TCP задерживает все потоки соединения</li><li>шифрование</li></ul><div class="why">Это решает HTTP/3.</div></div>
+<div class="mcq" data-ok="0"><p>Почему HTTP/3 работает поверх UDP?</p><ul><li>чтобы сделать надёжность для каждого потока отдельно и не зависеть от порядка TCP</li><li>UDP надёжнее TCP</li><li>TCP запрещён</li><li>UDP шифрует данные</li></ul><div class="why">Надёжность реализована в самом QUIC.</div></div>
+<div class="mcq" data-ok="3"><p>Нужно присылать пользователю уведомления, ответы от него не нужны. Что проще всего?</p><ul><li>WebSocket</li><li>gRPC</li><li>polling раз в секунду</li><li>SSE</li></ul><div class="why">Односторонний поток событий по HTTP.</div></div>
+<div class="mcq" data-ok="1"><p>Для чего лучше подходит WebSocket?</p><ul><li>загрузки картинок</li><li>чата, где сообщения идут в обе стороны</li><li>кэширования</li><li>DNS</li></ul><div class="why">Постоянный двусторонний канал.</div></div>
+<div class="mcq" data-ok="2"><p>Почему браузеры с HTTP/1.1 открывали несколько соединений к одному сайту?</p><ul><li>для безопасности</li><li>для экономии</li><li>в одном соединении запросы шли строго по очереди</li><li>так требовал сервер</li></ul><div class="why">Несколько «касс» вместо одной.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="11-http2-3-realtime.html">11 «HTTP/2, HTTP/3, WebSocket, gRPC»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 · Путь запроса — простыми словами</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/app.js"></script>
+</head>
+<body data-page="15e">
+<div class="layout">
+<aside class="sidebar"></aside>
+<main><div class="content">
+
+<header class="page-head">
+  <div class="kicker">ТЕМА 15 · СНАЧАЛА ПРОСТО</div>
+  <h1>Путь запроса — простыми словами</h1>
+  <p class="lead">Самый знаменитый вопрос собеседования: «что происходит, когда вы вводите адрес в браузере?». Пройдём весь путь по шагам со ссылками на главы, научимся прикидывать, сколько миллисекунд стоит каждый шаг, и посмотрим, как сетевые знания используются в задачах по проектированию систем.</p>
+  <div class="meta"><span class="tag">без формул</span><span class="tag">аналогии из жизни</span><span class="tag">~12 минут</span><span class="tag">словарик</span><span class="tag">тест</span></div>
+</header>
+
+<div class="callout info"><span class="c-title">Как читать эту страницу</span>
+Это упрощённая версия главы 15 <a href="15-url-journey.html">«Путь запроса и собеседование»</a>. Разделы идут в том же порядке, что и в полной главе, и под каждым есть ссылка на «взрослую» версию. Термины выделены <b>жирным</b> и собраны в словарике в конце. Если непонятно, что такое память, процессор и байты, — загляните в <a href="../computer-science/00-school.html">«Компьютер за 15 минут»</a>.</div>
+
+<nav class="toc" data-auto></nav>
+
+<h2 id="journey"><span class="h-num">15.1</span>По шагам</h2>
+<div class="widget stepper">
+  <div class="widget-title">https://app.bank.by/accounts</div>
+  <div class="st-stage"><pre class="out" style="min-height:60px"><span data-from="1" data-to="2">1. DNS: app.bank.by → 203.0.113.7 (кэш или цепочка резолвера)   — гл. 08</span><span data-from="2" data-to="3">2. TCP: SYN → SYN+ACK → ACK до ближайшей точки (CDN/балансировщик)   — гл. 06</span><span data-from="3" data-to="4">3. TLS 1.3: обмен ключами, проверка сертификата   — гл. 09</span><span data-from="4" data-to="5">4. HTTP/2: GET /accounts с cookie сессии   — гл. 10–11</span><span data-from="5" data-to="6">5. L7-балансировщик → Ingress → Service → под с Java-сервисом   — гл. 13</span><span data-from="6" data-to="7">6. сервис: проверка сессии, запрос в базу через пул соединений   — гл. 12</span><span data-from="7">7. ответ JSON едет обратно, браузер рисует страницу
+пакеты по пути: Wi-Fi → провайдер → BGP-маршруты → дата-центр   — гл. 02–05</span></pre></div>
+  <section class="st-step" data-t="DNS"><p>Имя превращается в адрес.</p></section>
+  <section class="st-step" data-t="TCP"><p>Рукопожатие с ближайшей точкой входа.</p></section>
+  <section class="st-step" data-t="TLS"><p>Защищённый канал и проверка, что это банк.</p></section>
+  <section class="st-step" data-t="HTTP"><p>Сам запрос.</p></section>
+  <section class="st-step" data-t="Инфраструктура"><p>Запрос проходит через балансировщики к поду.</p></section>
+  <section class="st-step" data-t="Сервис"><p>Бизнес-логика и база.</p></section>
+  <section class="st-step" data-t="Обратно"><p>Ответ по тому же пути.</p></section>
+</div>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+DNS → TCP → TLS → HTTP → балансировщики → сервис → база → обратно.</div>
+<p class="easy-bridge">В полной главе: <a href="15-url-journey.html#journey">15.1 https://app.bank.by/accounts — по шагам</a></p>
+
+<h2 id="calc"><span class="h-num">15.2</span>Бюджет задержки</h2>
+<p>Прикинем для пользователя в 20 мс (туда-обратно) от точки входа:</p>
+<div class="table-wrap"><table>
+<tr><th>Шаг</th><th>Примерно</th></tr>
+<tr><td>DNS (если нет в кэше)</td><td>20–50 мс</td></tr>
+<tr><td>TCP-рукопожатие</td><td>1 RTT ≈ 20 мс</td></tr>
+<tr><td>TLS 1.3</td><td>1 RTT ≈ 20 мс</td></tr>
+<tr><td>запрос и ответ</td><td>1 RTT ≈ 20 мс + время сервиса</td></tr>
+<tr><td>сервис + база</td><td>5–50 мс</td></tr>
+</table></div>
+<p>Итого для первого запроса — около 100 мс и больше, из которых большая часть — круги по сети. Поэтому так важны переиспользование соединений, точки входа поблизости (CDN) и кэш DNS: повторный запрос по готовому соединению стоит один RTT плюс работа сервиса.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Первый запрос дорог из-за рукопожатий; повторные по готовому соединению — намного дешевле.</div>
+<p class="easy-bridge">В полной главе: <a href="15-url-journey.html#calc">15.2 Калькулятор бюджета задержки</a></p>
+
+<h2 id="sd"><span class="h-num">15.3</span>Сеть в задачах проектирования</h2>
+<ul>
+  <li><b>Глобальный сервис</b> — CDN, anycast, точки входа в разных регионах.</li>
+  <li><b>Чат или уведомления</b> — WebSocket или SSE, балансировка долгих соединений.</li>
+  <li><b>Связь сервисов</b> — gRPC или REST, таймауты, повторы, circuit breaker, mTLS.</li>
+  <li><b>Отказоустойчивость</b> — несколько балансировщиков и зон, health checks, DNS с коротким TTL.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+В проектировании систем сеть — это задержка, точки входа, протоколы и устойчивость к отказам.</div>
+<p class="easy-bridge">В полной главе: <a href="15-url-journey.html#sd">15.3 Вопросы System Design с сетевой частью</a></p>
+
+<h2 id="blitz"><span class="h-num">15.4</span>Блиц</h2>
+<ul>
+  <li><b>TCP или UDP для видеозвонка?</b> UDP — опоздавшее не нужно.</li>
+  <li><b>Почему HTTP/3 на UDP?</b> Чтобы потеря одного пакета не тормозила все потоки.</li>
+  <li><b>Что такое TTL в DNS?</b> Сколько хранить ответ в кэше.</li>
+  <li><b>Много CLOSE_WAIT?</b> Приложение не закрывает соединения.</li>
+  <li><b>Чем L4 отличается от L7?</b> Соединения против HTTP-запросов.</li>
+</ul>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Короткий ответ + причина — лучший формат для блица.</div>
+<p class="easy-bridge">В полной главе: <a href="15-url-journey.html#blitz">15.5 Блиц</a></p>
+
+<h2 id="practicum"><span class="h-num">15.5</span>Итоговый практикум</h2>
+<p>Возьмите любой сайт и пройдите путь руками: <code>dig</code> — адрес, <code>curl -v -w</code> — время DNS, соединения, TLS и ответа, <code>openssl s_client</code> — сертификат, <code>traceroute</code> — маршрут. Сравните первый и повторный запрос. Это лучший способ связать все главы в одну картину.</p>
+<div class="callout ok"><span class="c-title">Главная мысль</span>
+Пройдите путь запроса сами — пять команд объясняют весь курс.</div>
+<p class="easy-bridge">В полной главе: <a href="15-url-journey.html#practicum">15.6 Итоговый практикум</a></p>
+
+<h2 id="gloss"><span class="h-num">15.6</span>Словарик</h2>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Слово</th><th>Простыми словами</th></tr>
+<tr><td>RTT</td><td>Время «туда и обратно».</td></tr>
+<tr><td>Бюджет задержки</td><td>Раскладка, на что уходит время запроса.</td></tr>
+<tr><td>Точка входа</td><td>Ближайший к пользователю узел: CDN, балансировщик.</td></tr>
+<tr><td>Keep-alive</td><td>Переиспользование соединения для многих запросов.</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">15.7</span>Проверьте себя</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Что происходит первым, когда вы открываете https-сайт впервые?</p><ul><li>TLS-рукопожатие</li><li>HTTP-запрос</li><li>DNS: поиск адреса по имени</li><li>TCP-рукопожатие</li></ul><div class="why">Без адреса некуда подключаться.</div></div>
+<div class="mcq" data-ok="0"><p>Почему первый запрос к сайту медленнее повторных?</p><ul><li>нужны DNS, TCP- и TLS-рукопожатия — несколько кругов по сети</li><li>сервер «просыпается»</li><li>браузер медленный</li><li>это не так</li></ul><div class="why">Повторные идут по готовому соединению.</div></div>
+<div class="mcq" data-ok="3"><p>Как сократить задержку для пользователей на другом континенте?</p><ul><li>увеличить канал сервера</li><li>купить мощный сервер</li><li>отключить TLS</li><li>точки входа и CDN поближе к ним</li></ul><div class="why">Расстояние определяет RTT.</div></div>
+<div class="mcq" data-ok="1"><p>RTT до точки входа 30 мс. Сколько займут TCP + TLS 1.3 до отправки запроса?</p><ul><li>30 мс</li><li>около 60 мс</li><li>около 120 мс</li><li>0</li></ul><div class="why">По одному кругу на каждое рукопожатие.</div></div>
+<div class="mcq" data-ok="2"><p>Какая команда покажет время DNS, соединения, TLS и ответа одного запроса?</p><ul><li>ping</li><li>dig</li><li>curl -w с нужными полями</li><li>traceroute</li></ul><div class="why">curl умеет выводить тайминги каждого этапа.</div></div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Если ответили хотя бы на 4 вопроса из 5 — открывайте полную главу <a href="15-url-journey.html">15 «Путь запроса и собеседование»</a>. Там те же идеи, но точно: с заголовками пакетов, командами диагностики, интерактивом и практикумом. Встретили непонятное место — вернитесь сюда, в раздел с тем же номером.</div>
+
+</div></main>
+</div>
+</body>
+</html>
