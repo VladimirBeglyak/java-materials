@@ -22,6 +22,10 @@
     { id: "14", file: "14-practice.html", title: "Практикум и собеседование", tier: "s", group: "Практика" }
   ];
   var TIER = { j: "Junior", m: "Middle", s: "Senior" };
+  /* У каждой главы есть упрощённая версия NN-name-easy.html (id «NNe»); в навигации она идёт перед главой */
+  function easyOf(p) { return p.intro ? null : { id: p.id + "e", file: p.file.replace(".html", "-easy.html"), title: "Простыми словами: " + p.title, easy: true, of: p.id }; }
+  var SEQ = [];
+  PAGES.forEach(function (p) { var e = easyOf(p); if (e) SEQ.push(e); SEQ.push(p); });
   var KEY = "crypto-guide-done-v1";
 
   function load() { try { return JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { return {}; } }
@@ -51,6 +55,9 @@
     PAGES.forEach(function (p) {
       if (p.group && p.group !== g) { g = p.group; html += '</ul><div class="nav-group">' + g + '</div><ul class="nav-list">'; }
       var cls = (p.id === current ? "current " : "") + (state[p.id] ? "done" : "");
+      var e = easyOf(p);
+      if (e) html += '<li class="sub"><a class="' + (e.id === current ? "current" : "") + '" href="' + e.file + '"><span class="num">' + p.id +
+        '</span><span>Сначала просто</span><span></span></a></li>';
       html += '<li><a class="' + cls + '" href="' + p.file + '"><span class="num">' + (p.num || p.id) + '</span><span>' + p.title +
         '</span>' + (p.intro ? "<span></span>" : '<span class="done-mark" title="изучено"></span>') + "</a></li>";
     });
@@ -82,18 +89,20 @@
   /* ---------- Footer: mark done + prev/next ---------- */
   function buildFooter() {
     var c = document.querySelector(".content");
-    var idx = PAGES.findIndex(function (p) { return p.id === current; });
-    if (!c || idx < 0 || PAGES[idx].intro) return;
+    var idx = SEQ.findIndex(function (p) { return p.id === current; });
+    if (!c || idx < 0 || SEQ[idx].intro) return;
+    var isEasy = !!SEQ[idx].easy;
     var wrap = document.createElement("div");
-    wrap.innerHTML =
+    wrap.innerHTML = isEasy ? "" :
       '<label class="mark-done"><input type="checkbox" id="doneBox"><span><b>Тема изучена.</b> Я могу объяснить механизм сам и применить его: выбрать алгоритм, режим и схему управления ключами под задачу, без подсказок.</span></label>';
     var pager = '<nav class="pager">';
-    var prev = PAGES[idx - 1], next = PAGES[idx + 1];
+    var prev = SEQ[idx - 1], next = SEQ[idx + 1];
     if (prev) pager += '<a class="prev" href="' + prev.file + '"><small>← Назад</small>' + prev.title + "</a>";
     if (next) pager += '<a class="next" href="' + next.file + '"><small>Дальше →</small>' + next.title + "</a>";
     pager += "</nav>";
     wrap.innerHTML += pager;
     c.appendChild(wrap);
+    if (isEasy) return;
     var box = document.getElementById("doneBox");
     box.checked = !!state[current];
     box.addEventListener("change", function () {
@@ -104,7 +113,7 @@
 
   /* ---------- Page header tier badge ---------- */
   function decorateHead() {
-    var p = PAGES.find(function (x) { return x.id === current; });
+    var p = SEQ.find(function (x) { return x.id === current; });
     var meta = document.querySelector(".page-head .meta");
     if (p && p.tier && meta) {
       var s = document.createElement("span");
