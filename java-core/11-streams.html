@@ -24,9 +24,16 @@
 <div class="callout info"><span class="c-title">Если совсем просто</span>
 Стрим — конвейер на фабрике: источник → фильтры и преобразования → итог. Конвейер ленивый: пока не нажали «итог», ничего не происходит, а потом каждый элемент проходит все станции по очереди. <a href="11-streams-easy.html"><b>Вся глава простыми словами →</b></a></div>
 
+<div class="callout ok"><span class="c-title">Что нужно знать заранее</span>
+Коллекции из <a href="08-collections.html">темы 08</a>; лямбды, ссылки на методы и функциональные интерфейсы (<code>Predicate</code>, <code>Function</code>) из <a href="10-lambdas.html">темы 10</a>; <code>Optional</code> оттуда же. <b>Stream API</b> (stream — «поток», здесь: поток элементов, не путать с потоком выполнения и с потоками ввода-вывода) — способ обрабатывать коллекции цепочкой операций «отфильтруй → преобразуй → собери». Сокращения собраны в <a href="#gloss">словарике</a>.
+</div>
+
 <nav class="toc" data-auto></nav>
 
 <h2 id="pipeline"><span class="h-num">11.1</span>Конвейер</h2>
+<h3>С нуля: конвейер на заводе</h3>
+<p>Представьте конвейерную ленту: в начале на неё кладут детали (это <b>источник</b> — коллекция), по пути стоят станции «отбраковать негодные», «покрасить», «упаковать» (это <b>промежуточные операции</b>: <code>filter</code>, <code>map</code>), а в конце — склад, куда всё собирается (<b>терминальная</b>, «конечная» операция: <code>toList</code>, <code>count</code>). Пока на склад ничего не просят, лента стоит: стрим работает, только когда есть терминальная операция.</p>
+<h3>Строго</h3>
 <figure class="diagram">
 <svg viewBox="0 0 800 150" role="img" aria-label="Конвейер стрима: источник, промежуточные операции, терминальная операция">
   <defs><marker id="t1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar-acc"/></marker></defs>
@@ -50,9 +57,13 @@
         .toList();                                              // терминальная</code></pre>
 <ul>
   <li><b>Стрим не хранит данные</b> и не изменяет источник — он описывает вычисление над ним.</li>
-  <li><b>Стрим одноразовый.</b> После терминальной операции повторное использование даёт <code>IllegalStateException: stream has already been operated upon or closed</code>.</li>
-  <li><b>Стрим ленив.</b> Без терминальной операции не выполняется ничего.</li>
+  <li><b>Стрим одноразовый.</b> После <b>терминальной</b> (завершающей) операции повторное использование даёт <code>IllegalStateException: stream has already been operated upon or closed</code>.</li>
+  <li><b>Стрим ленив</b> (lazy): без терминальной операции не выполняется ничего.</li>
 </ul>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+Стрим — конвейер: источник → промежуточные операции → терминальная операция. Он не хранит данные, не меняет источник, одноразовый и ленивый.
+</div>
 
 <h2 id="lazy"><span class="h-num">11.2</span>Ленивость и порядок выполнения</h2>
 <pre data-title="что будет напечатано?"><code class="java">Optional&lt;String&gt; first = Stream.of("a", "b", "c", "d")
@@ -62,14 +73,18 @@
 <pre data-title="вывод"><code class="txt">filter a
 filter b
 map b</code></pre>
-<p>Элементы проходят конвейер <b>по одному, сквозь все операции</b>, а не «слоями». Как только <code>findFirst</code> получил результат, обработка прекращается — <code>c</code> и <code>d</code> не затронуты. Это позволяет работать с бесконечными источниками и не делать лишней работы.</p>
+<p>Элементы проходят конвейер <b>по одному, сквозь все операции</b>, а не «слоями». Как только <code>findFirst</code> получил результат, обработка прекращается — <code>c</code> и <code>d</code> не затронуты. Это позволяет работать с <b>бесконечными</b> источниками (например, «все чётные числа») и не делать лишней работы.</p>
 <div class="table-wrap"><table>
 <tr><th>Вид операции</th><th>Примеры</th><th>Особенность</th></tr>
 <tr><td>Без состояния</td><td><code>filter</code>, <code>map</code>, <code>flatMap</code>, <code>peek</code></td><td>Каждый элемент обрабатывается независимо</td></tr>
-<tr><td>С состоянием</td><td><code>sorted</code>, <code>distinct</code></td><td>Должны увидеть все элементы (или помнить виденные) — буферизуют данные и ломают «поэлементность»</td></tr>
+<tr><td>С состоянием</td><td><code>sorted</code>, <code>distinct</code></td><td>Должны увидеть все элементы (или помнить виденные) — <b>буферизуют</b> (копят в памяти) данные и ломают «поэлементность»</td></tr>
 <tr><td>Укорачивающие</td><td><code>limit</code>, <code>takeWhile</code>, <code>findFirst</code>, <code>anyMatch</code></td><td>Могут завершить конвейер досрочно</td></tr>
 </table></div>
 <p><b>Порядок операций влияет на объём работы</b>: <code>filter</code> перед <code>map</code> и <code>sorted</code> уменьшает число элементов для дорогих шагов; <code>sorted().limit(10)</code> всё равно сортирует всё.</p>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+Элементы идут по конвейеру по одному сквозь все операции, и укорачивающие операции (findFirst, limit) останавливают обработку досрочно. Фильтруйте раньше дорогих шагов; sorted и distinct видят все элементы.
+</div>
 
 <h2 id="operations"><span class="h-num">11.3</span>Основные операции</h2>
 <div class="table-wrap"><table>
@@ -80,7 +95,7 @@ map b</code></pre>
 <tr><td><code>distinct()</code>, <code>sorted()</code></td><td>Убрать дубликаты (по <code>equals</code>), упорядочить</td></tr>
 <tr><td><code>limit(n)</code>, <code>skip(n)</code></td><td>Первые n; пропустить n</td></tr>
 <tr><td><code>takeWhile</code>, <code>dropWhile</code> (9)</td><td>Брать или пропускать, пока условие истинно</td></tr>
-<tr><td><code>peek(consumer)</code></td><td>Подсмотреть элемент — только для отладки</td></tr>
+<tr><td><code>peek(consumer)</code></td><td>Подсмотреть элемент — только для <b>отладки</b> (поиска ошибок)</td></tr>
 </table></div>
 <div class="table-wrap"><table>
 <tr><th>Терминальные</th><th>Результат</th></tr>
@@ -102,9 +117,14 @@ IntSummaryStatistics st = orders.stream().mapToInt(Order::quantity).summaryStati
 IntStream.range(0, 5);            // 0 1 2 3 4
 IntStream.rangeClosed(1, 5);      // 1 2 3 4 5
 IntStream.range(0, 5).boxed();    // Stream&lt;Integer&gt;, когда нужна коллекция</code></pre>
-<p><b><code>reduce</code></b> сворачивает элементы ассоциативной операцией: <code>prices.stream().reduce(BigDecimal.ZERO, BigDecimal::add)</code>. Первый аргумент — нейтральный элемент: ноль для сложения, единица для умножения, пустая строка для склейки. Для накопления в изменяемый контейнер (список, карту, <code>StringBuilder</code>) используют <code>collect</code>, а не <code>reduce</code>.</p>
+<p><b><code>reduce</code></b> («свести») сворачивает элементы <b>ассоциативной</b> операцией (такой, где расстановка скобок не важна: (a + b) + c = a + (b + c)): <code>prices.stream().reduce(BigDecimal.ZERO, BigDecimal::add)</code>. Первый аргумент — <b>нейтральный элемент</b> (identity — значение, которое ничего не меняет): ноль для сложения, единица для умножения, пустая строка для склейки. Для накопления в изменяемый контейнер (список, карту, <code>StringBuilder</code>) используют <code>collect</code>, а не <code>reduce</code>.</p>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+filter — отобрать, map — преобразовать один в один, flatMap — один во много, sorted, distinct, limit. Терминальные: toList, collect, count, anyMatch, findFirst, reduce. Для чисел — IntStream без упаковки.
+</div>
 
 <h2 id="collectors"><span class="h-num">11.4</span>Коллекторы</h2>
+<p><b>Коллектор</b> (Collector — «сборщик») — рецепт, как собрать элементы стрима в результат: в список, множество, карту, строку, группы. Готовые рецепты лежат в классе <code>Collectors</code>: <code>toSet()</code>, <code>toMap(…)</code>, <code>joining(", ")</code> (склеить строки), <code>groupingBy(…)</code> (разложить по группам), <code>counting()</code> (сосчитать).</p>
 <pre><code class="java">import static java.util.stream.Collectors.*;
 
 Map&lt;String, List&lt;Order&gt;&gt; byCustomer = orders.stream().collect(groupingBy(Order::customer));
@@ -133,6 +153,10 @@ toMap(User::id, u -&gt; u, (a, b) -&gt; a, LinkedHashMap::new)   // четвёр
 <code>stream.toList()</code> (Java 16) возвращает <b>неизменяемый</b> список. <code>collect(Collectors.toList())</code> возвращает список без гарантий — на практике изменяемый <code>ArrayList</code>. При замене одного на другое код, который потом вызывает <code>add</code> или <code>sort</code>, упадёт с <code>UnsupportedOperationException</code>. Если нужен изменяемый список — явно <code>collect(toCollection(ArrayList::new))</code>.
 </div>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+Коллекторы собирают стрим в коллекцию, карту, строку или группы. toMap падает на повторе ключа и null-значении; stream.toList() возвращает неизменяемый список.
+</div>
+
 <h2 id="traps"><span class="h-num">11.5</span>Ловушки</h2>
 <pre data-title="побочные эффекты" class="bad-code"><code class="java">List&lt;String&gt; names = new ArrayList&lt;&gt;();
 users.stream().filter(User::isActive).forEach(u -&gt; names.add(u.name()));   // работает, пока стрим не параллельный
@@ -143,31 +167,44 @@ users.stream().peek(u -&gt; u.setProcessed(true)).count();   // peek может 
 <ul>
   <li><b>Не изменяйте источник</b> во время работы стрима (<code>list.stream().forEach(x -&gt; list.remove(x))</code>) — результат не определён.</li>
   <li><b>Бесконечные стримы</b> (<code>Stream.iterate(1, x -&gt; x * 2)</code>, <code>Stream.generate(...)</code>) требуют укорачивающей операции; <code>sorted()</code> или <code>distinct()</code> на бесконечном стриме никогда не завершатся.</li>
-  <li><b>Стрим поверх ресурса нужно закрыть</b>: <code>Files.lines</code>, <code>Files.walk</code>, результат запроса JPA как <code>Stream</code> — только в try-with-resources.</li>
+  <li><b>Стрим поверх ресурса нужно закрыть</b>: <code>Files.lines</code> (строки файла), <code>Files.walk</code> (обход каталогов), результат запроса <b>JPA</b> (Jakarta Persistence API — работа с базой данных) как <code>Stream</code> — только в try-with-resources (тема 06).</li>
   <li><b>Читаемость важнее.</b> Цепочка на двадцать строк с вложенными лямбдами хуже цикла. Сложные шаги выносят в именованные методы: <code>.filter(this::isEligible)</code>.</li>
-  <li><b>Отладка.</b> Исключение внутри лямбды даёт длинный стектрейс из служебных кадров; точку останова ставят внутрь лямбды, а не на строку с <code>.stream()</code>.</li>
+  <li><b>Отладка.</b> Исключение внутри лямбды даёт длинный <b>стектрейс</b> (распечатку цепочки вызовов) из служебных кадров; <b>точку останова</b> (breakpoint — место, где отладчик останавливает программу) ставят внутрь лямбды, а не на строку с <code>.stream()</code>.</li>
 </ul>
-<p><b>Производительность.</b> Последовательный стрим обычно немного медленнее цикла — на создание объектов конвейера и вызовы лямбд; для бизнес-кода это несущественно. Заметно проигрывает только работа с упаковкой (<code>Stream&lt;Integer&gt;</code> вместо <code>IntStream</code>) и использование стримов на очень маленьких коллекциях в горячем цикле.</p>
+<p><b>Производительность.</b> Последовательный стрим обычно немного медленнее цикла — на создание объектов конвейера и вызовы лямбд; для <b>бизнес-кода</b> (обычной логики приложения) это несущественно. Заметно проигрывает только работа с упаковкой (<code>Stream&lt;Integer&gt;</code> вместо <code>IntStream</code>) и использование стримов на очень маленьких коллекциях в <b>горячем</b> (очень часто выполняемом) цикле.</p>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+Не меняйте внешние переменные и источник из лямбд, ограничивайте бесконечные стримы, закрывайте стримы поверх ресурсов. Длинную цепочку разбейте на именованные методы.
+</div>
 
 <h2 id="parallel"><span class="h-num">11.6</span>Параллельные стримы</h2>
-<p><code>parallelStream()</code> или <code>.parallel()</code> разбивают источник на части, обрабатывают их в нескольких потоках и объединяют результаты. Выглядит как бесплатное ускорение, на практике полезно редко.</p>
+<p><code>parallelStream()</code> или <code>.parallel()</code> разбивают источник на части, обрабатывают их в нескольких <b>потоках выполнения</b> (threads — частях программы, работающих одновременно на разных ядрах процессора) и объединяют результаты. Выглядит как бесплатное ускорение, на практике полезно редко.</p>
 <div class="vs">
   <div class="card"><h4>Когда помогает</h4><ul><li>Данных много — десятки тысяч элементов и больше.</li><li>Работа над элементом чисто вычислительная.</li><li>Источник хорошо делится пополам: <code>ArrayList</code>, массив, <code>IntStream.range</code>.</li><li>Операции без состояния и без общего изменяемого состояния.</li><li>Измерение показало выигрыш.</li></ul></div>
-  <div class="card"><h4>Когда вредит</h4><ul><li><b>Блокирующий ввод-вывод</b> внутри: HTTP, запросы в базу.</li><li>Мало данных — накладные расходы больше выигрыша.</li><li>Плохо делимый источник: <code>LinkedList</code>, <code>Stream.iterate</code>, <code>BufferedReader.lines</code>.</li><li>Операции, зависящие от порядка: <code>limit</code>, <code>findFirst</code>, <code>forEachOrdered</code>.</li><li>Сервер уже загружен параллельными запросами.</li></ul></div>
+  <div class="card"><h4>Когда вредит</h4><ul><li><b>Блокирующий ввод-вывод</b> (операции, где поток стоит и ждёт ответа) внутри: HTTP-запросы, запросы в базу.</li><li>Мало данных — накладные расходы больше выигрыша.</li><li>Плохо делимый источник: <code>LinkedList</code>, <code>Stream.iterate</code>, <code>BufferedReader.lines</code>.</li><li>Операции, зависящие от порядка: <code>limit</code>, <code>findFirst</code>, <code>forEachOrdered</code>.</li><li>Сервер уже загружен параллельными запросами.</li></ul></div>
 </div>
 <div class="callout bad"><span class="c-title">Общий пул — главная опасность</span>
-Все параллельные стримы приложения выполняются в одном <code>ForkJoinPool.commonPool()</code>, размер которого равен числу ядер минус один. Один стрим с медленными запросами к внешнему сервису занимает все его потоки — и останавливает остальные параллельные стримы и <code>CompletableFuture</code> без явного исполнителя во всём процессе. Для ввода-вывода используют отдельный пул или виртуальные потоки (<a href="../java-concurrency/08-executors.html">Java Concurrency, тема 08</a>).
+Все параллельные стримы приложения выполняются в одном <code>ForkJoinPool.commonPool()</code> (общем <b>пуле потоков</b> — наборе заранее созданных потоков), размер которого равен числу ядер минус один. Один стрим с медленными запросами к внешнему сервису занимает все его потоки — и останавливает остальные параллельные стримы и <code>CompletableFuture</code> (асинхронные задачи) без явного <b>исполнителя</b> (executor — пула, на котором выполнять) во всём процессе. Для ввода-вывода используют отдельный пул или <b>виртуальные потоки</b> (лёгкие потоки Java 21, которых можно создавать миллионами) (<a href="../java-concurrency/08-executors.html">Java Concurrency, тема 08</a>).
 </div>
 <p>В параллельном стриме лямбды обязаны быть без побочных эффектов, а операция в <code>reduce</code> — ассоциативной: <code>(a − b) − c ≠ a − (b − c)</code>, и результат вычитания будет зависеть от разбиения.</p>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+Параллельный стрим ускоряет только большие чисто вычислительные задачи на хорошо делимых источниках. Он работает в общем пуле ForkJoinPool — блокирующий ввод-вывод в нём тормозит весь процесс.
+</div>
+
 <h2 id="gatherers"><span class="h-num">11.7</span>Gatherers — свои промежуточные операции (Java 24)</h2>
-<p>До Java 24 набор промежуточных операций был закрытым: «разбить на пачки по 100» или «скользящее окно» приходилось делать вручную. Метод <code>gather</code> принимает произвольную операцию; несколько готовых лежат в классе <code>Gatherers</code>.</p>
+<p><b>Gatherer</b> («собиратель») — своя станция на конвейере: можно описать любую промежуточную операцию, которой нет среди стандартных.</p>
+<p>До Java 24 набор промежуточных операций был закрытым: «разбить на пачки по 100» или «<b>скользящее окно</b>» (группы из N соседних элементов со сдвигом на один) приходилось делать вручную. Метод <code>gather</code> принимает произвольную операцию; несколько готовых лежат в классе <code>Gatherers</code>.</p>
 <pre><code class="java">Stream.of(1, 2, 3, 4, 5, 6, 7).gather(Gatherers.windowFixed(3)).toList();    // [[1, 2, 3], [4, 5, 6], [7]]
 Stream.of(1, 2, 3, 4).gather(Gatherers.windowSliding(2)).toList();           // [[1, 2], [2, 3], [3, 4]]
 Stream.of(1, 2, 3, 4).gather(Gatherers.scan(() -&gt; 0, Integer::sum)).toList(); // [1, 3, 6, 10] — нарастающий итог
 
 ids.stream().gather(Gatherers.mapConcurrent(8, client::fetch)).toList();     // не более 8 вызовов одновременно,
                                                                              // порядок сохранён, виртуальные потоки</code></pre>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+С Java 24 метод gather позволяет добавлять свои промежуточные операции; готовые — пачки фиксированного размера и скользящее окно в классе Gatherers.
+</div>
 
 <h2 id="lab"><span class="h-num">11.8</span>Интерактив: трассировка конвейера</h2>
 <div class="widget" id="stW">
@@ -397,11 +434,39 @@ toList(): 100000, порядок сохранён: 99999</code></pre></details>
 </div>
 <!-- hands-on:end -->
 
-<h2 id="quiz"><span class="h-num">11.10</span>Самопроверка</h2>
+<h2 id="gloss"><span class="h-num">11.10</span>Словарик</h2>
+<h3>Сокращения главы</h3>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Сокращение</th><th>Полностью</th><th>Перевод</th><th>Что это</th></tr>
+<tr><td>JPA</td><td>Jakarta Persistence API</td><td>API постоянного хранения Jakarta</td><td>работа с базой данных через объекты</td></tr>
+</table></div>
+<h3>Термины</h3>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Термин</th><th>Простыми словами</th></tr>
+<tr><td>Стрим (Stream)</td><td>Конвейер обработки элементов коллекции.</td></tr>
+<tr><td>Источник</td><td>Откуда стрим берёт элементы: коллекция, массив, файл.</td></tr>
+<tr><td>Промежуточная / терминальная операция</td><td>Станция конвейера / завершающая операция, запускающая работу.</td></tr>
+<tr><td>Ленивость</td><td>Вычисления выполняются, только когда нужен результат.</td></tr>
+<tr><td>Укорачивающая операция</td><td>Может остановить конвейер досрочно: limit, findFirst.</td></tr>
+<tr><td>Операция с состоянием</td><td>Должна увидеть все элементы: sorted, distinct.</td></tr>
+<tr><td>map / flatMap</td><td>Один элемент в один / в несколько.</td></tr>
+<tr><td>reduce, ассоциативность</td><td>Свёртка в одно значение; независимость от расстановки скобок.</td></tr>
+<tr><td>Нейтральный элемент</td><td>Значение, которое ничего не меняет: 0 для сложения.</td></tr>
+<tr><td>Коллектор</td><td>Рецепт сборки результата: в список, карту, группы.</td></tr>
+<tr><td>Параллельный стрим</td><td>Обработка частей источника в нескольких потоках.</td></tr>
+<tr><td>Пул потоков, ForkJoinPool</td><td>Набор заранее созданных потоков; общий пул Java.</td></tr>
+<tr><td>Блокирующий ввод-вывод</td><td>Поток стоит и ждёт ответа от сети или диска.</td></tr>
+<tr><td>Gatherer</td><td>Своя промежуточная операция (Java 24).</td></tr>
+</table></div>
+
+<h2 id="quiz"><span class="h-num">11.11</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="1"><p>Что выведет <code>Stream.of(1, 2, 3).peek(System.out::println);</code>?</p><ul><li>1 2 3</li><li>Ничего — нет терминальной операции</li><li>Ошибку компиляции</li><li>IllegalStateException</li></ul><div class="why">peek — промежуточная операция. Конвейер запускается только терминальной.</div></div>
 <div class="mcq" data-ok="2"><p>Стрим сохранён в переменную и использован дважды: <code>s.count(); s.toList();</code>. Что произойдёт?</p><ul><li>Оба вызова отработают</li><li>Второй вернёт пустой список</li><li>IllegalStateException: stream has already been operated upon or closed</li><li>Ошибка компиляции</li></ul><div class="why">Стрим одноразовый. Для повторного прохода создайте новый из источника или сохраните Supplier&lt;Stream&gt;.</div></div>
 <div class="mcq" data-ok="0"><p>Когда parallelStream() скорее навредит?</p><ul><li>Блокирующие вызовы (БД, HTTP) в операциях, мало элементов, LinkedList как источник, общий изменяемый объект в лямбдах</li><li>Суммирование большого массива чисел</li><li>Независимые CPU-вычисления над ArrayList из миллиона элементов</li><li>Никогда — он всегда быстрее</li></ul><div class="why">Параллельные стримы работают на общем ForkJoinPool.commonPool: блокировка в нём тормозит всё приложение. Выигрыш — только для больших объёмов чистых вычислений над хорошо делимым источником.</div></div>
+<div class="mcq" data-ok="2"><p>Что выполнится в коде <code>list.stream().filter(x -&gt; { System.out.println(x); return true; });</code>?</p><ul><li>Напечатаются все элементы</li><li>Напечатается первый элемент</li><li>Ничего: нет терминальной операции, стрим ленив</li><li>Ошибка компиляции</li></ul><div class="why">Без терминальной операции конвейер не запускается.</div></div>
+<div class="mcq" data-ok="0"><p>Какой стрим лучше для суммы миллиона чисел int?</p><ul><li>IntStream — без упаковки в Integer</li><li>Stream&lt;Integer&gt;</li><li>Stream&lt;Object&gt;</li><li>Без разницы</li></ul><div class="why">Примитивные стримы не создают объект на каждое число.</div></div>
+
 
 <div class="quiz">
 <details class="q"><summary>Чем промежуточные операции отличаются от терминальных?</summary><div class="a"><p>Промежуточные возвращают новый стрим и ничего не выполняют — только достраивают описание конвейера. Терминальная запускает обработку и возвращает результат (или выполняет побочный эффект), после чего стрим использовать нельзя.</p></div></details>
