@@ -17,29 +17,52 @@
 <header class="page-head">
   <div class="kicker">ТЕМА 16 · ПОД КАПОТОМ И ПРАКТИКА</div>
   <h1>Сеть в Linux: очереди, сокеты, контейнеры</h1>
-  <p class="lead">Между сетевой картой и вызовом <code>read()</code> в вашем приложении — ядро Linux с десятком очередей и таблиц. У каждой есть размер, и когда он исчерпан, пакеты молча отбрасываются. Большинство «необъяснимых» сетевых проблем бэкенда — это переполнение одной из них. Разберём путь пакета через ядро, очереди слушающего сокета, порты, дескрипторы и то, как из тех же кирпичей собрана сеть контейнера.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">accept queue</span><span class="tag">conntrack</span><span class="tag">epoll</span><span class="tag">namespaces</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <p class="lead">Между сетевой картой и вызовом <code>read()</code> в вашем приложении — <b>ядро</b> Linux (главная часть операционной системы, управляющая железом) с десятком очередей и таблиц. У каждой есть предельный размер, и когда он исчерпан, пакеты молча выбрасываются. Большинство «необъяснимых» сетевых проблем бэкенда — переполнение одной из них. Разберём путь пакета через ядро, очереди слушающего сокета, порты, дескрипторы и то, как из тех же деталей собрана сеть контейнера.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">с нуля</span><span class="tag">интерактив</span><span class="tag">словарик</span><span class="tag">тест</span></div>
 </header>
 
 <div class="callout info"><span class="c-title">Если совсем просто</span>
 Пакет проходит через ядро Linux, а у слушающего сокета две очереди: недоделанных и готовых соединений; если приложение не успевает их забирать, новые клиенты отваливаются. Порты и дескрипторы конечны, epoll позволяет одному потоку следить за тысячами сокетов, а сеть контейнера собрана из тех же деталей ядра. <a href="16-linux-networking-easy.html"><b>Вся глава простыми словами →</b></a></div>
 
+<div class="callout ok"><span class="c-title">Что нужно знать заранее</span>
+TCP-рукопожатие, окно и состояния из <a href="06-tcp-udp.html">главы 06</a>, NAT из <a href="04-nat-dhcp.html">главы 04</a>, event loop из <a href="12-java-networking.html#io">главы 12</a>. <b>Системный вызов</b> (syscall) — просьба программы к ядру ОС что-то сделать: <code>read()</code> — прочитать, <code>write()</code> — записать, <code>accept()</code> — принять соединение. Команды в этой главе — для Linux; многие требуют прав администратора (<code>sudo</code>). Сокращения — в <a href="#gloss">словарике</a>.</div>
+
 <nav class="toc" data-auto></nav>
 
+<!-- ============================================================ -->
 <h2 id="path"><span class="h-num">16.1</span>Путь входящего пакета через ядро</h2>
+<p>Пакет пришёл на сетевую карту. Что с ним происходит, прежде чем приложение его прочитает? По шагам, сверху вниз:</p>
 <div class="flow col">
-  <div class="node info"><b>Сетевая карта</b><small>кадр в кольцевой буфер (RX ring); переполнен — rx_dropped</small></div><span class="to">↓ прерывание → softirq (NAPI)</span>
-  <div class="node"><b>Драйвер → sk_buff</b><small>пакет оформлен в структуру ядра; очередь netdev_max_backlog</small></div><span class="to">↓</span>
-  <div class="node warn"><b>netfilter: PREROUTING</b><small>conntrack — учёт соединений; DNAT (проброс портов, Service в Kubernetes)</small></div><span class="to">↓ решение о маршруте: себе или переслать</span>
-  <div class="node warn"><b>netfilter: INPUT</b><small>правила файрвола для локальных получателей</small></div><span class="to">↓</span>
+  <div class="node info"><b>Сетевая карта (NIC)</b><small>кадр кладётся в кольцевой буфер приёма (RX ring); если он переполнен — счётчик rx_dropped</small></div><span class="to">↓ прерывание → softirq (NAPI)</span>
+  <div class="node"><b>Драйвер → sk_buff</b><small>пакет оформлен в структуру ядра; очередь с пределом netdev_max_backlog</small></div><span class="to">↓</span>
+  <div class="node warn"><b>netfilter: PREROUTING</b><small>conntrack — учёт соединений; DNAT (проброс портов, Service в Kubernetes)</small></div><span class="to">↓ решение о маршруте: пакет мне или переслать дальше</span>
+  <div class="node warn"><b>netfilter: INPUT</b><small>правила файрвола для пакетов, адресованных этому компьютеру</small></div><span class="to">↓</span>
   <div class="node acc"><b>TCP</b><small>поиск сокета по четвёрке адресов и портов; проверка номеров; ACK; данные — в буфер приёма</small></div><span class="to">↓</span>
-  <div class="node"><b>Буфер приёма сокета</b><small>SO_RCVBUF; заполнен — окно 0, отправитель останавливается</small></div><span class="to">↓ epoll будит поток</span>
-  <div class="node ok"><b>Приложение: read()</b><small>копирование из ядра в память процесса</small></div>
+  <div class="node"><b>Буфер приёма сокета</b><small>размер SO_RCVBUF; заполнен — окно 0, отправитель останавливается</small></div><span class="to">↓ epoll будит поток</span>
+  <div class="node ok"><b>Приложение: read()</b><small>копирование данных из памяти ядра в память процесса</small></div>
 </div>
-<p>Исходящий путь зеркален: <code>write()</code> копирует данные в буфер отправки и возвращается сразу; ядро само нарезает сегменты, ждёт окна, повторяет потери. Успешный <code>write()</code> не означает, что данные доставлены и даже что они покинули машину.</p>
+<p>Что значат слова на схеме:</p>
+<div class="kv">
+<dt>NIC, RX ring</dt><dd>NIC — Network Interface Card, «сетевая карта». RX (receive, «приём») ring — <b>кольцевой буфер</b>: область памяти, куда карта складывает пришедшие кадры по кругу. Не успевают забрать — новые кадры теряются</dd>
+<dt>Прерывание, softirq, NAPI</dt><dd><b>прерывание</b> — сигнал от железа процессору «у меня новые данные». Чтобы не дёргать процессор на каждый пакет, Linux обрабатывает их пачками в отложенной задаче ядра (<b>softirq</b>, «программное прерывание») по механизму <b>NAPI</b> (New API, «новый интерфейс» драйверов)</dd>
+<dt>sk_buff</dt><dd>socket buffer — «буфер сокета», структура ядра, в которой пакет живёт, пока идёт по стеку</dd>
+<dt>netfilter</dt><dd>набор точек перехвата пакетов в ядре, на которых работают файрвол и NAT (раздел <a href="#netfilter">16.6</a>)</dd>
+<dt>Четвёрка</dt><dd>адрес и порт отправителя + адрес и порт получателя — по ним ядро находит нужное соединение</dd>
+</div>
+<p>Исходящий путь зеркальный. <code>write()</code> лишь копирует данные в буфер отправки ядра и <b>сразу возвращается</b>; дальше ядро само режет данные на сегменты, ждёт окна, повторяет потерянное. Поэтому успешный <code>write()</code> не значит, что данные доставлены, и даже что они покинули машину.</p>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+Пакет идёт: сетевая карта → кольцевой буфер → ядро → netfilter (conntrack, NAT, файрвол) → TCP → буфер сокета → read(). На каждом шаге есть очередь с пределом.</div>
+
+<!-- ============================================================ -->
 <h2 id="queues"><span class="h-num">16.2</span>Две очереди слушающего сокета</h2>
-<p>Когда приложение вызывает <code>listen(fd, backlog)</code>, ядро заводит две очереди. Рукопожатие выполняет <b>ядро</b>, без участия приложения; приложение забирает уже готовые соединения вызовом <code>accept()</code>.</p>
+<p>Когда сервер вызывает <code>listen(fd, backlog)</code> («слушать», fd — номер сокета), ядро заводит для него две очереди (их мы видели в <a href="06-tcp-udp.html#handshake">главе 06</a>). Важно понять: <b>рукопожатие выполняет ядро</b>, без участия приложения. Приложение вызовом <code>accept()</code> забирает уже готовые соединения.</p>
+<ul>
+  <li><b>Очередь SYN</b> — полуоткрытые соединения: SYN пришёл, SYN-ACK отправлен, ждём ACK.</li>
+  <li><b>Accept-очередь</b> — соединения, где рукопожатие завершено, ждут, пока приложение их заберёт.</li>
+</ul>
+<p>Аналогия: гардероб. Ядро принимает пальто (делает рукопожатие) и вешает номерки на стойку (accept-очередь), а приложение — гардеробщик, который уносит пальто в зал. Если гардеробщик медлит, стойка заполняется, и новых посетителей не принимают.</p>
+
 <div class="widget" id="aqSim">
   <div class="widget-title">Симулятор: очередь SYN и accept-очередь</div>
   <p class="hint">Для наглядности accept-очередь вмещает 3 соединения, очередь SYN — 4.</p>
@@ -81,24 +104,36 @@
   reset(); render();
 })();
 </script>
+
 <div class="table-wrap"><table>
 <tr><th>Параметр</th><th>Что ограничивает</th><th>По умолчанию</th></tr>
-<tr><td><code>backlog</code> в <code>listen()</code></td><td>размер accept-очереди (берётся минимум с <code>somaxconn</code>)</td><td>Tomcat <code>acceptCount=100</code>, Netty <code>SO_BACKLOG</code></td></tr>
-<tr><td><code>net.core.somaxconn</code></td><td>потолок backlog для всех сокетов</td><td>4096 (в ядрах до 5.4 — 128)</td></tr>
-<tr><td><code>net.ipv4.tcp_max_syn_backlog</code></td><td>очередь полуоткрытых соединений</td><td>зависит от памяти</td></tr>
-<tr><td><code>net.ipv4.tcp_syncookies</code></td><td>защита от SYN flood без хранения состояния</td><td>1</td></tr>
+<tr><td><code>backlog</code> в <code>listen()</code></td><td>размер accept-очереди (берётся меньшее из него и <code>somaxconn</code>)</td><td>в Tomcat — настройка <code>acceptCount=100</code>, в Netty — опция <code>SO_BACKLOG</code></td></tr>
+<tr><td><code>net.core.somaxconn</code></td><td>потолок backlog для всех сокетов системы (somaxconn — «socket max connections»)</td><td>4096 (в ядрах до версии 5.4 — 128)</td></tr>
+<tr><td><code>net.ipv4.tcp_max_syn_backlog</code></td><td>размер очереди полуоткрытых соединений</td><td>зависит от памяти</td></tr>
+<tr><td><code>net.ipv4.tcp_syncookies</code></td><td>защита от SYN flood без хранения состояния (<a href="06-tcp-udp.html#handshake">глава 06</a>)</td><td>1 (включено)</td></tr>
 </table></div>
-<div class="callout bad"><span class="c-title">Как это выглядит в продакшене</span>
-Сервис под нагрузкой: потоки заняты, <code>accept()</code> вызывается редко, accept-очередь переполняется. Клиенты видят таймауты соединения и редкие RST, при этом сервис «жив» и CPU не загружен. Проверка: <code>nstat -az TcpExtListenOverflows TcpExtListenDrops</code> — растущие счётчики; <code>ss -ltn</code> — столбцы Recv-Q (сейчас в очереди) и Send-Q (её предел).
+<p>Строки вида <code>net.core.somaxconn</code> — это параметры ядра. Посмотреть: <code>sysctl net.core.somaxconn</code>; изменить до перезагрузки: <code>sudo sysctl -w net.core.somaxconn=8192</code>.</p>
+<div class="callout bad"><span class="c-title">Как это выглядит на продакшене</span>
+Сервис под нагрузкой: все потоки заняты, <code>accept()</code> вызывается редко, accept-очередь переполняется. Клиенты видят таймауты подключения и редкие RST, хотя сервис «жив» и процессор не загружен. Проверка: <code>nstat -az TcpExtListenOverflows TcpExtListenDrops</code> («переполнения» и «сбросы» слушающих сокетов) — если счётчики растут, это оно. А <code>ss -ltn</code> покажет у слушающих сокетов столбцы <b>Recv-Q</b> (сколько сейчас в accept-очереди) и <b>Send-Q</b> (её предел).
 </div>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+Рукопожатие делает ядро, приложение лишь забирает готовые соединения. Если не успевает — accept-очередь переполняется, и клиенты получают таймауты. Смотрите счётчик ListenOverflows.</div>
+
+<!-- ============================================================ -->
 <h2 id="buffers"><span class="h-num">16.3</span>Буферы сокета и обратное давление</h2>
 <div class="grid-2">
-  <div class="card"><h4>Медленный получатель</h4><p>Приложение не успевает читать → буфер приёма заполняется → TCP объявляет окно 0 → буфер отправки на другой стороне тоже заполняется → <code>write()</code> отправителя блокируется (или возвращает 0 в неблокирующем режиме). Обратное давление TCP работает само — если приложение его не обходит неограниченной внутренней очередью.</p></div>
-  <div class="card"><h4>Размеры</h4><p>Ядро автоматически подстраивает буферы в пределах <code>net.ipv4.tcp_rmem</code> / <code>tcp_wmem</code> (минимум, начальный, максимум). Явный <code>SO_RCVBUF</code> отключает автонастройку — задавайте его, только понимая зачем. Для быстрых длинных каналов максимум должен быть не меньше BDP (тема 07).</p></div>
+  <div class="card"><h4>Медленный получатель</h4><p>Приложение не успевает читать → буфер приёма заполняется → TCP объявляет окно 0 → на другой стороне заполняется буфер отправки → <code>write()</code> отправителя блокируется (в неблокирующем режиме — записывает 0 байт). <b>Обратное давление</b> (backpressure) TCP работает само собой (<a href="06-tcp-udp.html#flow">глава 06</a>) — если только приложение не обходит его, складывая всё в собственную неограниченную очередь в памяти. Тогда вместо замедления будет нехватка памяти.</p></div>
+  <div class="card"><h4>Размеры буферов</h4><p>Ядро само подстраивает буферы (<b>autotuning</b>) в пределах <code>net.ipv4.tcp_rmem</code> / <code>tcp_wmem</code> — три числа: минимум, начальный размер, максимум (r — read, приём; w — write, отправка). Явная установка <code>SO_RCVBUF</code> (socket option receive buffer) отключает автоподстройку — делайте это, только понимая зачем. Для быстрых дальних каналов максимум должен быть не меньше BDP (<a href="07-tcp-performance.html#loss">глава 07</a>).</p></div>
 </div>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+Медленный получатель через окно TCP сам тормозит отправителя. Не ломайте это неограниченными очередями в приложении и не трогайте размеры буферов без замеров.</div>
+
+<!-- ============================================================ -->
 <h2 id="ports"><span class="h-num">16.4</span>Порты и дескрипторы — конечные ресурсы</h2>
+<p>Каждое исходящее соединение занимает эфемерный порт (в Linux по умолчанию диапазон 32768–60999, около 28 000 портов), и после закрытия порт ещё 60 секунд держит TIME_WAIT (<a href="06-tcp-udp.html#close">глава 06</a>). Калькулятор показывает, сколько новых соединений в секунду можно открывать:</p>
+
 <div class="widget" id="epW">
   <div class="widget-title">Калькулятор: сколько исходящих соединений возможно</div>
   <div class="controls">
@@ -122,75 +157,149 @@
   ["epRange", "epRate", "epMode", "epReuse"].forEach(function (i) { $(i).addEventListener("input", run); $(i).addEventListener("change", run); }); run();
 })();
 </script>
-<p>Ограничение действует на <b>четвёрку</b> (адрес источника, порт источника, адрес назначения, порт назначения): к разным серверам один и тот же локальный порт использовать можно. Поэтому порты заканчиваются именно при множестве соединений к <i>одному</i> адресу — к базе, к прокси, к NAT-шлюзу.</p>
+
+<p>Важная деталь: ограничение действует на <b>четвёрку</b> (адрес и порт источника, адрес и порт назначения). К разным серверам один и тот же локальный порт можно использовать одновременно. Поэтому порты кончаются именно при множестве соединений к <i>одному</i> адресу — к базе данных, к прокси, к NAT-шлюзу.</p>
 <div class="callout warn"><span class="c-title">Too many open files</span>
-Каждый сокет — файловый дескриптор. Лимит процесса (<code>ulimit -n</code>, часто 1024 по умолчанию; в systemd — <code>LimitNOFILE</code>) исчерпывается при утечке соединений или просто при большом числе клиентов. Симптом: <code>accept()</code> падает с EMFILE, сервис перестаёт принимать соединения, а заодно не может открыть ни файл лога, ни соединение с БД. Проверка: <code>ls /proc/&lt;pid&gt;/fd | wc -l</code>, <code>cat /proc/&lt;pid&gt;/limits</code>.
+Каждый сокет — это <b>файловый дескриптор</b> (номер, которым ОС учитывает открытые процессом файлы и сокеты). У процесса есть лимит: посмотреть — <code>ulimit -n</code>, часто по умолчанию всего 1024; для служб, запущенных через <b>systemd</b> (менеджер служб Linux), он задаётся параметром <code>LimitNOFILE</code>. Лимит кончается при утечке соединений или просто при большом числе клиентов. Симптом: <code>accept()</code> падает с ошибкой <b>EMFILE</b> («слишком много файлов у процесса»), сервис перестаёт принимать соединения, а заодно не может открыть ни файл лога, ни соединение с базой. Проверка: <code>ls /proc/&lt;pid&gt;/fd | wc -l</code> — сколько открыто сейчас (<code>/proc</code> — виртуальная папка, через которую ядро показывает сведения о процессах; pid — номер процесса), <code>cat /proc/&lt;pid&gt;/limits</code> — какие лимиты.
 </div>
 
-<h2 id="epoll"><span class="h-num">16.5</span>epoll: как один поток обслуживает тысячи сокетов</h2>
-<pre data-title="Цикл событий — основа Netty, NIO-коннектора Tomcat, nginx, Redis"><code class="txt">epfd = epoll_create1(0)
-epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, EPOLLIN)        # «сообщи, когда появятся новые соединения»
+<div class="callout ok"><span class="c-title">Главное</span>
+Эфемерные порты кончаются при множестве коротких соединений к одному адресу. Дескрипторы кончаются при утечках или больших нагрузках. Оба ресурса конечны и требуют присмотра.</div>
 
+<!-- ============================================================ -->
+<h2 id="epoll"><span class="h-num">16.5</span>epoll: как один поток обслуживает тысячи сокетов</h2>
+<p><b>epoll</b> («event poll» — «опрос событий») — механизм ядра Linux, на котором построены event loop'ы (<a href="12-java-networking.html#io">глава 12</a>): Netty, NIO-коннектор Tomcat, веб-сервер nginx, хранилище Redis. Программа регистрирует сокеты в epoll и потом спрашивает: «какие из них готовы?». Вот его цикл в упрощённом виде (это псевдокод, а не настоящий язык):</p>
+<pre data-title="Цикл событий — основа Netty, NIO-коннектора Tomcat, nginx, Redis"><code class="txt">epfd = epoll_create1(0)                                   # создать объект epoll
+epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, EPOLLIN)        # «сообщи, когда появятся новые соединения»
 loop:
     n = epoll_wait(epfd, events, MAX, timeout)            # спим, пока ни один сокет не готов
     for ev in events[0..n]:
         if ev.fd == listen_fd:
             conn = accept(listen_fd)                      # не блокируется: соединение уже в очереди
-            epoll_ctl(epfd, EPOLL_CTL_ADD, conn, EPOLLIN)
+            epoll_ctl(epfd, EPOLL_CTL_ADD, conn, EPOLLIN) # следить и за ним
         else:
             data = read(ev.fd)                            # не блокируется: данные уже в буфере приёма
             handle(data)                                  # обработчик не должен блокировать поток!</code></pre>
-<p>Ядро ведёт список готовых сокетов и возвращает только их — стоимость не зависит от общего числа соединений (в отличие от старых <code>select</code>/<code>poll</code>, перебиравших все). В Java это <code>Selector</code> из NIO; виртуальные потоки используют тот же механизм скрытно: «блокирующий» <code>read()</code> регистрирует сокет в поллере и размонтирует поток.</p>
+<p>Ядро само ведёт список готовых сокетов и возвращает только их, поэтому стоимость не зависит от общего числа соединений. Старые механизмы <code>select</code> и <code>poll</code> каждый раз перебирали все сокеты — при 10 000 соединений это медленно. В Java epoll скрыт за классом <code>Selector</code> из NIO. Виртуальные потоки используют тот же механизм незаметно: «блокирующий» <code>read()</code> на самом деле регистрирует сокет в epoll и <b>снимает</b> виртуальный поток с платформенного, пока данных нет.</p>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+epoll сообщает, какие сокеты готовы, и один поток обслуживает тысячи соединений. На нём держатся Netty, nginx, Redis и виртуальные потоки Java.</div>
+
+<!-- ============================================================ -->
 <h2 id="netfilter"><span class="h-num">16.6</span>netfilter и conntrack</h2>
-<p><b>netfilter</b> — точки перехвата в ядре (PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING), на которые вешаются правила iptables/nftables: фильтрация, NAT, маркировка. <b>conntrack</b> — таблица отслеживаемых соединений: без неё невозможны NAT и правила «разрешить ответы на исходящие».</p>
+<p><b>netfilter</b> — точки перехвата пакетов в ядре: <b>PREROUTING</b> («до маршрутизации», сразу после приёма), <b>INPUT</b> («вход», для пакетов этому компьютеру), <b>FORWARD</b> («пересылка» транзитных пакетов), <b>OUTPUT</b> («выход», пакеты от этого компьютера), <b>POSTROUTING</b> («после маршрутизации», перед отправкой). На них вешают правила утилитами <b>iptables</b> или её преемницей <b>nftables</b>: фильтрация, NAT, пометки.</p>
+<p><b>conntrack</b> (connection tracking, «отслеживание соединений») — таблица всех соединений, проходящих через компьютер. Без неё невозможны NAT (надо помнить, куда вернуть ответ) и правила вида «разрешить ответы на исходящие».</p>
 <div class="grid-2">
-  <div class="card"><h4>Таблица conntrack конечна</h4><p>Сообщение в <code>dmesg</code>: <code>nf_conntrack: table full, dropping packet</code> — новые соединения отбрасываются на узле (часто на узле Kubernetes или NAT-шлюзе), при том что сервисы исправны. Проверка: <code>conntrack -S</code>, <code>sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max</code>.</p></div>
-  <div class="card"><h4>Гонка DNAT в Kubernetes</h4><p>Два одновременных UDP-пакета (запросы A и AAAA к DNS) с одного сокета могут конфликтовать при вставке в conntrack — один теряется, и запрос к DNS висит 5 с. Известная причина «случайных пятисекундных задержек» в кластерах; лечится NodeLocal DNSCache или опцией <code>single-request-reopen</code>.</p></div>
+  <div class="card"><h4>Таблица conntrack конечна</h4><p>Сообщение в журнале ядра (команда <code>dmesg</code>): <code>nf_conntrack: table full, dropping packet</code> («таблица полна, пакет выброшен»). Новые соединения через этот компьютер отбрасываются — часто это узел Kubernetes или NAT-шлюз, — хотя сами сервисы исправны. Проверка: <code>conntrack -S</code>, <code>sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max</code> (сколько записей сейчас и сколько максимум).</p></div>
+  <div class="card"><h4>Гонка DNAT в Kubernetes</h4><p>Программа одновременно шлёт с одного сокета два UDP-запроса к DNS (A и AAAA). При вставке в conntrack они могут столкнуться, и один пакет теряется — запрос к DNS висит 5 секунд до повтора. Это известная причина «случайных пятисекундных задержек» в кластерах. Лечится кэшем NodeLocal DNSCache или опцией резолвера <code>single-request-reopen</code> (слать A и AAAA с разных сокетов).</p></div>
 </div>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+netfilter — точки, где ядро фильтрует и подменяет пакеты; conntrack — таблица соединений для NAT и файрвола. Таблица конечна, и её переполнение молча роняет новые соединения.</div>
+
+<!-- ============================================================ -->
 <h2 id="containers"><span class="h-num">16.7</span>Сеть контейнера — из тех же деталей</h2>
+<p>Docker и Kubernetes не изобретают свою сеть — они собирают её из стандартных возможностей ядра Linux:</p>
 <div class="flow">
   <div class="node acc"><b>Контейнер</b><small>свой network namespace: eth0 172.17.0.2, свои маршруты, свой lo</small></div><span class="to">⇄ veth-пара ⇄</span>
   <div class="node"><b>Мост docker0</b><small>виртуальный коммутатор, 172.17.0.1</small></div><span class="to">→ маршрутизация + MASQUERADE →</span>
   <div class="node info"><b>eth0 хоста</b><small>192.168.1.50</small></div>
 </div>
 <ul>
-  <li><b>Network namespace</b> — отдельный экземпляр сетевого стека: интерфейсы, таблица маршрутов, правила netfilter, порты. Поэтому два контейнера могут слушать порт 8080 одновременно.</li>
-  <li><b>veth-пара</b> — виртуальный кабель: один конец в контейнере (<code>eth0</code>), другой на хосте, воткнут в мост.</li>
-  <li><b>Исходящий трафик</b> — SNAT (MASQUERADE): адрес контейнера заменяется адресом хоста.</li>
-  <li><b>Публикация порта</b> <code>-p 8080:80</code> — правило DNAT в PREROUTING: пакеты на порт 8080 хоста переписываются на <code>172.17.0.2:80</code>.</li>
-  <li><b>Под Kubernetes</b> — несколько контейнеров в одном network namespace: они делят IP и видят друг друга через <code>localhost</code>. Связь между подами разных узлов обеспечивает CNI-плагин (overlay или маршрутизация), а Service — правила DNAT на каждом узле (тема 13).</li>
+  <li><b>Network namespace</b> («сетевое пространство имён») — отдельный экземпляр всего сетевого стека: свои интерфейсы, таблица маршрутов, правила netfilter, порты, свой loopback <code>lo</code>. Поэтому два контейнера могут одновременно слушать порт 8080.</li>
+  <li><b>veth-пара</b> (virtual Ethernet, «виртуальный Ethernet») — виртуальный кабель с двумя концами: один в контейнере (там он называется <code>eth0</code>), другой на хосте, воткнут в мост.</li>
+  <li><b>Мост</b> (bridge) <code>docker0</code> — виртуальный коммутатор внутри хоста, соединяющий все контейнеры.</li>
+  <li><b>Исходящий трафик</b> — <b>SNAT</b> (Source NAT, подмена адреса источника), в iptables это правило <b>MASQUERADE</b> («маскарад»): адрес контейнера заменяется адресом хоста, как дома у роутера (<a href="04-nat-dhcp.html#nat">глава 04</a>).</li>
+  <li><b>Публикация порта</b> <code>docker run -p 8080:80</code> — правило DNAT в PREROUTING: пакеты на порт 8080 хоста переписываются на <code>172.17.0.2:80</code>.</li>
+  <li><b>Под Kubernetes</b> — несколько контейнеров в <i>одном</i> network namespace: у них общий IP, и друг до друга они достают через <code>localhost</code>. Связь подов на разных узлах обеспечивает CNI-плагин (overlay или маршрутизация), а Service — правила DNAT на каждом узле (<a href="13-infrastructure.html#k8s">глава 13</a>).</li>
 </ul>
-<pre data-title="Посмотреть своими глазами"><code class="txt">ip netns list;  lsns -t net                     # пространства имён
+<pre data-title="Посмотреть своими глазами"><code class="txt">ip netns list;  lsns -t net                     # список сетевых пространств имён
 nsenter -t &lt;pid контейнера&gt; -n ip addr          # выполнить команду в сети контейнера, даже если в образе нет утилит
 ip link show type veth;  bridge link            # veth-пары и порты моста
-iptables -t nat -L -n -v | head -40             # правила DNAT/MASQUERADE Docker и kube-proxy</code></pre>
+iptables -t nat -L -n -v | head -40             # правила DNAT и MASQUERADE от Docker и kube-proxy</code></pre>
+<p><code>nsenter</code> («войти в namespace») с ключом <code>-n</code> запускает команду внутри сетевого пространства процесса — удобно, когда в образе контейнера нет никаких сетевых утилит.</p>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+Контейнер — отдельный сетевой стек (namespace), соединённый с хостом виртуальным кабелем (veth) через виртуальный коммутатор (мост). Наружу — через SNAT, внутрь по опубликованному порту — через DNAT.</div>
+
+<!-- ============================================================ -->
 <h2 id="tools"><span class="h-num">16.8</span>Шпаргалка наблюдения</h2>
 <div class="table-wrap"><table>
 <tr><th>Вопрос</th><th>Команда</th></tr>
-<tr><td>Кто слушает порт и какова очередь</td><td><code>ss -ltnp</code></td></tr>
+<tr><td>Кто слушает порт и сколько в очереди</td><td><code>ss -ltnp</code></td></tr>
 <tr><td>Сколько соединений в каких состояниях</td><td><code>ss -s</code>; <code>ss -tan state time-wait | wc -l</code></td></tr>
-<tr><td>Переполнения очередей, ретрансляции</td><td><code>nstat -az | grep -E "ListenOverflows|ListenDrops|RetransSegs|TCPTimeouts"</code></td></tr>
-<tr><td>Потери на сетевой карте</td><td><code>ip -s link show eth0</code>; <code>ethtool -S eth0 | grep -i drop</code></td></tr>
-<tr><td>Буферы и окно конкретного соединения</td><td><code>ss -tmi dst 10.2.3.40</code> (cwnd, rtt, retrans)</td></tr>
+<tr><td>Переполнения очередей, повторные передачи</td><td><code>nstat -az | grep -E "ListenOverflows|ListenDrops|RetransSegs|TCPTimeouts"</code></td></tr>
+<tr><td>Потери на сетевой карте</td><td><code>ip -s link show eth0</code>; <code>ethtool -S eth0 | grep -i drop</code> (ethtool — утилита настройки сетевых карт)</td></tr>
+<tr><td>Буферы и окно конкретного соединения</td><td><code>ss -tmi dst 10.2.3.40</code> (cwnd, rtt, retrans; <code>-m</code> — память буферов)</td></tr>
 <tr><td>Открытые дескрипторы процесса</td><td><code>ls /proc/&lt;pid&gt;/fd | wc -l</code></td></tr>
 <tr><td>Таблица conntrack</td><td><code>conntrack -S</code>; <code>conntrack -L | wc -l</code></td></tr>
 </table></div>
 
-<h2 id="quiz"><span class="h-num">16.9</span>Самопроверка</h2>
+<!-- ============================================================ -->
+<h2 id="gloss"><span class="h-num">16.9</span>Словарик</h2>
+<h3>Сокращения главы</h3>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Сокращение</th><th>Полностью</th><th>Перевод</th><th>Что это</th></tr>
+<tr><td>conntrack</td><td>connection tracking</td><td>отслеживание соединений</td><td>таблица соединений в ядре</td></tr>
+<tr><td>DNAT / SNAT</td><td>Destination / Source NAT</td><td>подмена адреса назначения / источника</td><td>проброс портов / выход наружу</td></tr>
+<tr><td>EMFILE</td><td>Error: too many open files (Many FILEs)</td><td>ошибка «слишком много файлов»</td><td>исчерпан лимит дескрипторов процесса</td></tr>
+<tr><td>epoll</td><td>event poll</td><td>опрос событий</td><td>механизм «какие сокеты готовы» в Linux</td></tr>
+<tr><td>fd</td><td>file descriptor</td><td>файловый дескриптор</td><td>номер открытого файла или сокета</td></tr>
+<tr><td>NAPI</td><td>New API</td><td>новый программный интерфейс</td><td>пакетная обработка приёма в драйверах</td></tr>
+<tr><td>NIC</td><td>Network Interface Card</td><td>сетевая карта</td><td>устройство подключения к сети</td></tr>
+<tr><td>pid</td><td>process identifier</td><td>идентификатор процесса</td><td>номер процесса</td></tr>
+<tr><td>RX / TX</td><td>receive / transmit</td><td>приём / передача</td><td>направления трафика</td></tr>
+<tr><td>sk_buff</td><td>socket buffer</td><td>буфер сокета</td><td>структура пакета в ядре</td></tr>
+<tr><td>SO_RCVBUF</td><td>socket option receive buffer</td><td>опция сокета «буфер приёма»</td><td>размер буфера приёма</td></tr>
+<tr><td>somaxconn</td><td>socket max connections</td><td>максимум соединений сокета</td><td>потолок accept-очереди</td></tr>
+<tr><td>veth</td><td>virtual Ethernet</td><td>виртуальный Ethernet</td><td>виртуальный кабель между namespace</td></tr>
+</table></div>
+<h3>Термины</h3>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Термин</th><th>Простыми словами</th></tr>
+<tr><td>Ядро (kernel)</td><td>Главная часть ОС, управляющая железом, памятью и сетью.</td></tr>
+<tr><td>Системный вызов</td><td>Просьба программы к ядру: read, write, accept…</td></tr>
+<tr><td>Кольцевой буфер</td><td>Память сетевой карты, заполняемая по кругу.</td></tr>
+<tr><td>Прерывание, softirq</td><td>Сигнал железа процессору; отложенная обработка в ядре.</td></tr>
+<tr><td>Очередь SYN / accept-очередь</td><td>Полуоткрытые / готовые соединения слушающего сокета.</td></tr>
+<tr><td>backlog</td><td>Размер accept-очереди.</td></tr>
+<tr><td>sysctl</td><td>Утилита просмотра и изменения параметров ядра.</td></tr>
+<tr><td>nstat</td><td>Утилита просмотра сетевых счётчиков ядра.</td></tr>
+<tr><td>Recv-Q / Send-Q</td><td>У слушающего сокета: сейчас в accept-очереди / её предел.</td></tr>
+<tr><td>Autotuning</td><td>Автоподстройка размеров буферов сокетов.</td></tr>
+<tr><td>Обратное давление</td><td>Медленный получатель тормозит отправителя.</td></tr>
+<tr><td>systemd, LimitNOFILE</td><td>Менеджер служб Linux; его лимит открытых файлов для службы.</td></tr>
+<tr><td>/proc</td><td>Виртуальная папка со сведениями о процессах.</td></tr>
+<tr><td>select / poll</td><td>Старые механизмы ожидания событий, перебирающие все сокеты.</td></tr>
+<tr><td>netfilter</td><td>Точки перехвата пакетов в ядре.</td></tr>
+<tr><td>PREROUTING, INPUT, FORWARD, OUTPUT, POSTROUTING</td><td>Этапы пути пакета, где срабатывают правила.</td></tr>
+<tr><td>iptables / nftables</td><td>Утилиты правил файрвола и NAT.</td></tr>
+<tr><td>dmesg</td><td>Журнал сообщений ядра.</td></tr>
+<tr><td>Network namespace</td><td>Отдельный сетевой стек для контейнера.</td></tr>
+<tr><td>Мост (bridge)</td><td>Виртуальный коммутатор внутри хоста.</td></tr>
+<tr><td>MASQUERADE</td><td>Правило SNAT с адресом хоста.</td></tr>
+<tr><td>nsenter</td><td>Запуск команды внутри namespace процесса.</td></tr>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="quiz"><span class="h-num">16.10</span>Самопроверка</h2>
 <div class="mcq-score"></div>
 <div class="mcq" data-ok="2"><p>Кто выполняет TCP-рукопожатие для входящего соединения?</p><ul><li>Приложение в вызове accept()</li><li>Сетевая карта</li><li>Ядро; приложение получает из accept-очереди уже установленное соединение</li><li>Балансировщик</li></ul><div class="why">Поэтому клиент может «подключиться» к зависшему приложению: рукопожатие пройдёт, а ответа не будет.</div></div>
 <div class="mcq" data-ok="1"><p>Сервис падает с «Cannot assign requested address» при вызовах к одному внешнему API.</p><ul><li>Закончилась память</li><li>Исчерпаны эфемерные порты: слишком много коротких соединений к одному адресу, порты висят в TIME_WAIT</li><li>Неверный DNS</li><li>Закрыт порт на файрволе</li></ul><div class="why">Нужен пул соединений с keep-alive.</div></div>
 <div class="mcq" data-ok="0"><p>Почему два контейнера на одном хосте могут одновременно слушать порт 80?</p><ul><li>У каждого свой network namespace — отдельный сетевой стек со своими портами</li><li>Docker меняет номер порта в приложении</li><li>Порт 80 особый</li><li>Не могут</li></ul><div class="why">Конфликт возникает только при публикации на один и тот же порт хоста.</div></div>
-<div class="mcq" data-ok="3"><p>В dmesg: «nf_conntrack: table full, dropping packet». Что происходит?</p><ul><li>Переполнен диск</li><li>Сетевая карта неисправна</li><li>Закончились дескрипторы</li><li>Таблица отслеживания соединений netfilter заполнена: новые соединения через этот узел отбрасываются</li></ul><div class="why">Увеличить nf_conntrack_max, сократить таймауты, уменьшить число коротких соединений.</div></div>
+<div class="mcq" data-ok="3"><p>В dmesg: «nf_conntrack: table full, dropping packet». Что происходит?</p><ul><li>Переполнен диск</li><li>Сетевая карта неисправна</li><li>Закончились дескрипторы</li><li>Таблица отслеживания соединений заполнена: новые соединения через этот узел выбрасываются</li></ul><div class="why">Увеличить nf_conntrack_max, сократить таймауты, уменьшить число коротких соединений.</div></div>
+<div class="mcq" data-ok="1"><p>write() вернул успех. Что это гарантирует?</p><ul><li>Данные доставлены получателю</li><li>Только то, что данные скопированы в буфер отправки ядра</li><li>Получатель прочитал данные</li><li>Данные покинули сетевую карту</li></ul><div class="why">Дальше ядро отправляет сегменты само. О доставке говорит только ответ прикладного протокола.</div></div>
+<div class="mcq" data-ok="2"><p>Почему epoll эффективнее select при 10 000 соединений?</p><ul><li>Он шифрует данные</li><li>Он использует UDP</li><li>Ядро само ведёт список готовых сокетов и возвращает только их, не перебирая все</li><li>Он открывает меньше соединений</li></ul><div class="why">Стоимость epoll зависит от числа готовых, а не всех сокетов.</div></div>
 
+<h3>Вопросы для разговора (с собеседований)</h3>
 <div class="quiz">
-<details class="q"><summary>Что происходит с пакетом от сетевой карты до read() в приложении?</summary><div class="a"><p>Карта → кольцевой буфер → softirq/NAPI → sk_buff → netfilter PREROUTING (conntrack, DNAT) → маршрутизация → INPUT → TCP: поиск сокета, проверка, ACK → буфер приёма → пробуждение через epoll → read() копирует данные в процесс. На каждом этапе есть очередь с пределом.</p></div></details>
-<details class="q"><summary>Чем отличаются очередь SYN и accept-очередь и что бывает при переполнении?</summary><div class="a"><p>В первой — соединения, получившие SYN-ACK и ждущие ACK; при переполнении SYN отбрасывается или включаются SYN cookies. Во второй — установленные соединения, ждущие accept(); при переполнении финальный ACK игнорируется, клиент видит задержки и таймауты. Размер второй задаёт backlog и somaxconn.</p></div></details>
+<details class="q"><summary>Что происходит с пакетом от сетевой карты до read() в приложении?</summary><div class="a"><p>Карта → кольцевой буфер → softirq/NAPI → sk_buff → netfilter PREROUTING (conntrack, DNAT) → решение о маршруте → INPUT → TCP: поиск сокета, проверка, ACK → буфер приёма → пробуждение через epoll → read() копирует данные в процесс. На каждом этапе — очередь с пределом.</p></div></details>
+<details class="q"><summary>Чем отличаются очередь SYN и accept-очередь и что бывает при переполнении?</summary><div class="a"><p>В первой — соединения, получившие SYN-ACK и ждущие ACK; при переполнении SYN выбрасывается или включаются SYN cookies. Во второй — установленные соединения, ждущие accept(); при переполнении последний ACK клиента игнорируется, клиент видит задержки и таймауты. Размер второй задают backlog и somaxconn.</p></div></details>
 <details class="q"><summary>Как устроена сеть Docker-контейнера?</summary><div class="a"><p>Отдельный network namespace; veth-пара соединяет его с мостом docker0 на хосте; исходящий трафик маскируется (SNAT) адресом хоста; публикация порта — правило DNAT. Под Kubernetes — общий namespace для контейнеров пода плюс CNI для связи между узлами.</p></div></details>
 </div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Вы знаете, где искать проблему. В <a href="17-packet-analysis.html">главе 17</a> научимся читать записи трафика строка за строкой и узнавать типичные аварии по картине пакетов.</div>
 
 </div></main>
 </div>
