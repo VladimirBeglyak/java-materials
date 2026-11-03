@@ -17,16 +17,23 @@
 <header class="page-head">
   <div class="kicker">ТЕМА 08 · ПРИКЛАДНОЙ УРОВЕНЬ · РОАДМАП j8</div>
   <h1>DNS</h1>
-  <p class="lead">Распределённая иерархическая база данных, которая переводит имена в адреса — и одна из самых частых причин аварий («it's always DNS»). Разберём, как идёт разрешение, что кэшируется и где, и как DNS ведёт себя в JVM и Kubernetes.</p>
-  <div class="meta"><span class="tag">~3 часа</span><span class="tag">RFC 1034/1035</span><span class="tag">интерактив</span><span class="tag">тест</span></div>
+  <p class="lead"><b>DNS</b> (Domain Name System — «система доменных имён») переводит имена вроде google.com в IP-адреса. Это огромная распределённая база данных, разложенная по тысячам серверов, и одна из самых частых причин аварий: у инженеров есть поговорка «it's always DNS» — «это всегда DNS». Разберём, как ищется адрес, что и где запоминается и как DNS ведёт себя в Java и Kubernetes.</p>
+  <div class="meta"><span class="tag">~3 часа</span><span class="tag">с нуля</span><span class="tag">интерактив</span><span class="tag">словарик</span><span class="tag">тест</span></div>
 </header>
 
 <div class="callout info"><span class="c-title">Если совсем просто</span>
 DNS — телефонная справочная Интернета: по имени сайта узнаёт его IP-адрес, спрашивая по цепочке корень → зону .ru → сервер домена. Ответы кэшируются на время TTL, поэтому изменения в DNS вступают в силу не мгновенно. <a href="08-dns-easy.html"><b>Вся глава простыми словами →</b></a></div>
 
+<div class="callout ok"><span class="c-title">Что нужно знать заранее</span>
+IP-адреса из <a href="03-ip.html">главы 03</a>, UDP и TCP из <a href="06-tcp-udp.html">главы 06</a>. <b>Кэш</b> — сохранённая копия ответа, чтобы не спрашивать заново. <b>Домен</b> — имя в Интернете; оно читается справа налево: в <code>api.shop.example.com</code> «com» — домен верхнего уровня, «example» — домен второго уровня, «shop» и «api» — поддомены. Сокращения — в <a href="#gloss">словарике</a>.</div>
+
 <nav class="toc" data-auto></nav>
 
+<!-- ============================================================ -->
 <h2 id="resolve"><span class="h-num">8.1</span>Как разрешается имя</h2>
+<p><b>Задача.</b> Пользователь ввёл api.example.com, а для соединения нужен IP-адрес. Хранить все имена мира в одном месте невозможно: их сотни миллионов, и они постоянно меняются.</p>
+<p><b>Решение</b> — иерархия, как в библиотечном каталоге. Никто не знает всего, но каждый знает, кого спросить дальше. Процесс поиска адреса по имени называется <b>разрешением имени</b> (resolution), а программа, которая это делает, — <b>резолвером</b>.</p>
+
 <figure class="diagram">
 <svg viewBox="0 0 800 330" role="img" aria-label="Рекурсивное и итеративное разрешение">
   <defs><marker id="g1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="ar"/></marker>
@@ -49,70 +56,131 @@ DNS — телефонная справочная Интернета: по им�
   <text x="20" y="288" font-size="12.5" class="muted">поэтому шаги 2–5 почти всегда пропускаются.</text>
 </svg>
 </figure>
-<p>Кэши по пути: браузер → ОС (<code>systemd-resolved</code>, кэш Windows) → <b>JVM</b> → рекурсивный резолвер → авторитативный. Запрос по UDP 53; если ответ не помещается или установлен флаг усечения — повтор по TCP. EDNS(0) позволяет UDP-ответы больше 512 байт.</p>
 
+<p>Участники по порядку:</p>
+<div class="kv">
+<dt>Stub-резолвер</dt><dd>«заглушка» внутри операционной системы. Сам ничего не ищет: передаёт вопрос рекурсивному резолверу и ждёт готовый ответ</dd>
+<dt>Рекурсивный резолвер</dt><dd>делает всю работу: обходит иерархию и запоминает ответы. Обычно это сервер провайдера или публичный: 1.1.1.1 (Cloudflare), 8.8.8.8 (Google). «Рекурсивный» — потому что доводит поиск до конца сам</dd>
+<dt>Корневой сервер «.»</dt><dd>вершина иерархии. Знает только, какие серверы отвечают за домены верхнего уровня. Имён корневых серверов 13 (от a.root-servers.net до m.root-servers.net), но каждое — anycast из сотен точек мира (<a href="05-internet.html#anycast">глава 05</a>)</dd>
+<dt>TLD-сервер</dt><dd>TLD — Top-Level Domain, «домен верхнего уровня»: .com, .ru, .by. Его сервер держит <b>регистратура</b> (registry) — организация, ведущая зону, — и знает, какие серверы отвечают за каждый домен второго уровня. Туда их вносит <b>регистратор</b> (registrar) — компания, у которой вы купили домен</dd>
+<dt>Авторитативный сервер</dt><dd>authoritative — «полномочный»: хранит настоящие записи конкретного домена и отвечает за него окончательно. Например, ns1.example.com</dd>
+</div>
+<p>Каждый ответ запоминается на своё время TTL. Адреса серверов зоны .com помнятся днями, поэтому шаги к корню и к .com почти всегда пропускаются.</p>
+<p>Кэшей по пути несколько: браузер → ОС (в Linux служба <code>systemd-resolved</code>, в Windows — свой кэш) → <b>JVM</b> (Java Virtual Machine, «виртуальная машина Java», раздел <a href="#jvm">8.6</a>) → рекурсивный резолвер → авторитативный сервер. Запросы идут по UDP на порт 53. Если ответ не поместился и сервер поставил флаг усечения (truncated, «обрезан»), запрос повторяется по TCP. Расширение <b>EDNS(0)</b> (Extension Mechanisms for DNS — «механизмы расширения DNS») позволяет UDP-ответы больше старого предела в 512 байт.</p>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+ОС спрашивает рекурсивный резолвер, а тот по цепочке: корень → сервер зоны (.com) → авторитативный сервер домена. Каждый ответ кэшируется на время TTL.</div>
+
+<!-- ============================================================ -->
 <h2 id="records"><span class="h-num">8.2</span>Типы записей</h2>
+<p>DNS хранит не только адреса. Каждая запись имеет <b>тип</b>, который говорит, что в ней лежит:</p>
 <div class="table-wrap"><table>
-<tr><th>Тип</th><th>Значение</th><th>Заметки</th></tr>
-<tr><td><b>A / AAAA</b></td><td>IPv4 / IPv6 адрес</td><td>несколько записей → клиент выбирает (round-robin)</td></tr>
-<tr><td><b>CNAME</b></td><td>псевдоним другого имени</td><td>нельзя на корне домена (<code>example.com</code>) и вместе с другими записями — для корня провайдеры дают ALIAS/ANAME</td></tr>
-<tr><td><b>NS</b></td><td>авторитативные серверы зоны</td><td>делегирование поддомена другому провайдеру</td></tr>
-<tr><td><b>SOA</b></td><td>параметры зоны</td><td>в т.ч. TTL отрицательного кэширования</td></tr>
-<tr><td><b>MX</b></td><td>почтовые серверы с приоритетом</td><td></td></tr>
-<tr><td><b>TXT</b></td><td>произвольный текст</td><td>SPF, DKIM, DMARC, подтверждение владения доменом</td></tr>
-<tr><td><b>SRV</b></td><td>хост и порт сервиса</td><td>Kerberos, SIP, некоторые сервис-дискавери (Consul)</td></tr>
-<tr><td><b>PTR</b></td><td>обратная зона: IP → имя</td><td>почтовые серверы проверяют PTR</td></tr>
-<tr><td><b>CAA</b></td><td>какие CA вправе выпускать сертификаты</td><td>защита от ошибочного выпуска</td></tr>
-<tr><td><b>HTTPS / SVCB</b></td><td>параметры подключения: ALPN (h3), ECH, адреса</td><td>браузер сразу узнаёт, что можно HTTP/3</td></tr>
+<tr><th>Тип</th><th>Что хранит</th><th>Заметки</th></tr>
+<tr><td><b>A / AAAA</b></td><td>адрес IPv4 / IPv6 (A — Address; AAAA — «четыре A», потому что адрес IPv6 в 4 раза длиннее)</td><td>записей может быть несколько — клиенты распределятся между адресами (<b>round-robin</b> — «по кругу»)</td></tr>
+<tr><td><b>CNAME</b></td><td>Canonical Name, «каноническое имя»: псевдоним — «это имя на самом деле называется вот так»</td><td>нельзя ставить на корень домена (<code>example.com</code>) и вместе с другими записями того же имени. Для корня провайдеры придумали нестандартные записи <b>ALIAS</b> / <b>ANAME</b> («псевдоним»)</td></tr>
+<tr><td><b>NS</b></td><td>Name Server, «сервер имён»: какие авторитативные серверы отвечают за зону</td><td>так поддомен передают (<b>делегируют</b>) другому DNS-провайдеру</td></tr>
+<tr><td><b>SOA</b></td><td>Start of Authority, «начало полномочий»: служебные параметры зоны</td><td>в том числе сколько кэшировать ответ «такого имени нет»</td></tr>
+<tr><td><b>MX</b></td><td>Mail Exchange, «почтовый обменник»: почтовые серверы домена с приоритетом</td><td><a href="18-other-protocols.html">глава 18</a></td></tr>
+<tr><td><b>TXT</b></td><td>Text: произвольный текст</td><td>используется для <b>SPF</b> (Sender Policy Framework — список серверов, которым разрешено слать почту от домена), <b>DKIM</b> (DomainKeys Identified Mail — ключ для подписи писем), <b>DMARC</b> (Domain-based Message Authentication, Reporting and Conformance — правило, что делать с поддельными письмами), а также для подтверждения, что домен ваш</td></tr>
+<tr><td><b>SRV</b></td><td>Service: хост и порт сервиса</td><td>используют Kerberos (система входа в корпоративных сетях), SIP (Session Initiation Protocol, IP-телефония) и некоторые системы поиска сервисов (service discovery), например Consul</td></tr>
+<tr><td><b>PTR</b></td><td>Pointer, «указатель»: обратная запись IP → имя</td><td>почтовые серверы проверяют PTR отправителя</td></tr>
+<tr><td><b>CAA</b></td><td>Certification Authority Authorization, «разрешение для удостоверяющих центров»: какие <b>CA</b> (Certificate Authority, организации, выпускающие сертификаты HTTPS, <a href="09-tls.html">глава 09</a>) вправе выпускать сертификаты для домена</td><td>защита от ошибочного выпуска</td></tr>
+<tr><td><b>HTTPS / SVCB</b></td><td>SVCB — Service Binding, «привязка сервиса»: параметры подключения</td><td>например, поддерживает ли сервер HTTP/3 (<b>ALPN</b>-метка h3, <a href="11-http2-3-realtime.html">глава 11</a>) и ключ для <b>ECH</b> (Encrypted Client Hello, шифрование имени сайта при подключении). Браузер сразу знает, что можно подключаться по HTTP/3</td></tr>
 </table></div>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+A и AAAA — адреса, CNAME — псевдоним, NS — кто отвечает за зону, MX — почта, TXT — текст для проверок и почтовой защиты.</div>
+
+<!-- ============================================================ -->
 <h2 id="ttl"><span class="h-num">8.3</span>TTL, кэширование и миграции</h2>
 <ul>
-  <li>TTL — сколько секунд ответ можно кэшировать. Большой TTL — меньше запросов и быстрее; маленький — быстрее переключение при аварии.</li>
-  <li><b>Отрицательное кэширование</b>: «такого имени нет» (NXDOMAIN) тоже кэшируется — если сервис обратился к имени до создания записи, ошибка может «залипнуть» на минуты.</li>
-  <li><b>План переезда</b>: за сутки до переключения снизить TTL до 60 с (подождав старый TTL, чтобы кэши его увидели), переключить запись, держать старый сервер живым ещё минимум старый TTL и посмотреть остаточный трафик, затем вернуть TTL.</li>
-  <li>Не все клиенты уважают TTL: старые JVM с бесконечным кэшем, библиотеки, кэширующие адрес при старте, — после переключения они продолжают ходить на старый IP.</li>
+  <li><b>TTL</b> (Time To Live, «время жизни») записи — сколько секунд её разрешено хранить в кэше. Большой TTL — меньше запросов и быстрее ответы; маленький — быстрее переключение при аварии. Типичные значения — от 60 секунд до суток.</li>
+  <li><b>Отрицательное кэширование.</b> Ответ «такого имени нет» — <b>NXDOMAIN</b> (Non-Existent Domain, «несуществующий домен») — тоже кэшируется. Если сервис обратился к имени до того, как вы создали запись, ошибка может «залипнуть» на несколько минут.</li>
+  <li><b>План переезда на новый сервер:</b>
+    <ol>
+      <li>за сутки снизить TTL записи до 60 с и подождать прежний TTL, чтобы все кэши получили запись с новым коротким TTL;</li>
+      <li>переключить запись на новый адрес;</li>
+      <li>держать старый сервер живым ещё как минимум старый TTL и смотреть, сколько трафика к нему ещё приходит;</li>
+      <li>вернуть TTL обратно.</li>
+    </ol></li>
+  <li>Не все клиенты уважают TTL. Старые JVM с бесконечным кэшем и библиотеки, которые запоминают адрес один раз при запуске, после переключения продолжают ходить на старый IP.</li>
 </ul>
 
-<h2 id="lb"><span class="h-num">8.4</span>DNS как балансировщик</h2>
-<p>Несколько A-записей, GeoDNS (разные ответы для разных регионов), DNS с проверками здоровья (Route 53, Cloudflare). Ограничения: кэши клиентов не видят мгновенных изменений, нет учёта нагрузки, рекурсивный резолвер видит регион резолвера, а не клиента (частично решается EDNS Client Subnet). Поэтому DNS-балансировку используют для грубого выбора региона, а точное распределение — на L4/L7-балансировщиках (тема 13).</p>
+<div class="callout ok"><span class="c-title">Главное</span>
+TTL — сколько хранить запись в кэше. Изменения DNS расходятся не мгновенно, поэтому перед переездом TTL снижают заранее.</div>
 
+<!-- ============================================================ -->
+<h2 id="lb"><span class="h-num">8.4</span>DNS как балансировщик</h2>
+<p>DNS можно использовать для грубого распределения нагрузки: несколько A-записей на одно имя; <b>GeoDNS</b> — разные ответы для разных регионов («пользователям из Европы — европейский сервер»); DNS с <b>проверками здоровья</b> (health checks), который перестаёт отдавать адрес упавшего сервера. Такие услуги есть, например, у Route 53 (DNS-сервис Amazon, назван по номеру порта DNS) и Cloudflare.</p>
+<p>Ограничения:</p>
+<ul>
+  <li>кэши клиентов не видят изменений мгновенно — упавший сервер ещё какое-то время будут спрашивать;</li>
+  <li>DNS ничего не знает о текущей нагрузке серверов;</li>
+  <li>авторитативный сервер видит адрес рекурсивного резолвера, а не самого пользователя, и может ошибиться с регионом. Частично помогает <b>EDNS Client Subnet</b> («подсеть клиента»): резолвер передаёт часть адреса пользователя.</li>
+</ul>
+<p>Поэтому DNS-балансировку используют для выбора региона, а точное распределение по серверам делают L4- и L7-балансировщики (<a href="13-infrastructure.html">глава 13</a>).</p>
+
+<div class="callout ok"><span class="c-title">Главное</span>
+DNS умеет грубо распределять трафик по регионам и убирать упавшие адреса, но медленно и без учёта нагрузки. Точную балансировку делают балансировщики.</div>
+
+<!-- ============================================================ -->
 <h2 id="security"><span class="h-num">8.5</span>Приватность и безопасность</h2>
+<p>Классический DNS передаётся открытым текстом: провайдер и любой в сети видят, какие сайты вы открываете, и могут подменить ответ.</p>
 <div class="grid-3">
-  <div class="card"><h4>DoT / DoH</h4><p>DNS поверх TLS (853) или HTTPS (443): провайдер и сеть не видят и не подменяют запросы. Браузеры используют DoH.</p></div>
-  <div class="card"><h4>DNSSEC</h4><p>Подписи записей: защищает от подмены ответов (cache poisoning), но не шифрует. Внедрён частично.</p></div>
-  <div class="card"><h4>Атаки</h4><p>Cache poisoning, захват аккаунта у регистратора, «висящие» CNAME на удалённые облачные ресурсы (subdomain takeover).</p></div>
+  <div class="card"><h4>DoT / DoH</h4><p><b>DoT</b> (DNS over TLS — «DNS поверх TLS», порт 853) и <b>DoH</b> (DNS over HTTPS — «DNS поверх HTTPS», порт 443): запросы шифруются, сеть не может их прочитать или подменить. Браузеры используют DoH.</p></div>
+  <div class="card"><h4>DNSSEC</h4><p>DNS Security Extensions — «расширения безопасности DNS»: записи подписываются цифровой подписью, и резолвер проверяет, что ответ настоящий. Защищает от подмены, но <b>не шифрует</b>. Внедрён лишь частично.</p></div>
+  <div class="card"><h4>Атаки</h4><p><b>Cache poisoning</b> («отравление кэша») — подсунуть резолверу поддельный ответ, который он раздаст всем. <b>Захват аккаунта у регистратора</b> — злоумышленник меняет NS-записи домена. <b>Subdomain takeover</b> («захват поддомена») — CNAME продолжает указывать на удалённый облачный ресурс, и злоумышленник регистрирует этот ресурс себе.</p></div>
 </div>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+DoT и DoH шифруют запросы, DNSSEC подписывает ответы. Следите за CNAME на удалённые ресурсы и защищайте аккаунт у регистратора.</div>
+
+<!-- ============================================================ -->
 <h2 id="jvm"><span class="h-num">8.6</span>DNS в JVM</h2>
-<p>JVM кэширует результаты <code>InetAddress</code> сама, независимо от ОС:</p>
+<p>Java-программа узнаёт адрес через класс <code>InetAddress</code>. JVM кэширует результаты <b>сама</b>, независимо от ОС и от TTL записи. Поведение задаётся свойствами в файле <code>java.security</code> или параметром запуска <code>-Dимя=значение</code>:</p>
 <div class="table-wrap"><table>
-<tr><th>Свойство (java.security / -D)</th><th>По умолчанию</th><th>Смысл</th></tr>
-<tr><td><code>networkaddress.cache.ttl</code></td><td>30 с (если не задан; при включённом SecurityManager в старых версиях — навсегда)</td><td>кэш успешных ответов, TTL записи игнорируется</td></tr>
-<tr><td><code>networkaddress.cache.negative.ttl</code></td><td>10 с</td><td>кэш ошибок</td></tr>
-<tr><td><code>networkaddress.cache.stale.ttl</code> (новые JDK — проверьте javadoc вашей версии)</td><td>0</td><td>сколько отдавать устаревший адрес, если DNS недоступен</td></tr>
+<tr><th>Свойство</th><th>По умолчанию</th><th>Смысл</th></tr>
+<tr><td><code>networkaddress.cache.ttl</code></td><td>30 с (если не задано). В старых версиях при включённом SecurityManager (устаревшем механизме ограничения прав Java-кода) — навсегда</td><td>сколько хранить успешный ответ; TTL самой записи игнорируется</td></tr>
+<tr><td><code>networkaddress.cache.negative.ttl</code></td><td>10 с</td><td>сколько хранить ошибку «имени нет»</td></tr>
+<tr><td><code>networkaddress.cache.stale.ttl</code> (есть в новых JDK — проверьте документацию своей версии)</td><td>0</td><td>сколько отдавать устаревший адрес, если DNS недоступен</td></tr>
 </table></div>
 <ul>
-  <li>Пулы соединений держат соединения к <b>старому</b> IP, пока они живы, — изменение DNS не применится, если не ограничить время жизни соединения (<code>maxLifetime</code> в HikariCP, <code>connection TTL</code> в HTTP-клиентах).</li>
-  <li><code>InetAddress.getByName</code> — блокирующий вызов. В Netty/WebFlux используйте асинхронный резолвер (<code>DnsAddressResolverGroup</code>), иначе медленный DNS блокирует event loop.</li>
-  <li>JDK 18+: SPI <code>InetAddressResolverProvider</code> позволяет подменить резолвер (тесты, своя логика).</li>
+  <li><b>Пулы соединений</b> держат открытые соединения к <b>старому</b> IP, пока они живы, и смена DNS к ним не применится. Нужно ограничить время жизни соединения: <code>maxLifetime</code> в пуле соединений с базой <b>HikariCP</b>, «connection TTL» в HTTP-клиентах.</li>
+  <li><code>InetAddress.getByName</code> — <b>блокирующий</b> вызов: поток стоит и ждёт ответа DNS. В реактивных фреймворках <b>Netty</b> и <b>WebFlux</b> немногие потоки обслуживают тысячи запросов в цикле событий (<b>event loop</b>), и один медленный DNS-запрос останавливает их всех. Там используют асинхронный резолвер (<code>DnsAddressResolverGroup</code>).</li>
+  <li>С JDK 18 есть <b>SPI</b> (Service Provider Interface — «интерфейс поставщика услуг», способ подключить свою реализацию) <code>InetAddressResolverProvider</code>: можно подменить резолвер, например в тестах.</li>
 </ul>
 
+<div class="callout ok"><span class="c-title">Главное</span>
+JVM кэширует адреса сама (по умолчанию 30 с), а пулы держат соединения к старым адресам. Ограничивайте время жизни соединений и не делайте блокирующих DNS-запросов в event loop.</div>
+
+<!-- ============================================================ -->
 <h2 id="k8s"><span class="h-num">8.7</span>DNS в Kubernetes</h2>
-<p>CoreDNS отвечает за имена сервисов: <code>payments.prod.svc.cluster.local</code> → ClusterIP. В <code>/etc/resolv.conf</code> пода стоит <code>search prod.svc.cluster.local svc.cluster.local cluster.local</code> и <code>options ndots:5</code>.</p>
+<p>В Kubernetes (системе запуска контейнеров, <a href="13-infrastructure.html">глава 13</a>) свой DNS-сервер — <b>CoreDNS</b>. Он отвечает на имена сервисов кластера: <code>payments.prod.svc.cluster.local</code> → <b>ClusterIP</b> (внутренний виртуальный адрес сервиса). Здесь <code>payments</code> — имя сервиса, <code>prod</code> — <b>пространство имён</b> (namespace, логический раздел кластера), <code>svc.cluster.local</code> — стандартный суффикс.</p>
+<p>В файле настроек резолвера <code>/etc/resolv.conf</code> каждого пода записано:</p>
+<pre class="out">search prod.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</pre>
+<p><code>search</code> — <b>суффиксы поиска</b>: их пробуют дописывать к короткому имени, поэтому внутри кластера можно писать просто <code>payments</code>. <code>ndots:5</code> — «если в имени меньше пяти точек, сначала пробуй суффиксы».</p>
 <div class="callout bad"><span class="c-title">ndots:5 и лишние запросы</span>
-Имя <code>api.partner.com</code> содержит 2 точки (&lt; 5), поэтому резолвер сначала пробует <code>api.partner.com.prod.svc.cluster.local</code>, затем остальные суффиксы поиска, — по запросу A и AAAA на каждую попытку, и только потом настоящее имя. Каждый вызов внешнего API порождает до 8 лишних DNS-запросов и нагрузку на CoreDNS. Лечение: точка в конце имени (<code>api.partner.com.</code>), уменьшение <code>ndots</code> в <code>dnsConfig</code> пода, NodeLocal DNSCache.
+В имени <code>api.partner.com</code> всего 2 точки (меньше 5). Поэтому резолвер сначала пробует <code>api.partner.com.prod.svc.cluster.local</code>, потом остальные два суффикса — и каждый раз отдельно спрашивает A и AAAA. Только после шести бесполезных запросов он спросит настоящее имя. Каждый вызов внешнего API порождает лишние запросы и нагрузку на CoreDNS. Лечение: писать полное имя с точкой в конце — <b>FQDN</b> (Fully Qualified Domain Name, «полностью определённое имя»): <code>api.partner.com.</code>; уменьшить <code>ndots</code> в настройке пода <code>dnsConfig</code>; включить <b>NodeLocal DNSCache</b> (кэш DNS на каждом сервере кластера).
 </div>
 
-<h2 id="lab"><span class="h-num">8.8</span>Лабораторная</h2>
-<pre><code class="sh">$ dig +trace yandex.ru               # весь путь: корень → .ru → авторитативные
-$ dig +short A github.com @1.1.1.1    # спросить конкретный резолвер
-$ dig github.com AAAA +noall +answer  # TTL в ответе уменьшается при повторных запросах
-$ dig -x 8.8.8.8                      # обратная запись PTR
-$ dig cloudflare.com HTTPS            # параметры для HTTP/3
-$ nslookup example.com                # Windows</code></pre>
+<div class="callout ok"><span class="c-title">Главное</span>
+В Kubernetes короткие имена сервисов работают за счёт суффиксов поиска. Из-за ndots:5 внешние имена порождают лишние DNS-запросы; помогает точка в конце имени.</div>
 
+<!-- ============================================================ -->
+<h2 id="lab"><span class="h-num">8.8</span>Практикум</h2>
+<p><code>dig</code> (Domain Information Groper — «щуп доменной информации») — главная утилита для DNS; есть в Linux и macOS, для Windows — в пакете BIND или через WSL. На Windows есть встроенная <code>nslookup</code> («поиск имени»).</p>
+<pre data-title="Терминал"><code class="sh">$ dig +trace yandex.ru               # весь путь: корень → .ru → авторитативные серверы
+$ dig +short A github.com @1.1.1.1    # спросить конкретный резолвер (@адрес), только ответ
+$ dig github.com AAAA +noall +answer  # повторите несколько раз: TTL в ответе уменьшается
+$ dig -x 8.8.8.8                      # обратная запись PTR: имя по адресу
+$ dig cloudflare.com HTTPS            # параметры подключения, в т.ч. поддержка HTTP/3
+> nslookup example.com                # Windows</code></pre>
+<p>Как читать ответ <code>dig</code>: в секции ANSWER строка <code>github.com. 60 IN A 140.82.121.3</code> означает «имя, TTL в секундах, класс IN (Internet), тип записи, значение». Если повторять запрос, TTL будет уменьшаться: это резолвер отдаёт запись из кэша и показывает, сколько ей осталось жить.</p>
+
+<!-- ============================================================ -->
 <h2 id="sim"><span class="h-num">8.9</span>Интерактив: разрешение имени по шагам</h2>
+<p>Пройдите путь поиска адреса <code>api.shop.example.com</code>, когда все кэши пусты.</p>
 <div class="widget stepper" id="dnsSim">
   <div class="widget-title">Симулятор: api.shop.example.com при пустых кэшах</div>
   <div class="flow st-stage">
@@ -121,30 +189,97 @@ $ nslookup example.com                # Windows</code></pre>
     <div class="node" id="dnRec"><b>Рекурсивный резолвер</b><small>провайдер, 8.8.8.8</small></div><span class="to">→</span>
     <div class="node" id="dnRoot"><b>Корень «.»</b></div>
     <div class="node" id="dnTld"><b>TLD .com</b></div>
-    <div class="node" id="dnAuth"><b>Авторитетный example.com</b></div>
+    <div class="node" id="dnAuth"><b>Авторитативный example.com</b></div>
   </div>
-  <section class="st-step" data-t="Запрос приложения" data-hl="dnApp" data-log="app: InetAddress.getByName(&quot;api.shop.example.com&quot;)"><h4>Приложение просит адрес</h4><p>JVM сначала смотрит собственный кэш (<code>networkaddress.cache.ttl</code>), затем вызывает системный резолвер.</p></section>
-  <section class="st-step" data-t="Локальные источники" data-hl="dnStub" data-log="os: /etc/hosts — нет; локальный кэш — нет"><h4>ОС: hosts и локальный кэш</h4><p>Порядок источников задаёт <code>/etc/nsswitch.conf</code>. Запись в <code>/etc/hosts</code> перекрывает DNS — частая причина «у меня открывается другой сервер».</p></section>
-  <section class="st-step" data-t="Stub → рекурсивный" data-hl="dnRec" data-log="stub → 10.0.0.2:53  A api.shop.example.com?  (UDP, флаг RD)"><h4>Запрос рекурсивному резолверу</h4><p>Адрес резолвера — из <code>/etc/resolv.conf</code> (выдан по DHCP). Stub-резолвер сам ничего не ищет: ставит флаг «нужна рекурсия» и ждёт готовый ответ. Таймаут по умолчанию 5 с × 2 попытки.</p></section>
-  <section class="st-step" data-t="Корневой сервер" data-hl="dnRoot" data-log="rec → a.root-servers.net  A api.shop.example.com?&#10;      ← направление: NS для com. — a.gtld-servers.net (+ адреса)"><h4>Корень отвечает направлением</h4><p>Корневые серверы знают только, кто отвечает за домены верхнего уровня. Их 13 имён, каждое — anycast из сотен точек. Адреса корня зашиты в резолвер.</p></section>
-  <section class="st-step" data-t="Сервер зоны .com" data-hl="dnTld" data-log="rec → a.gtld-servers.net  A api.shop.example.com?&#10;      ← направление: NS для example.com. — ns1.example.com (+ glue-адрес)"><h4>TLD отвечает направлением</h4><p>Реестр зоны <code>com</code> знает NS-серверы каждого домена второго уровня — их туда вносит регистратор.</p></section>
-  <section class="st-step" data-t="Авторитетный сервер" data-hl="dnAuth" data-log="rec → ns1.example.com  A api.shop.example.com?&#10;      ← ответ: CNAME api-lb.eu.example.net.  TTL 300"><h4>Авторитетный ответ — CNAME</h4><p>Имя оказалось псевдонимом. Резолвер должен разрешить и целевое имя — ещё один обход (здесь он сокращён).</p></section>
-  <section class="st-step" data-t="A-записи" data-hl="dnAuth" data-log="rec → ns.example.net  A api-lb.eu.example.net?&#10;      ← ответ: A 203.0.113.10, A 203.0.113.11  TTL 60"><h4>Итоговые адреса</h4><p>Две A-записи: порядок в ответе может меняться (round-robin). Клиент обычно берёт первый адрес; при ошибке соединения хороший клиент пробует следующий.</p></section>
-  <section class="st-step" data-t="Кэширование" data-hl="dnRec dnStub dnApp" data-log="rec: кэш CNAME на 300 с, A на 60 с;  ответ stub-резолверу&#10;app: адрес получен, connect(203.0.113.10:443)"><h4>Ответ кэшируется на каждом уровне</h4><p>Резолвер хранит ответ в течение TTL и отдаст его следующим клиентам мгновенно. ОС и JVM тоже кэшируют. Поэтому смена записи «доезжает» не сразу: до TTL резолверы отдают старый адрес, а некоторые клиенты (JVM с <code>ttl=-1</code>, пулы соединений) держат его ещё дольше.</p></section>
+  <section class="st-step" data-t="Запрос приложения" data-hl="dnApp" data-log="app: InetAddress.getByName(&quot;api.shop.example.com&quot;)"><h4>Приложение просит адрес</h4><p>Java-программа вызывает <code>InetAddress.getByName</code>. JVM сначала смотрит свой кэш (<code>networkaddress.cache.ttl</code>), затем вызывает системную функцию <code>getaddrinfo</code> («получить информацию об адресе»).</p></section>
+  <section class="st-step" data-t="Локальные источники" data-hl="dnStub" data-log="os: /etc/hosts — нет; локальный кэш — нет"><h4>ОС: файл hosts и локальный кэш</h4><p>Сначала ОС смотрит файл <code>/etc/hosts</code> (в Windows — <code>C:\Windows\System32\drivers\etc\hosts</code>), где можно вручную прописать «имя → адрес». Порядок источников в Linux задаёт <code>/etc/nsswitch.conf</code>. Запись в hosts перекрывает DNS — частая причина «у меня открывается не тот сервер».</p></section>
+  <section class="st-step" data-t="Stub → рекурсивный" data-hl="dnRec" data-log="stub → 10.0.0.2:53  A api.shop.example.com?  (UDP, флаг RD)"><h4>Запрос рекурсивному резолверу</h4><p>Адрес резолвера записан в <code>/etc/resolv.conf</code> (его выдал DHCP, <a href="04-nat-dhcp.html">глава 04</a>). Stub-резолвер ставит флаг <b>RD</b> (Recursion Desired — «нужна рекурсия»: найди всё сам) и ждёт ответа. Таймаут по умолчанию — 5 секунд, 2 попытки.</p></section>
+  <section class="st-step" data-t="Корневой сервер" data-hl="dnRoot" data-log="rec → a.root-servers.net  A api.shop.example.com?&#10;      ← направление: NS для com. — a.gtld-servers.net (+ адреса)"><h4>Корень отвечает направлением</h4><p>Корневой сервер не знает адрес, но говорит: «за .com отвечают вот эти серверы». Это называется <b>направлением</b> (referral). Адреса корневых серверов заранее зашиты в каждый резолвер.</p></section>
+  <section class="st-step" data-t="Сервер зоны .com" data-hl="dnTld" data-log="rec → a.gtld-servers.net  A api.shop.example.com?&#10;      ← направление: NS для example.com. — ns1.example.com (+ glue-адрес)"><h4>TLD отвечает направлением</h4><p>Сервер зоны .com знает NS-серверы каждого домена второго уровня — их туда внёс регистратор. Вместе с именем ns1.example.com он сразу даёт его адрес: такая подсказка называется <b>glue</b> («клей»), без неё был бы замкнутый круг — чтобы узнать адрес ns1.example.com, пришлось бы спросить сам ns1.example.com.</p></section>
+  <section class="st-step" data-t="Авторитативный сервер" data-hl="dnAuth" data-log="rec → ns1.example.com  A api.shop.example.com?&#10;      ← ответ: CNAME api-lb.eu.example.net.  TTL 300"><h4>Авторитативный ответ — CNAME</h4><p>Имя оказалось псевдонимом другого имени. Резолвер должен найти адрес и для него — ещё один обход иерархии (здесь сокращён).</p></section>
+  <section class="st-step" data-t="A-записи" data-hl="dnAuth" data-log="rec → ns.example.net  A api-lb.eu.example.net?&#10;      ← ответ: A 203.0.113.10, A 203.0.113.11  TTL 60"><h4>Итоговые адреса</h4><p>Две A-записи, их порядок в ответе может меняться (round-robin). Клиент обычно берёт первый адрес, а если подключиться не удалось, хороший клиент пробует следующий.</p></section>
+  <section class="st-step" data-t="Кэширование" data-hl="dnRec dnStub dnApp" data-log="rec: кэш CNAME на 300 с, A на 60 с;  ответ stub-резолверу&#10;app: адрес получен, connect(203.0.113.10:443)"><h4>Ответ кэшируется на каждом уровне</h4><p>Резолвер хранит ответ в течение TTL и следующим клиентам отдаст его мгновенно. ОС и JVM тоже кэшируют. Поэтому смена записи «доезжает» не сразу: до конца TTL резолверы отдают старый адрес, а некоторые клиенты (JVM с бесконечным кэшем, пулы соединений) держат его ещё дольше.</p></section>
 </div>
 
-<h2 id="quiz"><span class="h-num">8.10</span>Самопроверка</h2>
-<div class="mcq-score"></div>
-<div class="mcq" data-ok="2"><p>Вы сменили A-запись с TTL 3600. Когда все клиенты начнут ходить на новый адрес?</p><ul><li>Сразу</li><li>Через 5 минут</li><li>В течение часа и дольше: резолверы хранят старую запись до истечения TTL, а часть клиентов кэширует дольше</li><li>После перезапуска DNS-сервера</li></ul><div class="why">Перед миграцией TTL снижают заранее — за время не меньше старого TTL.</div></div>
-<div class="mcq" data-ok="1"><p>Почему на корне домена (example.com) нельзя поставить CNAME?</p><ul><li>Это ограничение регистратора</li><li>CNAME не может сосуществовать с другими записями того же имени, а на вершине зоны обязательны SOA и NS</li><li>CNAME работает только для www</li><li>Можно, это миф</li></ul><div class="why">Отсюда нестандартные ALIAS/ANAME у DNS-провайдеров: сервер сам разрешает цель и отдаёт A-записи.</div></div>
-<div class="mcq" data-ok="0"><p>Java-сервис годами ходит на старый IP после смены DNS. Причина?</p><ul><li>Кэш адресов в JVM (вечный при SecurityManager в старых версиях) или долгоживущие соединения в пуле, которые не переразрешают имя</li><li>Ошибка в tzdata</li><li>Неверный MTU</li><li>Истёк сертификат</li></ul><div class="why">Задайте <code>networkaddress.cache.ttl</code> и ограничьте время жизни соединений в пуле.</div></div>
+<!-- ============================================================ -->
+<h2 id="gloss"><span class="h-num">8.10</span>Словарик</h2>
+<h3>Сокращения главы</h3>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Сокращение</th><th>Полностью</th><th>Перевод</th><th>Что это</th></tr>
+<tr><td>A / AAAA</td><td>Address</td><td>адрес</td><td>запись с IPv4 / IPv6-адресом</td></tr>
+<tr><td>ALPN</td><td>Application-Layer Protocol Negotiation</td><td>согласование протокола прикладного уровня</td><td>выбор HTTP/1.1, HTTP/2 или HTTP/3 при подключении</td></tr>
+<tr><td>CA</td><td>Certificate Authority</td><td>удостоверяющий центр</td><td>выпускает сертификаты HTTPS</td></tr>
+<tr><td>CAA</td><td>Certification Authority Authorization</td><td>разрешение удостоверяющим центрам</td><td>кто вправе выпускать сертификаты домена</td></tr>
+<tr><td>CNAME</td><td>Canonical Name</td><td>каноническое имя</td><td>псевдоним другого имени</td></tr>
+<tr><td>DKIM</td><td>DomainKeys Identified Mail</td><td>почта, идентифицированная ключами домена</td><td>подпись исходящих писем</td></tr>
+<tr><td>DMARC</td><td>Domain-based Message Authentication, Reporting and Conformance</td><td>проверка, отчёты и соответствие сообщений на основе домена</td><td>политика для поддельных писем</td></tr>
+<tr><td>DNS</td><td>Domain Name System</td><td>система доменных имён</td><td>переводит имена в адреса</td></tr>
+<tr><td>DNSSEC</td><td>DNS Security Extensions</td><td>расширения безопасности DNS</td><td>цифровые подписи записей</td></tr>
+<tr><td>dig</td><td>Domain Information Groper</td><td>щуп доменной информации</td><td>утилита DNS-запросов</td></tr>
+<tr><td>DoH / DoT</td><td>DNS over HTTPS / TLS</td><td>DNS поверх HTTPS / TLS</td><td>зашифрованный DNS</td></tr>
+<tr><td>ECH</td><td>Encrypted Client Hello</td><td>зашифрованное приветствие клиента</td><td>скрывает имя сайта при подключении</td></tr>
+<tr><td>EDNS</td><td>Extension Mechanisms for DNS</td><td>механизмы расширения DNS</td><td>большие ответы, подсеть клиента и др.</td></tr>
+<tr><td>FQDN</td><td>Fully Qualified Domain Name</td><td>полностью определённое имя</td><td>полное имя, с точкой в конце</td></tr>
+<tr><td>JVM</td><td>Java Virtual Machine</td><td>виртуальная машина Java</td><td>среда выполнения Java-программ</td></tr>
+<tr><td>MX</td><td>Mail Exchange</td><td>почтовый обменник</td><td>почтовые серверы домена</td></tr>
+<tr><td>NS</td><td>Name Server</td><td>сервер имён</td><td>авторитативные серверы зоны</td></tr>
+<tr><td>NXDOMAIN</td><td>Non-Existent Domain</td><td>несуществующий домен</td><td>ответ «такого имени нет»</td></tr>
+<tr><td>PTR</td><td>Pointer</td><td>указатель</td><td>обратная запись: адрес → имя</td></tr>
+<tr><td>RD</td><td>Recursion Desired</td><td>нужна рекурсия</td><td>флаг «найди ответ сам»</td></tr>
+<tr><td>SIP</td><td>Session Initiation Protocol</td><td>протокол установления сеанса</td><td>IP-телефония</td></tr>
+<tr><td>SOA</td><td>Start of Authority</td><td>начало полномочий</td><td>служебные параметры зоны</td></tr>
+<tr><td>SPF</td><td>Sender Policy Framework</td><td>политика отправителей</td><td>какие серверы шлют почту от домена</td></tr>
+<tr><td>SPI</td><td>Service Provider Interface</td><td>интерфейс поставщика услуг</td><td>способ подключить свою реализацию в Java</td></tr>
+<tr><td>SRV</td><td>Service</td><td>сервис</td><td>хост и порт сервиса</td></tr>
+<tr><td>SVCB</td><td>Service Binding</td><td>привязка сервиса</td><td>параметры подключения (HTTP/3 и др.)</td></tr>
+<tr><td>TLD</td><td>Top-Level Domain</td><td>домен верхнего уровня</td><td>.com, .ru, .by</td></tr>
+<tr><td>TTL</td><td>Time To Live</td><td>время жизни</td><td>сколько секунд хранить запись в кэше</td></tr>
+<tr><td>TXT</td><td>Text</td><td>текст</td><td>произвольная текстовая запись</td></tr>
+</table></div>
+<h3>Термины</h3>
+<div class="table-wrap"><table class="gloss">
+<tr><th>Термин</th><th>Простыми словами</th></tr>
+<tr><td>Разрешение имени</td><td>Поиск IP-адреса по имени.</td></tr>
+<tr><td>Резолвер</td><td>Программа, которая ищет адрес по имени.</td></tr>
+<tr><td>Stub-резолвер</td><td>Часть ОС, которая лишь передаёт вопрос рекурсивному резолверу.</td></tr>
+<tr><td>Рекурсивный резолвер</td><td>Сервер, который сам обходит иерархию и кэширует ответы.</td></tr>
+<tr><td>Авторитативный сервер</td><td>Сервер, хранящий настоящие записи домена.</td></tr>
+<tr><td>Зона</td><td>Часть пространства имён, за которую отвечают одни серверы.</td></tr>
+<tr><td>Делегирование</td><td>Передача поддомена другим серверам через NS-записи.</td></tr>
+<tr><td>Регистратура / регистратор</td><td>Организация, ведущая зону (.com) / компания, продающая домены.</td></tr>
+<tr><td>Направление (referral)</td><td>Ответ «не знаю, спроси вот этих».</td></tr>
+<tr><td>Glue</td><td>Адрес NS-сервера, выданный вместе с направлением.</td></tr>
+<tr><td>Round-robin</td><td>Раздача нескольких адресов по кругу.</td></tr>
+<tr><td>GeoDNS</td><td>Разные ответы для разных регионов.</td></tr>
+<tr><td>Отрицательное кэширование</td><td>Кэширование ответа «имени нет».</td></tr>
+<tr><td>Cache poisoning</td><td>Подсовывание резолверу поддельного ответа.</td></tr>
+<tr><td>Subdomain takeover</td><td>Захват поддомена через «висящий» CNAME.</td></tr>
+<tr><td>/etc/hosts</td><td>Локальный файл «имя → адрес», перекрывающий DNS.</td></tr>
+<tr><td>CoreDNS</td><td>DNS-сервер внутри Kubernetes.</td></tr>
+<tr><td>Суффиксы поиска, ndots</td><td>Что дописывать к короткому имени и когда.</td></tr>
+<tr><td>Event loop</td><td>Цикл, в котором несколько потоков обслуживают тысячи запросов; блокировать его нельзя.</td></tr>
+</table></div>
 
+<!-- ============================================================ -->
+<h2 id="quiz"><span class="h-num">8.11</span>Самопроверка</h2>
+<div class="mcq-score"></div>
+<div class="mcq" data-ok="2"><p>Вы сменили A-запись с TTL 3600. Когда все клиенты начнут ходить на новый адрес?</p><ul><li>Сразу</li><li>Через 5 минут</li><li>В течение часа и дольше: резолверы хранят старую запись до конца TTL, а часть клиентов — ещё дольше</li><li>После перезапуска DNS-сервера</li></ul><div class="why">Перед миграцией TTL снижают заранее, не меньше чем за старый TTL.</div></div>
+<div class="mcq" data-ok="1"><p>Почему на корне домена (example.com) нельзя поставить CNAME?</p><ul><li>Это ограничение регистратора</li><li>CNAME не может соседствовать с другими записями того же имени, а на вершине зоны обязательны SOA и NS</li><li>CNAME работает только для www</li><li>Можно, это миф</li></ul><div class="why">Отсюда нестандартные ALIAS/ANAME у DNS-провайдеров: сервер сам находит адрес цели и отдаёт A-записи.</div></div>
+<div class="mcq" data-ok="0"><p>Java-сервис долго ходит на старый IP после смены DNS. Причина?</p><ul><li>Кэш адресов в JVM (в старых версиях — вечный) или долгоживущие соединения в пуле, которые не переразрешают имя</li><li>Ошибка часового пояса</li><li>Неверный MTU</li><li>Истёк сертификат</li></ul><div class="why">Задайте <code>networkaddress.cache.ttl</code> и ограничьте время жизни соединений в пуле.</div></div>
+<div class="mcq" data-ok="3"><p>Кто знает настоящий адрес api.example.com?</p><ul><li>Корневой сервер</li><li>Сервер зоны .com</li><li>Stub-резолвер ОС</li><li>Авторитативный сервер домена example.com</li></ul><div class="why">Корень и TLD дают только направления, а stub-резолвер ничего не ищет сам.</div></div>
+<div class="mcq" data-ok="1"><p>Какая запись указывает почтовые серверы домена?</p><ul><li>A</li><li>MX</li><li>CNAME</li><li>PTR</li></ul><div class="why">MX — Mail Exchange. PTR — обратная запись, а A — адрес.</div></div>
+<div class="mcq" data-ok="2"><p>Что даёт DoH (DNS over HTTPS)?</p><ul><li>Ускоряет сайты в 10 раз</li><li>Подписывает записи</li><li>Шифрует DNS-запросы, и сеть не может их прочитать или подменить</li><li>Заменяет IP-адреса</li></ul><div class="why">Подпись записей — это DNSSEC, а DoH именно шифрует канал до резолвера.</div></div>
+
+<h3>Вопросы для разговора (с собеседований)</h3>
 <div class="quiz">
 <details class="q"><summary>Чем рекурсивный резолвер отличается от авторитативного сервера?</summary><div class="a"><p>Рекурсивный (провайдера, 1.1.1.1, CoreDNS для внешних имён) принимает вопрос от клиента и сам обходит иерархию, кэшируя ответы. Авторитативный хранит записи конкретной зоны и отвечает только за неё, без рекурсии.</p></div></details>
-<details class="q"><summary>Поменяли A-запись (TTL 3600), а часть трафика ещё часы идёт на старый сервер. Почему?</summary><div class="a"><p>Кэши резолверов и клиентов держат старый ответ до часа; JVM и приложения могут кэшировать дольше; пулы соединений держат открытые соединения к старому IP. Нужно было заранее снизить TTL, ограничить время жизни соединений и держать старый сервер живым до схода трафика.</p></div></details>
-<details class="q"><summary>Почему нельзя поставить CNAME на example.com?</summary><div class="a"><p>CNAME не может сосуществовать с другими записями того же имени, а на корне зоны обязательны SOA и NS. Провайдеры обходят это записями ALIAS/ANAME (сами разрешают цель и отдают A).</p></div></details>
-<details class="q"><summary>Что такое ndots в Kubernetes и чем он вредит?</summary><div class="a"><p>Если в имени меньше ndots точек, резолвер сначала перебирает суффиксы из search-списка. При ndots:5 внешние имена резолвятся с серией обречённых запросов — растёт задержка и нагрузка на CoreDNS. Лечится FQDN с точкой, снижением ndots, локальным кэшем.</p></div></details>
+<details class="q"><summary>Поменяли A-запись (TTL 3600), а часть трафика ещё часы идёт на старый сервер. Почему?</summary><div class="a"><p>Кэши резолверов и клиентов держат старый ответ до часа; JVM и приложения могут кэшировать дольше; пулы держат открытые соединения к старому IP. Нужно было заранее снизить TTL, ограничить время жизни соединений и не выключать старый сервер, пока к нему идёт трафик.</p></div></details>
+<details class="q"><summary>Почему нельзя поставить CNAME на example.com?</summary><div class="a"><p>CNAME не может соседствовать с другими записями того же имени, а на корне зоны обязательны SOA и NS. Провайдеры обходят это записями ALIAS/ANAME: сами находят адрес цели и отдают A-записи.</p></div></details>
+<details class="q"><summary>Что такое ndots в Kubernetes и чем он вредит?</summary><div class="a"><p>Если в имени меньше ndots точек, резолвер сначала перебирает суффиксы поиска. При ndots:5 внешние имена разрешаются после серии заведомо бесполезных запросов — растёт задержка и нагрузка на CoreDNS. Лечится полным именем с точкой в конце, снижением ndots, локальным кэшем DNS.</p></div></details>
 </div>
+
+<div class="callout ok"><span class="c-title">Что дальше</span>
+Адрес найден, TCP-соединение открыто. Но данные по нему пока идут открытым текстом. Как их шифруют и как браузер убеждается, что говорит с настоящим сервером, — в <a href="09-tls.html">главе 09</a> про TLS.</div>
 
 </div></main>
 </div>
